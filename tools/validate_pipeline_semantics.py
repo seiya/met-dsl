@@ -5089,6 +5089,57 @@ def _infer_run_linter_preset_from_command(command: list[Any]) -> str | None:
     return None
 
 
+def _verify_mcp_command_log_record(
+    repo_root: Path,
+    meta_path: Path,
+    label: str,
+    command_id: str,
+    log_ref: str,
+    expected_tool: str,
+    violations: list[str],
+) -> list[Any] | None:
+    """Shared forgery-detection for a host-authored evidence entry that cites an MCP
+    ``command_log.jsonl`` record (used by both the lint and syntax certifications). The log
+    ref must be the canonical placement, the record must exist, be ``expected_tool``, have
+    ``ok=true``, and carry a non-empty ``command`` argv. Returns the logged ``command`` list
+    on success (for the caller's tool-specific final check — preset for lint, argv[0]
+    compiler for syntax), or ``None`` after appending exactly one violation. ``label``
+    prefixes each message (e.g. ``lint evidence run_linter[0]`` /
+    ``syntax evidence stages[0]``). Callers validate ``command_id`` / ``log_ref`` presence
+    before calling."""
+    canonical_refs = _canonical_mcp_log_refs_for_lint(meta_path, repo_root)
+    log_ref_norm = log_ref.rstrip("/")
+    if canonical_refs and log_ref_norm not in canonical_refs:
+        violations.append(
+            f"{meta_path}: {label}.command_log_ref must be the canonical MCP audit log "
+            f"placement (expected one of {sorted(canonical_refs)!r}, got {log_ref_norm!r}). "
+            "Non-canonical placements are rejected to prevent forged tool-execution evidence."
+        )
+        return None
+    matched = _find_command_log_record(repo_root, command_id, log_ref)
+    if matched is None:
+        violations.append(
+            f"{meta_path}: {label}: command log not found for command_id={command_id!r}"
+        )
+        return None
+    if matched.get("tool_name") != expected_tool:
+        violations.append(
+            f"{meta_path}: {label}: command_id={command_id!r} tool_name must be {expected_tool}"
+        )
+        return None
+    if matched.get("ok") is not True:
+        violations.append(
+            f"{meta_path}: {label}: command_id={command_id!r} {expected_tool} did not "
+            "succeed (ok must be true)"
+        )
+        return None
+    command = matched.get("command")
+    if not isinstance(command, list) or not command:
+        violations.append(f"{meta_path}: {label}: command log missing command")
+        return None
+    return command
+
+
 def _validate_generate_lint_command_logs(
     repo_root: Path,
     meta_path: Path,
@@ -5252,42 +5303,10 @@ def _validate_generate_lint_command_logs(
             )
             continue
 
-        canonical_refs_lint = _canonical_mcp_log_refs_for_lint(meta_path, repo_root)
-        log_ref_norm = log_ref.strip().rstrip("/")
-        if canonical_refs_lint and log_ref_norm not in canonical_refs_lint:
-            violations.append(
-                f"{meta_path}: lint evidence run_linter[{idx}].command_log_ref "
-                f"must be the canonical MCP audit log placement "
-                f"(expected one of {sorted(canonical_refs_lint)!r}, got {log_ref_norm!r}). "
-                "Non-canonical placements are rejected to prevent forged tool-execution "
-                "evidence."
-            )
-            continue
-
-        matched = _find_command_log_record(repo_root, command_id.strip(), log_ref.strip())
-        if matched is None:
-            violations.append(
-                f"{meta_path}: lint evidence run_linter[{idx}]: command log not found "
-                f"for command_id={command_id!r}"
-            )
-            continue
-        if matched.get("tool_name") != "run_linter":
-            violations.append(
-                f"{meta_path}: lint evidence run_linter[{idx}]: command_id={command_id!r} "
-                f"tool_name must be run_linter"
-            )
-            continue
-        if matched.get("ok") is not True:
-            violations.append(
-                f"{meta_path}: lint evidence run_linter[{idx}]: command_id={command_id!r} "
-                "run_linter did not succeed (ok must be true)"
-            )
-            continue
-        command = matched.get("command")
-        if not isinstance(command, list) or not command:
-            violations.append(
-                f"{meta_path}: lint evidence run_linter[{idx}]: command log missing command"
-            )
+        command = _verify_mcp_command_log_record(
+            repo_root, meta_path, f"lint evidence run_linter[{idx}]",
+            command_id.strip(), log_ref.strip(), "run_linter", violations)
+        if command is None:
             continue
         inferred = _infer_run_linter_preset_from_command(command)
         if inferred != preset_decl_l:
@@ -5410,42 +5429,10 @@ def _validate_generate_syntax_command_logs(
             continue
 
         # Same canonical placement as the lint records: <gen_dir>/src/command_log.jsonl.
-        canonical_refs = _canonical_mcp_log_refs_for_lint(meta_path, repo_root)
-        log_ref_norm = log_ref.strip().rstrip("/")
-        if canonical_refs and log_ref_norm not in canonical_refs:
-            violations.append(
-                f"{meta_path}: syntax evidence stages[{idx}].command_log_ref "
-                f"must be the canonical MCP audit log placement "
-                f"(expected one of {sorted(canonical_refs)!r}, got {log_ref_norm!r}). "
-                "Non-canonical placements are rejected to prevent forged tool-execution "
-                "evidence."
-            )
-            continue
-
-        matched = _find_command_log_record(repo_root, command_id.strip(), log_ref.strip())
-        if matched is None:
-            violations.append(
-                f"{meta_path}: syntax evidence stages[{idx}]: command log not found "
-                f"for command_id={command_id!r}"
-            )
-            continue
-        if matched.get("tool_name") != "run_syntax_check":
-            violations.append(
-                f"{meta_path}: syntax evidence stages[{idx}]: command_id={command_id!r} "
-                "tool_name must be run_syntax_check"
-            )
-            continue
-        if matched.get("ok") is not True:
-            violations.append(
-                f"{meta_path}: syntax evidence stages[{idx}]: command_id={command_id!r} "
-                "run_syntax_check did not succeed (ok must be true)"
-            )
-            continue
-        command = matched.get("command")
-        if not isinstance(command, list) or not command:
-            violations.append(
-                f"{meta_path}: syntax evidence stages[{idx}]: command log missing command"
-            )
+        command = _verify_mcp_command_log_record(
+            repo_root, meta_path, f"syntax evidence stages[{idx}]",
+            command_id.strip(), log_ref.strip(), "run_syntax_check", violations)
+        if command is None:
             continue
         exe_basename = Path(str(command[0])).name.strip().lower()
         if exe_basename != compiler:

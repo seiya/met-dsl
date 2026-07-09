@@ -2468,10 +2468,6 @@ clean:
                 "stdout": "",
                 "stderr": "" if ok else (failure_excerpt or "")}
 
-    # Free-form suffixes only, matching the generated-source contract (phase_02 §<module>.f90)
-    # and the run_syntax_check tool's own source discovery.
-    _SYNTAX_SOURCE_SUFFIXES: tuple[str, ...] = (".f90", ".f95", ".f03", ".f08")
-
     def _syntax_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
         """Deterministic Generate.syntax: in-process run_syntax_check (a real compiler
         front-end, gfortran -fsyntax-only) over the staged node + dependency-closure
@@ -2501,11 +2497,16 @@ clean:
         if mcp_dir not in _sys.path:
             _sys.path.insert(0, mcp_dir)
         from build_runtime_server import (
+            _FORTRAN_SYNTAX_SOURCE_SUFFIXES,
             _SYNTAX_COMPILER_ADAPTERS,
             tool_run_syntax_check,
         )
         from tools.hooks.syntax_evidence import write_syntax_evidence
 
+        # Single source of truth for the free-form Fortran suffix set: the tool that owns
+        # source discovery. The conductor's "no source to check" test and the tool's
+        # discover-and-order set must not drift.
+        suffixes = _FORTRAN_SYNTAX_SOURCE_SUFFIXES
         tc = self._read_toolchain(refs)
         language = tc["language"]
         src_dir = self.repo_root / refs.source_dir() / "src"
@@ -2519,7 +2520,7 @@ clean:
 
         node_sources = sorted(
             p for p in src_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in self._SYNTAX_SOURCE_SUFFIXES
+            if p.is_file() and p.suffix.lower() in suffixes
         ) if src_dir.is_dir() else []
 
         if language != "fortran":
@@ -2529,7 +2530,7 @@ clean:
             failure_category = "syntax_error"
             failure_excerpt = (
                 f"{self._rel(src_dir)}: no free-form Fortran source "
-                f"({'/'.join(self._SYNTAX_SOURCE_SUFFIXES)}) to syntax-check"
+                f"({'/'.join(suffixes)}) to syntax-check"
             )
         else:
             # Resolve + stage the dependency-closure `<dep>_model.f90` ONCE into a shared

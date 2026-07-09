@@ -851,10 +851,15 @@ def _fortran_syntax_source_order(project_dir: Path) -> list[str]:
     return ordered
 
 
-def _syntax_compiler_version(version_argv: list[str]) -> str | None:
+@lru_cache(maxsize=8)
+def _syntax_compiler_version(version_argv: tuple[str, ...]) -> str | None:
+    """First line of `<compiler> --version`, cached per argv. A compiler's version is
+    invariant for the process lifetime, so probe it once rather than re-spawning the
+    extra subprocess on every syntax stage and every warm-resume retry (the conductor
+    runs this tool in-process across the whole orchestration)."""
     try:
         proc = subprocess.run(
-            version_argv, text=True, capture_output=True, timeout=30, check=False
+            list(version_argv), text=True, capture_output=True, timeout=30, check=False
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -949,7 +954,7 @@ def tool_run_syntax_check(args: dict[str, Any]) -> dict[str, Any]:
     )
     return result | {
         "compiler": compiler,
-        "compiler_version": _syntax_compiler_version(list(adapter["version_argv"])),
+        "compiler_version": _syntax_compiler_version(tuple(adapter["version_argv"])),
         "std": std,
         "openmp": openmp,
         "skipped": False,
