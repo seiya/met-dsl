@@ -1596,6 +1596,510 @@ end program shallow_water2d_runner
                 f"guard case should be excused via in-file test_id; got: {missing_state}",
             )
 
+    def _write_target_cases_ir(self, repo_root: Path, node_safe: str, ir_ref: str,
+                               pipeline_dir: Path, *, predicates: list[dict] | None,
+                               evidence: list[dict], schema: dict,
+                               test_case_set: list[dict] | None = None) -> None:
+        ir_dir = repo_root / ir_ref
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(pipeline_dir / "lineage.json", {"ir_ref": ir_ref})
+        io_contract: dict = {
+            "inputs": [{"name": "U_L", "shape_expr": "[3]"}],
+            "outputs": [{"name": "F_star", "shape_expr": "[3]"}],
+            "raw_requirements": {
+                "required_evidence": [
+                    {"artifact": "state_snapshots", "required": True,
+                     "min_samples": 1, "schema": schema}
+                ]
+            },
+            "test_evidence_requirements": evidence,
+        }
+        if predicates is not None:
+            io_contract["test_predicates"] = predicates
+        _write_json(
+            ir_dir / "spec.ir.yaml",
+            {
+                # The M3c shape by default: case_id declared, `test_id` absent entirely (it is
+                # not a required field per phase_01_compile.md), so the case->test map is empty.
+                "case": {"test_case_set": test_case_set or [{"case_id": "case_equal_state"},
+                                                            {"case_id": "case_dry_state"}]},
+                "io_contract": io_contract,
+            },
+        )
+
+    def test_snapshot_scope_resolves_via_target_cases_when_no_test_id_anywhere(self) -> None:
+        """A host-rendered (M3c) runner writes `<case_id>.json` carrying `case_id` and no
+        `test_id`, while the IR's `case.test_case_set[]` omits `test_id` too — so neither the
+        case->test map, the in-file `test_id`, nor the file stem resolves a per-test contract.
+        `io_contract.test_predicates[].target_cases` is the remaining anchor, and it is the
+        exact field `runner_renderer._per_case_vars` renders the snapshot from.
+
+        Regression for the billed dev E2E 2026-07-09 (orch `…075057Z_89f9f59a`,
+        `dynamics_shallow_water_flux_2d_rusanov_p0`): the gate fell back to the strict union
+        and reported `F_star`/`G_star`/`guard_fired` missing from cases that legitimately omit
+        them, contradicting the `state_snapshots` bullet of phase_04_validate.md. The runner
+        output was conformant.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_tc__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-tc_20260709_001"
+            pipeline_dir = (repo_root / "workspace" / "pipelines" / node_safe
+                            / "demo-tc_20260709_001")
+            schema = {
+                "variables": [
+                    {"name": "U_L", "shape_expr": "[3]"},
+                    {"name": "F_star", "shape_expr": "[3]"},
+                    {"name": "guard_fired", "shape_expr": "scalar"},
+                ],
+                "time_variable": "t",
+                "time_shape_expr": "scalar",
+            }
+            self._write_target_cases_ir(
+                repo_root, node_safe, ir_ref, pipeline_dir, schema=schema,
+                predicates=[
+                    {"test_id": "l0_equal_state_pass", "target_cases": ["case_equal_state"]},
+                    {"test_id": "l0_dry_state_xfail", "target_cases": ["case_dry_state"]},
+                ],
+                evidence=[
+                    {"test_id": "l0_equal_state_pass",
+                     "required_raw_variables": ["U_L", "F_star"]},
+                    {"test_id": "l0_dry_state_xfail",
+                     "required_raw_variables": ["U_L", "guard_fired"]},
+                ],
+            )
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1,
+                "samples": ["case_equal_state.json", "case_dry_state.json"]})
+            # Exactly what the host renderer emits: only this case's required variables.
+            _write_json(snapshots_dir / "case_equal_state.json", {
+                "t": 0.0, "case_id": "case_equal_state",
+                "U_L": [1.0, 2.0, 3.0], "F_star": [0.5, 0.5, 0.5]})
+            _write_json(snapshots_dir / "case_dry_state.json", {
+                "t": 0.0, "case_id": "case_dry_state",
+                "U_L": [0.0, 0.5, 0.25], "guard_fired": 1.0})
+
+            execution = NodeExecution(
+                node_key="component/demo_tc@0.1.0", node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir)
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)
+            missing_state = [v for v in violations
+                             if "declared state_variables missing in snapshot files" in v]
+            self.assertFalse(
+                missing_state,
+                f"per-case snapshots scoped via target_cases must pass; got: {missing_state}")
+
+    def test_snapshot_scope_in_file_test_id_outranks_the_target_cases_union(self) -> None:
+        """Anchor order is load-bearing: a snapshot that names its own `test_id` is a per-TEST
+        file and must be scoped to that test, not to the union over every test ranging over its
+        case. Scoping it to the union would require variables the file legitimately omits.
+
+        Pins the ordering against a reorder that puts the union anchor first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_ord__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-ord_20260709_001"
+            pipeline_dir = (repo_root / "workspace" / "pipelines" / node_safe
+                            / "demo-ord_20260709_001")
+            schema = {
+                "variables": [
+                    {"name": "U_L", "shape_expr": "[3]"},
+                    {"name": "F_star", "shape_expr": "[3]"},
+                    {"name": "guard_fired", "shape_expr": "scalar"},
+                ],
+                "time_variable": "t",
+                "time_shape_expr": "scalar",
+            }
+            # One case, two tests: the union is {U_L, F_star, guard_fired}.
+            self._write_target_cases_ir(
+                repo_root, node_safe, ir_ref, pipeline_dir, schema=schema,
+                predicates=[
+                    {"test_id": "t_a", "target_cases": ["case_equal_state"]},
+                    {"test_id": "t_b", "target_cases": ["case_equal_state"]},
+                    {"test_id": "t_c", "target_cases": ["case_dry_state"]},
+                ],
+                evidence=[
+                    {"test_id": "t_a", "required_raw_variables": ["U_L", "F_star"]},
+                    {"test_id": "t_b", "required_raw_variables": ["U_L", "guard_fired"]},
+                    {"test_id": "t_c", "required_raw_variables": ["U_L"]},
+                ],
+            )
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1,
+                "samples": ["case_equal_state.json", "case_dry_state.json"]})
+            # A per-TEST snapshot for t_a: it carries `test_id` and omits `guard_fired`, which
+            # only the SIBLING test t_b requires. Correct under the t_a scope; a violation if
+            # the union anchor were consulted first.
+            _write_json(snapshots_dir / "case_equal_state.json", {
+                "t": 0.0, "case_id": "case_equal_state", "test_id": "t_a",
+                "U_L": [1.0, 2.0, 3.0], "F_star": [0.5, 0.5, 0.5]})
+            _write_json(snapshots_dir / "case_dry_state.json", {
+                "t": 0.0, "case_id": "case_dry_state", "U_L": [0.0, 0.5, 0.25]})
+
+            execution = NodeExecution(
+                node_key="component/demo_ord@0.1.0", node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir)
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)
+            missing_state = [v for v in violations
+                             if "declared state_variables missing in snapshot files" in v]
+            self.assertFalse(
+                missing_state,
+                f"an in-file test_id must outrank the union anchor; got: {missing_state}")
+
+    def _untargeted_case_violations(self, repo_root: Path, *, snapshot_case_id: str) -> list[str]:
+        """One targeted case + one DECLARED case no predicate ranges over. The second snapshot's
+        in-file `case_id` is parameterized so the undeclared-token path can be exercised too."""
+        node_safe = "component__demo_untargeted__0.1.0"
+        ir_ref = f"workspace/ir/{node_safe}/demo-untargeted_20260709_001"
+        pipeline_dir = (repo_root / "workspace" / "pipelines" / node_safe
+                        / "demo-untargeted_20260709_001")
+        schema = {
+            "variables": [
+                {"name": "U_L", "shape_expr": "[3]"},
+                {"name": "F_star", "shape_expr": "[3]"},
+                {"name": "guard_fired", "shape_expr": "scalar"},
+            ],
+            "time_variable": "t",
+            "time_shape_expr": "scalar",
+        }
+        self._write_target_cases_ir(
+            repo_root, node_safe, ir_ref, pipeline_dir, schema=schema,
+            # Only case_equal_state is targeted; case_dry_state is declared but targeted by nothing.
+            predicates=[{"test_id": "t_a", "target_cases": ["case_equal_state"]}],
+            evidence=[{"test_id": "t_a", "required_raw_variables": ["U_L", "F_star"]}],
+        )
+        node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+        snapshots_dir = node_dir / "raw" / "state_snapshots"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(snapshots_dir / "snapshot_schema.json", {
+            **schema, "min_samples": 1,
+            "samples": ["case_equal_state.json", "other.json"]})
+        _write_json(snapshots_dir / "case_equal_state.json", {
+            "t": 0.0, "case_id": "case_equal_state",
+            "U_L": [1.0, 2.0, 3.0], "F_star": [0.5, 0.5, 0.5]})
+        # The renderer emits an EMPTY-state snapshot for an untargeted case (`allocate(vals(0))`).
+        _write_json(snapshots_dir / "other.json", {"t": 0.0, "case_id": snapshot_case_id})
+
+        execution = NodeExecution(
+            node_key="component/demo_untargeted@0.1.0", node_dir=node_dir,
+            exec_dir=pipeline_dir / "runs" / "run_test_001",
+            pipeline_dir=pipeline_dir)
+        violations: list[str] = []
+        vps._validate_raw_evidence(repo_root, execution, violations)
+        return [v for v in violations
+                if "declared state_variables missing in snapshot files" in v]
+
+    def test_snapshot_scope_declared_but_untargeted_case_requires_nothing(self) -> None:
+        """A case declared in `case.test_case_set[]` that NO predicate ranges over has an empty
+        union, and `runner_renderer._per_case_vars` renders it as an empty-state snapshot
+        (`allocate(vals(0))`). The gate must mirror that instead of demanding every declared
+        variable — otherwise it false-rejects a conformant runner, the very defect the
+        `target_cases` anchor was added to remove. An untargeted case is schema-valid:
+        `validate_predicate_schema` checks each `target_cases` entry is a declared case, never
+        that every declared case is targeted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_state = self._untargeted_case_violations(
+                Path(tmp), snapshot_case_id="case_dry_state")
+            self.assertFalse(
+                missing_state,
+                f"a declared-but-untargeted case requires no state variables; got: {missing_state}")
+
+    def test_snapshot_scope_undeclared_case_token_keeps_the_strict_requirement(self) -> None:
+        """The empty-union relaxation is gated on the case being DECLARED. A snapshot whose
+        `case_id` matches no declared case cannot be scoped by anything, so the strict
+        all-declared requirement stands (it is not a renderer-emitted per-case file)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_state = self._untargeted_case_violations(
+                Path(tmp), snapshot_case_id="case_not_in_the_ir")
+            self.assertTrue(missing_state, "an unknown case token keeps the strict requirement")
+            self.assertIn("other.json", missing_state[0])
+            self.assertNotIn("case_equal_state.json", missing_state[0])
+
+    def test_snapshot_scope_union_outranks_the_legacy_single_test_mapping(self) -> None:
+        """A hybrid IR carries BOTH a legacy `case.test_case_set[].test_id` and predicates that
+        range several tests over the same case. The union is authoritative — it mirrors
+        `_per_case_vars`, which is what the runner emits — while the legacy map names one test
+        and would under-require a multi-test case. Pins anchor (2) ahead of anchor (3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_hybrid__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-hybrid_20260709_001"
+            pipeline_dir = (repo_root / "workspace" / "pipelines" / node_safe
+                            / "demo-hybrid_20260709_001")
+            schema = {
+                "variables": [{"name": "U_L", "shape_expr": "[3]"},
+                              {"name": "F_star", "shape_expr": "[3]"}],
+                "time_variable": "t",
+                "time_shape_expr": "scalar",
+            }
+            self._write_target_cases_ir(
+                repo_root, node_safe, ir_ref, pipeline_dir, schema=schema,
+                predicates=[{"test_id": "t_a", "target_cases": ["c1"]},
+                            {"test_id": "t_b", "target_cases": ["c1"]}],
+                test_case_set=[{"case_id": "c1", "test_id": "t_legacy"}],
+                evidence=[{"test_id": "t_legacy", "required_raw_variables": ["U_L"]},
+                          {"test_id": "t_a", "required_raw_variables": ["U_L"]},
+                          {"test_id": "t_b", "required_raw_variables": ["U_L", "F_star"]}],
+            )
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1, "samples": ["c1.json"]})
+            # Omits F_star, which the union {t_a, t_b} requires but the legacy t_legacy does not.
+            _write_json(snapshots_dir / "c1.json", {
+                "t": 0.0, "case_id": "c1", "U_L": [1.0, 2.0, 3.0]})
+
+            execution = NodeExecution(
+                node_key="component/demo_hybrid@0.1.0", node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir)
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)
+            missing_state = [v for v in violations
+                             if "declared state_variables missing in snapshot files" in v]
+            self.assertTrue(missing_state, "the union must win over the legacy single-test map")
+            self.assertIn("F_star", missing_state[0])
+
+    def test_snapshot_scope_empty_union_relaxation_requires_predicates(self) -> None:
+        """The empty-union relaxation is confined to the predicate-driven world by the
+        `case_to_tests` guard. A legacy IR that declares `test_evidence_requirements` but NO
+        `test_predicates` must keep the strict all-declared requirement for a declared case
+        it cannot otherwise scope — dropping the guard would silently accept a snapshot that
+        omits variables a test really requires."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_nopred__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-nopred_20260709_001"
+            pipeline_dir = (repo_root / "workspace" / "pipelines" / node_safe
+                            / "demo-nopred_20260709_001")
+            schema = {
+                "variables": [{"name": "U_L", "shape_expr": "[3]"},
+                              {"name": "F_star", "shape_expr": "[3]"}],
+                "time_variable": "t",
+                "time_shape_expr": "scalar",
+            }
+            self._write_target_cases_ir(
+                repo_root, node_safe, ir_ref, pipeline_dir, schema=schema,
+                predicates=None,  # no test_predicates at all
+                test_case_set=[{"case_id": "case_equal_state"}],
+                evidence=[{"test_id": "t_a", "required_raw_variables": ["U_L", "F_star"]}],
+            )
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1, "samples": ["case_equal_state.json"]})
+            _write_json(snapshots_dir / "case_equal_state.json", {
+                "t": 0.0, "case_id": "case_equal_state", "U_L": [1.0, 2.0, 3.0]})
+
+            execution = NodeExecution(
+                node_key="component/demo_nopred@0.1.0", node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir)
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)
+            missing_state = [v for v in violations
+                             if "declared state_variables missing in snapshot files" in v]
+            self.assertTrue(missing_state, "without predicates the strict requirement stands")
+            self.assertIn("F_star", missing_state[0])
+
+    def test_snapshot_scope_legacy_mapping_outranks_the_empty_union(self) -> None:
+        """The empty-union relaxation is ordered LAST. A case that no predicate ranges over but
+        that the legacy `case.test_case_set[].test_id` map does resolve must take the legacy
+        test's required set, not the empty union. Pins anchor (4) behind anchor (3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_mixed__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-mixed_20260709_001"
+            pipeline_dir = (repo_root / "workspace" / "pipelines" / node_safe
+                            / "demo-mixed_20260709_001")
+            schema = {
+                "variables": [{"name": "U_L", "shape_expr": "[3]"},
+                              {"name": "F_star", "shape_expr": "[3]"}],
+                "time_variable": "t",
+                "time_shape_expr": "scalar",
+            }
+            self._write_target_cases_ir(
+                repo_root, node_safe, ir_ref, pipeline_dir, schema=schema,
+                # c_legacy is declared and carries a legacy test_id, but no predicate targets it.
+                predicates=[{"test_id": "t_a", "target_cases": ["c_used"]}],
+                test_case_set=[{"case_id": "c_used"},
+                               {"case_id": "c_legacy", "test_id": "t_b"}],
+                evidence=[{"test_id": "t_a", "required_raw_variables": ["U_L"]},
+                          {"test_id": "t_b", "required_raw_variables": ["U_L", "F_star"]}],
+            )
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1, "samples": ["c_used.json", "c_legacy.json"]})
+            _write_json(snapshots_dir / "c_used.json", {
+                "t": 0.0, "case_id": "c_used", "U_L": [1.0, 2.0, 3.0]})
+            # c_legacy omits F_star, which its legacy test t_b requires.
+            _write_json(snapshots_dir / "c_legacy.json", {
+                "t": 0.0, "case_id": "c_legacy", "U_L": [1.0, 2.0, 3.0]})
+
+            execution = NodeExecution(
+                node_key="component/demo_mixed@0.1.0", node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir)
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)
+            missing_state = [v for v in violations
+                             if "declared state_variables missing in snapshot files" in v]
+            self.assertTrue(missing_state, "the legacy mapping must win over the empty union")
+            self.assertIn("c_legacy.json", missing_state[0])
+            self.assertIn("F_star", missing_state[0])
+            self.assertNotIn("c_used.json", missing_state[0])
+
+    def test_snapshot_scope_targeted_case_whose_tests_declare_no_evidence(self) -> None:
+        """A predicate whose `test_id` has no `test_evidence_requirements` entry contributes
+        nothing to the union. The renderer likewise emits no state for it, so the gate must not
+        raise (the `t in per_test_required` filter) nor demand every declared variable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_noevidence__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-noevidence_20260709_001"
+            pipeline_dir = (repo_root / "workspace" / "pipelines" / node_safe
+                            / "demo-noevidence_20260709_001")
+            schema = {
+                "variables": [
+                    {"name": "U_L", "shape_expr": "[3]"},
+                    {"name": "F_star", "shape_expr": "[3]"},
+                    {"name": "guard_fired", "shape_expr": "scalar"},
+                ],
+                "time_variable": "t",
+                "time_shape_expr": "scalar",
+            }
+            self._write_target_cases_ir(
+                repo_root, node_safe, ir_ref, pipeline_dir, schema=schema,
+                predicates=[
+                    {"test_id": "t_a", "target_cases": ["case_equal_state"]},
+                    # t_missing ranges over the case but declares no evidence requirement.
+                    {"test_id": "t_missing", "target_cases": ["case_equal_state"]},
+                ],
+                evidence=[{"test_id": "t_a", "required_raw_variables": ["U_L"]}],
+            )
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1, "samples": ["case_equal_state.json"]})
+            _write_json(snapshots_dir / "case_equal_state.json", {
+                "t": 0.0, "case_id": "case_equal_state", "U_L": [1.0, 2.0, 3.0]})
+
+            execution = NodeExecution(
+                node_key="component/demo_noevidence@0.1.0", node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir)
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)  # must not raise
+            missing_state = [v for v in violations
+                             if "declared state_variables missing in snapshot files" in v]
+            self.assertFalse(missing_state, f"scoped to t_a only; got: {missing_state}")
+
+    def test_case_id_to_test_ids_reads_the_unflattened_io_contract(self) -> None:
+        """`_io_contract_for_execution` hoists `test_predicates` out of the nested section, but a
+        doc that was never flattened still nests it; both shapes must resolve."""
+        predicates = [{"test_id": "t_a", "target_cases": ["c1", "c2"]},
+                      {"test_id": "t_b", "target_cases": ["c2"]}]
+        expected = {"c1": ["t_a"], "c2": ["t_a", "t_b"]}
+        self.assertEqual(vps._case_id_to_test_ids({"test_predicates": predicates}), expected)
+        self.assertEqual(
+            vps._case_id_to_test_ids({"io_contract": {"test_predicates": predicates}}), expected)
+        # Malformed entries are ignored rather than raising.
+        self.assertEqual(vps._case_id_to_test_ids({"test_predicates": "nope"}), {})
+        self.assertEqual(vps._case_id_to_test_ids({}), {})
+        self.assertEqual(
+            vps._case_id_to_test_ids({"test_predicates": [
+                "not-a-dict",
+                {"test_id": "", "target_cases": ["c1"]},
+                {"test_id": "t_x", "target_cases": [" ", 3, None]},
+                {"test_id": "t_y"},
+            ]}),
+            {},
+        )
+        # Identifiers are normalized, and a test naming the same case twice is recorded once.
+        self.assertEqual(
+            vps._case_id_to_test_ids({"test_predicates": [
+                {"test_id": " t_a ", "target_cases": [" c1 ", "c1"]},
+                {"test_id": "t_a", "target_cases": ["c1"]},
+            ]}),
+            {"c1": ["t_a"]},
+        )
+
+    def test_snapshot_scope_target_cases_takes_the_union_and_stays_strict(self) -> None:
+        """A case ranged over by SEVERAL tests requires the union of their raw variables
+        (what `_per_case_vars` emits) — and omitting one of them is still a violation, so the
+        anchor narrows the required set without weakening it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            node_safe = "component__demo_tcu__0.1.0"
+            ir_ref = f"workspace/ir/{node_safe}/demo-tcu_20260709_001"
+            pipeline_dir = (repo_root / "workspace" / "pipelines" / node_safe
+                            / "demo-tcu_20260709_001")
+            schema = {
+                "variables": [
+                    {"name": "U_L", "shape_expr": "[3]"},
+                    {"name": "F_star", "shape_expr": "[3]"},
+                    {"name": "guard_fired", "shape_expr": "scalar"},
+                ],
+                "time_variable": "t",
+                "time_shape_expr": "scalar",
+            }
+            # Two tests both range over case_equal_state -> union {U_L, F_star, guard_fired}.
+            self._write_target_cases_ir(
+                repo_root, node_safe, ir_ref, pipeline_dir, schema=schema,
+                predicates=[
+                    {"test_id": "t_a", "target_cases": ["case_equal_state"]},
+                    {"test_id": "t_b", "target_cases": ["case_equal_state"]},
+                    {"test_id": "t_c", "target_cases": ["case_dry_state"]},
+                ],
+                evidence=[
+                    {"test_id": "t_a", "required_raw_variables": ["U_L", "F_star"]},
+                    {"test_id": "t_b", "required_raw_variables": ["U_L", "guard_fired"]},
+                    {"test_id": "t_c", "required_raw_variables": ["U_L"]},
+                ],
+            )
+            node_dir = pipeline_dir / "runs" / "run_test_001" / node_safe
+            snapshots_dir = node_dir / "raw" / "state_snapshots"
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(snapshots_dir / "snapshot_schema.json", {
+                **schema, "min_samples": 1,
+                "samples": ["case_equal_state.json", "case_dry_state.json"]})
+            # Union member `guard_fired` omitted -> must be flagged.
+            _write_json(snapshots_dir / "case_equal_state.json", {
+                "t": 0.0, "case_id": "case_equal_state",
+                "U_L": [1.0, 2.0, 3.0], "F_star": [0.5, 0.5, 0.5]})
+            # Its own test needs only U_L; omitting F_star/guard_fired is legitimate.
+            _write_json(snapshots_dir / "case_dry_state.json", {
+                "t": 0.0, "case_id": "case_dry_state", "U_L": [0.0, 0.5, 0.25]})
+
+            execution = NodeExecution(
+                node_key="component/demo_tcu@0.1.0", node_dir=node_dir,
+                exec_dir=pipeline_dir / "runs" / "run_test_001",
+                pipeline_dir=pipeline_dir)
+            violations: list[str] = []
+            vps._validate_raw_evidence(repo_root, execution, violations)
+            missing_state = [v for v in violations
+                             if "declared state_variables missing in snapshot files" in v]
+            self.assertTrue(missing_state, "the missing union member must be flagged")
+            self.assertIn("case_equal_state.json", missing_state[0])
+            self.assertIn("guard_fired", missing_state[0])
+            self.assertNotIn("case_dry_state.json", missing_state[0])
+
     def test_snapshot_completeness_falls_back_to_strict_union_without_per_test_contract(self) -> None:
         """Backward-compat: when the IR carries no per-test evidence scoping
         (`io_contract.test_evidence_requirements`) and/or no `case.test_case_set`

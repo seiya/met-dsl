@@ -26557,6 +26557,8 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
                 ("dev_phase_rollback", "validate_execute_fail"),
                 # the C2 backstop's Compile reopen — reopening Generate would be wrong
                 ("dev_phase_rollback", "validate_execute_fail_ir"),
+                # an M3c snapshot gap re-attributed to the IR (host-rendered runner)
+                ("dev_phase_rollback", "validate_execute_snapshot_deliverable_gap_ir"),
                 ("dev_phase_rollback", "validate_execute_physics_fail"),
                 ("dev_phase_rollback", "validate_execute_structural_violation"),
                 ("dev_phase_rollback", "generate->compile"),

@@ -1621,3 +1621,78 @@ degradation. Like B1 the route fires only on a
 real structural execute failure, so a billed E2E exercises it only opportunistically: when E2E #4 passes
 on the clarified spec (Part A) the directive never fires, and when it fails structurally B2 replaces the
 deadlock.
+
+## B3 — node-aware execute routing + the per-case snapshot scope gate (IMPLEMENTED 2026-07-09)
+
+Found by billed dev E2E #4 (orch `…075057Z_89f9f59a`, `dynamics_shallow_water_flux_2d_rusanov_p0`). Part A
+held — the harness re-certified at `0.2.1` and emitted a flat `metrics_basis` — but the consumer node
+fail_closed with `dev_phase_rollback` / `validate_execute_post_execute_violation`. Two distinct defects.
+
+1. **`post_execute` false-rejected a conformant runner.** The `state_snapshots` bullet of
+   `phase_04_validate.md` states the gate "scopes required variables per the snapshot's case", and a
+   host-rendered (M3c) runner emits, per case, the union of `required_raw_variables` over the tests
+   targeting it (`runner_renderer._per_case_vars`). The gate tried to resolve that scope from
+   `case.test_case_set[].test_id` (`_case_id_to_test_id`), from an in-file `test_id`, or from the file
+   stem. An M3c IR declares none of the three: `test_id` is not a required `test_case_set` field, the
+   harness's `__write_snapshot` writes no `test_id` key, and the stem is a `case_id` (`case_dry_state`),
+   not a `test_id` (`l0_invalid_dry_state_xfail`). So the gate fell through to "require every declared
+   variable" and reported `F_star`/`G_star`/`a_x`/`guard_fired` missing from cases that legitimately omit
+   them. Fix: resolve the case's tests through `io_contract.test_predicates[].target_cases` — the one
+   case→test mapping every IR carries, and the exact field the renderer reads — as an anchor between the
+   in-file `test_id` and the legacy ones (`_case_id_to_test_ids`). A case ranged over by several tests
+   takes the **union**, which is what the renderer emits and has no single `test_id`. The anchor order is
+   load-bearing: a snapshot naming its own `test_id` is a per-test file and must scope to that one test,
+   never to the wider union. A case that is **declared** in `case.test_case_set[]` but that no predicate
+   ranges over takes the EMPTY union — `validate_predicate_schema` checks each `target_cases` entry is a
+   declared case, never that every declared case is targeted, and `_per_case_vars` renders such a case as
+   an empty-state snapshot (`allocate(vals(0))`), so demanding every declared variable of it is the same
+   false-reject. That relaxation is ordered last (a legacy per-case mapping still wins) and is gated on
+   the case being declared, so a snapshot whose `case_id` matches no declared case still gets the strict
+   set. The all-declared fallback therefore fires whenever no anchor resolves — an IR with no
+   `test_evidence_requirements`, or an unknown case token — and is not disabled merely by the presence of
+   predicates. `_io_contract_for_execution` flattens `io_contract` through a key whitelist that dropped
+   `test_predicates`; adding it there is what makes the anchor reachable. Re-running the real gate over
+   the failed run's artifacts turns `FAIL` into `PASS`, and the already-passing harness node stays `PASS`.
+2. **B1's routing table ignores which phase authored the runner.** It sends every structural category to
+   `("generate","reuse")`, which assumes the defect is in leaf-authored code. On an M3c node the leaf
+   authors only `<spec_id>_model.f90` + `<spec_id>_checks.f90`; the runner is host-rendered. The renderer
+   boxes that case's required variables **unconditionally** — `get_r1('F_star', …)` looks the value up in
+   a leaf registry and the found-flag is discarded — so the snapshot key set and shapes are fixed by the
+   IR while every value comes from the leaf. Therefore: `post_execute_violation` and
+   `quality_check_mismatch` remain leaf-repairable in the value domain (a trivial all-zero basis, a NaN, a
+   wrong metric) and keep the Generate route, but a `snapshot_deliverable_gap` — a missing per-case
+   `<case_id>.json`, which the rendered runner writes for every `case.test_case_set[].case_id` — can never
+   be fixed by regenerating model/checks. `classify_failure` now re-attributes exactly that category on a
+   `_conductor_authors_runner` node to the IR and reopens Compile, with the `_ir` reason suffix the C2
+   backstop already uses (`HOST_RENDERED_RUNNER_UNREPAIRABLE`). The suffix is not a routing-table key, so
+   it also keeps the case out of the reuse set that `_read_repair_findings` and the B2 dev resume
+   directive gate on — neither threads findings into a Generate repair that could not apply them. Like the
+   C2 threshold branch, this reopen **resets the C2 counter**: it regenerates the IR and everything
+   downstream, so the next execute failure is against fresh artifacts and must get its own
+   Generate-retry-first cycle. Without the reset the stale count sends the very next failure —
+   typically a leaf-repairable value defect in the regenerated checks module — to the findings-less C2
+   reopen, skipping the warm repair B1 exists for. A leaf `error stop` mid-loop cannot
+   reach this branch: it exits non-zero, so `_execute_inproc` writes no `trial_meta` and the cold
+   `validate_execute_fail` restart stands.
+
+**Dev limitation (unchanged by this section).** In dev the new Compile reopen is a cross-phase rollback,
+so F1 fail_closes it as `dev_phase_rollback` and no deriver claims the `_ir` reason detail — `--resume` is
+therefore a plain resume that reproduces the failure, exactly as the pre-existing `validate_execute_fail_ir`
+C2 reopen already behaves in dev. The operator runs `reopen-phase --from-phase compile` manually. This is not
+a regression: before this change dev reopened Generate, which cannot repair a host-rendered snapshot gap and
+therefore reproduced the failure after spending a Generate attempt.
+
+Suite green (2227). Coverage: the gate's anchors (per-case pass, multi-test union, union member omitted
+still flagged, in-file `test_id` outranking the union, the union outranking the legacy single-test map,
+the legacy map outranking the empty union, a declared-but-untargeted case requiring nothing, an
+undeclared case token keeping the strict requirement,
+the empty-union relaxation confined to predicate-carrying IRs, a targeted test with no evidence
+requirement, the un-flattened `io_contract` shape, malformed / duplicate / whitespace-padded predicate
+entries) — mutation-checked, with the whitelist entry removed, each anchor disabled in turn, the union
+replaced by an intersection, each adjacent anchor pair swapped, the empty-union mirror removed, its
+declared-case guard and its `case_to_tests` guard dropped, the `t in per_test_required` filter removed,
+and the dedup / strip dropped all failing distinct tests; the routing split (M3c snapshot gap → compile `_ir`, M3c `post_execute_violation` /
+`quality_check_mismatch` → generate/reuse as literals, non-M3c snapshot gap → generate/reuse), with
+`HOST_RENDERED_RUNNER_UNREPAIRABLE` pinned as a literal so an over-inclusive edit cannot make the
+value-domain test vacuous; the C2 counter reset (dropping it sends the next value defect to the
+findings-less reopen); and the B2 deriver rejecting the new `_ir` reason.

@@ -3411,6 +3411,16 @@ def _validate_raw_evidence(
                             else {}
                         )
                         case_to_test = _case_id_to_test_id(repo_root, execution)
+                        case_to_tests = (
+                            _case_id_to_test_ids(contract)
+                            if isinstance(contract, dict)
+                            else {}
+                        )
+                        # Declared `case.test_case_set[].case_id`, so a case the predicates
+                        # do not range over can be told apart from an unknown snapshot: the
+                        # former has an empty required set (the renderer emits an empty-state
+                        # snapshot for it), the latter cannot be scoped at all.
+                        declared_case_ids = _case_ids_for_execution(repo_root, execution)
                         for snapshot in snapshot_data_files:
                             if snapshot.suffix.lower() != ".json":
                                 continue
@@ -3423,9 +3433,9 @@ def _validate_raw_evidence(
                             keys = set(data.keys())
                             required_state_names = state_variables
                             if per_test_required:
-                                # Identify this snapshot's test_id to scope its
-                                # required raw variables. Compile/runner output
-                                # shape varies across runs (C-class IR
+                                # Identify what this snapshot's required raw
+                                # variables are. Compile/runner output shape
+                                # varies across runs (C-class IR
                                 # nondeterminism): the snapshot may carry an
                                 # explicit `test_id`, or only a `case_id`
                                 # (mapped via case.test_case_set, which itself
@@ -3442,19 +3452,61 @@ def _validate_raw_evidence(
                                     and raw_case_id.strip()
                                     else snapshot.stem
                                 )
-                                candidate_test_ids: list[str] = []
-                                raw_test_id = data.get("test_id")
-                                if isinstance(raw_test_id, str) and raw_test_id.strip():
-                                    candidate_test_ids.append(raw_test_id.strip())
-                                mapped_test_id = case_to_test.get(case_token)
-                                if mapped_test_id:
-                                    candidate_test_ids.append(mapped_test_id)
-                                candidate_test_ids.append(case_token)
                                 case_required = None
-                                for candidate in candidate_test_ids:
-                                    if candidate in per_test_required:
-                                        case_required = per_test_required[candidate]
-                                        break
+                                # (1) A per-TEST snapshot names its test outright.
+                                raw_test_id = data.get("test_id")
+                                if (
+                                    isinstance(raw_test_id, str)
+                                    and raw_test_id.strip() in per_test_required
+                                ):
+                                    case_required = per_test_required[raw_test_id.strip()]
+                                # (2) A per-CASE snapshot (the contract's `<case_id>.json`,
+                                # and everything a host-rendered runner writes) carries no
+                                # test_id. Its required set is the UNION over every test
+                                # ranging over the case — precisely what
+                                # `runner_renderer._per_case_vars` emitted. Without this
+                                # anchor an IR whose `case.test_case_set[]` omits `test_id`
+                                # (never a required field) falls through to "every declared
+                                # variable" and false-rejects a conformant per-case snapshot,
+                                # contradicting the `state_snapshots` bullet of
+                                # phase_04_validate.md ("the post_execute semantic gate scopes
+                                # required variables per the snapshot's case"). A case targeted by
+                                # several tests has no single test_id, so only the union is
+                                # well-defined. Anchor (1) must stay ahead of this one: a per-test
+                                # snapshot names its test and scopes to that test alone.
+                                if case_required is None:
+                                    union_tests = [
+                                        t
+                                        for t in case_to_tests.get(case_token, [])
+                                        if t in per_test_required
+                                    ]
+                                    if union_tests:
+                                        case_required = set().union(
+                                            *(per_test_required[t] for t in union_tests)
+                                        )
+                                # (3) Legacy single-test anchors: an IR that does declare
+                                # `case.test_case_set[].test_id`, or a snapshot whose stem
+                                # is itself the test_id.
+                                if case_required is None:
+                                    for candidate in (
+                                        case_to_test.get(case_token),
+                                        case_token,
+                                    ):
+                                        if candidate and candidate in per_test_required:
+                                            case_required = per_test_required[candidate]
+                                            break
+                                # (4) A DECLARED case that no predicate ranges over: its union is
+                                # EMPTY, and `_per_case_vars` renders it as an empty-state
+                                # snapshot. Demanding every declared variable of it would be the
+                                # same false-reject the union anchor exists to remove. An
+                                # untargeted case is schema-valid — `validate_predicate_schema`
+                                # checks each `target_cases` entry IS a declared case, never that
+                                # every declared case is targeted. Ordered last so a legacy
+                                # per-case mapping still wins; and gated on the case being
+                                # DECLARED, so an unknown snapshot token still gets the strict set.
+                                if (case_required is None and case_to_tests
+                                        and case_token in declared_case_ids):
+                                    case_required = set()
                                 if case_required is not None:
                                     required_state_names = [
                                         name
@@ -4323,6 +4375,10 @@ def _io_contract_for_execution(
             "raw_requirements",
             "semantic_dependency",
             "test_evidence_requirements",
+            # `test_predicates[].target_cases` is the only case -> test mapping every IR
+            # carries; the post_execute snapshot check scopes each per-case snapshot's
+            # required raw variables through it (`_case_id_to_test_ids`).
+            "test_predicates",
             "diagnostics_contract",
             "source",
         ):
@@ -4951,6 +5007,42 @@ def _case_id_to_test_id(
             and test_id.strip()
         ):
             mapping[case_id.strip()] = test_id.strip()
+    return mapping
+
+
+def _case_id_to_test_ids(contract: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each case_id to every test_id ranging over it, from
+    ``io_contract.test_predicates[].target_cases``.
+
+    This is the anchor a host-rendered runner is built from: `runner_renderer._per_case_vars`
+    emits, per case, the union of `required_raw_variables` over exactly these tests. Reading
+    the same field here makes the post_execute snapshot check a mirror of what the renderer
+    wrote, rather than an independent guess (the `_validate_harness_render_preconditions`
+    discipline). It is also the only case -> test mapping every IR carries: `case.test_case_set[]`
+    is not required to declare a `test_id` (`phase_01_compile.md`), so `_case_id_to_test_id`
+    returns {} for an IR that omits it, and a case targeted by several tests has no single id
+    at all. Empty dict when the IR declares no predicates.
+    """
+    predicates = contract.get("test_predicates")
+    if not isinstance(predicates, list):
+        # `_io_contract_for_execution` hoists the key out of the nested `io_contract`
+        # section; an un-flattened doc still nests it.
+        nested = contract.get("io_contract")
+        predicates = nested.get("test_predicates") if isinstance(nested, dict) else None
+    if not isinstance(predicates, list):
+        return {}
+    mapping: dict[str, list[str]] = {}
+    for item in predicates:
+        if not isinstance(item, dict):
+            continue
+        test_id = item.get("test_id")
+        if not (isinstance(test_id, str) and test_id.strip()):
+            continue
+        for case_id in item.get("target_cases") or []:
+            if isinstance(case_id, str) and case_id.strip():
+                bucket = mapping.setdefault(case_id.strip(), [])
+                if test_id.strip() not in bucket:
+                    bucket.append(test_id.strip())
     return mapping
 
 

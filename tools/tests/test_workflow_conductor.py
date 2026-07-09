@@ -4381,6 +4381,121 @@ class DeterministicBuildTest(unittest.TestCase):
                     ("retry", "generate", "reuse"), category)
                 self.assertEqual(d.reason, f"validate_execute_{category}")
 
+    def _m3c_conductor(self, repo: Path) -> "wc.Conductor":
+        """A conductor whose node host-renders its runner (M3c), without seeding a full IR."""
+        class _M3c(wc.Conductor):
+            def _conductor_authors_runner(self, refs):  # type: ignore[override]
+                return True
+        return _M3c(repo_root=repo, orchestration_id="o",
+                    orchestration_agent_run_id="O", backend="claude", env={})
+
+    def test_snapshot_gap_on_host_rendered_runner_reopens_compile(self) -> None:
+        """M3c: `src/<spec_id>_runner.f90` is host-rendered from the IR, and it emits the
+        per-case `__write_snapshot` for every declared case. A missing per-case snapshot file
+        therefore cannot be fixed by regenerating the leaf's model/checks — attribute it to the
+        IR and reopen Compile rather than burning a Generate attempt that cannot converge."""
+        import tempfile
+        ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                   wc.SubstepOutcome("ex", "fail", [], 0)]
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._m3c_conductor(repo)
+            refs = self._refs()
+            self._seed_trial_meta(repo, refs, status="fail",
+                                  failure_category="snapshot_deliverable_gap",
+                                  failure_excerpt="[execute fail]\nmissing case_b.json")
+            d = c.classify_failure(refs, "validate", ex_fail)
+            self.assertEqual((d.action, d.target_phase), ("reopen", "compile"))
+            self.assertEqual(d.reason, "validate_execute_snapshot_deliverable_gap_ir")
+            # The `_ir` suffix is not a routing-table key, so no findings are threaded into a
+            # Generate repair that could not apply them.
+            self.assertNotIn(
+                d.reason[len(wc.VALIDATE_EXECUTE_REASON_PREFIX):],
+                wc.VALIDATE_EXECUTE_FAILURE_ROUTING)
+            self.assertIsNone(c._read_repair_findings(refs, d.reason, "validate"))
+
+    def test_snapshot_gap_compile_reopen_resets_the_c2_counter(self) -> None:
+        """The M3c snapshot-gap Compile reopen must reset the C2 counter exactly like the
+        threshold branch does: it regenerates the IR and everything downstream, so the next
+        execute failure is against fresh artifacts. With a stale count of 1, the next failure —
+        typically a leaf-repairable value defect in the regenerated checks module — would hit
+        the C2 threshold and take the findings-less Compile reopen instead of the warm Generate
+        repair the routing table exists to provide."""
+        import tempfile
+        ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                   wc.SubstepOutcome("ex", "fail", [], 0)]
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._m3c_conductor(repo)
+            refs = self._refs()
+            self._seed_trial_meta(repo, refs, status="fail",
+                                  failure_category="snapshot_deliverable_gap",
+                                  failure_excerpt="[execute fail]\nmissing case_b.json")
+            first = c.classify_failure(refs, "validate", ex_fail)
+            self.assertEqual(first.reason, "validate_execute_snapshot_deliverable_gap_ir")
+            self.assertEqual(c._validate_execute_fail_count[refs.node_key], 0)
+
+            # Compile+Generate rebuilt; now a value defect the leaf CAN fix.
+            self._seed_trial_meta(repo, refs, status="fail",
+                                  failure_category="post_execute_violation",
+                                  failure_excerpt="[execute fail]\nall-zero basis")
+            second = c.classify_failure(refs, "validate", ex_fail)
+            self.assertEqual(
+                (second.action, second.target_phase, second.repair_strategy),
+                ("retry", "generate", "reuse"))
+            self.assertEqual(second.reason, "validate_execute_post_execute_violation")
+
+    def test_host_rendered_unrepairable_set_holds_only_the_snapshot_gap(self) -> None:
+        """Pinned as a LITERAL, not derived from the constant: the value-domain test below must
+        not silently shrink its coverage when a category is added to the set."""
+        self.assertEqual(wc.HOST_RENDERED_RUNNER_UNREPAIRABLE, frozenset({"snapshot_deliverable_gap"}))
+        self.assertTrue(wc.HOST_RENDERED_RUNNER_UNREPAIRABLE
+                        <= set(wc.VALIDATE_EXECUTE_FAILURE_ROUTING))
+
+    def test_value_categories_stay_on_generate_even_on_host_rendered_runner(self) -> None:
+        """The renderer boxes each of a case's required variables unconditionally (the leaf
+        registry's found-flag is discarded), so on an M3c node the snapshot key set and shapes
+        are host-fixed from the IR but every VALUE comes from the leaf's checks module. A
+        trivial basis / NaN / wrong metric is exactly what the warm repair fixes, so these
+        categories keep the Generate route.
+
+        The category list is a LITERAL: deriving it from `HOST_RENDERED_RUNNER_UNREPAIRABLE`
+        would make the test vacuous for any category wrongly added to that set.
+        """
+        import tempfile
+        ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                   wc.SubstepOutcome("ex", "fail", [], 0)]
+        for category in ("post_execute_violation", "quality_check_mismatch"):
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                c = self._m3c_conductor(repo)
+                refs = self._refs()
+                self._seed_trial_meta(repo, refs, status="fail", failure_category=category,
+                                      failure_excerpt="[execute fail]\nall-zero basis")
+                d = c.classify_failure(refs, "validate", ex_fail)
+                self.assertEqual(
+                    (d.action, d.target_phase, d.repair_strategy),
+                    ("retry", "generate", "reuse"), category)
+                self.assertEqual(d.reason, f"validate_execute_{category}")
+
+    def test_snapshot_gap_on_leaf_authored_runner_still_routes_generate(self) -> None:
+        """A non-M3c node's runner IS leaf-authored, so the gap is a Generate defect."""
+        import tempfile
+        ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                   wc.SubstepOutcome("ex", "fail", [], 0)]
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            # bare Conductor: no IR on disk -> _conductor_authors_runner is False
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="O", backend="claude", env={})
+            refs = self._refs()
+            self._seed_trial_meta(repo, refs, status="fail",
+                                  failure_category="snapshot_deliverable_gap",
+                                  failure_excerpt="[execute fail]\nmissing case_b.json")
+            d = c.classify_failure(refs, "validate", ex_fail)
+            self.assertEqual((d.action, d.target_phase, d.repair_strategy),
+                             ("retry", "generate", "reuse"))
+
     def test_structural_execute_failure_keeps_restart_without_category(self) -> None:
         # A passing / absent / unrecognized-category trial_meta is not understood well enough to
         # guide a warm repair -> the cold restart stands (and a missing trial_meta is exactly the

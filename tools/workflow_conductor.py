@@ -236,6 +236,21 @@ VALIDATE_EXECUTE_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
 # match on the CATEGORY suffix (a table key), never on the prefix alone.
 VALIDATE_EXECUTE_REASON_PREFIX = "validate_execute_"
 
+# Categories the table above routes to Generate that a HOST-RENDERED-runner node (M3c, see
+# `_conductor_authors_runner`) cannot repair there. On such a node the leaf authors only
+# `<spec_id>_model.f90` + `<spec_id>_checks.f90`; `src/<spec_id>_runner.f90` is rendered by the
+# conductor from the IR (`runner_renderer.render_runner`), which emits the per-case
+# `__write_snapshot` call for every `case.test_case_set[].case_id`. A missing per-case snapshot
+# file is therefore decided entirely by the IR + the renderer — regenerating model/checks cannot
+# add one — so it is attributed to the IR and reopens Compile, instead of burning a Generate
+# attempt that provably cannot converge (the C1/C2 "regenerating one side can't fix the other"
+# pattern). `post_execute_violation` and `quality_check_mismatch` stay on the Generate route even
+# on an M3c node: the renderer boxes that case's required variables unconditionally (it discards
+# the leaf registry's found-flag), so the key set and shapes are host-fixed by the IR, but every
+# VALUE comes from the leaf's checks module — a trivial (all-zero) basis, a NaN, or a wrong metric
+# is exactly what a warm repair fixes.
+HOST_RENDERED_RUNNER_UNREPAIRABLE: frozenset[str] = frozenset({"snapshot_deliverable_gap"})
+
 # Validate.judge (failure_class, attribution) -> routing action.
 # Action is one of:
 #   ("generate", strategy) | ("compile", "reopen") | ("validate", "re_execute")
@@ -4399,6 +4414,25 @@ clean:
                 category = trial.get("failure_category") if trial.get("status") == "fail" else None
                 route = VALIDATE_EXECUTE_FAILURE_ROUTING.get(str(category or ""))
                 if route:
+                    # On an M3c node the runner is host-rendered, so a category the table sends to
+                    # Generate may be structurally unrepairable there; attribute it to the IR and
+                    # reopen Compile (the `_ir` reason suffix, as the C2 backstop uses). The suffix
+                    # also keeps it out of the reuse set that `_read_repair_findings` and the dev
+                    # B2 resume directive key on, so neither threads findings into a Generate
+                    # repair that could not apply them.
+                    if (str(category) in HOST_RENDERED_RUNNER_UNREPAIRABLE
+                            and self._conductor_authors_runner(refs)):
+                        # Reset the C2 counter for the same reason the threshold branch above
+                        # does: this Compile reopen regenerates the IR and everything downstream,
+                        # so the next execute failure is against FRESH artifacts and must get its
+                        # own Generate-retry-first cycle. Without the reset the stale count (1)
+                        # would push the very next failure — typically a leaf-repairable value
+                        # defect in the regenerated checks module — straight into the
+                        # findings-less C2 reopen, skipping the warm repair this table exists for.
+                        self._validate_execute_fail_count[refs.node_key] = 0
+                        return RouteDecision(
+                            "reopen", target_phase="compile",
+                            reason=f"{VALIDATE_EXECUTE_REASON_PREFIX}{category}_ir")
                     target, strategy = route
                     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
                                          reason=f"{VALIDATE_EXECUTE_REASON_PREFIX}{category}")
