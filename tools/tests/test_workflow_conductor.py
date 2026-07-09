@@ -321,6 +321,33 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
                                 ir_id="x_1", pipeline_id="x_1", source_id="src_missing")
             self.assertIsNone(c._read_repair_findings(refs2, "static_post_generate_violation"))
 
+    def test_read_repair_findings_reads_execute_trial_meta_excerpt(self) -> None:
+        # B1: a structural validate.execute failure keeps its excerpt in the failed RUN's
+        # trial_meta.json. Matched on the category suffix — the reasons that merely share the
+        # `validate_execute_` prefix (the cold restart, the per-test predicate classes) must NOT
+        # pick it up, since their repairs are cold / not a Generate repair at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
+                               spec_path="spec/component/spec_x",
+                               ir_id="x_1", pipeline_id="x_1", source_id="src_1",
+                               run_id="run_1", binary_id="bin_1", source_binary_id="bin_1")
+            node_dir = repo / refs.run_node_dir()
+            node_dir.mkdir(parents=True)
+            (node_dir / "trial_meta.json").write_text(
+                json.dumps({"status": "fail", "failure_category": "post_execute_violation",
+                            "failure_excerpt": "missing required_raw_variables: a1"}),
+                encoding="utf-8")
+            c = _FakeConductor(repo_root=repo, orchestration_id="o",
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
+            self.assertEqual(
+                c._read_repair_findings(refs, "validate_execute_post_execute_violation",
+                                        "validate"),
+                "missing required_raw_variables: a1")
+            for reason in ("validate_execute_fail", "validate_execute_physics_fail",
+                           "validate_execute_structural_violation"):
+                self.assertIsNone(c._read_repair_findings(refs, reason, "validate"), reason)
+
 
 class NodeRefsTest(unittest.TestCase):
     def test_safe_and_spec_id(self) -> None:
@@ -847,6 +874,79 @@ class ConductRoutingTest(unittest.TestCase):
         self.assertEqual(len(gen_launches), 2)
         self.assertNotIn("repair_findings", gen_launches[0])
         self.assertEqual(gen_launches[1].get("repair_findings"), "C061 argument 'u_l'")
+
+    def test_structural_execute_failure_warm_reopens_generate_cross_phase(self) -> None:
+        # B1 end to end (prod): a structural validate.execute failure cross-phase reopens
+        # generate with a WARM reuse repair carrying the gate's findings — the same treatment
+        # the judge's ("structural_violation","code") route already gets. The findings must be
+        # read BEFORE reopen-phase, while refs still names the failed run.
+        c = self._conductor()
+        c.workflow_mode = "prod"  # cross-phase reopen is prod-only (dev fail_closes; see F1)
+        c._claude_session_resumable = lambda s: True  # type: ignore[assignment]
+        state = {"execute_failed": False}
+
+        def status_fn(phase, substep, n):
+            if phase == "validate" and substep == "execute" and not state["execute_failed"]:
+                state["execute_failed"] = True
+                return "fail"
+            return "pass"
+
+        c.status_fn = status_fn
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "retry", target_phase="generate", repair_strategy="reuse",
+            reason="validate_execute_post_execute_violation")
+        # Stub the on-disk excerpt read (covered by ReuseResumeAndFindingsTest) and record how
+        # many reopens had happened when it ran: reopen rotates the run id, so a read after it
+        # would look at a fresh (empty) run node dir.
+        seen: list[tuple[int, str | None, str | None, str | None]] = []
+
+        def fake_findings(refs, reason, phase=None):
+            seen.append((len([s for s, _ in c.calls if s == "reopen-phase"]),
+                         refs.run_id, reason, phase))
+            return "missing required_raw_variables: a1 (wrapper key 'values')"
+
+        c._read_repair_findings = fake_findings  # type: ignore[assignment]
+        status = c.conduct(self._refs(), "validate")
+        self.assertEqual(status, "pass")
+        # Read exactly once, BEFORE any reopen, with refs still naming the FAILED run and the
+        # route reason that selects the trial_meta branch.
+        self.assertEqual(
+            seen, [(0, "run_1_001", "validate_execute_post_execute_violation", "validate")])
+
+        reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
+        self.assertEqual(len(reopens), 1)
+        self.assertEqual(reopens[0]["--from-phase"], "generate")
+        self.assertEqual(reopens[0]["--reason"], "validate_execute_post_execute_violation")
+
+        gen_launches = [cap["--request-json"] for s, cap in c.calls
+                        if s == "record-launch"
+                        and cap.get("--request-json", {}).get("step") == "generate"
+                        and cap["--request-json"].get("substep") == "generate"]
+        self.assertEqual(len(gen_launches), 2)
+        self.assertNotIn("repair_findings", gen_launches[0])
+        self.assertEqual(gen_launches[1]["repair_strategy"], "reuse")
+        self.assertEqual(gen_launches[1]["repair_findings"],
+                         "missing required_raw_variables: a1 (wrapper key 'values')")
+        # reuse + findings + a resumable producer session -> the slim warm-resume repair turn.
+        self.assertTrue(gen_launches[1]["warm_resume"])
+        self.assertEqual(gen_launches[1]["skill_must_read_refs"], "")
+
+    def test_dev_structural_execute_failure_fails_closed_with_category_detail(self) -> None:
+        # F1 is unchanged by B1: dev still fail_closes the cross-phase rollback rather than
+        # auto-retrying. The category rides in reason_detail, which is what the B2 dev-resume
+        # deriver keys on.
+        c = self._conductor()
+        c.workflow_mode = "dev"
+        c.status_fn = lambda phase, substep, n: (
+            "fail" if (phase == "validate" and substep == "execute") else "pass")
+        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
+            "retry", target_phase="generate", repair_strategy="reuse",
+            reason="validate_execute_post_execute_violation")
+        self.assertEqual(c.conduct(self._refs(), "validate"), "fail_closed")
+        ss = [cap for s, cap in c.calls if s == "set-status"][-1]
+        self.assertEqual(ss["--reason-code"], "dev_phase_rollback")
+        self.assertEqual(ss["--reason-detail"], "validate_execute_post_execute_violation")
+        self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
 
     def test_static_finding_warm_reopens_generate_same_phase(self) -> None:
         # A generate.static finding routes retry/generate/reuse(static_*); conduct must do a
@@ -4072,6 +4172,300 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual((third.action, third.target_phase), ("retry", "generate"))
             fourth = c.classify_failure(refs, "validate", ex_fail)
             self.assertEqual((fourth.action, fourth.target_phase), ("reopen", "compile"))
+
+    def _seed_trial_meta(self, repo: Path, refs: "wc.NodeRefs", **fields: object) -> None:
+        node_dir = repo / refs.run_node_dir()
+        node_dir.mkdir(parents=True, exist_ok=True)
+        (node_dir / "trial_meta.json").write_text(json.dumps(fields), encoding="utf-8")
+
+    def test_structural_execute_failure_routes_generate_reuse(self) -> None:
+        # B1: a no-verdict execute failure whose trial_meta names a recognized structural
+        # category is repaired WARM (reuse) with the gate's own text as findings, instead of
+        # the blind cold restart the category-less case still gets.
+        import tempfile
+        ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                   wc.SubstepOutcome("ex", "fail", [], 0)]
+        for category in sorted(wc.VALIDATE_EXECUTE_FAILURE_ROUTING):
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                                 orchestration_agent_run_id="O", backend="claude", env={})
+                refs = self._refs()
+                self._seed_trial_meta(repo, refs, status="fail", failure_category=category,
+                                      failure_excerpt="[execute fail]\nmissing a1")
+                d = c.classify_failure(refs, "validate", ex_fail)
+                self.assertEqual(
+                    (d.action, d.target_phase, d.repair_strategy),
+                    ("retry", "generate", "reuse"), category)
+                self.assertEqual(d.reason, f"validate_execute_{category}")
+
+    def test_structural_execute_failure_keeps_restart_without_category(self) -> None:
+        # A passing / absent / unrecognized-category trial_meta is not understood well enough to
+        # guide a warm repair -> the cold restart stands (and a missing trial_meta is exactly the
+        # runner runtime-error case, which _execute_inproc never writes).
+        import tempfile
+        ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                   wc.SubstepOutcome("ex", "fail", [], 0)]
+        cases: list[dict] = [
+            {"status": "pass", "failure_category": "post_execute_violation"},
+            {"status": "fail", "failure_category": "some_future_category"},
+            {"status": "fail"},
+        ]
+        for fields in cases:
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                                 orchestration_agent_run_id="O", backend="claude", env={})
+                refs = self._refs()
+                self._seed_trial_meta(repo, refs, **fields)
+                d = c.classify_failure(refs, "validate", ex_fail)
+                self.assertEqual((d.action, d.target_phase, d.repair_strategy, d.reason),
+                                 ("retry", "generate", "restart", "validate_execute_fail"), fields)
+
+    def test_structural_execute_reuse_runs_after_c2_threshold(self) -> None:
+        # C2 ordering is load-bearing and unchanged: the second CONSECUTIVE no-verdict execute
+        # failure escalates to a Compile reopen even when a reuse-eligible category is present
+        # (a Generate repair already failed to fix it, so the IR is the wrong side).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="O", backend="claude", env={})
+            refs = self._refs()
+            self._seed_trial_meta(repo, refs, status="fail",
+                                  failure_category="post_execute_violation",
+                                  failure_excerpt="missing a1")
+            ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                       wc.SubstepOutcome("ex", "fail", [], 0)]
+            first = c.classify_failure(refs, "validate", ex_fail)
+            self.assertEqual(first.repair_strategy, "reuse")
+            second = c.classify_failure(refs, "validate", ex_fail)
+            self.assertEqual((second.action, second.target_phase, second.reason),
+                             ("reopen", "compile", "validate_execute_fail_ir"))
+
+    # -- B1 producer side: _execute_inproc's structural-failure classification ---------
+    #
+    # Each category is reached by driving ONE input to failure while the other two stay clean,
+    # so the 3-way precedence in _execute_inproc is pinned rather than incidentally satisfied:
+    #   post_execute_violation   <- a gate subprocess exits non-zero
+    #   snapshot_deliverable_gap <- gates clean, quality_check clean, a per-case snapshot missing
+    #   quality_check_mismatch   <- gates clean, no snapshot gap, the make-test re-run disagrees
+    _B1_IR_MINIMAL = ("impl_defaults:\n  toolchain:\n    language: fortran\n"
+                      "    build_system: make\n  target:\n    class: cpu\n")
+    _B1_IR_SNAPSHOTS = (_B1_IR_MINIMAL
+                        + "io_contract:\n  raw_requirements:\n    required_evidence:\n"
+                          "      - artifact: state_snapshots\n        required: true\n"
+                          "case:\n  test_case_set:\n    - case_id: c_alpha\n")
+
+    def _b1_refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+            run_id="run_1", source_binary_id="bin_1")
+
+    def _b1_execute(self, repo: Path, ir_yaml: str, *, gate_result: tuple[int, str],
+                    matching_diagnostics: bool) -> tuple[dict, dict]:
+        """Drive _execute_inproc with the two gate subprocesses stubbed to `gate_result`
+        (returncode, stdout) and the runner/make-test diagnostics seeded so the quality_check
+        passes (matching_diagnostics) or fails. Returns (result, trial_meta-or-{})."""
+        import sys
+        import subprocess as _sp
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+
+        c = wc.Conductor(repo_root=repo, orchestration_id="t",
+                         orchestration_agent_run_id="x", backend="claude", env={})
+        refs = self._b1_refs()
+        (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+        (repo / refs.ir_ref / "spec.ir.yaml").write_text(ir_yaml, encoding="utf-8")
+        (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+
+        # The runner's (mocked) output dirs: a matching pair of diagnostics makes
+        # _author_quality_check return "pass"; an absent candidate makes it "fail".
+        run_tmp = repo / "workspace" / "tmp" / "child-1" / "run"
+        qc_tmp = repo / "workspace" / "tmp" / "child-1" / "qc_run"
+        run_tmp.mkdir(parents=True, exist_ok=True)
+        diag = {"checks": {"k": {"status": "pass"}}, "verdict": {"overall": "pass"}}
+        (run_tmp / "diagnostics.json").write_text(json.dumps(diag), encoding="utf-8")
+        if matching_diagnostics:
+            qc_tmp.mkdir(parents=True, exist_ok=True)
+            (qc_tmp / "diagnostics.json").write_text(json.dumps(diag), encoding="utf-8")
+
+        rc, out = gate_result
+
+        def fake_subprocess_run(argv, **kwargs):
+            # Only the two gates (check_artifact_syntax / validate_pipeline_semantics) run here.
+            return _sp.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+        with mock.patch.object(build_runtime_server, "tool_run_program",
+                               lambda a: {"ok": True, "command_id": "R"}), \
+             mock.patch.object(build_runtime_server, "tool_run_quality_checks",
+                               lambda a: {"ok": True, "command_id": "Q"}), \
+             mock.patch.object(wc.subprocess, "run", fake_subprocess_run):
+            result = c._execute_inproc(refs, "child-1", "captok")
+
+        meta_path = repo / refs.run_node_dir() / "trial_meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        return result, meta
+
+    def test_execute_inproc_records_post_execute_violation(self) -> None:
+        # A genuine gate report (the gate RAN and exited non-zero) becomes the category and its
+        # text becomes the excerpt the warm repair leaf receives.
+        import tempfile
+        violation = ("workspace/.../raw/metrics_basis.json: test 'l0_pass' is missing "
+                     "required_raw_variables: a1 — the missing variables are nested under the "
+                     "unrecognized wrapper key 'values'")
+        with tempfile.TemporaryDirectory() as td:
+            out, meta = self._b1_execute(Path(td), self._B1_IR_MINIMAL,
+                                         gate_result=(1, violation),
+                                         matching_diagnostics=True)
+            # rc 0: a structural failure is a CONTENT failure, routed by the validate tables.
+            self.assertEqual(out["returncode"], 0)
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "post_execute_violation")
+            self.assertIn(meta["failure_category"], wc.VALIDATE_EXECUTE_FAILURE_ROUTING)
+            self.assertIn("[execute fail]", meta["failure_excerpt"])
+            self.assertIn("unrecognized wrapper key 'values'", meta["failure_excerpt"])
+            self.assertLessEqual(len(meta["failure_excerpt"].splitlines()), 50)
+
+    def test_execute_inproc_excerpt_is_bounded_by_characters_not_only_lines(self) -> None:
+        # The excerpt is rendered verbatim into the slim repair prompt. A post_execute violation is
+        # not line-shaped like compiler stderr — it interpolates whole dict payloads into ONE line
+        # (`declared state_variables missing in snapshot files ({...})`), so a 50-LINE cap alone
+        # leaves the excerpt unbounded. Both axes must hold.
+        import tempfile
+        one_huge_line = "post_execute: missing in snapshot files ({})".format("x" * 200_000)
+        with tempfile.TemporaryDirectory() as td:
+            _o, meta = self._b1_execute(Path(td), self._B1_IR_MINIMAL,
+                                        gate_result=(1, one_huge_line),
+                                        matching_diagnostics=True)
+            excerpt = meta["failure_excerpt"]
+            self.assertLessEqual(len(excerpt.splitlines()), wc._EXECUTE_EXCERPT_MAX_LINES)
+            # the truncation notice is prepended, so allow it on top of the character budget
+            self.assertLess(len(excerpt), wc._EXECUTE_EXCERPT_MAX_CHARS + 200)
+            self.assertIn(wc._EXECUTE_EXCERPT_TRUNCATION_MARK, excerpt)
+            # the TAIL is kept (a gate prints the offending detail last)
+            self.assertTrue(excerpt.endswith("x)"), excerpt[-40:])
+
+    def test_execute_inproc_short_excerpt_is_not_truncated(self) -> None:
+        # The common case is well under both bounds and must pass through byte-for-byte.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            _o, meta = self._b1_execute(Path(td), self._B1_IR_MINIMAL,
+                                        gate_result=(1, "post_execute: bad shape"),
+                                        matching_diagnostics=True)
+            self.assertNotIn(wc._EXECUTE_EXCERPT_TRUNCATION_MARK, meta["failure_excerpt"])
+            self.assertIn("post_execute: bad shape", meta["failure_excerpt"])
+
+    def test_execute_inproc_records_quality_check_mismatch(self) -> None:
+        # Gates clean, no snapshot requirement -> the only failing input is the make-test re-run
+        # (no candidate diagnostics), so the category must be quality_check_mismatch.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            out, meta = self._b1_execute(Path(td), self._B1_IR_MINIMAL, gate_result=(0, ""),
+                                         matching_diagnostics=False)
+            self.assertEqual(out["returncode"], 0)
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "quality_check_mismatch")
+            self.assertIn("[execute fail]", meta["failure_excerpt"])
+
+    def test_execute_inproc_records_snapshot_deliverable_gap(self) -> None:
+        # Gates clean and quality_check clean; the IR requires a per-case state snapshot the
+        # runner never wrote -> snapshot_deliverable_gap, and the gap message is the excerpt.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            out, meta = self._b1_execute(Path(td), self._B1_IR_SNAPSHOTS, gate_result=(0, ""),
+                                         matching_diagnostics=True)
+            self.assertEqual(out["returncode"], 0)
+            self.assertEqual(meta["status"], "fail")
+            self.assertEqual(meta["failure_category"], "snapshot_deliverable_gap")
+            self.assertIn("c_alpha", meta["failure_excerpt"])
+
+    def test_execute_inproc_category_precedence_when_inputs_fail_together(self) -> None:
+        # The categories differ only in report quality (all three route to generate/reuse), so the
+        # precedence is what the leaf reads first: the most specific report wins. A gate report
+        # beats a snapshot gap; a snapshot gap beats a bare quality_check mismatch.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            _o, meta = self._b1_execute(Path(td), self._B1_IR_SNAPSHOTS,
+                                        gate_result=(1, "post_execute: bad shape"),
+                                        matching_diagnostics=False)
+            self.assertEqual(meta["failure_category"], "post_execute_violation")
+        with tempfile.TemporaryDirectory() as td:
+            _o, meta = self._b1_execute(Path(td), self._B1_IR_SNAPSHOTS, gate_result=(0, ""),
+                                        matching_diagnostics=False)
+            self.assertEqual(meta["failure_category"], "snapshot_deliverable_gap")
+
+    def test_execute_inproc_structural_pass_writes_no_failure_fields(self) -> None:
+        # The mirror of the three above: every input clean -> no structural failure, so the
+        # category/excerpt fields must be ABSENT (classify_failure must not see a stale category
+        # on a run that only later fails its per-test predicates).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            _out, meta = self._b1_execute(Path(td), self._B1_IR_MINIMAL, gate_result=(0, ""),
+                                          matching_diagnostics=True)
+            self.assertNotIn("failure_category", meta)
+            self.assertNotIn("failure_excerpt", meta)
+
+    def test_execute_inproc_clears_stale_trial_meta(self) -> None:
+        # The runtime-error discriminator ("no trial_meta") must not depend on the external
+        # run-id rotation invariant: a stale trial_meta in the run node dir is cleared up front,
+        # so a runner runtime error cannot be misrouted as a warm structural repair.
+        import sys
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="t",
+                             orchestration_agent_run_id="x", backend="claude", env={})
+            refs = self._b1_refs()
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.ir_ref / "spec.ir.yaml").write_text(
+                self._B1_IR_MINIMAL, encoding="utf-8")
+            (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+            node_dir = repo / refs.run_node_dir()
+            node_dir.mkdir(parents=True, exist_ok=True)
+            (node_dir / "trial_meta.json").write_text(
+                json.dumps({"status": "fail", "failure_category": "post_execute_violation",
+                            "failure_excerpt": "stale"}), encoding="utf-8")
+
+            with mock.patch.object(build_runtime_server, "tool_run_program",
+                                   lambda a: {"ok": False, "stderr": "SIGFPE"}):
+                c._execute_inproc(refs, "child-1", "captok")
+            self.assertFalse((node_dir / "trial_meta.json").exists())
+
+    def test_execute_inproc_runtime_error_writes_no_trial_meta(self) -> None:
+        # The on-disk discriminator for the two no-verdict kinds: a runner runtime error returns
+        # before any trial_meta is authored, so classify_failure keeps its cold restart.
+        import sys
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="t",
+                             orchestration_agent_run_id="x", backend="claude", env={})
+            refs = wc.NodeRefs(
+                node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1",
+                run_id="run_1", source_binary_id="bin_1")
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.ir_ref / "spec.ir.yaml").write_text(
+                "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n"
+                "  target:\n    class: cpu\n", encoding="utf-8")
+            (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.object(build_runtime_server, "tool_run_program",
+                                   lambda a: {"ok": False, "stderr": "SIGFPE"}):
+                out = c._execute_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            self.assertFalse((repo / refs.run_node_dir() / "trial_meta.json").exists())
 
 
 class DeterministicLintTest(unittest.TestCase):

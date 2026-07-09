@@ -195,6 +195,47 @@ COMPILE_STATIC_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     "compile_static_violation": ("compile", "reuse"),
 }
 
+# Bound on the validate.execute `failure_excerpt`, which is rendered verbatim into the slim
+# repair prompt. Both axes are needed: the 50-line tail matches the binary_meta / lint_meta
+# convention, but a post_execute violation is NOT line-shaped like compiler stderr — it prints
+# whole dict/list payloads inline (`declared state_variables missing in snapshot files ({...})`),
+# and `_snapshot_deliverable_gap` emits its expected/written/missing sets on a single line. Fifty
+# such lines can exceed any prompt budget, so the tail is also capped by character count.
+_EXECUTE_EXCERPT_MAX_LINES = 50
+_EXECUTE_EXCERPT_MAX_CHARS = 4000
+_EXECUTE_EXCERPT_TRUNCATION_MARK = "[... excerpt truncated to the last "
+
+
+def _execute_failure_excerpt(text: str) -> str:
+    """The bounded tail of an `[execute fail]` report, safe to render into a repair prompt."""
+    tail = "\n".join(text.splitlines()[-_EXECUTE_EXCERPT_MAX_LINES:])
+    if len(tail) <= _EXECUTE_EXCERPT_MAX_CHARS:
+        return tail
+    return (f"{_EXECUTE_EXCERPT_TRUNCATION_MARK}{_EXECUTE_EXCERPT_MAX_CHARS} characters ...]\n"
+            + tail[-_EXECUTE_EXCERPT_MAX_CHARS:])
+
+
+# Validate.execute STRUCTURAL failure_category -> (retry_target_phase, repair_strategy).
+# A structural execute failure authors no verdict.json (the judge leaf never ran), so the
+# defect is in the generated runner/model code, not in a physics predicate: the same class the
+# judge would have reported as ("structural_violation", "code") -> ("generate", "reuse"). It is
+# routed warm (reuse) with the gate's own violation text threaded through as repair findings
+# (trial_meta.json#failure_excerpt), instead of a blind cold restart that discards the reason
+# the run failed. `_execute_inproc` records the category; an execute failure with NO trial_meta
+# (a runner runtime error, whose cause is in stderr rather than a gate report) keeps the cold
+# restart. The C2 counter / Compile-reopen backstop runs first and is unaffected.
+VALIDATE_EXECUTE_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+    "post_execute_violation": ("generate", "reuse"),
+    "snapshot_deliverable_gap": ("generate", "reuse"),
+    "quality_check_mismatch": ("generate", "reuse"),
+}
+
+# Route-reason prefix for the table above: `<prefix><failure_category>`. Also the prefix of the
+# no-category `validate_execute_fail` restart reason and of the per-test predicate reasons
+# (`validate_execute_physics_fail` / `validate_execute_structural_violation`), so consumers must
+# match on the CATEGORY suffix (a table key), never on the prefix alone.
+VALIDATE_EXECUTE_REASON_PREFIX = "validate_execute_"
+
 # Validate.judge (failure_class, attribution) -> routing action.
 # Action is one of:
 #   ("generate", strategy) | ("compile", "reopen") | ("validate", "re_execute")
@@ -2994,17 +3035,23 @@ clean:
         (run_tmp / "raw" / "state_snapshots").mkdir(parents=True, exist_ok=True)
         qc_tmp.mkdir(parents=True, exist_ok=True)
 
-        # R2 invariant guard: clear any pre-existing verdict.json in this run node dir so that,
-        # after this substep, `verdict.json present` ⟺ `THIS execute authored it`. A structural
-        # failure (bad/missing evidence) returns WITHOUT authoring a verdict, and classify_failure
-        # routes on `verdict.json#failure_class` — so a stale verdict from a prior run would
-        # misroute a runner failure as a predicate failure (escalate/dev fail_closed instead of the
-        # Generate/C2 path). run_id rotation (_ensure_fresh_producer_id) already gives each attempt
-        # a fresh dir, making this a no-op in practice; enforcing it here removes the reliance on
-        # that external invariant for a correctness-critical routing decision.
-        _prev_verdict = node_dir / "verdict.json"
-        if _prev_verdict.exists():
-            _prev_verdict.unlink()
+        # R2 invariant guard: clear any pre-existing verdict.json / trial_meta.json in this run
+        # node dir so that, after this substep, `<file> present` ⟺ `THIS execute authored it`.
+        # Both files carry a routing decision that a stale copy would corrupt:
+        #   - verdict.json: a structural failure returns WITHOUT authoring one, and
+        #     classify_failure routes on `verdict.json#failure_class` — a stale verdict would
+        #     misroute a runner failure as a predicate failure (escalate/dev fail_closed instead
+        #     of the Generate/C2 path).
+        #   - trial_meta.json: the runner runtime-error branch returns WITHOUT authoring one, and
+        #     classify_failure reads `trial_meta.json#failure_category` (B1) — a stale trial_meta
+        #     would misroute a runtime error as a warm, findings-carrying structural repair.
+        # run_id rotation (_ensure_fresh_producer_id) already gives each attempt a fresh dir,
+        # making this a no-op in practice; enforcing it here removes the reliance on that
+        # external invariant for two correctness-critical routing decisions.
+        for _stale in ("verdict.json", "trial_meta.json"):
+            _prev = node_dir / _stale
+            if _prev.exists():
+                _prev.unlink()
 
         gate_args = {"orchestration_id": self.orchestration_id,
                      "agent_run_id": child_arid, "capability_token": cap_token,
@@ -3125,23 +3172,40 @@ clean:
             # run_phase routes it via the validate tables / diagnostician, NOT transport
             # fail_closed. No verdict.json is authored — classify_failure's execute branch
             # sees no failure_class and routes to Generate (regenerate the runner/code).
-            stderr += ("\n[execute fail]\n" + syn.stdout + syn.stderr
-                       + gate.stdout + gate.stderr)
+            block = ("\n[execute fail]\n" + syn.stdout + syn.stderr
+                     + gate.stdout + gate.stderr)
             if snapshot_gap:
-                stderr += "\n" + snapshot_gap
+                block += "\n" + snapshot_gap
             # Actionable cause when the make-test candidate emitted no diagnostics/verdict:
             # the `test` target must invoke the runner with `--cases $(SPEC) $(CASES)` (the
             # runner requires `--cases` and aborts without it). run_program's diagnostics
             # being present while the candidate's is absent isolates the test-target form as
             # the cause rather than a buggy runner.
             if qc_status != "pass" and not qc_diag.get("verdict") and run_diag.get("verdict"):
-                stderr += (
+                block += (
                     "\n[execute fail: quality_check] the make-test re-run emitted no "
                     "diagnostics.json/verdict while run_program's is present — the Makefile "
                     "`test`/`check` target must invoke the runner with `--cases $(SPEC) "
                     "$(CASES)` (the runner requires `--cases`); see "
                     "docs/workflow/RUNNER_OUTPUT_CONTRACT.md §5 / phase_04_validate.md §4-1.")
+            stderr += block
+            # Classify the structural failure for classify_failure's execute branch (B1): the
+            # category selects the warm `("generate","reuse")` route out of
+            # VALIDATE_EXECUTE_FAILURE_ROUTING and the (bounded) excerpt becomes the repair leaf's
+            # findings, so the violation text that failed the run is what the leaf gets to fix.
+            # Precedence is report-quality only (all three route identically): a gate/syntax
+            # report is the most specific, a snapshot gap next, quality_check last. The runner
+            # runtime-error branch above returns BEFORE any trial_meta is written — a MISSING
+            # trial_meta is therefore the on-disk discriminator for that (cold-restart) kind.
+            if syn.returncode != 0 or gate.returncode != 0:
+                failure_category = "post_execute_violation"
+            elif snapshot_gap:
+                failure_category = "snapshot_deliverable_gap"
+            else:
+                failure_category = "quality_check_mismatch"
             trial_meta["status"] = "fail"
+            trial_meta["failure_category"] = failure_category
+            trial_meta["failure_excerpt"] = _execute_failure_excerpt(block)
             (node_dir / "trial_meta.json").write_text(
                 json.dumps(trial_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             return {"returncode": 0, "stdout": stdout, "stderr": stderr}
@@ -3383,9 +3447,10 @@ clean:
             "repair_target_agent_run_id": target_arid or "none",
             "repair_reason": decision.reason or "route_repair",
         }
-        # The lint/static findings excerpt to fix, threaded to the (warm) repair leaf so it
-        # can fix the exact reported lines instead of re-discovering them. Only carried for a
-        # generate lint/static reopen (see _read_repair_findings); empty otherwise.
+        # The failing gate's findings excerpt, threaded to the (warm) repair leaf so it can fix
+        # the exact reported lines instead of re-discovering them. Only carried for the reasons
+        # _read_repair_findings recognizes (the deterministic gates + a structural
+        # validate.execute failure); empty otherwise.
         if findings and findings.strip():
             payload["repair_findings"] = findings.strip()
         return payload
@@ -3400,6 +3465,8 @@ clean:
           `compile_static_*` -> ir/compile_static_meta.json#failure_excerpt
           `verify_*`         -> the phase's verify meta #last_fail_reason
                                 (compile -> ir/ir_meta.json, generate -> source/source_meta.json)
+          `validate_execute_<category>` (category in VALIDATE_EXECUTE_FAILURE_ROUTING)
+                             -> runs/<run_id>/trial_meta.json#failure_excerpt
         Read at the conduct reopen point where `refs` still names the FAILED artifact (rotation
         to the fresh id happens later, inside run_phase -> _ensure_fresh_producer_id). Returns
         None when unavailable so the repair simply falls back to the full prompt."""
@@ -3420,6 +3487,12 @@ clean:
             field = "last_fail_reason"
             meta_path = (self.repo_root / refs.ir_ref / "ir_meta.json" if phase == "compile"
                          else self.repo_root / refs.source_dir() / "source_meta.json")
+        elif (r.startswith(VALIDATE_EXECUTE_REASON_PREFIX)
+              and r[len(VALIDATE_EXECUTE_REASON_PREFIX):] in VALIDATE_EXECUTE_FAILURE_ROUTING):
+            # A structural validate.execute failure (B1). Matched on the CATEGORY suffix, not the
+            # prefix: the cold-restart `validate_execute_fail` and the per-test predicate reasons
+            # share the prefix and must NOT pick up an excerpt.
+            meta_path = self.repo_root / refs.run_node_dir() / "trial_meta.json"
         else:
             return None
         try:
@@ -4315,6 +4388,20 @@ clean:
                     return RouteDecision("reopen", target_phase="compile",
                                          reason="validate_execute_fail_ir")
                 self._validate_execute_fail_count[refs.node_key] = count
+                # B1: below the C2 threshold, split the no-verdict failure by the category
+                # _execute_inproc recorded in trial_meta.json. A recognized structural category
+                # is a code defect the failing gate DESCRIBED, so repair it warm (reuse) with
+                # that description threaded through as findings (_read_repair_findings), the
+                # same treatment the judge's ("structural_violation","code") already gets. A
+                # runner runtime error writes no trial_meta, and an unknown category is not
+                # understood well enough to guide a repair — both keep the cold restart.
+                trial = _read_json(self.repo_root / refs.run_node_dir() / "trial_meta.json") or {}
+                category = trial.get("failure_category") if trial.get("status") == "fail" else None
+                route = VALIDATE_EXECUTE_FAILURE_ROUTING.get(str(category or ""))
+                if route:
+                    target, strategy = route
+                    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
+                                         reason=f"{VALIDATE_EXECUTE_REASON_PREFIX}{category}")
                 return RouteDecision("retry", target_phase="generate", repair_strategy="restart",
                                      reason="validate_execute_fail")
             verdict = _read_json(self.repo_root / refs.run_node_dir() / "verdict.json") or {}
@@ -4515,11 +4602,17 @@ clean:
                 self.set_status("fail", reason_code=f"{phase}_fail",
                                 reason_detail="reopen_no_trigger")
                 return "fail"
+            # As in the same-phase branch: read the findings excerpt BEFORE reopen_phase, while
+            # refs still names the failed artifact (a validate.execute structural failure keeps
+            # its excerpt in the failed run's trial_meta.json, and reopen rotates the run id).
+            # Every other cross-phase reason yields None -> the repair falls back to the full
+            # prompt, exactly as before.
+            findings = self._read_repair_findings(refs, decision.reason, phase)
             self.reopen_phase(refs.node_key, from_phase=target, trigger_arid=trigger,
                               reason=decision.reason or f"{phase}_reopen")
             if decision.repair_strategy and decision.repair_strategy not in ("none", None):
                 pending_repair[target] = self._repair_payload(
-                    decision, self._producer_arid.get(target, "none"))
+                    decision, self._producer_arid.get(target, "none"), findings=findings)
             idx = target_idx
         self.set_status("pass")
         return "pass"

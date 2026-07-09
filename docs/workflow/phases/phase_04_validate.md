@@ -83,12 +83,34 @@ The phase that runs the binary produced by `Build`, obtains the primary evidence
 - On a physics `fail`, the performance evaluation is skipped.
 
 ## Decision criteria for retry on failure
-There are two `Validate`-failure origins with distinct routing:
+There are three `Validate`-failure origins with distinct routing:
 
 1. **A deterministic per-test predicate `fail` at `execute`** (R2): `verdict.json#failure_class ∈ {physics_fail, structural_violation}`, host-authored, the judge NOT spawned. Attribution (`code` / `ir` / `spec`) needs reasoning, so `classify_failure` routes it to the **escalate diagnostician** in prod (which reads `verdict.json#per_test.basis`) and **`fail_closed`** in dev (F1 cross-phase-rollback posture). The decision table below is the diagnostician's mapping once it assigns an attribution.
-2. **A semantic-review `fail` at `judge`**: `semantic_review.json#decision=fail`; the mechanical verdict was clean. Routed via `findings[*].attribution` (below), through the escalate diagnostician (`judge_semantic_review_fail`).
+2. **A structural `fail` at `execute`** (no `verdict.json` is authored): the run produced bad or missing primary evidence, so no predicate could be evaluated. Routed deterministically to `Generate` without LLM inference, by the `trial_meta.json` failure fields below.
+3. **A semantic-review `fail` at `judge`**: `semantic_review.json#decision=fail`; the mechanical verdict was clean. Routed via `findings[*].attribution` (below), through the escalate diagnostician (`judge_semantic_review_fail`).
 
 The judgment input is `semantic_review.json#findings[*]` (judge origin) and `verdict.json#failure_class` + `per_test.basis` (execute origin).
+
+### Structural `execute` failure: trigger fields and `repair_strategy` (no LLM involvement)
+When the structural check fails, `Validate.execute` records the following keys in `trial_meta.json` as required (alongside `status=fail`). They are absent on any other outcome, so their presence means "THIS execute failed structurally":
+
+| field | range | extraction source |
+|---|---|---|
+| `failure_category` | `post_execute_violation` / `snapshot_deliverable_gap` / `quality_check_mismatch` | mechanically classified by which structural input failed |
+| `failure_excerpt` | text (the tail of the `[execute fail]` report, bounded to 50 lines **and** 4000 characters) | a direct excerpt of the failing gate / gap / quality-check output |
+
+Classification convention for `failure_category` (evaluated in this order; a more specific report wins):
+- `post_execute_violation`: a non-zero exit of `check_artifact_syntax.py` or of `validate_pipeline_semantics --stage post_execute`.
+- `snapshot_deliverable_gap`: a required `raw/state_snapshots/<case_id>.json` is missing or misnamed.
+- `quality_check_mismatch`: `quality_check.json#status != pass` (the `make test` re-run disagrees with `run_program`).
+
+| `failure_category` | `repair_strategy` | basis |
+|---|---|---|
+| `post_execute_violation` | `reuse` | the gate names the offending artifact and shape; a local fix of the emitting code converges |
+| `snapshot_deliverable_gap` | `reuse` | a local fix of the snapshot filename / emission site |
+| `quality_check_mismatch` | `reuse` | a local fix of the `test` target or of nondeterministic runner output |
+
+The `Generate` re-submission quotes `failure_excerpt` as `launches/<new_agent_run_id>.request.json#repair_findings`, and the producing `generate.generate` session is warm-resumed (`repair_strategy=reuse`), so the same leaf fixes the violation it caused. A **runner runtime error** (a non-zero exit of `run_program` itself) authors no `trial_meta.json` at all; the cause is in `stderr.log`, not in a gate report, so it routes to `Generate` with `repair_strategy=restart` (a cold re-generation). Independently of the category, the **second consecutive `execute` failure that authors no `verdict.json`** on the same `node` — of either kind, structural violation or runner runtime error — reopens `Compile` instead of `Generate` (a `Generate` repair regenerates the runner, which cannot fix an IR-rooted mismatch, so the IR is then the likely wrong side). A per-test predicate `fail` (origin 1) is a different class and resets that counter.
 
 ### Classification fields the `judge` records as required
 When `Validate.judge` detects a failure, it records the following keys in `semantic_review.json#findings[*]` as required:

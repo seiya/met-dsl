@@ -182,8 +182,9 @@ but auto-repair may not converge.
   post_generate) check that the snapshot `time_variable` shape is scalar. (Analog of the
   BIN robustness fix, on the Compile side.)
 
-- **C2 (design note):** the deterministic `execute→Generate restart` routing (Codex
-  finding 1) regenerates the **runner**, which fixes *code* defects but **not IR**
+- **C2 (design note; the `restart` strategy is superseded by B1 for recognized structural
+  categories, the `Compile` backstop below is not):** the deterministic `execute→Generate`
+  routing (Codex finding 1) regenerates the **runner**, which fixes *code* defects but **not IR**
   defects. For C1 the IR's `[1]` is the actual error, so regenerating the runner to keep
   emitting scalar never matches → the loop relies on the attempt budget, not convergence.
   A structural mismatch attributed to the IR should route to `Compile` (reopen), but the
@@ -1493,3 +1494,65 @@ value-pinned, not exported" rather than adding a visibility check that would fal
 harness. **Real verification is a billed E2E #2′** (operator-run: harness single-node re-certification at 0.2.0,
 `aggregate_verdict=pass`, the strengthened gates forcing correct signatures from attempt 1). Unit
 suite green (2034). M3c-β (physical-node narrowing + host-rendered glue) and M3d (recovery) follow.
+
+## B1 — structural `Validate.execute` failure: warm `generate` reuse carrying the gate findings (IMPLEMENTED 2026-07-09)
+
+Canonical plan: `~/.claude/plans/floofy-cuddling-octopus.md` (Part B / B1). An execute failure that
+authors no `verdict.json` (case (b) of `classify_failure`'s execute branch) routed uniformly to
+`("generate", "restart")` — a **cold** re-roll that discards the text explaining why the run failed —
+while the judge's equivalent class, `("structural_violation", "code")`, routes to
+`("generate", "reuse")` (warm). The two differ only in whether the defect was caught by the
+deterministic `post_execute` gate or by the judge, not in how repairable it is, so the cold restart was
+a misclassification. Its cost is concrete: a `raw/metrics_basis.json` shaped
+`{"test_id": ..., "values": {...}}` fails the `required_raw_variables` check, and a blind restart cannot
+learn that (Part A removes the ambiguity that produces the wrong shape; this part makes the repair turn
+informed regardless).
+
+1. **On-disk discriminator.** The two no-verdict kinds are distinguishable without a new file:
+   the runner runtime-error branch of `_execute_inproc` returns **before** any `trial_meta.json` is
+   written, while the structural branch writes one. That branch now also records
+   `failure_category` (`post_execute_violation` / `snapshot_deliverable_gap` /
+   `quality_check_mismatch`, in that precedence — a gate report is the most specific) and
+   `failure_excerpt` (the `[execute fail]` block, tail 50 lines as in `binary_meta` / `lint_meta`,
+   **and** tail 4000 characters: unlike compiler stderr a `post_execute` violation is not
+   line-shaped — it interpolates whole dict payloads into one line — so the line cap alone leaves
+   the prompt-rendered excerpt unbounded). `trial_meta.json` is already an execute `allowed_output_paths`
+   entry and `_validate_trial_meta` checks only required fields, so no authorization or gate
+   wiring changes. Because `trial_meta.json` is now routing-critical, it joins `verdict.json` in the
+   R2 stale-artifact guard at the top of `_execute_inproc`: both are unlinked before the run, so
+   `<file> present ⟺ THIS execute authored it` holds without relying on the external run-id-rotation
+   invariant. The field contract (values, classification convention, `repair_strategy` mapping) is
+   canonical in `docs/workflow/phases/phase_04_validate.md`, presented exactly as `binary_meta.json`'s
+   is in `phase_03_build.md`.
+2. **Routing table.** `VALIDATE_EXECUTE_FAILURE_ROUTING` maps each category to
+   `("generate", "reuse")`, with `VALIDATE_EXECUTE_REASON_PREFIX` composing the route reason
+   `validate_execute_<category>`. Consumers must match on the **category suffix** (a table key),
+   never the prefix: the cold-restart `validate_execute_fail` and the per-test predicate reasons
+   `validate_execute_physics_fail` / `validate_execute_structural_violation` share it.
+3. **`classify_failure` case (b).** The C2 counter increment and the threshold-2 Compile reopen run
+   **first and unchanged** (a Generate repair that already failed to fix the failure still attributes
+   the defect to the IR). Below the threshold, a `status == "fail"` trial_meta whose category is in
+   the table yields `RouteDecision("retry", "generate", "reuse", reason=validate_execute_<category>)`.
+   A missing trial_meta (runtime error) or an unrecognized category keeps the cold restart.
+4. **Findings channel.** `_read_repair_findings` gains a branch reading the failed run's
+   `trial_meta.json#failure_excerpt`, and `conduct`'s cross-phase reopen now reads the findings
+   **before** `reopen_phase` (while `refs` still names the failed run — reopen rotates the run id)
+   and threads them into `_repair_payload`, mirroring the same-phase branch. Every other cross-phase
+   reason yields `None`, so the change is upward compatible. Nothing else is new: `reuse` + findings +
+   a resumable producer session is exactly the existing **G1-slim** path — `_resolve_reuse_resume`
+   warm-`--resume`s the `generate.generate` producer and the slim prompt renders the findings inside
+   its untrusted fence. No new substep, no new run-node file, no new prompt form, and no marker-parity
+   change (the slim branch is payload-flag driven, not reason driven). A garbage-collected session
+   degrades to the cold full prompt, exactly as a lint/static repair does today.
+5. **dev is unchanged (F1).** A cross-phase rollback still fail_closes on the first occurrence with
+   `reason_code=dev_phase_rollback`; the category now rides in `reason_detail` as
+   `validate_execute_<category>`, which is what the B2 dev `--resume` directive keys on.
+
+Unit suite green (2195), including: the routing split (category present / absent / unrecognized), the
+preserved C2 ordering, one producer test per `failure_category` plus the precedence between them
+(mutation-checked: each category literal and each precedence edge fails a distinct test), the
+runtime-error branch writing no trial_meta and the stale-trial_meta guard, the prefix-collision guard in
+`_read_repair_findings`, and a `conduct`-level pass asserting the prod warm reopen (findings read before
+reopen with `refs` still naming the failed run, `warm_resume` + emptied must-read on the repair launch)
+and the dev fail_closed detail. The route fires only on a real structural execute failure, so its live
+exercise is opportunistic; B2 (dev `--resume` → generate + findings injection) follows.
