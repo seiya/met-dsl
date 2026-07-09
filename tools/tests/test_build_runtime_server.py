@@ -105,6 +105,20 @@ class RunSyntaxCheckTests(unittest.TestCase):
             self.mod._fortran_syntax_source_order(d),
             ["z_model.f90", "a_runner.f90", "m_checks.f90"])
 
+    def test_source_order_ignores_identifier_starting_with_use(self) -> None:
+        # `use\b` guards against an ordinary identifier that merely starts with "use"
+        # (user_flag / usedcount) being parsed as a USE statement and minting a bogus edge.
+        d = self._src_dir({
+            "a.f90": "program p\n  logical :: user_flag\n  integer :: usedcount\n"
+                     "  user_flag = .true.\n  usedcount = 2\nend program p\n",
+            "user.f90": "module user\nend module user\n",  # would be a false provider
+        })
+        # user.f90 defines module `user`; if `user_flag` were mis-parsed as `use r_flag`/
+        # `use user`, ordering could shuffle. With the fix a.f90 has no real `use`, so the
+        # order is a plain name-sort and no spurious dependency is introduced.
+        self.assertEqual(
+            self.mod._fortran_syntax_source_order(d), ["a.f90", "user.f90"])
+
     def test_source_order_ignores_unknown_and_intrinsic_modules(self) -> None:
         d = self._src_dir({
             "a.f90": "program p\n  use, intrinsic :: iso_fortran_env, only: int64\n"

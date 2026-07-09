@@ -4363,14 +4363,21 @@ class DeterministicSyntaxTest(unittest.TestCase):
                     c._syntax_inproc(refs, "child-1", "captok")
 
     def test_syntax_inproc_optional_stage_skipped_records_and_passes(self) -> None:
+        import sys
         import tempfile
+        from unittest import mock
         from tools.hooks.syntax_evidence import read_syntax_evidence
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
             refs = self._refs()
             self._seed(repo, refs)
-            # frt listed but not installed: recorded skipped, gate still passes.
+            # frt is a REGISTERED adapter here (temporarily) but its binary is not
+            # installed: the tool returns skipped, the gate records it and still passes.
             c = self._conductor(repo, env={"METDSL_SYNTAX_COMPILERS": "frt,gfortran"})
+            registry = dict(build_runtime_server._SYNTAX_COMPILER_ADAPTERS)
+            registry["frt"] = registry["gfortran"]
 
             def fake(args):
                 if args["compiler"] == "frt":
@@ -4379,7 +4386,9 @@ class DeterministicSyntaxTest(unittest.TestCase):
                 return {"ok": True, "return_code": 0, "command_id": "sid",
                         "compiler_version": "GNU Fortran 13", "skipped": False}
 
-            with self._patch_syntax(fake):
+            with mock.patch.object(
+                    build_runtime_server, "_SYNTAX_COMPILER_ADAPTERS", registry), \
+                    self._patch_syntax(fake):
                 out = c._syntax_inproc(refs, "child-1", "captok")
             self.assertEqual(out["returncode"], 0)
             meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
@@ -4392,6 +4401,53 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertEqual(ev["stages"][0]["compiler"], "gfortran")
             self.assertEqual(by_compiler["gfortran"]["status"], "pass")
             self.assertEqual(by_compiler["frt"]["status"], "skipped")
+
+    def test_syntax_inproc_nonmake_with_deps_fails_closed_not_loops(self) -> None:
+        # A fortran node whose dependency modules cannot be staged (non-make: the conductor
+        # does not own its Makefile, so _stage_dependency_sources is a no-op) must fail
+        # CLOSED (RuntimeError -> transport) rather than run gfortran, get "Cannot open
+        # module file", and misclassify it as a content syntax_error that loops forever.
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            with mock.patch.object(c, "_stage_dependency_sources", return_value=[]), \
+                    mock.patch.object(c, "_dependency_closure_nodes",
+                                      return_value=["component/dep@0.1.0"]):
+                with self._patch_syntax(lambda args: {"ok": True, "skipped": False}):
+                    with self.assertRaises(RuntimeError):
+                        c._syntax_inproc(refs, "child-1", "captok")
+
+    def test_syntax_inproc_unregistered_optional_compiler_skipped(self) -> None:
+        # An optional METDSL_SYNTAX_COMPILERS entry with no registered adapter is recorded
+        # skipped, NOT crashed: the tool raises ValueError for an unknown compiler, which
+        # would otherwise propagate as a transport fail_closed even though gfortran passed.
+        import tempfile
+        from tools.hooks.syntax_evidence import read_syntax_evidence
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo, env={"METDSL_SYNTAX_COMPILERS": "gfortran,frtxx"})
+
+            def fake(args):
+                # frtxx is unregistered, so the tool must never be called for it.
+                self.assertEqual(args["compiler"], "gfortran")
+                return {"ok": True, "return_code": 0, "command_id": "sid",
+                        "compiler_version": "GNU Fortran 13", "skipped": False}
+
+            with self._patch_syntax(fake):
+                out = c._syntax_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)
+            ev = read_syntax_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
+            assert ev is not None
+            by_compiler = {s["compiler"]: s for s in ev["stages"]}
+            self.assertEqual(by_compiler["gfortran"]["status"], "pass")
+            self.assertEqual(by_compiler["frtxx"]["status"], "skipped")
+            self.assertIn("no registered", by_compiler["frtxx"]["reason"])
 
     def test_determine_substep_status_syntax_branch(self) -> None:
         import tempfile

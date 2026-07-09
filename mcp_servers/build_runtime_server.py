@@ -794,8 +794,13 @@ _FORTRAN_MODULE_DECL_RE = re.compile(
     r"^\s*module\s+(?!procedure\b|subroutine\b|function\b)([a-z][a-z0-9_]*)\s*(?:!.*)?$",
     re.IGNORECASE | re.MULTILINE,
 )
+# `use\b` (word boundary) so only a real `use` STATEMENT matches — `use foo`, `use::foo`,
+# `use, intrinsic :: foo` — and an ordinary identifier that merely starts with the letters
+# "use" (`user_flag = ...`, `usedcount = ...`) does NOT (there is no word boundary between
+# `use` and a following word char). Without the boundary the old `use\s*` over-matched such
+# names and minted a spurious dependency edge in the source ordering.
 _FORTRAN_USE_STMT_RE = re.compile(
-    r"^\s*use\s*(?:,\s*(?:non_)?intrinsic\s*)?(?:::)?\s*([a-z][a-z0-9_]*)",
+    r"^\s*use\b\s*(?:,\s*(?:non_)?intrinsic\s*)?(?:::)?\s*([a-z][a-z0-9_]*)",
     re.IGNORECASE | re.MULTILINE,
 )
 

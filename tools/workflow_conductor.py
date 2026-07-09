@@ -2500,7 +2500,10 @@ clean:
         mcp_dir = str(self.repo_root / "mcp_servers")
         if mcp_dir not in _sys.path:
             _sys.path.insert(0, mcp_dir)
-        from build_runtime_server import tool_run_syntax_check
+        from build_runtime_server import (
+            _SYNTAX_COMPILER_ADAPTERS,
+            tool_run_syntax_check,
+        )
         from tools.hooks.syntax_evidence import write_syntax_evidence
 
         tc = self._read_toolchain(refs)
@@ -2529,6 +2532,33 @@ clean:
                 f"({'/'.join(self._SYNTAX_SOURCE_SUFFIXES)}) to syntax-check"
             )
         else:
+            # Resolve + stage the dependency-closure `<dep>_model.f90` ONCE into a shared
+            # cache dir (not per compiler — the resolved source set is identical across
+            # stages; only the per-compiler `.mods` must stay isolated). `<dep>_model.f90`
+            # sources the node `use`s must be present or gfortran reports "Cannot open
+            # module file", which the syntax gate would misdiagnose as a content error.
+            #   * make+fortran: staging copies each certified dep model, or RAISES (a clean
+            #     transport fail_closed) if a dep is not yet certified — the same
+            #     `--with-deps` precondition Build enforces (`_stage_dependency_sources`).
+            #   * non-make fortran with dependencies: the conductor does not own that node's
+            #     Makefile, so staging is a no-op and the gate cannot resolve `use
+            #     <dep>_model`. Running gfortran anyway would misclassify the unresolved
+            #     module as a content `syntax_error` and warm-resume generate.generate in a
+            #     futile loop (the regenerated source references the same real module). Fail
+            #     closed cleanly instead — such a node is unbuildable regardless (Build's
+            #     `_require_make_build_system` rejects non-make fortran).
+            deps_dir = (self.repo_root / "workspace" / "tmp" / child_arid
+                        / "syntax" / "_deps")
+            deps_dir.mkdir(parents=True, exist_ok=True)
+            staged_deps = self._stage_dependency_sources(refs, deps_dir)
+            if not staged_deps and self._dependency_closure_nodes(refs):
+                raise RuntimeError(
+                    f"generate.syntax: cannot stage dependency modules for build_system="
+                    f"{tc['build_system']!r} (only make+fortran staging is supported); the "
+                    f"syntax gate would misdiagnose an unresolved `use <dep>_model` as a "
+                    f"content error and loop — fail closed (this node is unbuildable anyway)")
+            dep_files = [p for p in deps_dir.iterdir() if p.is_file()]
+
             raw = self.env.get("METDSL_SYNTAX_COMPILERS", "gfortran")
             compilers = [c.strip().lower() for c in raw.split(",") if c.strip()]
             # gfortran is the mandatory gate regardless of the env list's content/order:
@@ -2537,12 +2567,29 @@ clean:
                 compilers.remove("gfortran")
             compilers.insert(0, "gfortran")
             for compiler in compilers:
+                # An entry with no registered adapter (e.g. a future `frt` listed before its
+                # adapter ships) is recorded skipped, not crashed: the tool would raise
+                # ValueError for an unknown compiler, which — unlike the "binary not
+                # installed" skip — would propagate as a transport fail_closed even though
+                # the mandatory gfortran stage passed. gfortran must always be registered.
+                if compiler not in _SYNTAX_COMPILER_ADAPTERS:
+                    if compiler == "gfortran":
+                        raise RuntimeError(
+                            "generate.syntax: gfortran has no registered syntax-check "
+                            "adapter (build-tooling bug)")
+                    stages.append({
+                        "compiler": compiler,
+                        "status": "skipped",
+                        "reason": f"no registered syntax-check adapter for {compiler}",
+                    })
+                    continue
                 stage_dir = (self.repo_root / "workspace" / "tmp" / child_arid
                              / "syntax" / compiler)
                 stage_dir.mkdir(parents=True, exist_ok=True)
                 for p in node_sources:
                     shutil.copy2(p, stage_dir / p.name)
-                self._stage_dependency_sources(refs, stage_dir)
+                for p in dep_files:
+                    shutil.copy2(p, stage_dir / p.name)
                 result = tool_run_syntax_check({
                     "compiler": compiler,
                     "std": tc["standard"],
