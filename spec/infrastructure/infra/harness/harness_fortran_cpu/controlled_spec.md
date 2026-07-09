@@ -2,7 +2,7 @@
 
 ## 0. Meta information
 - `spec_id`: `harness_fortran_cpu`
-- `spec_version`: `0.2.0`
+- `spec_version`: `0.2.1`
 - `status`: `controlled_draft`
 - `spec_kind`: `infrastructure`
 - `domain`: `infra`
@@ -29,7 +29,20 @@ Output artifacts (produced by the writers, into the run node dir relative to `cw
   - `l0_perf_derived_pass`: `throughput_residual` (scalar — `|throughput_cells_per_sec - cells_updated/walltime_sec|`).
   - `l0_missing_cases_xfail`: `guard_fired` (scalar, `1.0` when `__parse_cases` on a length-0 token array returned `ok=.false.`). A guard case still emits its snapshot, shape-valid.
   Each case's `required_raw_variables` is exactly its listed variables above; a variable is declared once in `snapshot_schema.json` and emitted only by the cases that require it.
-- **`raw/metrics_basis.json`** — a `{ "per_test": [ { "test_id": <id>, <that test's required_raw_variables> }, ... ] }` index with one entry per `tests.md` `test_id`, holding only primary evidence (never a copy of `diagnostics.json`). Assembled inside `__write_metrics_basis` from the caller-supplied per-test entry records (§3).
+- **`raw/metrics_basis.json`** — a `{ "per_test": [ <entry>, ... ] }` index with one entry per `tests.md` `test_id`, holding only primary evidence (never a copy of `diagnostics.json`). Assembled inside `__write_metrics_basis` from the caller-supplied per-test entry records (§3). Each entry is a **flat JSON object**: the `test_id` key, and every name in that test's `io_contract.test_evidence_requirements.required_raw_variables` as a **direct sibling key of `test_id`**. Wrapping the required variables under any nested object is forbidden — in particular under the literal key `values`, which is the Fortran component name of `harness_fortran_cpu__h_mb_entry` (§3.1) and never a JSON key. The `post_execute` gate rejects an entry that nests them under the unrecognized key `values` as `missing required_raw_variables`. One entry, with its numeric tokens abbreviated for readability (the serialization rule below governs their emitted form):
+
+  ```json
+  {
+    "test_id": "l0_array_emit_pass",
+    "a1": [1.0, 2.0],
+    "a2": [[1.0, 2.0], [3.0, 4.0]],
+    "a3": [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
+    "a4": [[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]], [[[9.0, 10.0], [11.0, 12.0]], [[13.0, 14.0], [15.0, 16.0]]]],
+    "max_abs_deviation": 0.0
+  }
+  ```
+
+  The wrapped form `{ "test_id": "l0_array_emit_pass", "values": { "a1": [1.0, 2.0], … } }` is rejected.
 
 Numeric serialization is the runner-output contract (`docs/workflow/RUNNER_OUTPUT_CONTRACT.md §4`): reals via `ES24.16E3` then `trim(adjustl())` (or a bounded `Fw.d`, never `F0`/`F0.d`), integers via `I0`, booleans by branching to the literal token `true`/`false` (never an `L`-family descriptor).
 
@@ -51,8 +64,8 @@ The module publishes five derived types (each named by its fully-qualified `harn
 - `harness_fortran_cpu__emit_bool(b) result(s)` — format a `logical` as the JSON literal `true`/`false`.
 - `harness_fortran_cpu__emit_array_r1(a) result(s)` … `__emit_array_r4(a) result(s)` — format an assumed-shape rank-1..4 `real(dp)` array as a nested JSON array (`[ ... ]`, row-major over the leading index), reusing `__emit_real` per element.
 - `harness_fortran_cpu__box(name, json) result(nv)` — pack a JSON key `name` and an already-serialized JSON value `json` into a `type(harness_fortran_cpu__h_named)`. A consuming runner emits each of a case's snapshot variables (via the matching `__emit_*`), boxes each with `__box`, and hands the resulting `values(:)` array to `__write_snapshot` in one call; in a physics node the host-rendered glue emits this `__box` list mechanically from `snapshot_schema.json` (the harness stays stateless — it holds no snapshot registry, and does no serialization of the boxed value beyond copying the caller's token).
-- `harness_fortran_cpu__write_snapshot(case_id, values, time)` — write the per-case `raw/state_snapshots/<case_id>.json` (runtime-built filename) holding the boxed state variables in `values` (`type(harness_fortran_cpu__h_named) :: values(:)`, each written under its `name` with its already-serialized `json`) plus the scalar time variable.
-- `harness_fortran_cpu__write_metrics_basis(entries, n)` — write `raw/metrics_basis.json` as the `per_test` index from `entries(1:n)` (`type(harness_fortran_cpu__h_mb_entry) :: entries(:)`); the harness assembles the `{ "per_test": [ ... ] }` envelope and, per entry, the `{ "test_id": ..., <boxed values> }` body from the entry's `values`. **Data-driven plumbing**: the caller supplies the boxed evidence; the harness owns the JSON envelope.
+- `harness_fortran_cpu__write_snapshot(case_id, values, time)` — write the per-case `raw/state_snapshots/<case_id>.json` (runtime-built filename) holding the boxed state variables in `values` (`type(harness_fortran_cpu__h_named) :: values(:)`) plus the scalar time variable. The emitted object is **flat**: each boxed variable is written as a **top-level key of the snapshot object**, keyed by its `name` with its already-serialized `json` as the value, sibling to the time variable's key. `values` is the dummy-argument name of the boxed array; neither it nor any other wrapper key appears in the emitted JSON.
+- `harness_fortran_cpu__write_metrics_basis(entries, n)` — write `raw/metrics_basis.json` as the `per_test` index from `entries(1:n)` (`type(harness_fortran_cpu__h_mb_entry) :: entries(:)`); the harness assembles the `{ "per_test": [ ... ] }` envelope and, per entry, a **flat body**: the entry's `test_id` key, followed by one key per element of that entry's `values(:)` array, each written under its `name` with its already-serialized `json` as a **direct sibling key of `test_id`**. `values` is the component name of `harness_fortran_cpu__h_mb_entry` (§3.1); neither it nor any other wrapper key appears in the emitted JSON (§2 gives the literal entry shape and the rejected shape). **Data-driven plumbing**: the caller supplies the boxed evidence; the harness owns the JSON envelope.
 - `harness_fortran_cpu__write_diagnostics(results, n)` — write `diagnostics.json` from `results(1:n)` (`type(harness_fortran_cpu__h_case_result) :: results(:)`). The harness computes every derived value: each case's per-case verdict (`overall == fail` iff any of that case's `checks` has `status == 'fail'`; `failed_checks` = those check ids), the top-level `checks` object (one entry per distinct check id; `status == fail` iff that id fails in some case with `expected_xfail == .false.`), and the top-level `verdict` (xfail-excluded fold per §2). It emits the full JSON: top-level `checks` / `verdict` and the `per_case` map (each case's `checks`, `verdict`, and `metrics` leaf object, with an `is_na` metric encoded as `null` + a `_reason_na` sibling). **Data-driven plumbing, not judgment**: the harness folds and serializes; the per-case check statuses, metric values, and each case's `expected_xfail` are computed by the (self-test or physics) caller and passed in. It embeds no per-test pass/fail decision of its own.
 - `harness_fortran_cpu__write_perf(case_id, target, steps, cells_updated, walltime_sec, mpi_ranks, threads_per_rank, gpu_devices)` — write `perf.json` with all required fields incl. the derived `throughput_cells_per_sec` and the `parallelism` object (`parallel_degree_total = mpi_ranks*threads_per_rank*max(gpu_devices,1)`).
 

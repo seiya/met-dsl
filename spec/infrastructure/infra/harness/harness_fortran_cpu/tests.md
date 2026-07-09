@@ -6,7 +6,7 @@
 - `status`: `draft`
 - `spec_ref.spec_kind`: `infrastructure`
 - `spec_ref.spec_id`: `harness_fortran_cpu`
-- `spec_ref.spec_version`: `0.2.0`
+- `spec_ref.spec_version`: `0.2.1`
 - `spec_ref.controlled_spec_path`: `spec/infrastructure/infra/harness/harness_fortran_cpu/controlled_spec.md`
 
 ## 1. Test purpose

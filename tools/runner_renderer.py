@@ -833,9 +833,10 @@ def _xfail_expr(case_ids: list[str], xfail: set[str]) -> str:
 
 EXPECTED_HARNESS_SPEC_ID = "harness_fortran_cpu"
 
-# Verbatim copy of the harness controlled_spec §5.1 canonical interface block (v2,
-# spec_version 0.2.0). If a harness recert changes §5.1, THIS block and the render
-# template must be updated together (the pin message says so).
+# Verbatim copy of the harness controlled_spec §5.1 canonical interface block (v2;
+# unchanged since spec_version 0.2.0, current 0.2.1 — the pin compares signatures, not
+# versions). If a harness recert changes §5.1, THIS block and the render template must
+# be updated together (the pin message says so).
 _HARNESS_V2_INTERFACE = """\
 type :: harness_fortran_cpu__h_named
   character(len=:), allocatable :: name

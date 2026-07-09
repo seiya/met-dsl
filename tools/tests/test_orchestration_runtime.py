@@ -25578,7 +25578,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 8500->9200: R1/M3c-β scope note — on an M3c node the runner is host-rendered,
         # so this doc describes the rendered output + scopes its authoring rules to a
         # leaf-authored runner (infra self-test / legacy no-harness node).
-        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 9200,
+        # Bumped 9200->9600: the metrics_basis entry shape (required_raw_variables as direct
+        # sibling keys of test_id, never wrapped under `values`) plus a correct/wrong pair.
+        # The rule lived only in gate code before, and a runner-authoring leaf that wrapped the
+        # evidence under `values` failed post_execute with no doc to correct it against.
+        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 9600,
         # R1/M3c-β: the fixed-ABI contract for a physics node's `<spec_id>_checks.f90`
         # (leaf-authored callbacks the host-rendered runner drives). Leaf must-read for
         # every generate LLM leaf (its SKILL branches on whether the node is M3c).

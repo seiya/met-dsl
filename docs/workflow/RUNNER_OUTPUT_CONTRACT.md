@@ -70,13 +70,17 @@ source; do not uniformly require a fixed minimal composition.
 
 - **`raw/metrics_basis.json`** must hold a **`per_test` list (or `tests`
   object)** targeting all `test_id` of `io_contract.test_evidence_requirements`.
-  Each entry holds the `test_id` and the primary evidence carrying that
-  `test_id`'s `required_raw_variables` without omission (needed for the
-  per-test recomputation of `Validate.judge`). A custom structure without a
-  per-test index (e.g. a single `evidence[]`) is rejected by `post_execute`
-  (`must contain per_test list or tests object`). `metrics_basis.json` holds
-  only the primary evidence and must not copy `diagnostics.json`; different
+  Each entry is **flat**: the `test_id`, plus that `test_id`'s
+  `required_raw_variables` without omission as **direct sibling keys of
+  `test_id`** (needed for the per-test recomputation of `Validate.judge`).
+  Wrapping them under an unrecognized key — notably `values`, a Fortran identifier
+  of the harness entry record and never a JSON key — fails `post_execute`. A
+  structure without a per-test index (e.g. a single `evidence[]`) is likewise
+  rejected (`must contain per_test list or tests object`). `metrics_basis.json`
+  holds only the primary evidence and must not copy `diagnostics.json`; different
   `test_id` must not overwrite each other.
+  - Correct: `{"test_id":"l0_emit_pass","a1":[0.5,1.5],"max_abs_deviation":0.0}`
+  - Wrong: `{"test_id":"l0_emit_pass","values":{"a1":[0.5,1.5],"max_abs_deviation":0.0}}` → `post_execute` fails with "missing required_raw_variables", naming the unrecognized wrapper key.
 - **`raw/state_snapshots/<case_id>.json`** — when `state_snapshots` is required,
   the runner writes **exactly one snapshot per case**, named from the `case_id`
   it receives on argv (`--cases <spec.ir.yaml> <case_id>...`, one positional per
