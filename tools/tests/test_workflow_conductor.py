@@ -4294,6 +4294,42 @@ class DeterministicBuildTest(unittest.TestCase):
                                    env={}, workflow_mode="dev")
                 d_dev = dev.classify_failure(refs, "validate", ex_fail)
                 self.assertEqual(d_dev.action, "fail_closed", fclass)
+                self.assertEqual(d_dev.reason, f"validate_execute_{fclass}", fclass)
+
+    def test_execute_predicate_error_verdict_is_attributed_to_the_ir(self) -> None:
+        # A `predicate_error` verdict is the missing/malformed test_predicates DSL — a defect in
+        # the certified IR, which Generate cannot author. It must carry the `_ir` attribution
+        # suffix so the dev `--resume` directive declines it (reopening Generate would rebuild and
+        # deterministically re-fail) and the prod diagnostician sees the attribution.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            rn = repo / refs.run_node_dir()
+            rn.mkdir(parents=True, exist_ok=True)
+            (rn / "verdict.json").write_text(json.dumps(
+                {"self_verdict": "fail", "failure_class": "structural_violation", "per_test": [],
+                 "predicate_error": "PredicateError: io_contract.test_predicates missing/empty"}),
+                encoding="utf-8")
+            ex_fail = [wc.SubstepOutcome("pj", "pass", [], 0),
+                       wc.SubstepOutcome("ex", "fail", [], 0)]
+            for mode, action in (("prod", "escalate"), ("dev", "fail_closed")):
+                c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                                 orchestration_agent_run_id="O", backend="claude",
+                                 env={}, workflow_mode=mode)
+                d = c.classify_failure(refs, "validate", ex_fail)
+                self.assertEqual((d.action, d.reason),
+                                 (action, "validate_execute_structural_violation_ir"), mode)
+            # The suffix must not leak onto a physics_fail (no predicate_error there) nor onto a
+            # genuine ref_absent structural_violation, which a warm Generate repair CAN fix.
+            (rn / "verdict.json").write_text(json.dumps(
+                {"self_verdict": "fail", "failure_class": "physics_fail", "per_test": [],
+                 "predicate_error": "ignored on a physics verdict"}), encoding="utf-8")
+            dev = wc.Conductor(repo_root=repo, orchestration_id="o",
+                               orchestration_agent_run_id="O", backend="claude",
+                               env={}, workflow_mode="dev")
+            self.assertEqual(dev.classify_failure(refs, "validate", ex_fail).reason,
+                             "validate_execute_physics_fail")
 
     def test_semantic_review_fail_on_clean_verdict_escalates(self) -> None:
         # G6 (Codex P2): the judge substep fails on semantic_review.decision=="fail" even when
@@ -4553,6 +4589,25 @@ class DeterministicBuildTest(unittest.TestCase):
                         + "io_contract:\n  raw_requirements:\n    required_evidence:\n"
                           "      - artifact: state_snapshots\n        required: true\n"
                           "case:\n  test_case_set:\n    - case_id: c_alpha\n")
+    # A structurally clean run needs a SATISFIABLE predicate too, else _author_execute_verdict
+    # authors a structural_violation verdict (the missing-DSL guard) and the run fails anyway.
+    # `_b1_execute` seeds diagnostics `verdict.overall == pass`.
+    _B1_IR_CLEAN_VERDICT = (_B1_IR_MINIMAL
+                            + "case:\n  test_case_set:\n    - case_id: c_alpha\n"
+                              "io_contract:\n  test_predicates:\n    - test_id: t_alpha\n"
+                              "      expected_outcome: pass\n      target_cases: [c_alpha]\n"
+                              "      pass_when:\n        all:\n"
+                              "          - ref: verdict.overall\n            op: eq\n"
+                              "            value: pass\n")
+    # The same predicate, but over a per-case metric ADDRESS the seeded diagnostics never emits:
+    # every gate is clean, so execute reaches the verdict and fails it structurally (ref_absent).
+    _B1_IR_VERDICT_FAIL = (_B1_IR_MINIMAL
+                           + "case:\n  test_case_set:\n    - case_id: c_alpha\n"
+                             "io_contract:\n  test_predicates:\n    - test_id: t_alpha\n"
+                             "      expected_outcome: pass\n      target_cases: [c_alpha]\n"
+                             "      pass_when:\n        all:\n"
+                             "          - ref: metrics.max_abs_dev\n            op: le\n"
+                             "            value: 1.0e-12\n            per_case: true\n")
 
     def _b1_refs(self) -> wc.NodeRefs:
         return wc.NodeRefs(
@@ -4561,7 +4616,8 @@ class DeterministicBuildTest(unittest.TestCase):
             run_id="run_1", source_binary_id="bin_1")
 
     def _b1_execute(self, repo: Path, ir_yaml: str, *, gate_result: tuple[int, str],
-                    matching_diagnostics: bool) -> tuple[dict, dict]:
+                    matching_diagnostics: bool,
+                    diagnostics: dict | None = None) -> tuple[dict, dict]:
         """Drive _execute_inproc with the two gate subprocesses stubbed to `gate_result`
         (returncode, stdout) and the runner/make-test diagnostics seeded so the quality_check
         passes (matching_diagnostics) or fails. Returns (result, trial_meta-or-{})."""
@@ -4583,7 +4639,8 @@ class DeterministicBuildTest(unittest.TestCase):
         run_tmp = repo / "workspace" / "tmp" / "child-1" / "run"
         qc_tmp = repo / "workspace" / "tmp" / "child-1" / "qc_run"
         run_tmp.mkdir(parents=True, exist_ok=True)
-        diag = {"checks": {"k": {"status": "pass"}}, "verdict": {"overall": "pass"}}
+        diag = diagnostics or {"checks": {"k": {"status": "pass"}},
+                               "verdict": {"overall": "pass"}}
         (run_tmp / "diagnostics.json").write_text(json.dumps(diag), encoding="utf-8")
         if matching_diagnostics:
             qc_tmp.mkdir(parents=True, exist_ok=True)
@@ -4712,15 +4769,71 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual(meta["failure_category"], "snapshot_deliverable_gap")
 
     def test_execute_inproc_structural_pass_writes_no_failure_fields(self) -> None:
-        # The mirror of the three above: every input clean -> no structural failure, so the
-        # category/excerpt fields must be ABSENT (classify_failure must not see a stale category
-        # on a run that only later fails its per-test predicates).
+        # The mirror of the three above: every input clean (gates, quality_check, AND the
+        # per-test verdict) -> no failure at all, so the category/excerpt fields must be ABSENT.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            _out, meta = self._b1_execute(Path(td), self._B1_IR_CLEAN_VERDICT,
+                                          gate_result=(0, ""), matching_diagnostics=True)
+            self.assertEqual(meta["status"], "pass")
+            self.assertNotIn("failure_category", meta)
+            self.assertNotIn("failure_excerpt", meta)
+
+    # -- verdict-fail side: the per-test predicate failure authors findings, not a category ----
+
+    def test_execute_inproc_verdict_fail_authors_a_failure_excerpt(self) -> None:
+        # Every structural gate is clean, so execute reaches the deterministic verdict and the
+        # predicate fails. The excerpt is what a dev `--resume` threads into the reopened
+        # Generate, so it must name the failing predicate (test / ref / op / case / reason).
+        import tempfile
+        diag = {"checks": {"k": {"status": "pass"}}, "verdict": {"overall": "pass"},
+                "per_case": {"c_alpha": {"metrics": {"metrics.other": 0.0}}}}
+        with tempfile.TemporaryDirectory() as td:
+            out, meta = self._b1_execute(Path(td), self._B1_IR_VERDICT_FAIL, gate_result=(0, ""),
+                                         matching_diagnostics=True, diagnostics=diag)
+            self.assertEqual(out["returncode"], 0)
+            self.assertEqual(meta["status"], "fail")
+            excerpt = meta["failure_excerpt"]
+            self.assertIn(wc._VERDICT_FAIL_MARKER, excerpt)
+            self.assertIn("failure_class=structural_violation", excerpt)
+            self.assertIn("test t_alpha", excerpt)
+            self.assertIn("metrics.max_abs_dev", excerpt)
+            self.assertIn("reason=ref_absent", excerpt)
+            self.assertIn("case='c_alpha'", excerpt)
+            self.assertIn(excerpt, out["stderr"])
+            # The B1 routing table keys on failure_category; a verdict failure is NOT one of its
+            # categories, and classify_failure's no-verdict branch must never see one here.
+            self.assertNotIn("failure_category", meta)
+
+    def test_execute_inproc_verdict_fail_excerpt_is_bounded(self) -> None:
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            huge = {"self_verdict": "fail", "failure_class": "physics_fail",
+                    "per_test": [{"test_id": f"t{i}", "status": "fail",
+                                  "basis": {"conditions": [{"ref": "metrics.x", "op": "le",
+                                                            "evaluated": [{"satisfied": False,
+                                                                           "lhs": "y" * 500}]}]}}
+                                 for i in range(200)]}
+            with mock.patch.object(wc.Conductor, "_author_execute_verdict",
+                                   lambda self, refs, ir, run_diag: huge):
+                _out, meta = self._b1_execute(Path(td), self._B1_IR_CLEAN_VERDICT,
+                                              gate_result=(0, ""), matching_diagnostics=True)
+            excerpt = meta["failure_excerpt"]
+            self.assertLessEqual(len(excerpt.splitlines()), wc._EXECUTE_EXCERPT_MAX_LINES)
+            self.assertLess(len(excerpt), wc._EXECUTE_EXCERPT_MAX_CHARS + 200)
+
+    def test_execute_inproc_verdict_fail_excerpt_reports_a_predicate_error(self) -> None:
+        # A missing/malformed predicate DSL is authored as a structural_violation verdict with an
+        # empty per_test; the excerpt must still carry the reason (the IR defect).
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             _out, meta = self._b1_execute(Path(td), self._B1_IR_MINIMAL, gate_result=(0, ""),
                                           matching_diagnostics=True)
+            self.assertEqual(meta["status"], "fail")
+            self.assertIn("predicate_error:", meta["failure_excerpt"])
+            self.assertIn("test_predicates missing/empty", meta["failure_excerpt"])
             self.assertNotIn("failure_category", meta)
-            self.assertNotIn("failure_excerpt", meta)
 
     def test_execute_inproc_clears_stale_trial_meta(self) -> None:
         # The runtime-error discriminator ("no trial_meta") must not depend on the external

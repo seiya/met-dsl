@@ -10894,6 +10894,25 @@ _DEV_VALIDATE_EXECUTE_REASON_PREFIX = "validate_execute_"
 _DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES: frozenset[str] = frozenset(
     {"post_execute_violation", "snapshot_deliverable_gap", "quality_check_mismatch"}
 )
+# The per-test PREDICATE failure classes (`verdict.json#failure_class`) that deadlock the same
+# way. In dev, `classify_failure` fail_closes them directly — `RouteDecision("fail_closed",
+# reason="validate_execute_<failure_class>")`, terminalized as `conductor_phase_fail_closed`
+# rather than the F1 `dev_phase_rollback` above — and a plain `--resume` re-runs the identical
+# binary into the identical deterministic verdict. A `structural_violation` is a contract gap in
+# the generated code (an absent diagnostics ref), the same defect class the reuse categories
+# describe, so it reopens Generate with the failing predicates as findings. `physics_fail` is
+# excluded: a wrong physical result is the operator's call, not a warm regenerate. So is
+# `structural_violation_ir` — the `_ir`-suffixed reason `classify_failure` emits when the verdict
+# carries a `predicate_error` (a missing/malformed `test_predicates` DSL). That defect lives in
+# the certified IR, which Generate cannot author, so reopening Generate would rebuild and re-fail
+# deterministically; the suffix keeps it out of this set and the plain resume surfaces it to the
+# operator (prod escalates it to the diagnostician, which can reopen Compile).
+# These are NOT keys of `VALIDATE_EXECUTE_FAILURE_ROUTING` (that table covers only the
+# no-verdict structural categories), hence a separate constant.
+_DEV_VALIDATE_EXECUTE_VERDICT_CATEGORIES: frozenset[str] = frozenset({"structural_violation"})
+# The two `orchestration_meta.reason_code` values that carry a routeable validate.execute failure.
+_DEV_ROLLBACK_REASON_CODE = "dev_phase_rollback"
+_DEV_FAIL_CLOSED_REASON_CODE = "conductor_phase_fail_closed"
 # `source` marker of the directive below; the conductor's `_consume_resume_directive` keys on it.
 DEV_VALIDATE_EXECUTE_RESUME_SOURCE = "dev_validate_execute_structural"
 # Bound on the findings text rendered into the resumed repair prompt (matches the conductor's
@@ -10986,10 +11005,12 @@ def _dev_execute_failure_findings(
     """The failing gate's own violation text for the failed execute run `arid`.
 
     Canonical source is `trial_meta.json#failure_excerpt` (authored by `_execute_inproc` for
-    exactly the structural categories this directive gates on). Fallback is the `[execute fail]`
-    block the conductor persisted to the substep's `deterministic.stderr.log` (the same text,
-    unbounded), used when the excerpt field is absent. None when neither survives — the resumed
-    repair then falls back to the full prompt, as an expired session already would."""
+    exactly the categories this directive gates on — the structural gate reports and the
+    `[execute fail: verdict]` predicate report). Fallback is the `[execute fail]` block the
+    conductor persisted to the substep's `deterministic.stderr.log` (the same text, unbounded),
+    used when the excerpt field is absent. The fallback marker matches the structural report
+    only; a verdict failure predating the excerpt authoring yields no findings, and the resumed
+    repair falls back to the full prompt, as an expired session already would."""
     excerpt: str | None = None
     if isinstance(trial, dict) and str(trial.get("status") or "").strip() == "fail":
         value = trial.get("failure_excerpt")
@@ -11020,33 +11041,47 @@ def _derive_dev_validate_execute_resume_directive(
     reason_code: str | None,
     reason_detail: str | None,
 ) -> dict[str, Any] | None:
-    """Build a `resume_directive` when a dev run fail_closed on the F1 guard because a
-    STRUCTURAL validate.execute failure routed back to Generate.
+    """Build a `resume_directive` when a dev run fail_closed because a STRUCTURAL
+    validate.execute failure could not route back to Generate.
 
-    Without it, `--resume` skips the checkpointed Compile/Generate/Build phases and re-runs
-    Validate against the identical binary, so the deterministic gate fails identically — a
-    deadlock. The directive records the parameters `Conductor._consume_resume_directive` feeds
-    to `reopen_phase` (reopen Generate, triggered by the failed execute run) plus the gate's own
-    violation text, so the resumed Generate producer is warm-resumed with the findings that
-    prod's B1 retry would have carried. F1 itself is unchanged: an in-run automatic rollback
-    still fail_closes; this fires only on an operator `--resume`.
+    Two failure shapes reach this, both terminal in dev and both deadlocked on a plain resume:
+
+    - a structural GATE failure (no `verdict.json`), which `classify_failure` routes to
+      ("generate", "reuse") and F1 fail_closes as `dev_phase_rollback` because that is a
+      cross-phase backward rollback;
+    - a per-test PREDICATE failure whose `verdict.json#failure_class` is `structural_violation`,
+      which `classify_failure` fail_closes directly (terminalized `conductor_phase_fail_closed`,
+      never reaching F1).
+
+    Without the directive, `--resume` skips the checkpointed Compile/Generate/Build phases and
+    re-runs Validate against the identical binary, so the deterministic evaluation fails
+    identically — a deadlock. The directive records the parameters
+    `Conductor._consume_resume_directive` feeds to `reopen_phase` (reopen Generate, triggered by
+    the failed execute run) plus the failure's own violation text, so the resumed Generate
+    producer is warm-resumed with the findings that prod's B1 retry would have carried. F1 itself
+    is unchanged: an in-run automatic rollback still fail_closes; this fires only on an operator
+    `--resume`.
 
     Nothing new is persisted — the directive is a cache derived from `agent_runs.jsonl`, the
     failing run's launch request and its `trial_meta.json`. Returns None (plain resume)
-    whenever the reason does not name a reuse-routed category, the evidence is incomplete, or
+    whenever the reason does not name an accepted category, the evidence is incomplete, or
     the evidence is STALE (B4: `trial_meta.json#repo_revision` differs from the revision at
     resume time — the source that produced the violation text is not the source that will now
     be repaired against, so the findings may describe a defect that no longer exists)."""
-    if not isinstance(reason_code, str) or reason_code.strip() != "dev_phase_rollback":
+    code = reason_code.strip() if isinstance(reason_code, str) else ""
+    if code not in (_DEV_ROLLBACK_REASON_CODE, _DEV_FAIL_CLOSED_REASON_CODE):
         return None
     detail = reason_detail.strip() if isinstance(reason_detail, str) else ""
     if not detail.startswith(_DEV_VALIDATE_EXECUTE_REASON_PREFIX):
         return None
     # Match on the CATEGORY suffix, never the prefix alone: the cold-restart
-    # `validate_execute_fail` (a runner runtime error) and the per-test predicate reasons
-    # (`validate_execute_physics_fail`) share it and must keep the plain resume.
+    # `validate_execute_fail` (a runner runtime error) and `validate_execute_physics_fail` share
+    # it and must keep the plain resume. Each reason_code admits exactly its own category set —
+    # the two are disjoint, so a category can never ride in under the wrong terminalization.
     category = detail[len(_DEV_VALIDATE_EXECUTE_REASON_PREFIX):]
-    if category not in _DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES:
+    accepted = (_DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES if code == _DEV_ROLLBACK_REASON_CODE
+                else _DEV_VALIDATE_EXECUTE_VERDICT_CATEGORIES)
+    if category not in accepted:
         return None
 
     root = _orchestration_root(repo_root, orchestration_id)
@@ -11083,7 +11118,7 @@ def _derive_dev_validate_execute_resume_directive(
         "reopen_from": "generate",
         "node_key": str(rec.get("node_key")).strip(),
         "trigger_agent_run_id": trigger_arid,
-        "reason_code": reason_code.strip(),
+        "reason_code": code,
         "failure_category": category,
         "source": DEV_VALIDATE_EXECUTE_RESUME_SOURCE,
     }

@@ -18,15 +18,26 @@ over the runner's ``diagnostics.json``::
           target_cases: [<case_id>, ...]  # the case_ids this predicate ranges over
           pass_when:
             all:                          # `all` is the only combinator (add any/not on real demand)
-              - ref: <dotted path into diagnostics.json>   # e.g. checks.input_guard.pass / verdict.overall
+              - ref: <diagnostics ref>     # e.g. checks.input_guard.status / verdict.overall / metrics.cfl_max
                 op: eq|ne|le|ge|lt|gt|includes
                 value: <scalar|bool|string|list>            # OR {per_case: {<case_id>: value}} for nx-dependent thresholds
                 per_case: <bool>          # optional: resolve `ref` inside each target case's diagnostics slice
                 na_allowed: <bool>        # optional: a null/absent lhs counts as satisfied (a "not applied" metric)
 
+A ``ref`` resolves by its HEAD, over the same closed head vocabulary the Compile-stage gate
+(``_check_ref``) validates:
+
+- ``checks`` / ``verdict`` — a dotted path nested inside the diagnostics slice.
+- any other head — an opaque per-case **metric address** (``metrics.*`` / ``errors.*`` /
+  ``cfl.*`` / ``convergence.*``, pinned in ``diagnostics_contract.metrics``), looked up as a
+  whole-string KEY of the slice's ``metrics`` map. The runner writes that map flat, keyed by the
+  full dotted address (``{"metrics": {"metrics.cfl_max": 0.4}}``), so the address is never
+  decomposed into path segments. An N/A metric is written as ``"<address>": null`` beside an
+  ``"<address>_reason_na"`` sibling, which the ``na_allowed`` handling consumes.
+
 The runner emits every numeric judgment already reduced to a diagnostics field (a
-boolean ``checks.<id>`` / a ``metrics.<name>`` scalar / a ``verdict.overall`` enum), so
-the predicate never does arithmetic — it only compares a dotted diagnostics value
+``checks.<id>.status`` enum / a metric-address scalar / a ``verdict.overall`` enum), so
+the predicate never does arithmetic — it only compares a resolved diagnostics value
 against a constant/set and conjoins the results. ``xfail_condition`` is a case-construction
 fact (verified at Compile), never an evaluated runtime predicate.
 """
@@ -65,6 +76,30 @@ def _resolve_ref(obj: Any, ref: str) -> tuple[bool, Any]:
             return (False, None)
         cur = cur[seg]
     return (True, cur)
+
+
+# Heads whose `ref` is a NESTED path into the diagnostics slice. Every other head is an opaque
+# metric ADDRESS — the runner keys its `metrics` map by the whole dotted address, so decomposing
+# it into path segments would never resolve. Exactly mirrors `_check_ref`'s Compile-stage
+# vocabulary: that gate pins a metric ref against the declared addresses by whole-string equality,
+# which is the same key this resolves.
+_NESTED_REF_HEADS: frozenset[str] = frozenset({"checks", "verdict"})
+
+
+def _resolve_predicate_ref(obj: Any, ref: str) -> tuple[bool, Any]:
+    """Resolve a predicate ``ref`` against one diagnostics slice, dispatching on its head.
+
+    Returns ``(present, value)``. A metric address present with a ``null`` value (the runner's
+    honest-N/A encoding) resolves as ``(True, None)``; the caller's ``na_allowed`` handling
+    decides whether that satisfies the condition."""
+    if not isinstance(obj, dict):
+        return (False, None)
+    if ref.split(".", 1)[0] in _NESTED_REF_HEADS:
+        return _resolve_ref(obj, ref)
+    metrics = obj.get("metrics")
+    if not isinstance(metrics, dict) or ref not in metrics:
+        return (False, None)
+    return (True, metrics[ref])
 
 
 def _case_slice(diagnostics: dict[str, Any], case_id: str) -> tuple[bool, Any]:
@@ -190,7 +225,7 @@ def _eval_condition(cond: dict[str, Any], diagnostics: dict[str, Any],
                      "reason": "case_absent"}
             evaluated.append(basis)
             return (False, _KIND_STRUCTURAL, {"ref": ref, "op": op, "evaluated": evaluated})
-        lhs_present, lhs = _resolve_ref(ctx if isinstance(ctx, dict) else {}, ref)
+        lhs_present, lhs = _resolve_predicate_ref(ctx, ref)
         if not lhs_present or lhs is None:
             if na_allowed:
                 evaluated.append({"case": cid, "ref": ref, "op": op,
@@ -473,9 +508,14 @@ def _check_ref(loc: str, ref: str, check_ids: set[str], verdict_fields: set[str]
             return [f"{loc}.ref checks.{cid} not in diagnostics_contract.checks "
                     f"({sorted(check_ids)})"]
         return []
-    # Any other head is a per-case metric address; it must be pinned in
-    # diagnostics_contract.metrics (the intermediate per-case addressing contract).
-    if ref not in metric_addrs and head not in metric_addrs:
+    # Any other head is a per-case metric ADDRESS; the WHOLE ref must be pinned in
+    # diagnostics_contract.metrics (the intermediate per-case addressing contract). Exact match,
+    # never a head prefix: the renderer emits one metric key per declared address verbatim
+    # (`runner_renderer._metrics`) and `_resolve_predicate_ref` looks the ref up as a whole-string
+    # key, so a `metrics: ["cfl"]` pin behind a `cfl.max` ref would emit `cfl`, resolve
+    # `ref_absent`, and fail every run as a structural_violation. Reject it here, where it is
+    # repairable, rather than at execute.
+    if ref not in metric_addrs:
         return [f"{loc}.ref {ref} not declared in diagnostics_contract.metrics "
-                f"({sorted(metric_addrs)})"]
+                f"({sorted(metric_addrs)}) — the full dotted address must be pinned verbatim"]
     return []

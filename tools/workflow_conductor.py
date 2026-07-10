@@ -215,6 +215,55 @@ def _execute_failure_excerpt(text: str) -> str:
             + tail[-_EXECUTE_EXCERPT_MAX_CHARS:])
 
 
+# Marker of the per-test predicate failure report. Deliberately NOT the `[execute fail]` literal
+# the structural branch uses (`orchestration_runtime._EXECUTE_FAIL_MARKER`, which the dev resume
+# directive's stderr-log fallback searches for): a predicate failure is a different failure class
+# and reaches that directive through `trial_meta.json#failure_excerpt` only.
+_VERDICT_FAIL_MARKER = "[execute fail: verdict]"
+
+
+def _verdict_failure_report(verdict_doc: dict[str, Any]) -> str:
+    """The `[execute fail: verdict]` block for a `self_verdict=fail` run.
+
+    Names every unsatisfied condition (`ref` / `op` / case / reason or lhs-vs-rhs), not merely
+    the failing test: this text is the findings a repair leaf reasons from, and `verdict.json`
+    is outside the leaf's read set."""
+    lines = [
+        f"{_VERDICT_FAIL_MARKER} deterministic per-test verdict is fail "
+        f"(failure_class={verdict_doc.get('failure_class')}); the judge leaf was not spawned. "
+        f"See verdict.json#per_test for the failing predicate(s)."
+    ]
+    error = verdict_doc.get("predicate_error")
+    if isinstance(error, str) and error.strip():
+        lines.append(f"predicate_error: {error.strip()}")
+    per_test = verdict_doc.get("per_test")
+    for item in (per_test if isinstance(per_test, list) else []):
+        if not isinstance(item, dict) or item.get("status") != "fail":
+            continue
+        lines.append(f"- test {item.get('test_id')}: fail")
+        basis = item.get("basis")
+        conditions = basis.get("conditions") if isinstance(basis, dict) else None
+        for cond in (conditions if isinstance(conditions, list) else []):
+            if not isinstance(cond, dict):
+                continue
+            evaluated = cond.get("evaluated")
+            for ev in (evaluated if isinstance(evaluated, list) else []):
+                if not isinstance(ev, dict) or ev.get("satisfied"):
+                    continue
+                parts = [f"ref={ev.get('ref', cond.get('ref'))!r}",
+                         f"op={ev.get('op', cond.get('op'))!r}"]
+                if ev.get("case") is not None:
+                    parts.append(f"case={ev['case']!r}")
+                if ev.get("reason"):
+                    parts.append(f"reason={ev['reason']}")
+                if "lhs" in ev:
+                    parts.append(f"lhs={ev['lhs']!r}")
+                if "rhs" in ev:
+                    parts.append(f"rhs={ev['rhs']!r}")
+                lines.append("  - " + " ".join(parts))
+    return "\n".join(lines)
+
+
 # Validate.execute STRUCTURAL failure_category -> (retry_target_phase, repair_strategy).
 # A structural execute failure authors no verdict.json (the judge leaf never ran), so the
 # defect is in the generated runner/model code, not in a physics predicate: the same class the
@@ -3243,13 +3292,19 @@ clean:
         # authors semantic_review.json only.
         verdict_doc = self._author_execute_verdict(refs, ir, run_diag)
         if verdict_doc.get("self_verdict") == "fail":
+            # Persist the failing predicate(s) as `failure_excerpt`, symmetric with the structural
+            # branch above: a dev `--resume` after the `fail_closed` threads it into the reopened
+            # Generate as repair findings (`_derive_dev_validate_execute_resume_directive`).
+            # `failure_category` is deliberately NOT written — it keys
+            # VALIDATE_EXECUTE_FAILURE_ROUTING, and classify_failure's no-verdict branch (B1) would
+            # then read this run as a structural gate failure. The resume deriver takes the category
+            # from the routing reason's suffix instead.
+            block = _verdict_failure_report(verdict_doc)
             trial_meta["status"] = "fail"
+            trial_meta["failure_excerpt"] = _execute_failure_excerpt(block)
             (node_dir / "trial_meta.json").write_text(
                 json.dumps(trial_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            stderr += (
-                f"\n[execute fail: verdict] deterministic per-test verdict is fail "
-                f"(failure_class={verdict_doc.get('failure_class')}); the judge leaf was not "
-                f"spawned. See verdict.json#per_test for the failing predicate(s).")
+            stderr += "\n" + block
         return {"returncode": 0, "stdout": stdout, "stderr": stderr}
 
     def _author_execute_verdict(self, refs: NodeRefs, ir: dict[str, Any],
@@ -4384,9 +4439,19 @@ clean:
                     # reopen one attempt early).
                     if hasattr(self, "_validate_execute_fail_count"):
                         self._validate_execute_fail_count[refs.node_key] = 0
+                    reason = f"{VALIDATE_EXECUTE_REASON_PREFIX}{fclass}"
+                    # A `predicate_error` verdict is the missing/malformed `test_predicates` DSL
+                    # (_author_execute_verdict's guard), i.e. a defect in the already-certified IR
+                    # that Generate cannot author. Attribute it to the IR with the same `_ir`
+                    # suffix the C2 backstop and the host-rendered-runner re-attribution use: the
+                    # diagnostician gets the attribution in prod, and in dev the suffix keeps the
+                    # reason out of the resume directive's category set, so `--resume` does not
+                    # reopen (and rebuild) a Generate that provably cannot converge.
+                    if fclass == "structural_violation" and verdict.get("predicate_error"):
+                        reason += "_ir"
                     if self.workflow_mode == "dev":
-                        return RouteDecision("fail_closed", reason=f"validate_execute_{fclass}")
-                    return RouteDecision("escalate", reason=f"validate_execute_{fclass}")
+                        return RouteDecision("fail_closed", reason=reason)
+                    return RouteDecision("escalate", reason=reason)
                 #   (b) a STRUCTURAL/runtime execute failure (no verdict.json): the runner
                 # produced bad/missing primary evidence (a runtime error or a post_execute
                 # structural violation), which is a code defect -> regenerate. Route to Generate
@@ -4479,13 +4544,14 @@ clean:
         (`cmd_init --resume-from-checkpoint`), returning the `pending_repair` it seeds.
 
         Only the dev structural-validate.execute directive
-        (`_derive_dev_validate_execute_resume_directive`) is honored: in dev, F1 fail_closes
-        such a failure as `dev_phase_rollback` instead of retrying, and a plain `--resume`
-        would skip the checkpointed Generate/Build and re-run the identical binary into the
-        identical deterministic gate failure. Reopening Generate here — with the gate's own
-        violation text as warm repair findings — is the operator-initiated equivalent of the
-        `("generate","reuse")` route prod takes automatically (B1). F1 is unchanged: an
-        in-run automatic rollback still fail_closes.
+        (`_derive_dev_validate_execute_resume_directive`) is honored. In dev such a failure is
+        terminal — F1 fail_closes a structural GATE failure as `dev_phase_rollback` instead of
+        retrying it, and a per-test `structural_violation` verdict fail_closes directly
+        (`conductor_phase_fail_closed`) — so a plain `--resume` would skip the checkpointed
+        Generate/Build and re-run the identical binary into the identical deterministic failure.
+        Reopening Generate here — with the failure's own violation text as warm repair findings —
+        is the operator-initiated equivalent of the `("generate","reuse")` route prod takes
+        automatically (B1). F1 is unchanged: an in-run automatic rollback still fail_closes.
 
         The producer arid is recovered BEFORE `reopen_phase`, which drops the checkpoint entry
         it is read from. A reopen failure degrades to a plain resume (no repair seeded) rather

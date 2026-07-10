@@ -76,8 +76,12 @@ from tools.orchestration_runtime import (
     _derive_dev_validate_execute_resume_directive,
     DEV_VALIDATE_EXECUTE_RESUME_SOURCE,
     _DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES,
+    _DEV_VALIDATE_EXECUTE_VERDICT_CATEGORIES,
     _DEV_VALIDATE_EXECUTE_REASON_PREFIX,
+    _DEV_FAIL_CLOSED_REASON_CODE,
+    _DEV_ROLLBACK_REASON_CODE,
     _DEV_RESUME_FINDINGS_MAX_CHARS,
+    FAIL_CLOSED_REASON_CODES,
     _node_key_to_safe,
     _validate_orchestration_completion_for_pass,
     reserve_phase_root,
@@ -25703,7 +25707,15 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # via MCP run_syntax_check) — the leaf must not run it, and must write
         # standard-conforming f2008 that passes the real compiler front-end on the first
         # attempt (replaces the retired post_generate compiler-mimic text heuristics).
-        "skills/workflow-generate-generate/SKILL.md": 29100,
+        # Bumped 29100->29950: the two authoring rules the E2E #4 leaf broke six times over,
+        # neither of which was stated anywhere in its must-read set — the `<spec_id>__` prefix
+        # marks the node's PUBLISHED operations (infra: `public_api.published_operations[].
+        # operation_id`; physics: the entry points realizing io_contract.outputs, since a physics
+        # node's interface is derived post-hoc and `algorithm.published_operations` is not a
+        # schema-guaranteed field — helpers take bare names), and Fortran identifiers are
+        # case-insensitive (a `g`/`G` dummy-vs-output pair is one symbol). Inform-over-prohibit:
+        # doc text, not a new gate.
+        "skills/workflow-generate-generate/SKILL.md": 29950,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
@@ -26499,7 +26511,8 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
 
     def _seed(self, repo_root: Path, oid: str, *, status: str = "fail",
               write_trial_meta: bool = True, write_request: bool = True,
-              trial_revision: object = _OMIT, trial_excerpt: object = _OMIT) -> Path:
+              trial_revision: object = _OMIT, trial_excerpt: object = _OMIT,
+              trial_category: object = _OMIT) -> Path:
         """An orchestration whose only failed run is a structural validate.execute substep."""
         root = repo_root / "workspace" / "orchestrations" / oid
         (root / "launches").mkdir(parents=True, exist_ok=True)
@@ -26527,8 +26540,12 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
                 encoding="utf-8",
             )
         if write_trial_meta:
-            doc: dict = {"run_id": "run_1", "node_key": self.NODE_KEY, "status": "fail",
-                         "failure_category": "post_execute_violation"}
+            doc: dict = {"run_id": "run_1", "node_key": self.NODE_KEY, "status": "fail"}
+            # A verdict failure writes NO failure_category (only the structural gate branch does).
+            if trial_category is self._OMIT:
+                doc["failure_category"] = "post_execute_violation"
+            elif trial_category is not None:
+                doc["failure_category"] = trial_category
             if trial_revision is not self._OMIT:
                 doc["repo_revision"] = trial_revision
             else:
@@ -26561,9 +26578,10 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
             self.assertEqual(directive["repair_findings"], self.EXCERPT)
 
     def test_directive_gated_on_reason_code_and_category(self) -> None:
-        """Only `dev_phase_rollback` + a reuse-routed category fires. The cold-restart
-        `validate_execute_fail` (runner runtime error) and the per-test predicate reasons
-        share the prefix and must keep the plain resume."""
+        """Each reason_code admits only its own category set: `dev_phase_rollback` the
+        reuse-routed structural-gate categories, `conductor_phase_fail_closed` the verdict
+        `structural_violation`. The cold-restart `validate_execute_fail` (runner runtime error)
+        and `validate_execute_physics_fail` share the prefix and must keep the plain resume."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             oid = "orch_dev_exec_gate"
@@ -26578,19 +26596,87 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
                 # an M3c snapshot gap re-attributed to the IR (host-rendered runner)
                 ("dev_phase_rollback", "validate_execute_snapshot_deliverable_gap_ir"),
                 ("dev_phase_rollback", "validate_execute_physics_fail"),
-                ("dev_phase_rollback", "validate_execute_structural_violation"),
                 ("dev_phase_rollback", "generate->compile"),
                 ("dev_phase_rollback", None),
+                # a physics predicate fail_closes the same way but stays the operator's call
+                ("conductor_phase_fail_closed", "validate_execute_physics_fail"),
+                ("conductor_phase_fail_closed", "validate_execute_fail"),
+                # the category sets are disjoint per reason_code: neither rides in under the other
+                ("dev_phase_rollback", "validate_execute_structural_violation"),
+                ("conductor_phase_fail_closed", "validate_execute_post_execute_violation"),
+                ("conductor_phase_fail_closed", "leaf_transport_error"),
+                # a `predicate_error` verdict: the malformed test_predicates DSL lives in the
+                # certified IR, so Generate cannot repair it — the `_ir` suffix declines here and
+                # the plain resume surfaces the IR defect instead of rebuilding into it again.
+                ("conductor_phase_fail_closed", "validate_execute_structural_violation_ir"),
             ):
                 self.assertIsNone(
                     _derive_dev_validate_execute_resume_directive(
                         repo_root, oid, reason_code, detail),
                     f"{reason_code!r}/{detail!r} must not emit a directive")
-            # The reuse-routed categories all fire.
+            # The reuse-routed categories all fire under the F1 rollback.
             for category in ("post_execute_violation", "snapshot_deliverable_gap",
                              "quality_check_mismatch"):
                 self.assertIsNotNone(_derive_dev_validate_execute_resume_directive(
                     repo_root, oid, "dev_phase_rollback", f"validate_execute_{category}"))
+
+    def test_directive_fires_on_a_verdict_structural_violation(self) -> None:
+        """A per-test predicate `structural_violation` fail_closes as
+        `conductor_phase_fail_closed` (it never reaches the F1 guard), and its trial_meta carries
+        an excerpt but NO failure_category. It must still reopen Generate with findings."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_verdict"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            excerpt = ("[execute fail: verdict] deterministic per-test verdict is fail "
+                       "(failure_class=structural_violation)\n- test l0_zero_rhs: fail\n"
+                       "  - ref='metrics.zero_rhs_max_abs_dev' op='le' case='c1' "
+                       "reason=ref_absent")
+            self._seed(repo_root, oid, trial_category=None, trial_excerpt=excerpt)
+
+            directive = _derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "conductor_phase_fail_closed",
+                "validate_execute_structural_violation")
+
+            self.assertEqual(directive["reopen_from"], "generate")
+            self.assertEqual(directive["node_key"], self.NODE_KEY)
+            self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
+            self.assertEqual(directive["reason_code"], "conductor_phase_fail_closed")
+            self.assertEqual(directive["failure_category"], "structural_violation")
+            self.assertEqual(directive["source"], DEV_VALIDATE_EXECUTE_RESUME_SOURCE)
+            self.assertEqual(directive["repair_findings"], excerpt)
+
+    def test_verdict_directive_without_an_excerpt_carries_no_findings(self) -> None:
+        """A verdict failure predating the excerpt authoring: the stderr-log fallback searches
+        for the structural `[execute fail]` marker, which the verdict report does not use. The
+        directive still reopens Generate; only the findings are lost (full-prompt repair)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_verdict_nofindings"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = self._seed(repo_root, oid, trial_category=None, trial_excerpt=None)
+            dialogs = root / "agents" / self.EXEC_ARID / "dialogs"
+            dialogs.mkdir(parents=True, exist_ok=True)
+            (dialogs / "deterministic.stderr.log").write_text(
+                "[execute fail: verdict] per-test verdict is fail\n", encoding="utf-8")
+            directive = _derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "conductor_phase_fail_closed",
+                "validate_execute_structural_violation")
+            self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
+            self.assertNotIn("repair_findings", directive)
+
+    def test_verdict_directive_declines_when_the_repo_revision_moved(self) -> None:
+        """B4 freshness holds for the verdict shape too: findings from a source that is no
+        longer checked out are never injected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_verdict_stale"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid, trial_category=None,
+                       trial_revision={"commit": "b" * 40, "dirty": False})
+            self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "conductor_phase_fail_closed",
+                "validate_execute_structural_violation"))
 
     def test_directive_requires_a_failed_execute_run(self) -> None:
         """A passing execute run (a stale failure_analysis) is never a reopen trigger."""
@@ -26838,6 +26924,31 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             self.assertNotIn("resume_directive", meta)
 
+    def test_resume_sets_the_verdict_directive_through_the_deriver_chain(self) -> None:
+        """`enable_checkpoint_resume` tries three derivers in order. The first two gate on an
+        `_ir` reason suffix / the unauthorized-write code, so a `conductor_phase_fail_closed`
+        verdict failure must fall through to this one rather than be short-circuited."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_verdict_chain"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = self._seed(repo_root, oid, trial_category=None,
+                              trial_excerpt="[execute fail: verdict] ref_absent")
+
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail_closed",
+                reason_code="conductor_phase_fail_closed",
+                reason_detail="validate_execute_structural_violation")
+            enable_checkpoint_resume(repo_root, oid)
+
+            meta = json.loads((root / "orchestration_meta.json").read_text(encoding="utf-8"))
+            directive = meta["resume_directive"]
+            self.assertEqual(directive["source"], DEV_VALIDATE_EXECUTE_RESUME_SOURCE)
+            self.assertEqual(directive["reopen_from"], "generate")
+            self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
+            self.assertEqual(directive["failure_category"], "structural_violation")
+            self.assertEqual(directive["repair_findings"], "[execute fail: verdict] ref_absent")
+
     def test_reuse_category_parity_with_conductor_routing_table(self) -> None:
         """The literal category set here mirrors the conductor's routing table (the
         conductor imports this module, so the constant cannot be shared the other way)."""
@@ -26850,6 +26961,25 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
         )
         self.assertEqual(_DEV_VALIDATE_EXECUTE_REASON_PREFIX, wc.VALIDATE_EXECUTE_REASON_PREFIX)
         self.assertEqual(_DEV_RESUME_FINDINGS_MAX_CHARS, wc._EXECUTE_EXCERPT_MAX_CHARS)
+
+    def test_verdict_category_set_is_disjoint_from_the_routing_table(self) -> None:
+        """The verdict failure classes are per-test predicate outcomes, not keys of the
+        no-verdict structural routing table — so they need their own constant, and neither set
+        may leak into the other's reason_code."""
+        import tools.workflow_conductor as wc
+
+        self.assertEqual(
+            _DEV_VALIDATE_EXECUTE_VERDICT_CATEGORIES & set(wc.VALIDATE_EXECUTE_FAILURE_ROUTING),
+            set())
+        self.assertEqual(
+            _DEV_VALIDATE_EXECUTE_VERDICT_CATEGORIES & _DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES,
+            set())
+        # `physics_fail` is the sibling verdict class classify_failure fail_closes identically;
+        # it must stay OUT (a wrong physical result is not a warm-regenerate defect).
+        self.assertNotIn("physics_fail", _DEV_VALIDATE_EXECUTE_VERDICT_CATEGORIES)
+        # The reason_code literals mirror `conduct`'s fail_closed mapping / the F1 guard.
+        self.assertIn(_DEV_FAIL_CLOSED_REASON_CODE, FAIL_CLOSED_REASON_CODES)
+        self.assertIn(_DEV_ROLLBACK_REASON_CODE, FAIL_CLOSED_REASON_CODES)
 
 
 class CompletionValidatorSupersededTest(unittest.TestCase):
