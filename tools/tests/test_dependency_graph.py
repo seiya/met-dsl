@@ -356,6 +356,66 @@ class BuildDependencyGraphTests(unittest.TestCase):
             self.assertIsNone(graph)
             self.assertEqual(err["reason"], "spec_catalog_corrupt")
 
+    def test_include_via_false_preserves_the_node_sets(self) -> None:
+        """The R6-lite freshness comparison reads the NODE SETS (`all_nodes` + the
+        `transitive_deps` membership) but never the `via` paths, whose enumeration is
+        exponential on a wide diamond. Skipping `via` must leave both node sets identical, or
+        freshness would compare a different closure than the sidecar recorded."""
+        cases = [
+            (self._seed_chain, "spec/component/top", "component/top@0.1.0"),
+            (self._seed_diamond, "spec/problem/a", "problem/a@0.3.0"),
+        ]
+        for seed, spec_ref, node_key in cases:
+            with self.subTest(seed=seed.__name__):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = Path(tmp)
+                    _load_spec_catalog.cache_clear()
+                    seed(repo)
+                    kwargs = dict(target_spec_ref=spec_ref, target_node_key=node_key)
+                    full, err_full = build_dependency_graph(repo, **kwargs)
+                    _load_spec_catalog.cache_clear()
+                    lite, err_lite = build_dependency_graph(
+                        repo, include_via=False, **kwargs)
+                    self.assertIsNone(err_full)
+                    self.assertIsNone(err_lite)
+                    self.assertEqual(full["all_nodes"], lite["all_nodes"])
+                    self.assertEqual(full["node_key"], lite["node_key"])
+                    # Membership is preserved (a set difference); only the paths are dropped.
+                    self.assertEqual([d["node_key"] for d in full["transitive_deps"]],
+                                     [d["node_key"] for d in lite["transitive_deps"]])
+                    self.assertTrue(all(d["via"] == [] for d in lite["transitive_deps"]))
+                    if seed is self._seed_diamond:
+                        # Sanity: the full build really does have a `via` block to skip.
+                        self.assertTrue(any(d["via"] for d in full["transitive_deps"]))
+
+    def test_all_nodes_alone_does_not_identify_a_closure(self) -> None:
+        """`topo_level` is a node's HEIGHT, so `a->b, a->c, b->c` and `a->b->c` share every
+        `(node_key, topo_level)` pair. They differ only in whether `c` is direct or transitive.
+        This is why `_closure_signature` compares the `transitive_deps` membership too — a
+        deps.yaml edit that only moves an edge must still re-certify the node."""
+        shapes = {}
+        for label, a_deps in (("wide", ["b", "c"]), ("chain", ["b"])):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                _load_spec_catalog.cache_clear()
+                _write_catalog(repo, [
+                    {"spec_kind": "component", "spec_id": s, "spec_version": "0.1.0",
+                     "deps_path": f"spec/component/{s}/deps.yaml"} for s in ("a", "b", "c")])
+                _write_deps(repo, "spec/component/a", "component", "a",
+                            components=[(d, ">=0.1.0 <1.0.0") for d in a_deps])
+                _write_deps(repo, "spec/component/b", "component", "b",
+                            components=[("c", ">=0.1.0 <1.0.0")])
+                _write_deps(repo, "spec/component/c", "component", "c")
+                graph, err = build_dependency_graph(
+                    repo, target_spec_ref="spec/component/a",
+                    target_node_key="component/a@0.1.0")
+                self.assertIsNone(err)
+                shapes[label] = graph
+        self.assertEqual(shapes["wide"]["all_nodes"], shapes["chain"]["all_nodes"])
+        self.assertEqual([d["node_key"] for d in shapes["wide"]["transitive_deps"]], [])
+        self.assertEqual([d["node_key"] for d in shapes["chain"]["transitive_deps"]],
+                         ["component/c@0.1.0"])
+
     def test_missing_deps_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

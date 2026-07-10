@@ -335,8 +335,28 @@ def resolve_spec_ref_for(
     `spec_kind` / `spec_id` are validated with `_is_safe_path_token` before any
     path use, consistent with the rest of the dependency-resolution layer.
     """
-    if not (_is_safe_path_token(spec_kind) and _is_safe_path_token(spec_id)):
+    found = _spec_ref_candidates(repo_root, spec_kind, spec_id)
+    if len(found) != 1:
+        # No match → None. Multiple distinct dirs for one (kind, spec_id) →
+        # ambiguous; fail closed rather than silently choosing. Callers that need to tell
+        # 0 (absent) from >1 (ambiguous) apart call `_spec_ref_candidates` directly.
         return None
+    return next(iter(found))
+
+
+def _spec_ref_candidates(
+    repo_root: Path, spec_kind: Any, spec_id: Any
+) -> set[str]:
+    """The set of distinct, repo-confined spec directories the catalog resolves
+    ``(spec_kind, spec_id)`` to. Empty when the id has no catalog entry with a usable path;
+    a single element on a healthy registry; more than one when the catalog is AMBIGUOUS.
+
+    ``resolve_spec_ref_for`` collapses 0 and >1 both to ``None``; this exposes the
+    distinction so the freshness check can treat an ambiguous entry (a definitive registry
+    defect) as stale while leaving a genuinely-absent one alone. Raises ``SpecCatalogCorruption``
+    on a missing/unparseable registry, matching ``resolve_spec_ref_for``."""
+    if not (_is_safe_path_token(spec_kind) and _is_safe_path_token(spec_id)):
+        return set()
     catalog_path = Path(repo_root) / "spec" / "registry" / "spec_catalog.yaml"
     if not catalog_path.is_file():
         raise SpecCatalogCorruption(
@@ -374,11 +394,7 @@ def resolve_spec_ref_for(
         except ValueError:
             continue
         found.add(spec_ref)
-    if len(found) != 1:
-        # No match → None. Multiple distinct dirs for one (kind, spec_id) →
-        # ambiguous; fail closed rather than silently choosing.
-        return None
-    return next(iter(found))
+    return found
 
 
 _SEMVER_RE = re.compile(
@@ -811,6 +827,278 @@ def _latest_pipeline_dir(safe_root: Path) -> Path | None:
     return _select_max_by_id_extracted(candidates, lambda d: d.name)
 
 
+def _certified_ir_dir(repo_root: Path, kind: str, spec_id: str, version: str) -> Path | None:
+    """The IR phase-root directory of the CURRENT certified IR for `(kind, id, version)` —
+    the one `_verify_dep_stage`'s `ir_ref` stage evaluates (latest `*/ir_meta.json` by mtime).
+    `None` when the versioned workspace root or the meta is absent."""
+    if not (
+        _is_safe_path_token(kind)
+        and _is_safe_path_token(spec_id)
+        and _is_safe_path_token(version)
+    ):
+        return None
+    root = repo_root / "workspace" / "ir" / f"{kind}__{spec_id}__{version}"
+    if not root.is_dir():
+        return None
+    latest = _latest_meta_under(root, "*/ir_meta.json")
+    return None if latest is None else latest.parent
+
+
+def _dep_ir_meta_passes(repo_root: Path, kind: str, spec_id: str, version: str) -> bool:
+    """The artifact half of the `ir_ref` readiness stage: the current `ir_meta.json` records
+    `verification_status: pass`. Split out from `_verify_dep_stage` so the R6-lite freshness
+    reporter can ask "did this dep ever certify?" without re-triggering the freshness compare."""
+    ir_dir = _certified_ir_dir(repo_root, kind, spec_id, version)
+    if ir_dir is None:
+        return False
+    try:
+        doc = json.loads((ir_dir / "ir_meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (
+        isinstance(doc, dict)
+        and str(doc.get("verification_status", "")).strip().lower() == "pass"
+    )
+
+
+def _closure_signature(graph: Any) -> tuple[list[list[Any]], list[str]] | None:
+    """Canonical comparable form of a dependency graph: the sorted `all_nodes`
+    `[[node_key, topo_level], ...]` PLUS the sorted `transitive_deps` node_key list.
+    `None` when the graph is unusable.
+
+    `all_nodes` alone is NOT a faithful signature. `topo_level` is a node's height, so two
+    genuinely different closures can share every `(node_key, topo_level)` pair: with nodes
+    a/b/c, the shapes `a→b, a→c, b→c` and `a→b→c` both give heights 2/1/0. They differ only
+    in whether `c` is a DIRECT dep of `a` or a transitive one — exactly what
+    `transitive_deps` records, and exactly the kind of `deps.yaml` edit that must re-certify
+    `a`. Including the transitive set also pins the direct set, which is
+    `all_nodes − {self} − transitive`.
+
+    `via` paths are deliberately excluded: they are derived from the same edges, and the
+    freshness derivation skips computing them (`include_via=False`) because the enumeration
+    is exponential on a wide diamond.
+
+    The signature is injective for the property that matters, not for the whole graph: it pins
+    the SUBJECT's own direct-dep set exactly, so any edit to the subject's `deps.yaml` (an edge
+    added or removed, a version bump renaming a node_key) always changes it. Two closures can
+    still collide by reshaping edges DEEPER in the transitive subgraph while preserving every
+    height — but that edit belongs to a deeper node's own `deps.yaml`, and it changes THAT
+    node's signature, which is checked when it is itself the freshness subject (every closure
+    node is, under `--with-deps`).
+
+    Sorting on `node_key` alone is total: a graph names each `(kind, spec_id)` at exactly one
+    version (`build_dependency_graph.node_key_of`), so node_keys are unique. It also avoids
+    ordering on `topo_level`, whose value comes from an on-disk sidecar and may be any JSON
+    type — a mixed-type sort key would raise, and a `str()` cast would order 10 before 2. The
+    level still participates in the EQUALITY comparison, which is all the caller needs."""
+    if not isinstance(graph, dict):
+        return None
+    nodes = graph.get("all_nodes")
+    transitive = graph.get("transitive_deps")
+    if not isinstance(nodes, list) or not isinstance(transitive, list):
+        return None
+    out: list[list[Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            return None
+        node_key = node.get("node_key")
+        if not isinstance(node_key, str) or not node_key.strip():
+            return None
+        out.append([node_key.strip(), node.get("topo_level")])
+    out.sort(key=lambda item: item[0])
+    trans: list[str] = []
+    for node in transitive:
+        if not isinstance(node, dict):
+            return None
+        node_key = node.get("node_key")
+        if not isinstance(node_key, str) or not node_key.strip():
+            return None
+        trans.append(node_key.strip())
+    trans.sort()
+    return (out, trans)
+
+
+# `build_dependency_graph` error reasons that mean "the registry could not be READ" — they carry
+# no information about the recorded dependency resolution, so they are not evidence of staleness
+# (the gates that surface the read failure own them). Every OTHER reason the builder returns
+# (`dependency_unresolvable` / `dependency_version_conflict` / `dependency_identity_conflict` /
+# `dependency_cycle`) means the registry WAS read and yields no valid closure — the recorded
+# resolution provably cannot be reproduced today, which is exactly staleness.
+_UNREADABLE_CLOSURE_REASONS: frozenset[str] = frozenset({
+    "dependency_deps_unreadable",
+    "dependency_deps_malformed",
+    "dependency_spec_ref_unresolved",
+    "spec_catalog_corrupt",
+})
+# `dependency_spec_ref_unresolved` stays here (→ fresh) because `build_dependency_graph` conflates
+# a TRANSITIVE node's absence (a path-less catalog entry, benign) with its ambiguity (a real
+# defect) into one reason, and its error string cannot tell them apart — so marking it stale would
+# false fail-close a valid closure. The precise ambiguity check lives at the SUBJECT node instead
+# (the `_spec_ref_candidates` length test above), and every closure node is a subject in turn under
+# `--with-deps`, so a genuine ambiguity is still caught where it can be distinguished from absence.
+
+
+def _dependency_resolution_freshness(
+    repo_root: Path, kind: str, spec_id: str, version: str
+) -> tuple[bool, str | None]:
+    """R6-lite incremental recertification (version granularity): is the dependency
+    resolution a certified node was built against still the one the registry derives TODAY?
+
+    A certified node records its resolved dependency closure in the conductor-authored
+    `<ir_ref>/dependency_graph.json` sidecar (G7) — each `all_nodes[]` entry is a
+    `kind/spec_id@version` node_key. Re-deriving that closure from the current
+    `deps.yaml` + `spec_catalog.yaml` (the SAME pure builder, `tools/dependency_graph.py`)
+    and comparing is how "a dependency spec was updated, so its dependents must be
+    regenerated" becomes a mechanism instead of an operator ritual: bumping the harness to
+    0.3.0 in the catalog makes every node certified against 0.2.1 resolve differently, so
+    each one goes stale and `--with-deps` re-certifies the closure in one run. No
+    content-free version bump of the dependents is needed (that is R6 proper: content-hash
+    invalidation within one version; this is version granularity only, which the respec
+    discipline "content change ⇒ spec_version bump" makes sufficient).
+
+    Returns `(fresh, detail)`; `detail` is an actionable message when stale.
+
+    A node whose derived closure is only ITSELF (a leaf) has no recorded resolution that
+    could drift, so it is fresh by construction — and needs no sidecar.
+
+    When the closure does not build, the reason decides. A registry the derivation could not
+    READ (`_UNREADABLE_CLOSURE_REASONS`, plus a `RecursionError` from the builder's DFS) says
+    nothing about the recorded resolution: freshness is a comparison, and manufacturing
+    staleness from a missing right-hand side would mask the real defect — those inputs fail
+    closed in their own gates (`_resolve_dependency_closure`,
+    `_validate_compile_dependency_consistency`). Every other reason means the registry WAS read
+    and yields no valid closure (the constraint now matches nothing, two edges conflict, an edge
+    became a cycle) — a definitive statement that the recorded resolution is not reproducible
+    today. That IS staleness, and reporting it routes the node to a re-run whose own closure
+    resolution names the underlying registry defect precisely.
+    """
+    from tools.dependency_graph import build_dependency_graph
+
+    if not (
+        _is_safe_path_token(kind)
+        and _is_safe_path_token(spec_id)
+        and _is_safe_path_token(version)
+    ):
+        return (False, f"{kind}/{spec_id}@{version}: unsafe identifier token")
+    node_key = f"{kind}/{spec_id}@{version}"
+    try:
+        candidates = _spec_ref_candidates(repo_root, kind, spec_id)
+    except SpecCatalogCorruption:
+        # The catalog FILE is missing/unparseable — unreadable, no comparison possible.
+        return (True, None)
+    if len(candidates) > 1:
+        # The catalog was read but resolves this node to MORE THAN ONE spec directory (two
+        # entries for `(kind, spec_id)` point at different dirs). That is a definitive registry
+        # defect — exactly what `_resolve_dependency_closure` fail-closes on with
+        # `dependency_spec_ref_unresolved` — so the recorded resolution cannot be reproduced.
+        # Report STALE, or the launch gate would call the dependency ready while `--with-deps`
+        # refuses to run on the same registry.
+        return (
+            False,
+            f"{node_key} resolves to more than one spec directory in the current "
+            f"spec_catalog.yaml ({sorted(candidates)}); the ambiguous catalog entry means the "
+            "resolution it was certified against cannot be reproduced",
+        )
+    if not candidates:
+        # No catalog entry with a usable path resolves this node. Unlike ambiguity, this carries
+        # no comparison — there is no closure to derive — so it is not evidence of staleness (a
+        # genuinely absent/path-less entry is a different defect its own gates own). Fresh.
+        return (True, None)
+    spec_ref = next(iter(candidates))
+    try:
+        # `include_via=False`: the node sets are compared, never the `via` paths — and the
+        # path enumeration the sidecar author needs is exponential on a wide diamond closure.
+        graph, error = build_dependency_graph(
+            repo_root, target_spec_ref=spec_ref, target_node_key=node_key,
+            include_via=False,
+        )
+    except RecursionError:
+        # The builder's DFS is recursive. A pathologically deep closure would otherwise turn
+        # readiness — which previously built no graph at all — into a crash inside
+        # `_certify_and_collect_dep_artifacts` / the launch gate. Read failure, not evidence.
+        return (True, None)
+    if error is not None:
+        reason = str(error.get("reason") or "")
+        if reason in _UNREADABLE_CLOSURE_REASONS:
+            # No comparison is possible; do not manufacture staleness from a missing rhs.
+            return (True, None)
+        # Irreconcilable — or a reason neither set knows, meaning the builder grew a failure
+        # mode this function has not been taught. Fail closed: a re-run reports the underlying
+        # registry defect precisely, whereas silently passing readiness would hide it.
+        return (
+            False,
+            f"{node_key} was certified against a dependency closure that no longer resolves "
+            f"from deps.yaml + spec_catalog.yaml ({reason}: {error.get('detail')})",
+        )
+    derived = _closure_signature(graph)
+    if derived is None:
+        return (True, None)
+    if len(derived[0]) <= 1:
+        return (True, None)  # leaf: its closure is only itself, so nothing can drift
+
+    ir_dir = _certified_ir_dir(repo_root, kind, spec_id, version)
+    sidecar = None if ir_dir is None else ir_dir / "dependency_graph.json"
+    if sidecar is None or not sidecar.is_file():
+        return (
+            False,
+            f"{node_key} has dependencies but its certified IR records no "
+            "dependency_graph.json sidecar, so the resolution it was certified against "
+            "cannot be compared with the current deps.yaml + spec_catalog.yaml",
+        )
+    try:
+        recorded = _closure_signature(json.loads(sidecar.read_text(encoding="utf-8")))
+    except Exception:
+        recorded = None
+    if recorded is None:
+        return (False, f"{node_key}: dependency_graph.json sidecar is unreadable or malformed")
+    if recorded != derived:
+        recorded_keys = [item[0] for item in recorded[0]]
+        derived_keys = [item[0] for item in derived[0]]
+        if recorded_keys == derived_keys:
+            # Same nodes, different SHAPE (a node moved between direct and transitive). Say so,
+            # or the message reads as though nothing changed.
+            return (
+                False,
+                f"{node_key} was certified against a dependency closure with the same nodes but "
+                f"a different shape: transitive deps were {recorded[1]}, deps.yaml + "
+                f"spec_catalog.yaml now derive {derived[1]}",
+            )
+        return (
+            False,
+            f"{node_key} was certified against dependency closure {recorded_keys} but "
+            f"deps.yaml + spec_catalog.yaml now resolve {derived_keys}",
+        )
+    return (True, None)
+
+
+def _stale_dependency_details(repo_root: Path, spec_ref: Any) -> list[str]:
+    """R6-lite: actionable staleness reports for the direct dependencies of `spec_ref`.
+
+    Only a dependency that DID certify (its current `ir_meta.json` passes) can be stale — an
+    un-built one is merely "not ready", a distinct and already-reported condition. Used to
+    turn an opaque `direct_dependency_*_readiness_not_pass` into a message that names the
+    drifted node and the remedy."""
+    deps_doc = _read_deps_yaml(repo_root, spec_ref)
+    if not isinstance(deps_doc, dict):
+        return []
+    entries, well_formed = _parse_dep_entries(deps_doc)
+    if not well_formed or not entries:
+        return []
+    try:
+        catalog = _load_spec_catalog(str(repo_root.resolve()))
+    except SpecCatalogCorruption:
+        return []
+    details: list[str] = []
+    for kind, spec_id, constraint in entries:
+        for version in _matching_dep_versions(catalog, kind, spec_id, constraint):
+            if not _dep_ir_meta_passes(repo_root, kind, spec_id, version):
+                continue
+            fresh, detail = _dependency_resolution_freshness(repo_root, kind, spec_id, version)
+            if not fresh and detail:
+                details.append(detail)
+    return details
+
+
 def _verify_dep_stage(
     repo_root: Path, kind: str, spec_id: str, version: str, stage: str
 ) -> bool:
@@ -823,7 +1111,12 @@ def _verify_dep_stage(
 
     stage ∈ {"ir_ref", "pipeline_ref", "aggregate_verdict"}:
 
-    - ir_ref: latest `workspace/ir/<safe>/*/ir_meta.json` has verification_status=pass.
+    - ir_ref: latest `workspace/ir/<safe>/*/ir_meta.json` has verification_status=pass,
+      AND (R6-lite) the dependency resolution that IR was certified against still matches
+      the one the current deps.yaml + spec_catalog.yaml derive
+      (`_dependency_resolution_freshness`). Anchoring freshness on the `ir_ref` stage makes
+      it a single choke point: every readiness caller requires `ir_ref`, and the cumulative
+      chains in `_verify_dependency_readiness` short-circuit on it.
     - pipeline_ref: latest `workspace/pipelines/<safe>/*/binary/*/binary_meta.json`
       has verification_status=pass.
     - aggregate_verdict: latest `workspace/pipelines/<safe>/**/aggregate_verdict.json`
@@ -840,20 +1133,9 @@ def _verify_dep_stage(
         return False
     safe = f"{kind}__{spec_id}__{version}"
     if stage == "ir_ref":
-        root = repo_root / "workspace" / "ir" / safe
-        if not root.is_dir():
+        if not _dep_ir_meta_passes(repo_root, kind, spec_id, version):
             return False
-        latest = _latest_meta_under(root, "*/ir_meta.json")
-        if latest is None:
-            return False
-        try:
-            doc = json.loads(latest.read_text(encoding="utf-8"))
-        except Exception:
-            return False
-        return (
-            isinstance(doc, dict)
-            and str(doc.get("verification_status", "")).strip().lower() == "pass"
-        )
+        return _dependency_resolution_freshness(repo_root, kind, spec_id, version)[0]
     if stage in {"pipeline_ref", "aggregate_verdict"}:
         # Codex round 11 F2: both pipeline_ref and aggregate_verdict are
         # evaluated against the SAME selected pipeline run (latest pipeline_id
@@ -1830,6 +2112,13 @@ def _certify_and_collect_dep_artifacts(
         for v in matched:
             stage_bytes = _read_candidate_artifact_bytes(repo_root, kind, spec_id, v)
             level = _level_from_stage_bytes(stage_bytes)
+            # R6-lite: this path is the launch gate's OWN readiness evaluator (it does not go
+            # through `_verify_dep_stage`), so the freshness invariant must be enforced here
+            # too — otherwise a stale dependency that `--with-deps` would re-run still passes
+            # `workflow-launch-check` on a single-node run. Staleness demotes the version to
+            # level 0 exactly as an ir_ref failure would.
+            if level >= 1 and not _dependency_resolution_freshness(repo_root, kind, spec_id, v)[0]:
+                level = 0
             if level > best_level:
                 best_level = level
                 best_v = v
@@ -2130,6 +2419,14 @@ def _dependency_set_fingerprint(repo_root: Path, spec_ref: Any) -> str:
     ambiguity introduced) invalidates persisted readiness. Without this,
     `_resolve_dep_version` outcomes can drift while readiness booleans
     silently stay true.
+
+    SCOPE (R6-lite): "dependency set" here means the DIRECT deps only. The catalog
+    contribution is narrowed to the direct-dep subset (`_relevant_catalog_subset_bytes`), so a
+    catalog bump of a TRANSITIVE dependency leaves this fingerprint byte-identical even though
+    a direct dep has gone stale against it. That is safe because `_dependency_ready` recomputes
+    readiness live and treats the recomputed booleans as authoritative — the fingerprint is only
+    a cheap early stale-detector, never the sole evidence. Do not add a fingerprint-only trust
+    path without extending the header to the transitive closure.
     """
     # Codex round 16 F1: route through the shared `_walk_dep_artifacts`
     # walker so the fingerprint observed at gate time uses the same canonical
@@ -4132,15 +4429,29 @@ def _dependency_ready(
             if readiness.get("direct_dependency_execution_readiness") is not True:
                 return False, "direct_dependency_execution_readiness_not_pass"
             return True, None
+        # R6-lite: a dependency whose recorded resolution no longer matches the registry is
+        # not "unbuilt", it is STALE — and the remedy (`--with-deps`, which re-certifies the
+        # closure bottom-up) differs from the remedy for an unbuilt dep. Name the drifted node
+        # instead of leaving the operator with an opaque `..._readiness_not_pass`. Computed
+        # only on the reject path, so the happy path pays nothing.
+        def _reject(reason: str) -> tuple[bool, str]:
+            stale = _stale_dependency_details(repo_root, spec_ref)
+            if not stale:
+                return False, reason
+            return False, (
+                f"{reason}; dependency stale: " + "; ".join(stale)
+                + " — re-run with `--with-deps` to re-certify the dependency closure"
+            )
+
         if step_token == "compile":
             if not recomputed.get("ir_ref_verified"):
-                return False, "direct_dependency_compile_readiness_not_pass"
+                return _reject("direct_dependency_compile_readiness_not_pass")
             return True, None
         # generate / build / validate
         required = ("ir_ref_verified", "pipeline_ref_verified", "aggregate_verdict_verified")
         for required_key in required:
             if not recomputed.get(required_key):
-                return False, f"dependency_readiness_detail_not_pass:{required_key}"
+                return _reject(f"dependency_readiness_detail_not_pass:{required_key}")
         return True, None
 
 

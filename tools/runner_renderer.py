@@ -5,7 +5,7 @@ Pure-function module (sibling of ``tools/verdict_evaluator.py`` /
 spec ids and returns the text of ``<spec_id>_runner.f90`` — the deterministic
 "glue" main program that drives the physics node's ``<spec_id>_checks`` callbacks
 and emits the standard runner outputs *through the certified
-``harness_fortran_cpu`` plumbing*. Because the harness's v2 interface owns the
+``harness_fortran_cpu`` plumbing*. Because the harness's v3 interface owns the
 JSON envelope assembly and the verdict fold (§3 / §5.1 of the harness
 controlled_spec), this renderer holds **no serialization knowledge**: it builds
 the harness record types and calls the writers — it never formats a JSON token,
@@ -34,6 +34,7 @@ the *certified* harness IR signatures + source before rendering.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # The fixed ABI of the leaf-authored `<spec_id>_checks` module (see
@@ -54,10 +55,33 @@ HARNESS_RESERVED_SNAPSHOT_KEYS = frozenset({"t", "case_id", "step"})
 CHECK_ID_WIDTH = 32
 CHECK_STATUS_WIDTH = 4
 
+# The fixed width of a parsed case id. The rendered runner declares its `case_ids(:)` buffer
+# `character(len=case_id_len)` and passes it to `__parse_cases` as an `intent(out)` actual, so
+# this MUST equal the harness's own `case_id_len` (harness controlled_spec §3 pins the value; an
+# assumed-length `intent(out)` character dummy is disallowed, which is why the width is fixed at
+# all). `assert_harness_pin` enforces that equality against the certified harness source, so the
+# two cannot drift.
+#
+# It also bounds the declared case ids: a longer one is truncated into the buffer, while the
+# `select case` labels and `find_case_index` literals this renderer emits carry the full id — so
+# `trim(case_ids(ci))` would never match, and every run would `error stop 1` with "target case
+# not run" from a runner that compiled cleanly. The 100-column lint guard does not catch it (a
+# bare `case ('<id>')` label only reaches column 100 at ~87 chars), so `_case_ids` bounds it.
+CASE_ID_LEN = 64
+
 # f2008 identifier limit; the longest derived name is `<spec_id>_checks` /
 # `<spec_id>_runner` (spec_id + 7). Keep a margin: cap spec_id at 55.
 MAX_SPEC_ID_LEN = 55
 MAX_IDENTIFIER_LEN = 63
+
+# The character grammar a case_id must obey. The harness builds each per-case snapshot path by
+# concatenating the runtime case_id — `raw/state_snapshots/'//trim(case_id)//'.json'` (harness
+# controlled_spec §3) — so a `case_id` such as `../../evil` traverses OUT of the run directory
+# and the runner (which compiles and runs cleanly) writes an arbitrary file. The compile gates
+# only require a case_id to be a non-empty string, and `_flit` only bars non-printable-ASCII, so
+# `..`/`/` slip through both. Restrict the id to the same safe-token grammar the dependency layer
+# uses for path segments (`orchestration_runtime._is_safe_path_token`): `[A-Za-z0-9._-]`, no `..`.
+_CASE_ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def spec_id_length_violation(spec_id: Any) -> str | None:
@@ -193,6 +217,17 @@ def _case_ids(ir: dict[str, Any]) -> list[str]:
             out.append(cid.strip())
     if not out:
         raise RenderError("IR case.test_case_set is empty (no cases to run)")
+    # A case_id is concatenated straight into the per-case snapshot PATH by the harness
+    # (`raw/state_snapshots/'//trim(case_id)//'.json'`), so an id containing `/` or `..`
+    # traverses out of the run directory and the (cleanly compiling) runner writes an arbitrary
+    # file. `_flit` only bars non-printable-ASCII and the length gate only bounds size, so both
+    # let `../evil` through. Restrict the id to a filesystem-and-Fortran-safe token.
+    unsafe = sorted({c for c in out if not _CASE_ID_TOKEN_RE.match(c) or ".." in c})
+    if unsafe:
+        raise RenderError(
+            f"case_id(s) {unsafe} are not safe tokens; a case_id is concatenated into the "
+            "per-case snapshot path (raw/state_snapshots/<case_id>.json), so it must match "
+            "[A-Za-z0-9._-] with no '..' (else it escapes the run directory at runtime)")
     # Duplicate case_ids would render two identical `case ('id')` labels in the runner's
     # `select case`, a hard gfortran error the leaf cannot repair (host-rendered runner).
     # Fail closed rather than emit a non-compiling, unrepairable runner.
@@ -201,6 +236,17 @@ def _case_ids(ir: dict[str, Any]) -> list[str]:
         raise RenderError(
             f"IR case.test_case_set has duplicate case_id(s) {dups}; the runner's "
             "select-case would emit overlapping case labels that do not compile")
+    # A case_id longer than the harness's `case_id_len` is truncated when `__parse_cases`
+    # stores it, so it can never match the full-length literal the runner compares against.
+    # The result compiles and then error-stops on every run — fail closed at Compile instead,
+    # where a re-author can shorten the id.
+    too_long = sorted({c for c in out if len(c) > CASE_ID_LEN})
+    if too_long:
+        raise RenderError(
+            f"case_id(s) {too_long} exceed the harness case_id_len ({CASE_ID_LEN} chars); "
+            "`__parse_cases` truncates a parsed case id to that width, so the runner's "
+            "select-case label and metrics-basis lookup could never match it at runtime. "
+            f"Shorten the case_id to ≤{CASE_ID_LEN} chars")
     return out
 
 
@@ -222,8 +268,10 @@ def _xfail_cases(ir: dict[str, Any]) -> set[str]:
 
 def _target_cases(ir: dict[str, Any], test_id: str) -> list[str]:
     """All distinct case ids targeted by the predicate(s) for ``test_id``, in
-    declaration order. Used to fail-close (rather than silently record partial
-    evidence) when a metrics-basis test targets more than one case."""
+    declaration order. This is the metrics-basis row set of that test: the runner
+    records one ``h_mb_entry`` per ``(test_id, case_id)`` pair, and the post_execute
+    completeness matrix (``_validate_metrics_basis_per_test``) is anchored on the
+    same field."""
     seen: list[str] = []
     for p in _test_predicates(ir):
         if str(p.get("test_id") or "").strip() == test_id:
@@ -306,7 +354,7 @@ def _verify_verdict_fields(ir: dict[str, Any]) -> None:
     if extra:
         raise RenderError(
             f"diagnostics_contract.verdict.fields {sorted(extra)} outside the harness "
-            f"v2 fold surface {sorted(allowed)} — the rendered glue only builds "
+            f"fold surface {sorted(allowed)} — the rendered glue only builds "
             "overall/failed_checks records")
 
 
@@ -368,12 +416,23 @@ def _flit(value: str) -> str:
     IR-sourced names (case_ids, snapshot variable names, metric addresses, test_ids)
     are only required to be non-empty by the compile gates, not to be Fortran
     identifiers, so a name containing a `'` would otherwise break the generated literal
-    (`case ('a'b')`). Fortran escapes an embedded apostrophe by doubling it. A control
-    character (newline/tab) cannot appear in a literal at all, so it is fail-closed."""
-    if any(ord(ch) < 0x20 for ch in value):
+    (`case ('a'b')`). Fortran escapes an embedded apostrophe by doubling it.
+
+    Everything embedded must be **printable ASCII**. A control character (newline/tab)
+    cannot appear in a literal at all. A non-ASCII character is worse than it looks: the
+    Fortran default character kind counts BYTES, while every length this renderer reasons
+    about — the ``CASE_ID_LEN`` bound, the 100-column lint limit — counts Python code
+    points. A 64-code-point case_id that is 68 UTF-8 bytes therefore slips past the bound
+    and is silently truncated into the harness's ``character(len=64)`` slot, producing a
+    runner that compiles and then ``error stop``s on every run. Reject the whole class
+    here, where one check covers every embedded name."""
+    bad = sorted({ch for ch in value if not (0x20 <= ord(ch) <= 0x7E)})
+    if bad:
         raise RenderError(
-            f"value {value!r} contains a control character and cannot be embedded in the "
-            "generated Fortran source")
+            f"value {value!r} contains character(s) {bad!r} outside printable ASCII and cannot "
+            "be embedded in the generated Fortran source (a control character has no literal "
+            "form; a non-ASCII character makes the byte length disagree with the code-point "
+            "length every render bound is measured in)")
     return value.replace("'", "''")
 
 
@@ -569,7 +628,7 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     a("  implicit none")
     a("")
     a("  integer, parameter :: dp = real64")
-    a("  integer, parameter :: case_id_len = 64")
+    a(f"  integer, parameter :: case_id_len = {CASE_ID_LEN}")
     a(f"  integer, parameter :: ncheck_max = {len(checks)}")
     a("")
     a("  integer :: nargs, i, ci, ic, ln, ncases")
@@ -655,7 +714,7 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     a("      allocate(vals(0))")
     a("    end select")
     a(f"    call {H('write_snapshot')}(trim(case_ids(ci)), vals, tval)")
-    a("    snap_cache(ci)%test_id = trim(case_ids(ci))")
+    a("    snap_cache(ci)%case_id = trim(case_ids(ci))")
     a("    snap_cache(ci)%values = vals")
     a("    deallocate(vals)")
     a("")
@@ -704,37 +763,33 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     a("  walltime = real(clock1 - clock0, dp) / real(clock_rate, dp)")
     a("  if (walltime <= 0.0_dp) walltime = 1.0e-9_dp")
     a("")
-    # ---- metrics-basis: one per-test entry, sourced from that test's FIRST target case.
-    # This is a deliberate M3c-β scope choice (the plan pins it): every current M3c test is
-    # 1:1 case↔test (the harness self-test, boundary_2d_periodic_copy), so the first target
-    # case IS the test's case. A multi-target-case test (a convergence/resolution sweep whose
-    # per-test evidence needs EVERY targeted case, e.g. error at nx=32 AND nx=64) is an R3
-    # test-kind that this renderer does not yet serve — it would record only the first case's
-    # evidence. R3 (property/mms/convergence, docs/design/workflow_scaling_redesign.md) extends
-    # the metrics-basis shape before those specs land; until then M3c nodes are single-case
-    # per test. See docs/workflow/CHECKS_MODULE_CONTRACT.md §2 (metrics-basis scope note).
-    a("  ! --- per-test metrics-basis entries (first target case's primary evidence) ---")
-    a(f"  allocate(mb_entries({len(evidence)}))")
-    for k, (tid, req_vars) in enumerate(evidence, start=1):
+    # ---- metrics-basis: ONE entry per (test_id, target case_id) pair (R3-core).
+    # A test's primary evidence is the evidence of EVERY case its predicate ranges over: a
+    # single-target test contributes one row, a convergence sweep (nx = 32/64/128) three, a
+    # base/shifted equivariance pair two. `(test_id, case_id)` is the entry's unique key, and
+    # the post_execute completeness matrix (`_validate_metrics_basis_per_test`) pins the entry
+    # set against exactly this product, so partial evidence cannot pass.
+    #
+    # Every target case emits its test's `required_raw_variables` BY CONSTRUCTION: `_per_case_vars`
+    # DEFINES a case's emitted set as the union of `required_raw_variables` over the tests
+    # targeting it, and already fail-closes there when one is absent from the snapshot schema.
+    # So each `pick` below resolves — there is no additional precondition to check here.
+    mb_rows: list[tuple[str, str, list[str]]] = []
+    for tid, req_vars in evidence:
         tcases = _target_cases(ir, tid)
         if not tcases:
             raise RenderError(
                 f"test {tid!r} in test_evidence_requirements has no target case in "
                 "any test predicate (cannot resolve its metrics-basis source case)")
-        if len(tcases) > 1:
-            # Fail closed rather than silently record only the first case: a multi-target
-            # metrics-basis test needs EVERY targeted case's evidence, which this renderer
-            # does not yet serve (see the scope note above + CHECKS_MODULE_CONTRACT.md §2).
-            raise RenderError(
-                f"test {tid!r} targets {len(tcases)} cases {tcases} but this renderer "
-                "records per-test metrics-basis evidence from a single case only "
-                "(M3c-β single-case-per-test scope; multi-target convergence/resolution "
-                "sweeps are an R3 test-kind). Refusing to emit partial evidence.")
-        tcase = tcases[0]
         for rv in req_vars:
             if rv not in schema_vars:
                 raise RenderError(
                     f"test {tid!r} required_raw_variable {rv!r} is not a snapshot variable")
+        for tcase in tcases:
+            mb_rows.append((tid, tcase, req_vars))
+    a("  ! --- metrics-basis entries: one per (test_id, target case_id) --------------")
+    a(f"  allocate(mb_entries({len(mb_rows)}))")
+    for k, (tid, tcase, req_vars) in enumerate(mb_rows, start=1):
         # Wrap the case-id-bearing lines so a long case_id cannot exceed the 100-col lint limit.
         a("  tci = find_case_index(case_ids, ncases, &")
         a(f"    '{_flit(tcase)}')")
@@ -744,6 +799,8 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
         a("    error stop 1")
         a("  end if")
         a(f"  mb_entries({k})%test_id = '{_flit(tid)}'")
+        a(f"  mb_entries({k})%case_id = &")
+        a(f"    '{_flit(tcase)}'")
         a(f"  allocate(sel({len(req_vars)}))")
         for j, rv in enumerate(req_vars, start=1):
             a(f"  sel({j}) = pick(snap_cache(tci)%values, '{_flit(rv)}')")
@@ -751,7 +808,7 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
         a("  deallocate(sel)")
     a("")
     a("  ! --- emit the run outputs (harness owns every envelope + the fold) ----------")
-    a(f"  call {H('write_metrics_basis')}(mb_entries, {len(evidence)})")
+    a(f"  call {H('write_metrics_basis')}(mb_entries, {len(mb_rows)})")
     a(f"  call {H('write_diagnostics')}(results, ncases)")
     a(f"  call {H('write_perf')}(trim(case_ids(ncases)), '{_flit(target_class)}', &")
     a(f"    steps_total, cells_total, walltime, 1, {threads}, 0)")
@@ -824,7 +881,7 @@ def _xfail_expr(case_ids: list[str], xfail: set[str]) -> str:
 # --- harness interface signature pin (fail-closed, run before rendering) ------
 #
 # The only harness this renderer targets is harness_fortran_cpu (the R1 (fortran,
-# cpu) plumbing). The template is written against its v2 §5.1 signatures, embedded
+# cpu) plumbing). The template is written against its v3 §5.1 signatures, embedded
 # below verbatim. `assert_harness_pin` checks that the *certified* harness the
 # consumer will build against still publishes those exact signatures — in both its
 # IR (`public_api.signatures`) and its generated model source — so a harness recert
@@ -833,11 +890,12 @@ def _xfail_expr(case_ids: list[str], xfail: set[str]) -> str:
 
 EXPECTED_HARNESS_SPEC_ID = "harness_fortran_cpu"
 
-# Verbatim copy of the harness controlled_spec §5.1 canonical interface block (v2;
-# unchanged since spec_version 0.2.0, current 0.2.1 — the pin compares signatures, not
-# versions). If a harness recert changes §5.1, THIS block and the render template must
-# be updated together (the pin message says so).
-_HARNESS_V2_INTERFACE = """\
+# Verbatim copy of the harness controlled_spec §5.1 canonical interface block (v3, harness
+# spec_version 0.3.0: `h_mb_entry` gained the `case_id` component so metrics-basis evidence is
+# keyed by (test_id, case_id) and a multi-target test records every targeted case — the pin
+# compares signatures, not versions). If a harness recert changes §5.1, THIS block and the
+# render template must be updated together (the pin message says so).
+_HARNESS_V3_INTERFACE = """\
 type :: harness_fortran_cpu__h_named
   character(len=:), allocatable :: name
   character(len=:), allocatable :: json
@@ -864,6 +922,7 @@ end type harness_fortran_cpu__h_case_result
 
 type :: harness_fortran_cpu__h_mb_entry
   character(len=:), allocatable :: test_id
+  character(len=:), allocatable :: case_id
   type(harness_fortran_cpu__h_named), allocatable :: values(:)
 end type harness_fortran_cpu__h_mb_entry
 
@@ -944,11 +1003,23 @@ subroutine harness_fortran_cpu__write_perf(case_id, target, steps, cells_updated
 end subroutine harness_fortran_cpu__write_perf
 """
 
+# The §5.1 module-level `parameter` declarations. They are part of the published ABI but are not
+# stanzas, so `_parse_interface_stanzas` never sees them and the signature pin above compares only
+# the SYMBOL `case_id_len`, never its value. A harness recert lowering it to 32 would therefore
+# leave the interface pin green while this renderer kept emitting a 64-wide `case_ids(:)` actual
+# for a 32-wide `intent(out)` dummy — the compiles-then-breaks class the case_id bound exists to
+# prevent, reintroduced through harness drift. `dp` likewise fixes the kind of every `real(dp)`
+# actual the glue passes. Pin both values against the certified source.
+_HARNESS_V3_PARAMETERS: tuple[str, ...] = (
+    "integer, parameter :: dp = real64",
+    f"integer, parameter :: case_id_len = {CASE_ID_LEN}",
+)
+
 _PIN_DRIFT_HINT = (
     "the certified harness interface no longer matches the renderer's pinned "
     "expectation — a harness recert changed its published surface; update the "
-    "runner_renderer pin (_HARNESS_V2_INTERFACE) AND the render template together, "
-    "then re-certify dependent nodes")
+    "runner_renderer pin (_HARNESS_V3_INTERFACE / _HARNESS_V3_PARAMETERS) AND the "
+    "render template together, then re-certify dependent nodes")
 
 
 def assert_harness_pin(
@@ -969,16 +1040,32 @@ def assert_harness_pin(
     certified ``<harness_spec_id>_model.f90`` (resolved via ``_certified_model_source``).
     """
     from tools.validate_pipeline_semantics import (
-        _parse_interface_stanzas, _stanza_atoms, _stanza_line_set, _stanza_line_list)
+        _fortran_logical_lines, _parse_interface_stanzas, _stanza_atoms, _stanza_line_set,
+        _stanza_line_list)
 
     if (harness_spec_id or "").strip() != EXPECTED_HARNESS_SPEC_ID:
         raise RenderError(
             f"harness_spec_id {harness_spec_id!r} is not the pinned "
             f"{EXPECTED_HARNESS_SPEC_ID!r}; the renderer only targets that harness")
 
-    exp_ops, exp_types, exp_errs = _parse_interface_stanzas(_HARNESS_V2_INTERFACE)
+    exp_ops, exp_types, exp_errs = _parse_interface_stanzas(_HARNESS_V3_INTERFACE)
     if exp_errs:  # a renderer bug, not an input problem
         raise RenderError(f"embedded harness interface failed to parse: {exp_errs}")
+
+    # Module parameter VALUES (see `_HARNESS_V3_PARAMETERS`). Per-entity atoms, so a combined
+    # `integer, parameter :: dp = real64, case_id_len = 64` declaration matches — the same
+    # normalization `_validate_infrastructure_generated_signatures` uses to pin §5.1 against the
+    # source, applied here to pin the RENDERER against the source.
+    src_atoms = frozenset(
+        atom for line in _fortran_logical_lines(harness_source or "")
+        for atom in _stanza_atoms([line])
+    )
+    for pline in _HARNESS_V3_PARAMETERS:
+        if any(atom not in src_atoms for atom in _stanza_atoms([pline])):
+            raise RenderError(
+                f"certified harness model source does not declare the pinned module parameter "
+                f"`{pline}`, whose VALUE the rendered glue hardcodes (its `case_ids(:)` buffer "
+                f"width and its `real(dp)` actuals): {_PIN_DRIFT_HINT}")
 
     used_symbols = [_hname(harness_spec_id, op) for op in _used_harness_ops(ir)]
     used_symbols += [_hname(harness_spec_id, t) for t in _HARNESS_TYPES]

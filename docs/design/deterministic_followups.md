@@ -1753,3 +1753,215 @@ carrying 1334 characters of stale findings. Suite green (2234); mutation-checked
 removing the stamp, excluding `dirty` from the comparison, resolving the trigger from the FIRST execute
 run instead of the newest (the frozen-analysis bug), and dropping the newest-run-passed check each fail a
 distinct test.
+
+## R3-core — multi-target test evidence: metrics-basis keyed by (test_id, case_id) (IMPLEMENTED 2026-07-10)
+
+**The wedge.** `shallow_water2d`'s `tests.md` v0.2.0 declares three intrinsically multi-target tests — two
+grid-refinement convergence sweeps over `nx ∈ {32, 64, 128}` and a translation-equivariance test over a
+base/shifted case pair. The M3c-β renderer recorded each test's `raw/metrics_basis.json` evidence from that
+test's **first** target case and explicitly fail-closed on any test targeting more than one
+(`runner_renderer.py`, "Refusing to emit partial evidence"). So a faithful IR was rejected by the gate and a
+gate-passing IR violated the Compile V3 faithfulness invariant: **no IR was authorable**, and `compile.generate`
+correctly reported `Unrepresentable contract`. The leaf was right; the contract was wrong.
+
+**The fix — the evidence index is a matrix, not a list.** `raw/metrics_basis.json` now carries one entry per
+(`test_id`, target `case_id`) pair, `case_id` being a direct sibling key of `test_id` in every entry (single-target
+tests included — no special case). The product is taken over `io_contract.test_predicates[].target_cases`, which
+was already the anchor the host-rendered runner emits from (`_per_case_vars`, the per-case snapshot scope gate of
+B3) and is the only case→test mapping every IR carries. Both sides therefore read ONE field:
+
+- `runner_renderer.render_runner` emits `Σ len(target_cases)` `h_mb_entry` records instead of one per test;
+- `validate_pipeline_semantics._validate_metrics_basis_per_test` pins the entry set against the same product,
+  in both directions (missing row and unknown row alike), via the new `_test_id_to_case_ids` — the exact reverse
+  sibling of `_case_id_to_test_ids`.
+
+The harness respec (`harness_fortran_cpu` `0.2.1` → `0.3.0`) adds the `case_id` component to
+`harness_fortran_cpu__h_mb_entry` (§3.1 / §5.1, component order `test_id, case_id, values` — the §5.1 type stanza
+is compared line-for-line) and teaches `__write_metrics_basis` to emit it. Its self-test grew a seventh test,
+`l0_multi_case_evidence_pass`, which declares no case of its own and ranges over the two existing cases that
+already emit `max_abs_deviation` — so the multi-entry writer path is exercised by the harness's own certification
+with no new snapshot variable and no new check id.
+
+**Cross-case reductions stay inside the runner.** The DSL invariant "the runner reduces, the predicate compares"
+is untouched. A convergence order or a symmetry residual is accumulated by the checks module's module-level
+accumulator pattern (`CHECKS_MODULE_CONTRACT.md` §3, already contractual) and emitted through `metric_compute` as
+a **per-case metric of the case where it first becomes computable** — the `n064` case carries
+`convergence.order_n032_to_n064`, the `n128` case carries `order_n064_to_n128` (zero-padded, so the ordering rule
+below holds). A sparse per-case metric (present in
+some cases, absent in others) passes every existing gate; there is no metric-coverage gate to satisfy.
+
+To read such a metric a predicate needs to name ONE case, which the DSL could not express: `per_case: true` means
+"in every target case", and predicates are one-per-test (`test_id` duplication is rejected), so the scope had to be
+a **condition-level** selector. `verdict_evaluator` gained `case: <case_id>`, which resolves `ref` inside that one
+case's `_case_slice`. Schema: non-empty string, a member of the predicate's own `target_cases`, and mutually
+exclusive with `per_case` (the evaluator raises `PredicateError` on the pair as its own mirror). The evaluated
+basis is the same `{"case": cid, ...}` shape `per_case` already produced, so the conductor's
+`_verdict_failure_report` renders it unchanged.
+
+**Ordering is lexicographic, and that is a contract.** `read_case_ids` sorts, and both execution paths (the
+`Makefile` and `validate.execute`) pass the sorted list, so an accumulator may depend only on cases whose `case_id`
+sorts **before** the emitting case's. Zero-padded resolutions (`n032 < n064 < n128`), zero-padded shifts, and
+suffix-extended derivatives satisfy this naturally; the trap — documented in `CHECKS_MODULE_CONTRACT.md` §2 — is a
+derived case whose id sorts ahead of its base (`..._dts050` before `..._dts100`). `test_case_set` declaration order
+is never the execution order.
+
+**Why no new render precondition.** An earlier draft added a gate for "a target case that does not emit the test's
+`required_raw_variables`". It cannot fire: `_per_case_vars` *defines* a case's emitted set as the union of
+`required_raw_variables` over the tests targeting it, and already `RenderError`s when one is absent from the
+snapshot schema. Adding the check would have been dead code asserting its own precondition.
+
+**Why the tools change forces the harness recert.** `runner_renderer._HARNESS_V3_INTERFACE` (renamed from `_V2`)
+carries the new `h_mb_entry` verbatim, and `assert_harness_pin` three-way-compares it against the certified harness
+IR's `public_api.signatures` and the certified model source. Until the harness re-certifies at 0.3.0, every
+consumer's render fails closed with the pin-drift hint. The harness's own recert does not pass through the pin
+(`_conductor_authors_runner` is False for `infrastructure`; `_ir_is_m3c_physics` no-ops), so the ordering
+tools → harness recert → dependent recert is *structurally* enforced, not merely documented. The dependent recert is
+then automatic — see R6-lite.
+
+The `tests` **object** container form is still parsed but deprecated: being keyed by `test_id` it cannot hold the
+several rows a multi-target test owes, so `_validate_metrics_basis_per_test` rejects that combination with an
+actionable message naming the `per_test` list rather than reporting the rows as merely missing.
+
+**Two adjacent holes review closed on the way.** Both are the same shape as the wedge above — something compiles and
+then fails at runtime, in a host-authored file no leaf can repair:
+
+1. **`case_id` longer than the harness's `case_id_len` (64).** `__parse_cases` stores each parsed id in a fixed-width
+   `character(len=case_id_len)` slot (an assumed-length `intent(out)` character dummy is disallowed), truncating a
+   longer id — while the `select case` labels and `find_case_index` literals the renderer emits carry the full id. So
+   `trim(case_ids(ci))` never matches, `case default` yields an empty snapshot, and the run `error stop`s. The
+   100-column lint guard does not catch it: a bare `case ('<id>')` label only reaches column 100 at ~87 chars, leaving
+   a 65–87-char window that renders, compiles, and always fails. `_case_ids` now bounds it with an `identity=False`
+   `RenderError`, so `compile.static` hoists it to a `compile.generate` re-author.
+2. **The renderer's copy of `case_id_len` was pinned to nothing.** `assert_harness_pin` compares interface *stanzas*,
+   which name the SYMBOL `case_id_len` and never its value; the §5.1↔source parameter gate pins the harness against
+   its own spec, not the renderer against the harness. A recert lowering the width to 32 therefore left every gate
+   green while the glue kept passing a 64-wide actual to a 32-wide `intent(out)` dummy. `_HARNESS_V3_PARAMETERS` now
+   pins both module parameter VALUES (`dp`, `case_id_len`) against the certified source, using the same per-entity
+   atom normalization the §5.1 gate uses — so `CASE_ID_LEN`, the width the runner declares, and the harness's own
+   parameter are one constant that cannot drift apart.
+3. **A non-ASCII name reopened (1) through the units the bound is measured in.** Fortran's default character kind
+   counts BYTES; `len()` and the 100-column guard count Python code points. A 64-code-point, 68-byte `case_id`
+   therefore passed the new bound, was truncated into the `character(len=64)` slot, and `error stop`ped on every run
+   — reproduced end-to-end through gfortran. `_flit`, the single choke point every embedded IR-sourced name (case_id,
+   snapshot variable, metric address, test_id, target class) passes through, now rejects anything outside printable
+   ASCII. One check, one class of bug, no per-name bound to keep in sync.
+4. **A `case_id` is also a PATH, and printable ASCII includes `/` and `..`.** The harness builds each per-case
+   snapshot filename by concatenating the runtime case_id — `raw/state_snapshots/'//trim(case_id)//'.json'` — so a
+   case_id of `../../pwned` traverses out of the run directory and the cleanly-compiling, cleanly-running runner
+   writes an arbitrary file (reproduced through gfortran: it wrote `pwned.json` a directory above the run node). The
+   compile gates only required a case_id to be non-empty, and `_flit`/`CASE_ID_LEN` pass anything printable and short.
+   `_case_ids` now restricts a case_id to `[A-Za-z0-9._-]` with no `..` — the same safe-token grammar the dependency
+   layer (`orchestration_runtime._is_safe_path_token`) uses for the path segments it interpolates. All 20 existing
+   spec case_ids already satisfy it. An apostrophe is thereby also barred from a case_id (it is a filename), so
+   `_flit`'s apostrophe-doubling now only ever fires on the non-path names (test_id, metric address, snapshot
+   variable) that legitimately reach a Fortran literal without becoming a path.
+
+**And one in R6-lite: `all_nodes` is not a faithful closure signature.** `topo_level` is a node's *height*, so the
+shapes `a→b, a→c, b→c` and `a→b→c` produce identical `(node_key, topo_level)` pairs for every node. They differ only
+in whether `c` is a direct or a transitive dependency of `a` — precisely the `deps.yaml` edit that must re-certify
+`a`, since its IR's `direct_deps` are gated against the sidecar at Compile. `_closure_signature` now compares the
+`transitive_deps` membership as well (which pins the direct set too, as `all_nodes − {self} − transitive`). The
+`via` PATHS stay excluded and uncomputed: they are derived from the same edges, and their enumeration is the
+exponential part. So the builder's flag became `include_via=False` — membership is a set difference, and only the
+path enumeration is skipped.
+
+## R6-lite — dependency-freshness readiness: a dependency spec update regenerates its dependents (IMPLEMENTED 2026-07-10)
+
+**The problem R3-core surfaced.** Bumping `harness_fortran_cpu` to 0.3.0 must re-certify the five nodes that depend
+on it. The obvious lever — bump each dependent's `spec_version` so its artifacts miss — was rejected: their content
+did not change, and a version bump that means nothing re-authenticates nothing. The freshness signal belongs in the
+workflow, not in the specs.
+
+**The mechanism.** A certified node already records the dependency closure it was built against: the G7
+conductor-authored sidecar `<ir_ref>/dependency_graph.json`, whose `all_nodes[]` entries are
+`kind/spec_id@version` node_keys. `_dependency_resolution_freshness` re-derives that closure from the current
+`deps.yaml` + `spec_catalog.yaml` using the **same pure builder** (`tools/dependency_graph.py`) and compares. A
+mismatch is *stale* — a distinct condition from *unbuilt*, with a distinct remedy. No new persisted file: the
+recorded side is an artifact that already exists.
+
+Enforcement is at the two — and only two — readiness evaluators, because the invariant leaks the moment one path
+is missed:
+
+- `_verify_dep_stage`, anchored on the `ir_ref` stage (every caller requires it, and the cumulative chains in
+  `_verify_dependency_readiness` short-circuit on it). This covers `run_workflow._dependency_node_ready`, so
+  `--with-deps` re-runs a stale dependency instead of skipping it as ready.
+- `_certify_and_collect_dep_artifacts`, which the launch gate's own recomputation
+  (`_compute_dep_readiness_and_fingerprint` → `_dependency_ready`) uses and which does **not** route through
+  `_verify_dep_stage`. Staleness demotes the version to level 0, exactly as an `ir_ref` failure would. Without this
+  a stale dependency would still pass `workflow-launch-check` on a single-node run.
+
+On the reject path `_dependency_ready` calls `_stale_dependency_details` to turn the opaque
+`direct_dependency_*_readiness_not_pass` into a message naming the drifted node, the resolution it was certified
+against, the one derived now, and the remedy (`--with-deps`). Only a dependency whose `ir_meta.json` actually passes
+can be reported stale; an unbuilt one is merely not ready.
+
+**The leaf carve-out.** A node whose derived closure is only itself (a leaf — the harness) has no recorded resolution
+that could drift, so it is fresh by construction and needs no sidecar. Without this every leaf would demand a sidecar
+it has no reason to have.
+
+**When the closure does not build, the reason decides.** The two halves are not symmetric, and conflating them was
+the review's one real finding:
+
+- The registry could not be **read** (`_UNREADABLE_CLOSURE_REASONS`: unreadable/malformed `deps.yaml`, unresolved
+  spec_ref, corrupt catalog — plus a `RecursionError` from the builder's recursive DFS, which readiness must not turn
+  into a crash now that it builds a graph where it previously built none). This says nothing about the recorded
+  resolution. Freshness is a *comparison*; manufacturing staleness from a missing right-hand side would mask the real
+  defect, which its own gates (`_resolve_dependency_closure`, `_validate_compile_dependency_consistency`) already
+  surface. Treated as fresh.
+- The registry **was** read and yields no valid closure (`dependency_unresolvable` / `dependency_version_conflict` /
+  `dependency_identity_conflict` / `dependency_cycle`, or any reason the builder grows later). That is a definitive
+  statement that the recorded resolution is not reproducible today — i.e. staleness. Fail closed. Reporting it routes
+  the node to a re-run whose own closure resolution names the registry defect precisely, instead of letting a
+  consumer link against a dependency that can no longer be re-derived.
+
+Freshness passes `include_transitive=False` to the builder: it compares `all_nodes` only, and the sidecar author's
+`via_for` enumerates every simple path (exponential on a wide diamond). `all_nodes` is byte-identical either way, so
+the comparison still matches what the sidecar recorded.
+
+**Scope: version granularity.** A content change within one `spec_version` is invisible here, which the respec
+discipline (content change ⇒ `spec_version` bump) makes sufficient. Content-hash chaining is R6 proper.
+
+**Effect on the harness bump.** Registering `harness_fortran_cpu` 0.3.0 in the catalog (with the five consumers'
+`version_constraint` tightened to `>=0.3.0`) makes every dependent's recorded resolution stop matching, so a single
+`--with-deps` run re-certifies the whole closure bottom-up. The constraint tightening is load-bearing rather than
+decorative: under the old `>=0.2.0` range the harness node itself would still resolve to a ready 0.2.1 and be skipped,
+while its consumers went stale — and Build stages dependency sources by resolved version.
+
+### R6-lite follow-up — an ambiguous catalog entry must be stale, not fresh (review round 6)
+
+`_dependency_resolution_freshness` resolves the subject node's spec directory before comparing closures.
+`resolve_spec_ref_for` returns `None` for TWO different conditions — the catalog resolves the node to zero
+directories (absence: a version-only entry with no `deps_path`), or to more than one (ambiguity: two entries for one
+`(kind, spec_id)` pointing at different dirs). The original code treated both as "no comparison possible → fresh".
+
+That masked a real defect. An ambiguous catalog was read fine and is a definitive statement that the recorded
+resolution cannot be reproduced — exactly the condition `_resolve_dependency_closure` fail-closes on with
+`dependency_spec_ref_unresolved`. So `--with-deps` would refuse to run while `_verify_dependency_readiness` reported
+the dependency ready, and a single-node consumer built against it. Symmetric with the round-5 unreadable-vs-
+irreconcilable split, ambiguity belongs on the stale side.
+
+The two conditions had to be told apart, because marking absence stale false-fail-closes (24 tests, and any valid
+path-less entry). `_spec_ref_candidates` was extracted from `resolve_spec_ref_for` to expose the candidate SET:
+`len > 1` → ambiguity → stale; `len == 0` → absence → fresh; `len == 1` → the healthy path. The transitive-depth
+case (a deeper node ambiguous inside `build_dependency_graph`) stays on the fresh side, because the builder's error
+string conflates absence and ambiguity and cannot distinguish them — but every closure node is a freshness SUBJECT
+in turn under `--with-deps`, where the precise `_spec_ref_candidates` check catches it.
+
+### R3-core follow-up — the path-traversal case_id was gated only for M3c nodes (review round 6)
+
+Bug (4) above put a case_id safe-token gate in `runner_renderer._case_ids`, but that runs only for M3c host-rendered
+nodes. A **non-M3c** physics node has a leaf-authored runner (contractually building `raw/state_snapshots/'//trim(
+case_id)//'.json'` from the argv), and NOTHING gated its case_id grammar — so an IR-declared `../../evil` survived
+Compile, reached the conductor's `read_case_ids` → the runner argv, and the honest, cleanly-compiling runner wrote
+outside the run directory (reproduced: a two-level `..` dropped a `.json` a directory above the run node; the execute
+is a plain `run_program` subprocess, not bwrap-confined). Same class as (4), a layer up.
+
+The canonical fix is a spec-input gate, not a renderer one: `_validate_case_ids` (compile stage, ALL node kinds)
+rejects any `case.test_case_set[].case_id` outside `[A-Za-z0-9._-]`/no-`..`, routing to `compile.generate` before any
+build. It reuses the renderer's `_CASE_ID_TOKEN_RE` as the single grammar. `read_case_ids` — the shared runtime argv
+boundary for M3c and non-M3c alike — additionally DROPS any unsafe token, so even a hand-crafted IR that bypassed
+Compile can never place a traversal string on the argv (the dropped case then fails its own in-directory deliverable
+gate, a bounded failure, rather than writing out of bounds). The M3c renderer gate remains as defense-in-depth. All 20
+existing spec case_ids satisfy the grammar. (A related NIT the same review found: `_validate_test_predicates` built
+its case_id set unstripped while every runtime reader strips — fixed, so a whitespace-padded case_id no longer desyncs
+predicate membership from the runtime identity.)

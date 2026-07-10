@@ -163,6 +163,18 @@ Behavior:
 - The target node's final JSON result carries a `dependency_runs` summary of which nodes ran / were skipped.
 - Every node of a `--with-deps` closure (each dependency and the target) records a `closure_id` (= the target's orchestration id) in `orchestration_meta.json#invocation`, so a later `--resume` can re-derive and continue the **whole** closure — see the closure-aware resume note in §3-1. (Historically `--with-deps` was ignored with `--resume`, resuming only a single node.)
 
+### Updating a shared dependency spec (R6-lite dependency freshness)
+
+When you edit a `spec` that other nodes depend on — a shared component, or the `harness_fortran_cpu` infrastructure node — bump its `spec_version` in all three places that carry it (`controlled_spec.md` §0, `tests.md` §0 `spec_ref.spec_version`, and `spec/registry/spec_catalog.yaml`), bump `tests.md`'s own `test_profile_version` if the test profile changed, and — if the change is breaking — tighten the dependents' `version_constraint` in their `deps.yaml`. **Do not bump the dependents' own `spec_version`**: their content did not change.
+
+Re-certifying the dependents is then a single command. Each certified node records the dependency closure it was built against in its `dependency_graph.json` sidecar; readiness re-derives that closure from the current `deps.yaml` + `spec_catalog.yaml` and compares, so every node certified against the old version is automatically **stale** (= not ready) and gets re-run:
+
+```bash
+python3 tools/run_workflow.py <target spec_ref> validate --llm claude --with-deps
+```
+
+Without `--with-deps` a single-node run stops at `workflow-launch-check` with `dependency_not_ready`, and the `reason_detail` names the drifted node and the resolution it was certified against versus the one derived now. Staleness is detected at **version granularity only**: a content edit that does not move `spec_version` is not seen, which is why the respec discipline is "content change ⇒ `spec_version` bump".
+
 ## 3-1. Resuming a failed workflow (`--resume`)
 
 The canonical path to resume a workflow that failed midway, from the failure point while reusing completed `step` (e.g. already-compiled), is `python3 tools/run_workflow.py --resume`.

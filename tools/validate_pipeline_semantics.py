@@ -5046,6 +5046,39 @@ def _case_id_to_test_ids(contract: dict[str, Any]) -> dict[str, list[str]]:
     return mapping
 
 
+def _test_id_to_case_ids(contract: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each test_id to every case_id its predicate ranges over, from
+    ``io_contract.test_predicates[].target_cases`` — the reverse of ``_case_id_to_test_ids``,
+    reading the very same field.
+
+    This is the row set of a test's metrics-basis evidence: the host-rendered runner emits one
+    ``h_mb_entry`` per ``(test_id, case_id)`` pair over exactly this product
+    (``runner_renderer.render_runner``), so the post_execute completeness matrix
+    (``_validate_metrics_basis_per_test``) mirrors the renderer rather than guessing. Empty dict
+    when the IR declares no predicates.
+    """
+    predicates = contract.get("test_predicates")
+    if not isinstance(predicates, list):
+        # `_io_contract_for_execution` hoists the key out of the nested `io_contract`
+        # section; an un-flattened doc still nests it.
+        nested = contract.get("io_contract")
+        predicates = nested.get("test_predicates") if isinstance(nested, dict) else None
+    if not isinstance(predicates, list):
+        return {}
+    mapping: dict[str, list[str]] = {}
+    for item in predicates:
+        if not isinstance(item, dict):
+            continue
+        test_id = item.get("test_id")
+        if not (isinstance(test_id, str) and test_id.strip()):
+            continue
+        bucket = mapping.setdefault(test_id.strip(), [])
+        for case_id in item.get("target_cases") or []:
+            if isinstance(case_id, str) and case_id.strip() and case_id.strip() not in bucket:
+                bucket.append(case_id.strip())
+    return mapping
+
+
 def _case_ids_for_execution(repo_root: Path, execution: NodeExecution) -> set[str]:
     """All declared ``case.test_case_set[].case_id`` for the execution's IR.
 
@@ -5074,13 +5107,38 @@ def _case_ids_for_execution(repo_root: Path, execution: NodeExecution) -> set[st
 
 def _metrics_basis_entries(
     metrics_basis: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], list[str]]:
+) -> tuple[dict[tuple[str, str], dict[str, Any]], list[str], str | None]:
+    """Index a ``raw/metrics_basis.json`` document by its ``(test_id, case_id)`` entry key.
+
+    R3-core: a test's primary evidence is the evidence of EVERY case its predicate ranges over,
+    so ``test_id`` alone is not a key. Every entry carries a non-empty ``case_id`` as a direct
+    sibling of ``test_id`` (harness controlled_spec §2), and ``(test_id, case_id)`` is unique.
+
+    Returns ``(entries, problems, form)`` where ``form`` names the container actually parsed
+    (``"per_test"`` / ``"tests"``, or ``None`` when neither did). The ``tests`` object form is
+    keyed by test_id and therefore cannot hold two entries for one test — it is deprecated for
+    that reason; ``_validate_metrics_basis_per_test`` turns a multi-target test written that way
+    into an actionable violation rather than an opaque "missing evidence".
+    """
     raw_entries = metrics_basis.get("per_test")
+    form: str | None = "per_test"
     if raw_entries is None:
         raw_entries = metrics_basis.get("tests")
+        form = "tests"
 
-    entries: dict[str, dict[str, Any]] = {}
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
     problems: list[str] = []
+
+    def _entry_case_id(item: dict[str, Any], loc: str, test_id: str) -> str | None:
+        raw_case_id = item.get("case_id")
+        if not isinstance(raw_case_id, str) or not raw_case_id.strip():
+            problems.append(
+                f"{loc} (test_id {test_id}) must carry a non-empty `case_id` as a direct "
+                "sibling of `test_id` — metrics-basis evidence is keyed by (test_id, case_id), "
+                "one entry per case the test's predicate targets"
+            )
+            return None
+        return raw_case_id.strip()
 
     if isinstance(raw_entries, list):
         for idx, item in enumerate(raw_entries):
@@ -5092,11 +5150,16 @@ def _metrics_basis_entries(
                 problems.append(f"per_test[{idx}].test_id must be non-empty string")
                 continue
             test_id = raw_test_id.strip()
-            if test_id in entries:
-                problems.append(f"per_test has duplicated test_id ({test_id})")
+            case_id = _entry_case_id(item, f"per_test[{idx}]", test_id)
+            if case_id is None:
                 continue
-            entries[test_id] = item
-        return entries, problems
+            if (test_id, case_id) in entries:
+                problems.append(
+                    f"per_test has duplicated (test_id, case_id) (({test_id}, {case_id}))"
+                )
+                continue
+            entries[(test_id, case_id)] = item
+        return entries, problems, form
 
     if isinstance(raw_entries, dict):
         for raw_test_id, item in raw_entries.items():
@@ -5106,11 +5169,26 @@ def _metrics_basis_entries(
             if not isinstance(item, dict):
                 problems.append(f"tests[{raw_test_id!r}] must be object")
                 continue
-            entries[raw_test_id.strip()] = item
-        return entries, problems
+            test_id = raw_test_id.strip()
+            case_id = _entry_case_id(item, f"tests[{raw_test_id!r}]", test_id)
+            if case_id is None:
+                continue
+            # JSON object keys are unique as WRITTEN, but this reader strips them — so
+            # `"test_a"` and `" test_a "` are two distinct keys that name one entry. Without
+            # this check the later one silently overwrites the earlier, and a malformed row
+            # (say, one missing a required variable) simply disappears. Same rule as the
+            # `per_test` list branch: one entry per (test_id, case_id).
+            if (test_id, case_id) in entries:
+                problems.append(
+                    f"tests has duplicated (test_id, case_id) (({test_id}, {case_id})) — two "
+                    "keys normalize to the same test_id"
+                )
+                continue
+            entries[(test_id, case_id)] = item
+        return entries, problems, form
 
     problems.append("must contain per_test list or tests object")
-    return entries, problems
+    return entries, problems, None
 
 
 _METRICS_BASIS_NESTED_VARIABLE_FIELDS = ("raw_variables", "variables", "evidence")
@@ -7001,34 +7079,74 @@ def _validate_metrics_basis_per_test(
         return
 
     metrics_basis_path = execution.node_dir / "raw" / "metrics_basis.json"
-    entries, problems = _metrics_basis_entries(metrics_basis)
+    entries, problems, form = _metrics_basis_entries(metrics_basis)
     for problem in problems:
         violations.append(f"{metrics_basis_path}: {problem}")
     if problems:
         return
 
-    expected_test_ids = set(test_requirements)
-    actual_test_ids = set(entries)
-    missing = sorted(expected_test_ids - actual_test_ids)
-    extra = sorted(actual_test_ids - expected_test_ids)
+    # The expected evidence is the test x target_case MATRIX: one entry per case each test's
+    # predicate ranges over. `test_predicates[].target_cases` is the anchor the host-rendered
+    # runner emits from (`runner_renderer._target_cases`), so both sides read one field.
+    #
+    # The row SET is `test_requirements`, whose source (`_contract_test_evidence_requirements`)
+    # drops a test declaring an EMPTY `required_raw_variables` while the renderer's
+    # `_test_evidence` keeps it — so such a test would render a row this matrix calls "unknown".
+    # That IR never reaches here: `_validate_test_evidence_requirements` rejects an empty
+    # `required_raw_variables` outright. Should that ever be relaxed, the two filters must be
+    # reconciled rather than left to disagree.
+    test_to_cases = _test_id_to_case_ids(contract)
+    expected_keys: set[tuple[str, str]] = set()
+    untargeted_tests: list[str] = []
+    multi_target_tests: list[str] = []
+    for test_id in test_requirements:
+        target_cases = test_to_cases.get(test_id) or []
+        if not target_cases:
+            untargeted_tests.append(test_id)
+            continue
+        if len(target_cases) > 1:
+            multi_target_tests.append(test_id)
+        for case_id in target_cases:
+            expected_keys.add((test_id, case_id))
+    if untargeted_tests:
+        violations.append(
+            f"{metrics_basis_path}: test_id {sorted(untargeted_tests)} declare "
+            "required_raw_variables but no io_contract.test_predicates[].target_cases — the "
+            "expected (test_id, case_id) evidence rows cannot be derived"
+        )
+        return
+    if form == "tests" and multi_target_tests:
+        # A `tests` object is keyed by test_id, so it physically cannot hold the several rows a
+        # multi-target test owes. Say so instead of reporting the rows as merely "missing".
+        violations.append(
+            f"{metrics_basis_path}: the deprecated `tests` object form is keyed by test_id and "
+            f"cannot express the multiple (test_id, case_id) rows owed by {sorted(multi_target_tests)}; "
+            "emit a `per_test` LIST with one entry per (test_id, case_id)"
+        )
+        return
+
+    actual_keys = set(entries)
+    missing = sorted(expected_keys - actual_keys)
+    extra = sorted(actual_keys - expected_keys)
     if missing:
         violations.append(
-            f"{metrics_basis_path}: missing per-test evidence for test_id ({missing})"
+            f"{metrics_basis_path}: missing per-test evidence for (test_id, case_id) ({missing})"
         )
     if extra:
         violations.append(
-            f"{metrics_basis_path}: has unknown per-test evidence test_id ({extra})"
+            f"{metrics_basis_path}: has unknown per-test evidence (test_id, case_id) ({extra})"
         )
 
-    for test_id, required_variables in sorted(test_requirements.items()):
-        entry = entries.get(test_id)
-        if not isinstance(entry, dict):
+    for (test_id, case_id), entry in sorted(entries.items()):
+        required_variables = test_requirements.get(test_id)
+        if required_variables is None or not isinstance(entry, dict):
             continue
         variable_keys = _metrics_basis_variable_keys(entry)
         missing_variables = sorted(required_variables - variable_keys)
         if missing_variables:
             message = (
-                f"{metrics_basis_path}: test_id {test_id} missing required_raw_variables ({missing_variables})"
+                f"{metrics_basis_path}: test_id {test_id} case_id {case_id} "
+                f"missing required_raw_variables ({missing_variables})"
             )
             found = _metrics_basis_unrecognized_wrapper(
                 entry, missing_variables, required_variables
@@ -9096,11 +9214,56 @@ def _validate_compile_stage_impl(
     _validate_ir_meta_json(ir_dir, violations)
     _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
     _validate_test_predicates(repo_root, ir_dir, violations)
+    _validate_case_ids(ir_dir, violations)
     _validate_infrastructure_public_api(repo_root, ir_dir, violations)
     _validate_harness_dependency_consistency(repo_root, ir_dir, violations)
     _validate_harness_render_preconditions(repo_root, ir_dir, violations)
 
     return violations
+
+
+def _validate_case_ids(ir_dir: Path, violations: list[str]) -> None:
+    """Every ``case.test_case_set[].case_id`` is a filesystem-and-Fortran-safe token — for ALL
+    node kinds, not only the M3c host-rendered ones.
+
+    A case_id becomes a PATH at runtime: every node's runner writes its per-case snapshot to
+    ``raw/state_snapshots/<case_id>.json`` (the argv the conductor's ``read_case_ids`` builds), so
+    a case_id like ``../../evil`` makes the (honest, cleanly-compiling) runner write OUTSIDE the
+    run directory. The M3c renderer's ``_case_ids`` gate bounds only the literals IT embeds, so it
+    covers host-rendered nodes; a non-M3c leaf-authored runner has no such gate. This spec-input
+    gate closes the gap uniformly at Compile — a violation routes to ``compile.generate``, and the
+    id must match the same ``[A-Za-z0-9._-]`` (no ``..``) grammar the renderer pins."""
+    from tools.runner_renderer import _CASE_ID_TOKEN_RE
+
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return  # missing IR already flagged upstream
+    try:
+        ir = _read_yaml(derived_path)
+    except yaml.YAMLError:
+        return  # malformed IR already flagged upstream
+    if not isinstance(ir, dict):
+        return
+    case_block = ir.get("case")
+    tcs = case_block.get("test_case_set") if isinstance(case_block, dict) else None
+    if not isinstance(tcs, list):
+        return
+    unsafe: list[str] = []
+    for c in tcs:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("case_id")
+        if not isinstance(cid, str):
+            continue
+        token = cid.strip()
+        if token and (not _CASE_ID_TOKEN_RE.match(token) or ".." in token):
+            unsafe.append(token)
+    if unsafe:
+        violations.append(
+            f"{derived_path}: case.test_case_set has case_id(s) {sorted(set(unsafe))} that are "
+            "not safe tokens; a case_id is concatenated into the per-case snapshot path "
+            "(raw/state_snapshots/<case_id>.json), so it must match [A-Za-z0-9._-] with no '..' "
+            "(else the run writes outside its directory)")
 
 
 def _validate_harness_dependency_consistency(
@@ -9168,8 +9331,8 @@ def _validate_harness_render_preconditions(
     renderer cannot faithfully render (a ``time_variable`` other than the harness's fixed key
     ``t``; a snapshot variable colliding with a reserved key ``t``/``case_id``/``step``; an
     unparseable ``shape_expr`` or rank>4; a ``verdict.fields`` outside the harness fold surface
-    ``{overall, failed_checks}``; a required raw variable absent from the snapshot schema; a
-    multi-target metrics-basis test) makes ``render_runner`` raise ``RenderError``. That render
+    ``{overall, failed_checks}``; a required raw variable absent from the snapshot schema; a test
+    no predicate targets) makes ``render_runner`` raise ``RenderError``. That render
     runs *inside the conductor* before the Generate substeps, so its fail_closed kills the whole
     workflow rather than retrying — the E2E #3 failure class (orch ``…dcf0533e``): a
     Compile-authored value caught at an unrecoverable position.
@@ -9722,10 +9885,13 @@ def _validate_test_predicates(
 
     case_block = ir.get("case")
     tcs = case_block.get("test_case_set") if isinstance(case_block, dict) else None
+    # `.strip()` so this set uses the SAME case_id identity as the runtime argv
+    # (`read_case_ids`), the snapshot path, and `_case_id_to_test_ids` — all of which strip.
+    # A surrounding-whitespace case_id would otherwise desync predicate membership from runtime.
     case_ids = {
-        str(c.get("case_id"))
+        c["case_id"].strip()
         for c in (tcs if isinstance(tcs, list) else [])
-        if isinstance(c, dict) and c.get("case_id")
+        if isinstance(c, dict) and isinstance(c.get("case_id"), str) and c["case_id"].strip()
     }
 
     dc = io_contract.get("diagnostics_contract")

@@ -68,19 +68,23 @@ The required composition is IR-driven —
 `spec.ir.yaml.io_contract.raw_requirements.required_evidence` is the canonical
 source; do not uniformly require a fixed minimal composition.
 
-- **`raw/metrics_basis.json`** must hold a **`per_test` list (or `tests`
-  object)** targeting all `test_id` of `io_contract.test_evidence_requirements`.
-  Each entry is **flat**: the `test_id`, plus that `test_id`'s
-  `required_raw_variables` without omission as **direct sibling keys of
-  `test_id`** (needed for the per-test recomputation of `Validate.judge`).
-  Wrapping them under an unrecognized key — notably `values`, a Fortran identifier
-  of the harness entry record and never a JSON key — fails `post_execute`. A
-  structure without a per-test index (e.g. a single `evidence[]`) is likewise
-  rejected (`must contain per_test list or tests object`). `metrics_basis.json`
-  holds only the primary evidence and must not copy `diagnostics.json`; different
-  `test_id` must not overwrite each other.
-  - Correct: `{"test_id":"l0_emit_pass","a1":[0.5,1.5],"max_abs_deviation":0.0}`
-  - Wrong: `{"test_id":"l0_emit_pass","values":{"a1":[0.5,1.5],"max_abs_deviation":0.0}}` → `post_execute` fails with "missing required_raw_variables", naming the unrecognized wrapper key.
+- **`raw/metrics_basis.json`** must hold a **`per_test` list** with exactly one entry per
+  (`test_id`, `case_id`) pair: every `test_id` of `io_contract.test_evidence_requirements`,
+  once per case named in that test's `io_contract.test_predicates[].target_cases`. So a
+  multi-target test (a convergence sweep, an equivariance pair) contributes one entry per
+  targeted case. `post_execute` pins that matrix both ways — a missing row and an unknown
+  row are equally rejected. Each entry is **flat**: `test_id`, `case_id`, plus that test's
+  `required_raw_variables` without omission as **direct sibling keys of `test_id`**, valued
+  from the entry's own case (needed for the per-test recomputation of `Validate.judge`). An
+  entry omitting `case_id` is rejected. Wrapping the variables under an unrecognized key —
+  notably `values`, a Fortran identifier of the harness entry record and never a JSON key —
+  fails `post_execute`. So does a structure with no per-test index, e.g. a single
+  `evidence[]` (`must contain per_test list or tests object`). The legacy `tests` **object**
+  form still parses but is **deprecated**: keyed by `test_id`, it cannot hold a multi-target
+  test's several rows. `metrics_basis.json` holds only the primary evidence and must not
+  copy `diagnostics.json`; different (`test_id`, `case_id`) pairs must not overwrite each other.
+  - Correct: `{"test_id":"l0_emit_pass","case_id":"l0_emit_pass","a1":[0.5,1.5],"max_abs_deviation":0.0}`
+  - Wrong: `{"test_id":"l0_emit_pass","case_id":"l0_emit_pass","values":{"a1":[0.5,1.5],"max_abs_deviation":0.0}}` → `post_execute` fails with "missing required_raw_variables", naming the unrecognized wrapper key.
   - **Never a zero-filled skeleton.** `post_execute` also rejects a file whose nested
     numeric leaves (booleans excluded) are **all** `0` or `null`:
     `all numeric fields are zero or null (trivial placeholder detected)`. Emit the

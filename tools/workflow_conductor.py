@@ -1912,10 +1912,22 @@ clean:
         # strip() so the case_id identity is the SAME across the runner argv
         # (--cases), the expected raw/state_snapshots/<case_id>.json deliverable
         # path, and the validator's _case_ids_for_execution exemption set.
+        #
+        # This case_id becomes a FILESYSTEM PATH — the runner writes
+        # raw/state_snapshots/<case_id>.json — so a `/` or `..` would let the run write outside
+        # its directory. The Compile gate `_validate_case_ids` rejects such an id for every node,
+        # but this is the shared runtime boundary (M3c and non-M3c alike), so drop any unsafe
+        # token here too: never put a traversal string on the argv, even from a hand-crafted IR
+        # that bypassed Compile. A dropped case is simply absent from the run (and from the
+        # deliverable set this same list feeds); if a predicate still references it, the
+        # metrics-basis matrix reports the missing (test_id, case_id). Either way the run stays
+        # in-directory — the dropped case never produces an out-of-bounds write.
+        from tools.runner_renderer import _CASE_ID_TOKEN_RE
         return tuple(sorted(
-            c["case_id"].strip() for c in tcs
+            tok for c in tcs
             if isinstance(c, dict) and isinstance(c.get("case_id"), str)
-            and c["case_id"].strip()
+            and (tok := c["case_id"].strip())
+            and _CASE_ID_TOKEN_RE.match(tok) and ".." not in tok
         ))
 
     def _read_evidence_artifacts(self, refs: NodeRefs) -> tuple[str, ...]:

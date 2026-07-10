@@ -1956,6 +1956,24 @@ class TransportFailureTest(unittest.TestCase):
                 json.dumps({}), encoding="utf-8")
             self.assertEqual(c._judge_semantic_decision(refs), "")  # missing field
 
+    def test_read_case_ids_drops_path_traversal_tokens(self) -> None:
+        # Runtime defense-in-depth: read_case_ids builds the runner argv (--cases ...), from
+        # which the snapshot path raw/state_snapshots/<case_id>.json is formed. A `/` or `..`
+        # must never reach the argv — even from a hand-crafted IR that bypassed the Compile gate
+        # — or the honest runner writes outside its directory. Safe ids survive; unsafe are dropped.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = wc.Conductor(repo_root=repo, orchestration_id="orch_x",
+                             orchestration_agent_run_id="ORCH", backend="claude", env={})
+            ir_dir = repo / refs.ir_ref
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text(json.dumps({"case": {"test_case_set": [
+                {"case_id": "c_ok"}, {"case_id": "l0.v1-2"},
+                {"case_id": "../../evil"}, {"case_id": "a/b"}, {"case_id": ".."},
+            ]}}), encoding="utf-8")
+            self.assertEqual(c.read_case_ids(refs), ("c_ok", "l0.v1-2"))
+
     def test_gather_failure_context_includes_gate_metas(self) -> None:
         # G5: _gather_failure_context embeds post_judge_meta.json / pre_judge_meta.json so the
         # read-only escalate leaf reasons over the violations without touching the FS.

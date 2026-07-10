@@ -131,12 +131,23 @@ in a submodule / a second module / after `end module` does not count as defined.
   metric that simply does not apply to a case sets `found=.false.` (omitted).
 - **`case_run` perf counters** feed the single `perf.json` (`steps` summed,
   `cells_updated` summed across the run); make them the real work done.
-- **Metrics-basis scope (M3c-β).** The host-rendered runner records each test's
-  `raw/metrics_basis.json` per-test evidence from that test's **first target case**.
-  Every M3c test today is 1:1 case↔test, so this is exact. A multi-target-case test
-  (a convergence/resolution sweep needing evidence from *every* targeted case) is an
-  R3 test-kind not yet served by the renderer — do not author such a test on an M3c
-  node until R3 extends the metrics-basis shape.
+- **Metrics-basis is a test × target-case matrix.** The host-rendered runner records one
+  `raw/metrics_basis.json` entry per (`test_id`, target `case_id`) pair, from
+  `io_contract.test_predicates[].target_cases`. A multi-target test (a convergence sweep, a
+  base/shifted pair) therefore records evidence for *every* case it ranges over; partial
+  evidence fails the `post_execute` completeness matrix.
+- **Cross-case reductions are per-case metrics.** A quantity that exists only across cases (a
+  convergence order, a symmetry residual) is accumulated by the §3 module-level pattern and
+  returned by `metric_compute` as a per-case metric of the case where it first becomes
+  computable — the `n064` case carries `convergence.order_n032_to_n064`, the `n128` case
+  `order_n064_to_n128`. Earlier cases return `found=.false.` for it (a sparse metric is
+  normal). The predicate reads it with a `case: <case_id>` condition, so the runner still
+  reduces and the predicate still only compares.
+- **Accumulator ordering rule.** The runner receives its `case_id`s **sorted**, so an
+  accumulator may depend only on cases whose `case_id` sorts **before** the emitting case's.
+  Zero-padded resolutions (`n032` < `n064` < `n128`), zero-padded shifts, and suffix-extended
+  derivatives satisfy this naturally; the trap is a derived case sorting ahead of its base
+  (`..._dts050` before `..._dts100`). `test_case_set` declaration order is NOT the run order.
 - **Metrics-basis values must not be uniformly zero.** The harness fills
   `raw/metrics_basis.json` from the values the snapshot getters return for each
   test's `required_raw_variables`, so those getters must return the values the run
@@ -151,6 +162,10 @@ The runner calls `case_setup` then `case_run` then the getters for one case at a
 time. Keeping the current case's fields (and any cross-case accumulators a metric
 needs) in **module-level variables** is the intended pattern — the getters read
 that state. Key any cross-case accumulation by `case_id`.
+
+A cross-case reduction (§2) uses exactly this: accumulate each case's contribution as it runs;
+when `metric_compute` is called for the case that completes the reduction, return the derived
+value (`found=.true.`), and `found=.false.` for the earlier cases.
 
 ## 4. Prohibitions
 

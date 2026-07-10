@@ -303,6 +303,93 @@ class VerdictReduceTest(unittest.TestCase):
                                "pass_when": {"all": [{"ref": "a", "op": "eq", "value": 1}]}}], {})
 
 
+class CaseScopedConditionTest(unittest.TestCase):
+    """R3-core: `case: <case_id>` resolves ONE target case's slice.
+
+    This is the scope a cross-case reduction is read at — the checks module emits a
+    convergence order as a per-case metric of the case that completes it, so the predicate
+    must compare it there rather than in every case (`per_case`) or suite-wide (neither).
+    """
+
+    # Two resolutions; only the finer one carries the derived order metric (a sparse
+    # per-case metric, exactly what the accumulator pattern produces).
+    _DIAG = {
+        "per_case": {
+            "n032": {"metrics": {"errors.h.l2": 4.0e-3}},
+            "n064": {"metrics": {"errors.h.l2": 1.0e-3,
+                                 "convergence.order_n032_to_n064": 2.0}},
+        }
+    }
+
+    def _pred(self, **cond):
+        base = {"ref": "convergence.order_n032_to_n064", "op": "ge", "value": 1.9,
+                "case": "n064"}
+        base.update(cond)
+        # `case=None` from a caller means "drop the key". An absent `case` and an explicit
+        # `case: null` are NOT the same thing to the evaluator — see `test_explicit_null_case_raises`.
+        if "case" in cond and cond["case"] is None:
+            base.pop("case")
+        return {"test_id": "t", "expected_outcome": "pass",
+                "target_cases": ["n032", "n064"], "pass_when": {"all": [base]}}
+
+    def test_resolves_the_named_case(self) -> None:
+        status, kind, basis = evaluate_predicate(self._pred(), self._DIAG)
+        self.assertEqual((status, kind), ("pass", "pass"))
+        evaluated = basis["conditions"][0]["evaluated"]
+        self.assertEqual([e["case"] for e in evaluated], ["n064"])
+        self.assertEqual(evaluated[0]["lhs"], 2.0)
+
+    def test_physics_fail_when_the_named_case_misses_the_threshold(self) -> None:
+        status, kind, _ = evaluate_predicate(self._pred(value=2.5), self._DIAG)
+        self.assertEqual((status, kind), ("fail", "physics"))
+
+    def test_a_per_case_condition_would_be_structural_on_the_sparse_metric(self) -> None:
+        # The contrast that motivates `case:`: `per_case` ranges over BOTH cases, and n032
+        # legitimately has no order metric — reporting a contract gap for correct evidence.
+        status, kind, _ = evaluate_predicate(
+            self._pred(case=None, per_case=True), self._DIAG)
+        self.assertEqual((status, kind), ("fail", "structural"))
+
+    def test_absent_slice_is_structural(self) -> None:
+        status, kind, basis = evaluate_predicate(self._pred(), {"per_case": {"n032": {}}})
+        self.assertEqual((status, kind), ("fail", "structural"))
+        self.assertEqual(basis["conditions"][0]["evaluated"][0]["reason"], "case_absent")
+
+    def test_absent_ref_in_the_named_case_is_structural(self) -> None:
+        status, kind, basis = evaluate_predicate(
+            self._pred(), {"per_case": {"n064": {"metrics": {}}}})
+        self.assertEqual((status, kind), ("fail", "structural"))
+        self.assertEqual(basis["conditions"][0]["evaluated"][0]["reason"], "ref_absent")
+
+    def test_case_and_per_case_together_raise(self) -> None:
+        with self.assertRaises(PredicateError):
+            evaluate_predicate(self._pred(per_case=True), self._DIAG)
+
+    def test_non_string_case_raises(self) -> None:
+        for bad in (7, "", "   ", ["n064"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(PredicateError):
+                    evaluate_predicate(self._pred(case=bad), self._DIAG)
+
+    def test_explicit_null_case_raises(self) -> None:
+        # `case: null` is rejected by the schema gate. The evaluator must not read it as
+        # "absent" and silently widen the condition to suite-level scope — that would
+        # evaluate different data than the author wrote.
+        pred = self._pred()
+        pred["pass_when"]["all"][0]["case"] = None
+        with self.assertRaises(PredicateError):
+            evaluate_predicate(pred, self._DIAG)
+
+    def test_absent_case_key_resolves_suite_scope(self) -> None:
+        # ...whereas an ABSENT `case` key legitimately means the suite-level object.
+        pred = self._pred()
+        pred["pass_when"]["all"][0].pop("case")
+        pred["pass_when"]["all"][0]["ref"] = "verdict.overall"
+        pred["pass_when"]["all"][0].update(op="eq", value="pass")
+        self.assertEqual(
+            evaluate_predicate(pred, {"verdict": {"overall": "pass"}, **self._DIAG})[0], "pass")
+
+
 class SchemaTest(unittest.TestCase):
     def _kwargs(self, **over):
         base = dict(case_ids={"c1"}, test_ids=["t1"], check_ids={"g"},
@@ -342,6 +429,47 @@ class SchemaTest(unittest.TestCase):
     def test_unknown_target_case(self) -> None:
         v = validate_predicate_schema([self._pred(target_cases=["zzz"])], **self._kwargs())
         self.assertTrue(any("unknown case_id" in x for x in v))
+
+    def _case_scoped(self, **cond):
+        base = {"ref": "verdict.overall", "op": "eq", "value": "pass", "case": "c1"}
+        base.update(cond)
+        return self._pred(target_cases=["c1", "c2"], pass_when={"all": [base]})
+
+    def test_case_scoped_condition_is_valid(self) -> None:
+        self.assertEqual(
+            validate_predicate_schema([self._case_scoped()],
+                                      **self._kwargs(case_ids={"c1", "c2"})), [])
+
+    def test_case_must_be_one_of_this_predicates_target_cases(self) -> None:
+        # `c3` is a DECLARED case, so `target_cases` validation would pass it — but this
+        # predicate does not range over it, and no metrics-basis row exists for the pair.
+        v = validate_predicate_schema([self._case_scoped(case="c3")],
+                                      **self._kwargs(case_ids={"c1", "c2", "c3"}))
+        self.assertTrue(any("is not one of this predicate's target_cases" in x for x in v), v)
+
+    def test_case_must_be_a_non_empty_string(self) -> None:
+        for bad in ("", "   ", 7, ["c1"], None):
+            with self.subTest(bad=bad):
+                v = validate_predicate_schema([self._case_scoped(case=bad)],
+                                              **self._kwargs(case_ids={"c1", "c2"}))
+                self.assertTrue(any(".case must be a non-empty string" in x for x in v), v)
+
+    def test_case_membership_message_does_not_stringify_a_non_str_target(self) -> None:
+        # `target_cases: [123, "c2"]` is separately reported as an unknown case_id. The `case`
+        # membership message must not print `123` as `'123'`, which would read as though the
+        # rejected case WERE present in the list it is being compared against.
+        pred = self._pred(target_cases=[123, "c2"],
+                          pass_when={"all": [{"ref": "verdict.overall", "op": "eq",
+                                              "value": "pass", "case": "123"}]})
+        v = validate_predicate_schema([pred], **self._kwargs(case_ids={"c1", "c2"}))
+        matched = [x for x in v if ".case '123' is not one of" in x]
+        self.assertEqual(len(matched), 1, v)
+        self.assertIn("target_cases (['c2'])", matched[0])
+
+    def test_case_and_per_case_are_mutually_exclusive(self) -> None:
+        v = validate_predicate_schema([self._case_scoped(per_case=True)],
+                                      **self._kwargs(case_ids={"c1", "c2"}))
+        self.assertTrue(any("mutually exclusive condition scopes" in x for x in v), v)
 
     def test_test_id_set_mismatch(self) -> None:
         v = validate_predicate_schema([self._pred()], **self._kwargs(test_ids=["t1", "t2"]))

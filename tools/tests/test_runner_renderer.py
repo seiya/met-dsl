@@ -10,6 +10,8 @@ rendered runner against a v2 harness stub + a fixed-ABI checks stub end-to-end.
 from __future__ import annotations
 
 import copy
+import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,10 +20,12 @@ import unittest
 from pathlib import Path
 
 from tools.runner_renderer import (
+    CASE_ID_LEN,
     EXPECTED_HARNESS_SPEC_ID,
+    _HARNESS_V3_PARAMETERS,
     MAX_SPEC_ID_LEN,
     RenderError,
-    _HARNESS_V2_INTERFACE,
+    _HARNESS_V3_INTERFACE,
     assert_harness_pin,
     ir_content_violations,
     render_runner,
@@ -280,13 +284,13 @@ _RANK_CHECKS_STUB = textwrap.dedent(f"""\
 
 def _harness_signatures() -> list[dict]:
     """The certified harness IR public_api.signatures, synthesized from §5.1."""
-    ops, types, errs = _parse_interface_stanzas(_HARNESS_V2_INTERFACE)
+    ops, types, errs = _parse_interface_stanzas(_HARNESS_V3_INTERFACE)
     assert not errs, errs
     return [{"symbol": n, "interface": "\n".join(lines)}
             for n, lines in {**ops, **types}.items()]
 
 
-# The v2 harness stub source (canonical `type ::` + separate `public ::`), used by
+# The v3 harness stub source (canonical `type ::` + separate `public ::`), used by
 # the pin test and the gfortran smoke. Only enough body to link + emit outputs.
 _HARNESS_STUB = textwrap.dedent("""\
     module harness_fortran_cpu_model
@@ -318,6 +322,7 @@ _HARNESS_STUB = textwrap.dedent("""\
       end type harness_fortran_cpu__h_case_result
       type :: harness_fortran_cpu__h_mb_entry
         character(len=:), allocatable :: test_id
+        character(len=:), allocatable :: case_id
         type(harness_fortran_cpu__h_named), allocatable :: values(:)
       end type harness_fortran_cpu__h_mb_entry
       public :: harness_fortran_cpu__h_named, harness_fortran_cpu__h_check
@@ -446,7 +451,9 @@ _HARNESS_STUB = textwrap.dedent("""\
         open(newunit=u, file='raw/metrics_basis.json', status='replace')
         write(u, '(A)') '{ "per_test": ['
         do k = 1, n
+          if (k > 1) write(u, '(A)') '  ,'
           write(u, '(A)') '  { "test_id": "'//trim(entries(k)%test_id)//'"'
+          write(u, '(A)') '  , "case_id": "'//trim(entries(k)%case_id)//'"'
           do j = 1, size(entries(k)%values)
             write(u, '(A)') '  , "'//trim(entries(k)%values(j)%name)//'": '//entries(k)%values(j)%json
           end do
@@ -502,6 +509,7 @@ _CHECKS_STUB = textwrap.dedent("""\
       real(dp) :: interior(2, 2) = 0.0_dp
       real(dp) :: deviation = 0.0_dp
       real(dp) :: guard = 0.0_dp
+      integer :: ncase_seen = 0
       public :: case_setup, case_run, get_time
       public :: get_scalar, get_r1, get_r2, get_r3, get_r4
       public :: checks_compute, metric_compute
@@ -516,7 +524,10 @@ _CHECKS_STUB = textwrap.dedent("""\
           end do
         end do
         ghost = 0.0_dp
-        deviation = 0.0_dp
+        ! A per-case ordinal, so a metrics-basis row that sourced the WRONG case's
+        ! snapshot carries a detectably wrong value.
+        ncase_seen = ncase_seen + 1
+        deviation = real(ncase_seen, dp)
         guard = 0.0_dp
         ok = trim(case_id) /= 'l0_invalid_ny_xfail'
       end subroutine case_setup
@@ -687,6 +698,61 @@ class RenderShapeTest(unittest.TestCase):
         self.assertIn("implicit none", self.txt)
 
 
+class MultiTargetMetricsBasisTest(unittest.TestCase):
+    """R3-core: the metrics-basis index is the (test_id, target case_id) product."""
+
+    @staticmethod
+    def _multi_target_ir() -> dict:
+        # The x_wrap test now ranges over BOTH wrap cases (a convergence-sweep shape:
+        # one test, several cases). The other two tests stay single-target.
+        ir = copy.deepcopy(_boundary_ir())
+        ir["io_contract"]["test_predicates"][0]["target_cases"] = [
+            "l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass"]
+        return ir
+
+    def setUp(self) -> None:
+        self.txt = render_runner(self._multi_target_ir(), BOUNDARY_SID, HARNESS)
+
+    def test_entry_count_is_the_product(self) -> None:
+        # 2 (multi-target test) + 1 + 1 = 4 rows, NOT 3 (one per test).
+        self.assertIn("allocate(mb_entries(4))", self.txt)
+        self.assertIn("call harness_fortran_cpu__write_metrics_basis(mb_entries, 4)", self.txt)
+
+    def test_each_row_carries_its_own_case_id(self) -> None:
+        rows = re.findall(
+            r"mb_entries\((\d+)\)%test_id = '([^']+)'\n"
+            r"  mb_entries\(\d+\)%case_id = &\n    '([^']+)'",
+            self.txt)
+        self.assertEqual(
+            [(t, c) for _, t, c in rows],
+            [("l0_periodic_x_wrap_pass", "l0_periodic_x_wrap_pass"),
+             ("l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass"),
+             ("l0_periodic_y_wrap_pass", "l0_periodic_y_wrap_pass"),
+             ("l0_invalid_ny_xfail", "l0_invalid_ny_xfail")])
+        self.assertEqual([int(i) for i, _, _ in rows], [1, 2, 3, 4])
+
+    def test_each_row_picks_from_its_own_case_snapshot(self) -> None:
+        # The two rows of the multi-target test resolve DIFFERENT source cases, so each
+        # `pick` reads the snap_cache slot that case's `find_case_index` returned.
+        self.assertIn("    'l0_periodic_x_wrap_pass')\n", self.txt)
+        self.assertIn("    'l0_periodic_y_wrap_pass')\n", self.txt)
+        self.assertEqual(self.txt.count("pick(snap_cache(tci)%values, 'max_abs_deviation')"), 3)
+
+    def test_snapshot_cache_is_keyed_by_case_id(self) -> None:
+        self.assertIn("snap_cache(ci)%case_id = trim(case_ids(ci))", self.txt)
+        self.assertNotIn("snap_cache(ci)%test_id", self.txt)
+
+    def test_single_target_rows_still_carry_case_id(self) -> None:
+        # No special case: a 1:1 test is just a 1-row slice of the same product.
+        txt = render_runner(_boundary_ir(), BOUNDARY_SID, HARNESS)
+        self.assertIn("allocate(mb_entries(3))", txt)
+        self.assertEqual(txt.count("%case_id = &"), 3)
+
+    def test_line_width(self) -> None:
+        over = [ln for ln in self.txt.splitlines() if len(ln) > 100]
+        self.assertEqual(over, [], f"lines over 100 cols: {over}")
+
+
 class DeterminismTest(unittest.TestCase):
     def test_byte_identical(self) -> None:
         a = render_runner(_boundary_ir(), BOUNDARY_SID, HARNESS)
@@ -743,18 +809,39 @@ class RenderErrorMatrixTest(unittest.TestCase):
         self._expect(lambda ir: ir["io_contract"]["test_evidence_requirements"][0]
                      ["required_raw_variables"].append("ghost_field_typo"))
 
+    def test_over_long_case_id_fails_closed(self) -> None:
+        # 70 chars: under the 100-column render guard (a `case ('<id>')` label only reaches
+        # column 100 at ~87 chars), but over the harness `case_id_len = 64`. Without this gate
+        # the runner COMPILES and then `error stop 1`s on every run, because `__parse_cases`
+        # truncated the stored id to 64 while the emitted literal carries all 70.
+        def mut(ir: dict) -> None:
+            long_id = "c_" + "x" * 68
+            ir["case"]["test_case_set"][0]["case_id"] = long_id
+            ir["io_contract"]["test_predicates"][0]["target_cases"] = [long_id]
+        self._expect(mut)
+
+    def test_case_id_at_the_harness_width_still_renders(self) -> None:
+        # Exactly `case_id_len` fits: the bound is inclusive, not off-by-one.
+        ir = copy.deepcopy(_boundary_ir())
+        exact = "c_" + "x" * (CASE_ID_LEN - 2)
+        self.assertEqual(len(exact), CASE_ID_LEN)
+        ir["case"]["test_case_set"][0]["case_id"] = exact
+        ir["io_contract"]["test_predicates"][0]["target_cases"] = [exact]
+        txt = render_runner(ir, BOUNDARY_SID, HARNESS)
+        self.assertIn(f"case ('{exact}')", txt)
+        self.assertIn(f"  integer, parameter :: case_id_len = {CASE_ID_LEN}", txt)
+
     def test_duplicate_case_id_fails_closed(self) -> None:
         # Two entries with the same case_id would emit overlapping `case ('id')` labels in
         # the runner's select-case — a hard gfortran error the leaf cannot repair. Fail closed.
         self._expect(lambda ir: ir["case"]["test_case_set"].append(
             {"case_id": "l0_periodic_x_wrap_pass"}))
 
-    def test_multi_target_metrics_test_fails_closed(self) -> None:
-        # A metrics-basis test whose predicate targets >1 case cannot be faithfully
-        # rendered (only the first case's evidence would be recorded); fail closed rather
-        # than silently emit partial evidence (M3c-β single-case-per-test scope).
+    def test_test_with_no_target_case_fails_closed(self) -> None:
+        # A test declaring metrics-basis evidence but ranging over no case has no
+        # (test_id, case_id) row to record — its evidence source is unresolvable.
         self._expect(lambda ir: ir["io_contract"]["test_predicates"][0].__setitem__(
-            "target_cases", ["l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass"]))
+            "target_cases", []))
 
     def test_non_t_time_variable(self) -> None:
         # The harness writes the snapshot time under the fixed key 't'; a different
@@ -766,24 +853,67 @@ class RenderErrorMatrixTest(unittest.TestCase):
         self._expect(lambda ir: ir["case"]["test_case_set"][0]
                      .__setitem__("case_id", "l0\nx"))
 
+    def test_path_traversal_case_id_fails_closed(self) -> None:
+        # A case_id is concatenated into `raw/state_snapshots/<case_id>.json`, so `/` or `..`
+        # traverses out of the run directory and the cleanly-compiling runner writes an
+        # arbitrary file. Reproduced end-to-end before this gate (case_id "../../pwned" wrote
+        # node/pwned.json). Reject anything that is not a filesystem-safe token.
+        for name in ("../../pwned", "a/b", "..", "foo/../bar", "x\\y"):
+            with self.subTest(name=name):
+                self._expect(lambda ir, n=name: (
+                    ir["case"]["test_case_set"][0].__setitem__("case_id", n),
+                    ir["io_contract"]["test_predicates"][0].__setitem__("target_cases", [n])))
+
+    def test_dotted_and_dashed_case_id_still_renders(self) -> None:
+        # The safe grammar allows `.` and `-`; a single dot is not `..` and must pass.
+        ir = copy.deepcopy(_boundary_ir())
+        ok = "l0_v1.2-alpha"
+        ir["case"]["test_case_set"][0]["case_id"] = ok
+        ir["io_contract"]["test_predicates"][0]["target_cases"] = [ok]
+        self.assertIn(f"case ('{ok}')", render_runner(ir, BOUNDARY_SID, HARNESS))
+
+    def test_non_ascii_in_name_fails_closed(self) -> None:
+        # Fortran's default character kind counts BYTES; `CASE_ID_LEN` and the 100-column
+        # guard count Python code points. A 64-code-point / 68-byte case_id would slip past
+        # the bound and be truncated into the harness's `character(len=64)` slot, giving a
+        # runner that compiles and then `error stop`s. Reject non-ASCII outright.
+        for name in ("l0_café_wrap", "c_" + "x" * 58 + "é" * 4):
+            with self.subTest(name=name[:20]):
+                self._expect(lambda ir, n=name: (
+                    ir["case"]["test_case_set"][0].__setitem__("case_id", n),
+                    ir["io_contract"]["test_predicates"][0].__setitem__("target_cases", [n])))
+
+    def test_non_ascii_metric_address_fails_closed(self) -> None:
+        # Every IR-sourced name the renderer embeds goes through `_flit`, so one check covers
+        # metric addresses and snapshot variables too, not just case ids.
+        ir = copy.deepcopy(_metrics_ir())
+        ir["io_contract"]["diagnostics_contract"]["metrics"] = ["error.ℓ2"]
+        with self.assertRaisesRegex(RenderError, "outside printable ASCII"):
+            render_runner(ir, "prob_x", HARNESS)
+
     def test_extreme_name_length_fails_closed(self) -> None:
-        # A pathologically long case_id would push a rendered line past the 100-col lint limit;
-        # since the runner is host-rendered (unrepairable by a leaf), fail closed at render time.
-        def mut(ir: dict) -> None:
-            long_id = "c_" + "x" * 95
-            ir["case"]["test_case_set"][0]["case_id"] = long_id
-            ir["io_contract"]["test_evidence_requirements"][0]["test_id"] = long_id
-            ir["io_contract"]["test_predicates"][0]["test_id"] = long_id
-            ir["io_contract"]["test_predicates"][0]["target_cases"] = [long_id]
-        self._expect(mut)
+        # A pathologically long name pushes a rendered line past the 100-col lint limit; since
+        # the runner is host-rendered (unrepairable by a leaf), fail closed at render time.
+        # The name must be a test_id, not a case_id: a long case_id now trips the earlier
+        # `CASE_ID_LEN` bound instead, so it would never reach the column guard.
+        with self.assertRaisesRegex(RenderError, "exceeds 100 columns"):
+            ir = copy.deepcopy(_boundary_ir())
+            _long_name_mut(ir)
+            render_runner(ir, BOUNDARY_SID, HARNESS)
+
+
+def _over_long_case_id_mut(ir: dict) -> None:
+    long_id = "c_" + "x" * 68  # > CASE_ID_LEN, < the 100-column render guard
+    ir["case"]["test_case_set"][0]["case_id"] = long_id
+    ir["io_contract"]["test_predicates"][0]["target_cases"] = [long_id]
 
 
 def _long_name_mut(ir: dict) -> None:
-    long_id = "c_" + "x" * 95
-    ir["case"]["test_case_set"][0]["case_id"] = long_id
+    # A long TEST_ID (the case_id stays short, so the CASE_ID_LEN bound does not pre-empt this):
+    # `  mb_entries(1)%test_id = '<95 chars>'` renders past the 100-column lint limit.
+    long_id = "t_" + "x" * 95
     ir["io_contract"]["test_evidence_requirements"][0]["test_id"] = long_id
     ir["io_contract"]["test_predicates"][0]["test_id"] = long_id
-    ir["io_contract"]["test_predicates"][0]["target_cases"] = [long_id]
 
 
 # (label, mutate, spec_id, is_identity): each mutation of _boundary_ir makes render_runner raise.
@@ -805,8 +935,16 @@ _RENDER_FAILCLOSE_CASES = [
      [0]["required_raw_variables"].append("ghost_field_typo"), BOUNDARY_SID, False),
     ("duplicate_case_id", lambda ir: ir["case"]["test_case_set"].append(
         {"case_id": "l0_periodic_x_wrap_pass"}), BOUNDARY_SID, False),
-    ("multi_target_metrics", lambda ir: ir["io_contract"]["test_predicates"][0].__setitem__(
-        "target_cases", ["l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass"]),
+    ("test_with_no_target_case", lambda ir: ir["io_contract"]["test_predicates"][0].__setitem__(
+        "target_cases", []), BOUNDARY_SID, False),
+    ("over_long_case_id", _over_long_case_id_mut, BOUNDARY_SID, False),
+    ("path_traversal_case_id", lambda ir: (
+        ir["case"]["test_case_set"][0].__setitem__("case_id", "../../evil"),
+        ir["io_contract"]["test_predicates"][0].__setitem__("target_cases", ["../../evil"])),
+     BOUNDARY_SID, False),
+    ("non_ascii_case_id", lambda ir: (
+        ir["case"]["test_case_set"][0].__setitem__("case_id", "l0_café"),
+        ir["io_contract"]["test_predicates"][0].__setitem__("target_cases", ["l0_café"])),
      BOUNDARY_SID, False),
     ("non_t_time_variable", lambda ir: ir["io_contract"]["raw_requirements"]
      ["required_evidence"][0]["schema"].__setitem__("time_variable", "tau"), BOUNDARY_SID, False),
@@ -959,29 +1097,38 @@ class FortranLiteralEscapingTest(unittest.TestCase):
     single quote must be doubled (`''`) in the generated Fortran literal, not break it."""
 
     def test_apostrophe_in_names_is_escaped(self) -> None:
+        # A case_id may not contain `'` (it is filesystem-gated to [A-Za-z0-9._-]), but a
+        # test_id flows into a Fortran literal (`mb_entries(k)%test_id = '...'`) without being
+        # a path, so an apostrophe there must be doubled, not break the literal.
         ir = _boundary_ir()
-        ir["case"]["test_case_set"][0]["case_id"] = "l0_x'wrap"
         ir["io_contract"]["test_evidence_requirements"][0]["test_id"] = "l0_x'wrap"
         ir["io_contract"]["test_predicates"][0]["test_id"] = "l0_x'wrap"
-        ir["io_contract"]["test_predicates"][0]["target_cases"] = ["l0_x'wrap"]
         txt = render_runner(ir, BOUNDARY_SID, HARNESS)
-        self.assertIn("case ('l0_x''wrap')", txt)
-        # no broken (unescaped) literal
-        self.assertNotIn("case ('l0_x'wrap')", txt)
+        self.assertIn("%test_id = 'l0_x''wrap'", txt)
+        self.assertNotIn("'l0_x'wrap'", txt)  # no broken (unescaped) literal
 
     @unittest.skipUnless(_HAVE_GFORTRAN, "gfortran not available")
     def test_escaped_runner_compiles(self) -> None:
-        # An apostrophe in a case_id must produce a valid (doubled-quote) Fortran literal that
-        # compiles + links against the harness/checks stubs, not a broken literal.
+        # An apostrophe in a test_id must produce a valid (doubled-quote) Fortran literal that
+        # compiles + links against the harness/checks stubs, not a broken one. (case_ids are
+        # token-gated, so the apostrophe lives on a non-path name that still flows through `_flit`.)
         ir = _boundary_ir()
-        for c in ir["case"]["test_case_set"]:
-            c["case_id"] = c["case_id"].replace("l0_", "l0'")
         for r in ir["io_contract"]["test_evidence_requirements"]:
             r["test_id"] = r["test_id"].replace("l0_", "l0'")
         for p in ir["io_contract"]["test_predicates"]:
             p["test_id"] = p["test_id"].replace("l0_", "l0'")
-            p["target_cases"] = [tc.replace("l0_", "l0'") for tc in p["target_cases"]]
         runner = render_runner(ir, BOUNDARY_SID, HARNESS)
+        self.assertIn("''", runner)  # the apostrophe was doubled
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "harness_fortran_cpu_model.f90").write_text(_HARNESS_STUB)
+            (d / f"{BOUNDARY_SID}_checks.f90").write_text(_CHECKS_STUB)
+            (d / f"{BOUNDARY_SID}_runner.f90").write_text(runner)
+            for srcs in (["harness_fortran_cpu_model.f90"], [f"{BOUNDARY_SID}_checks.f90"],
+                         [f"{BOUNDARY_SID}_runner.f90"]):
+                r = subprocess.run(["gfortran", "-std=f2008", "-c", *srcs],
+                                   cwd=d, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "harness_fortran_cpu_model.f90").write_text(_HARNESS_STUB)
@@ -1015,6 +1162,52 @@ class HarnessPinTest(unittest.TestCase):
                                                          "intent(in) :: tstamp")
         with self.assertRaises(RenderError):
             assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, bad, self.src)
+
+    def test_case_id_len_value_drift_is_caught(self) -> None:
+        # The interface stanzas name the SYMBOL `case_id_len`, never its value, so a harness
+        # recert lowering the width leaves the signature pin green — while this renderer keeps
+        # emitting a 64-wide `case_ids(:)` actual for a 32-wide `intent(out)` dummy. That runner
+        # compiles and then breaks at runtime. Pin the parameter VALUE.
+        bad_src = self.src.replace("integer, parameter :: case_id_len = 64",
+                                   "integer, parameter :: case_id_len = 32")
+        self.assertNotEqual(bad_src, self.src)
+        with self.assertRaises(RenderError) as cm:
+            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, self.sigs, bad_src)
+        self.assertIn("case_id_len", str(cm.exception))
+
+    def test_dp_kind_value_drift_is_caught(self) -> None:
+        # `dp` fixes the kind of every `real(dp)` actual the glue passes.
+        bad_src = self.src.replace("integer, parameter :: dp = real64",
+                                   "integer, parameter :: dp = real32")
+        self.assertNotEqual(bad_src, self.src)
+        with self.assertRaises(RenderError):
+            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, self.sigs, bad_src)
+
+    def test_combined_parameter_declaration_still_pins(self) -> None:
+        # `integer, parameter :: dp = real64, case_id_len = 64` is the same ABI; per-entity
+        # atom matching must accept it rather than false-fail a legal harness.
+        combined = self.src.replace(
+            "  integer, parameter :: dp = real64\n"
+            "  integer, parameter :: case_id_len = 64\n",
+            "  integer, parameter :: dp = real64, case_id_len = 64\n")
+        self.assertNotEqual(combined, self.src)
+        assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, self.sigs, combined)
+
+    def test_one_constant_drives_bound_declaration_and_pin(self) -> None:
+        # Three things must agree, or the case_id bound stops describing the real truncation
+        # width: the `_case_ids` bound, the width the rendered runner declares for its own
+        # `case_ids(:)` buffer, and the parameter value pinned against the certified harness.
+        # All three are `CASE_ID_LEN`; this test is the invariant, stated once.
+        txt = render_runner(self.ir, BOUNDARY_SID, HARNESS)
+        self.assertIn(f"  integer, parameter :: case_id_len = {CASE_ID_LEN}", txt)
+        self.assertIn(f"integer, parameter :: case_id_len = {CASE_ID_LEN}",
+                      _HARNESS_V3_PARAMETERS)
+        over = "c" * (CASE_ID_LEN + 1)
+        ir = copy.deepcopy(self.ir)
+        ir["case"]["test_case_set"][0]["case_id"] = over
+        ir["io_contract"]["test_predicates"][0]["target_cases"] = [over]
+        with self.assertRaises(RenderError):
+            render_runner(ir, BOUNDARY_SID, HARNESS)
 
     def test_source_signature_drift(self) -> None:
         bad_src = self.src.replace(
@@ -1100,6 +1293,62 @@ class GfortranSmokeTest(unittest.TestCase):
             self.assertTrue((d / "raw" / "metrics_basis.json").is_file())
             diag = (d / "diagnostics.json").read_text()
             self.assertIn("input_guard", diag)
+
+    def test_multi_target_runner_compiles_and_emits_one_row_per_case(self) -> None:
+        # The multi-target mb_rows path is otherwise only text-asserted. Compile, link and RUN
+        # it, then parse the emitted metrics_basis.json: the multi-target test must contribute
+        # one entry per target case, each keyed by its own case_id and holding THAT case's
+        # evidence (a wrong `tci` would silently copy one case's values into both rows).
+        ir = copy.deepcopy(_boundary_ir())
+        ir["io_contract"]["test_predicates"][0]["target_cases"] = [
+            "l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass"]
+        runner = render_runner(ir, BOUNDARY_SID, HARNESS)
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "harness_fortran_cpu_model.f90").write_text(_HARNESS_STUB)
+            (d / f"{BOUNDARY_SID}_checks.f90").write_text(_CHECKS_STUB)
+            (d / f"{BOUNDARY_SID}_runner.f90").write_text(runner)
+
+            def fc(*srcs: str) -> None:
+                r = subprocess.run(
+                    ["gfortran", "-std=f2008", "-c", *srcs],
+                    cwd=d, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+            fc("harness_fortran_cpu_model.f90")
+            fc(f"{BOUNDARY_SID}_checks.f90")
+            fc(f"{BOUNDARY_SID}_runner.f90")
+            link = subprocess.run(
+                ["gfortran", "harness_fortran_cpu_model.o",
+                 f"{BOUNDARY_SID}_checks.o", f"{BOUNDARY_SID}_runner.o", "-o", "runner"],
+                cwd=d, capture_output=True, text=True)
+            self.assertEqual(link.returncode, 0, link.stderr)
+
+            (d / "raw" / "state_snapshots").mkdir(parents=True)
+            run = subprocess.run(
+                ["./runner", "--cases", "spec.ir.yaml",
+                 "l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass", "l0_invalid_ny_xfail"],
+                cwd=d, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+
+            mb = json.loads((d / "raw" / "metrics_basis.json").read_text())
+            rows = [(e["test_id"], e["case_id"]) for e in mb["per_test"]]
+            self.assertEqual(rows, [
+                ("l0_periodic_x_wrap_pass", "l0_periodic_x_wrap_pass"),
+                ("l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass"),
+                ("l0_periodic_y_wrap_pass", "l0_periodic_y_wrap_pass"),
+                ("l0_invalid_ny_xfail", "l0_invalid_ny_xfail"),
+            ])
+            # Each row carries ITS OWN case's evidence, not the first case's copied twice.
+            # The checks stub sets `max_abs_deviation` to the case ordinal, so the two rows of
+            # the multi-target test must differ — a wrong `tci` would make them equal.
+            by_row = {r: e for r, e in zip(rows, mb["per_test"])}
+            self.assertEqual(
+                by_row[("l0_periodic_x_wrap_pass", "l0_periodic_x_wrap_pass")]["max_abs_deviation"],
+                1.0)
+            self.assertEqual(
+                by_row[("l0_periodic_x_wrap_pass", "l0_periodic_y_wrap_pass")]["max_abs_deviation"],
+                2.0)
 
     def test_metrics_and_high_rank_runner_compiles_and_runs(self) -> None:
         # The boundary smoke only covers the no-metrics, scalar+rank-2 family. This one

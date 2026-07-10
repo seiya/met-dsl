@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -26152,7 +26153,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # `_validate_metrics_basis_not_trivial` (an all-zero/all-null metrics_basis is rejected)
         # and the `raw/state_snapshots/` placeholder-text scan ("dummy" / "placeholder" /
         # "sample": "state_recorded"). A leaf could not correct against an undocumented gate.
-        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 10400,
+        # Bumped 10400->11000: R3-core — metrics_basis is now indexed by (test_id, case_id),
+        # one entry per case each test targets, and post_execute pins that matrix both ways.
+        # A leaf that emitted one entry per test_id (the old shape) fails post_execute, so the
+        # key + the multi-target rule + the `tests`-object deprecation must be stated here.
+        "docs/workflow/RUNNER_OUTPUT_CONTRACT.md": 11000,
         # R1/M3c-β: the fixed-ABI contract for a physics node's `<spec_id>_checks.f90`
         # (leaf-authored callbacks the host-rendered runner drives). Leaf must-read for
         # every generate LLM leaf (its SKILL branches on whether the node is M3c).
@@ -26164,7 +26169,14 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # (b) §2 gains the `_validate_metrics_basis_not_trivial` rule, because the harness fills
         # metrics_basis.json from THIS module's getters yet an M3c leaf never reads
         # RUNNER_OUTPUT_CONTRACT.md (its scope note excludes it), so §3's copy was unreachable.
-        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 9900,
+        # Bumped 9900->11100: R3-core replaces the M3c-β "single case per test" scope note with
+        # the three rules a multi-target node's checks module cannot be written without —
+        # metrics_basis is the (test_id, case_id) matrix; a cross-case reduction is emitted as a
+        # per-case metric of the case that completes it (read by a `case:` predicate); and the
+        # accumulator may only consume cases whose case_id sorts BEFORE the emitting case's
+        # (argv is sorted). All three lived only in tool code, and an M3c leaf reads this doc,
+        # not RUNNER_OUTPUT_CONTRACT.md.
+        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 11100,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).
         # Bumped 17000->18200: documented the deterministic Compile.static substep (G2,
@@ -26197,7 +26209,22 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # keys, shape_expr form/rank, verdict.fields, distinct case_id, one target case per
         # test_id, embeddable names) + the excluded node-identity ones. Undocumented, these
         # surfaced only as a render fail_closed that kills the workflow (E2E #3, orch …dcf0533e).
-        "docs/workflow/phases/phase_01_compile.md": 30600,
+        # (R3-core superseded the "exactly one target case per test_id" clause of that
+        # precondition; the rule is now "at least one" — see the 30600->32600 note below.)
+        # Bumped 30600->32600: R3-core — the predicate DSL's `case: <case_id>` condition scope
+        # (the only way to read a cross-case reduction), the three-way scope table it completes
+        # (none / per_case / case), and that `target_cases` doubles as the (test_id, case_id)
+        # metrics-basis evidence contract. Without these a Compile leaf cannot author a
+        # multi-target test — the very defect that made E2E #4's shallow_water2d IR unauthorable.
+        # ...and the case_id <= 64 render precondition (the harness `case_id_len`): a longer id
+        # is truncated by `__parse_cases`, so the runner compiles and then error-stops on every
+        # run — a wedge no leaf can repair, and one the 100-column guard does not catch. The
+        # embedded-name precondition also widened to "printable ASCII": Fortran counts BYTES
+        # while every render bound counts code points, so a 64-code-point / 68-byte case_id
+        # reopened the same truncation wedge; and the case_id path-safety token ([A-Za-z0-9._-],
+        # no ".."), because a case_id is concatenated into the snapshot path and `../` escaped
+        # the run directory.
+        "docs/workflow/phases/phase_01_compile.md": 33150,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -26225,7 +26252,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 16700->17000: the time_variable rule now points at the canonical harness
         # render-precondition list in phase_01 (a force-read doc for this leaf) instead of
         # restating a hand-maintained subset here, which could drift from the renderer.
-        "skills/workflow-compile-generate/SKILL.md": 17000,
+        # Bumped 17000->18100: R3-core — the condition-scope choice (none / per_case / `case:`)
+        # and the rule that `target_cases` is also the (test_id, case_id) evidence contract.
+        # This leaf authors test_predicates, so the scope vocabulary must be here.
+        "skills/workflow-compile-generate/SKILL.md": 18100,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
@@ -26272,7 +26302,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # schema-guaranteed field — helpers take bare names), and Fortran identifiers are
         # case-insensitive (a `g`/`G` dummy-vs-output pair is one symbol). Inform-over-prohibit:
         # doc text, not a new gate.
-        "skills/workflow-generate-generate/SKILL.md": 29950,
+        # Bumped 29950->30500: R3-core — a leaf-authored runner (the infra self-test, a legacy
+        # no-harness node) must emit metrics_basis as the (test_id, case_id) matrix, one entry
+        # per case each test targets. The old "one entry per test_id" shape now fails post_execute.
+        "skills/workflow-generate-generate/SKILL.md": 30500,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
@@ -28394,6 +28427,362 @@ class R5ExemplarConductorGatingTests(unittest.TestCase):
         n, attached = self._run("generate", "generate", repair=reuse, resumable=True)
         self.assertEqual(n, 0)
         self.assertFalse(attached)
+
+
+class DependencyFreshnessTests(unittest.TestCase):
+    """R6-lite: a certified node whose RECORDED dependency resolution no longer matches the
+    one the registry derives is stale — not ready — so `--with-deps` re-certifies it.
+
+    This is what makes "a dependency spec was updated, so its dependents are regenerated" a
+    mechanism instead of an operator ritual, and it is why a content-free `spec_version` bump
+    of the dependents is never needed.
+    """
+
+    def _seed(self, repo_root: Path, *, dep_version: str, recorded_dep_version: str | None,
+              sidecar: bool = True) -> None:
+        """`b@0.1.0` depends on `c`; the catalog offers `c@<dep_version>`.
+
+        `recorded_dep_version` is what b's certified `dependency_graph.json` sidecar says it
+        was built against (None → write no sidecar)."""
+        from tools.orchestration_runtime import _load_spec_catalog
+        (repo_root / "spec" / "registry").mkdir(parents=True, exist_ok=True)
+        (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: b\n    spec_version: 0.1.0\n"
+            "    deps_path: spec/component/b/deps.yaml\n"
+            f"  - spec_kind: component\n    spec_id: c\n    spec_version: {dep_version}\n"
+            "    deps_path: spec/component/c/deps.yaml\n",
+            encoding="utf-8",
+        )
+        for ref, body in (
+            ("spec/component/b", "spec_id: b\nspec_kind: component\ndependencies:\n"
+                                 "  components:\n    - component_id: c\n"
+                                 '      version_constraint: ">=0.1.0 <1.0.0"\n'
+                                 "  profiles: []\n"),
+            ("spec/component/c", "spec_id: c\nspec_kind: component\ndependencies:\n"
+                                 "  components: []\n  profiles: []\n"),
+        ):
+            d = repo_root / ref
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "deps.yaml").write_text(body, encoding="utf-8")
+
+        ir_dir = repo_root / "workspace" / "ir" / "component__b__0.1.0" / "b_20260101_001"
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        (ir_dir / "ir_meta.json").write_text(
+            json.dumps({"verification_status": "pass"}), encoding="utf-8")
+        if sidecar and recorded_dep_version is not None:
+            (ir_dir / "dependency_graph.json").write_text(json.dumps({
+                "node_key": "component/b@0.1.0",
+                "all_nodes": [
+                    {"node_key": f"component/c@{recorded_dep_version}", "topo_level": 0},
+                    {"node_key": "component/b@0.1.0", "topo_level": 1},
+                ],
+                "transitive_deps": [],
+                "generated_by": "conductor",
+            }), encoding="utf-8")
+        _load_spec_catalog.cache_clear()
+
+    def test_matching_resolution_is_fresh_and_ready(self) -> None:
+        from tools.orchestration_runtime import (
+            _dependency_resolution_freshness, _verify_dep_stage)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version="0.1.0")
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "b", "0.1.0")
+            self.assertTrue(fresh)
+            self.assertIsNone(detail)
+            self.assertTrue(_verify_dep_stage(repo_root, "component", "b", "0.1.0", "ir_ref"))
+
+    def test_catalog_version_bump_makes_the_dependent_stale(self) -> None:
+        # The harness-0.3.0 scenario: b certified against c@0.1.0, catalog now offers c@0.2.0
+        # (which the `>=0.1.0` constraint still matches, so the resolution moves to it).
+        from tools.orchestration_runtime import (
+            _dependency_resolution_freshness, _verify_dep_stage)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.2.0", recorded_dep_version="0.1.0")
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "b", "0.1.0")
+            self.assertFalse(fresh)
+            self.assertIn("component/c@0.1.0", detail)
+            self.assertIn("component/c@0.2.0", detail)
+            # The single choke point: readiness fails, so `--with-deps` re-runs the node.
+            self.assertFalse(_verify_dep_stage(repo_root, "component", "b", "0.1.0", "ir_ref"))
+
+    def test_dependent_ready_check_mirrors_verify_dep_stage(self) -> None:
+        import tools.run_workflow as run_workflow
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.2.0", recorded_dep_version="0.1.0")
+            node = {"spec_kind": "component", "spec_id": "b", "spec_versions": ["0.1.0"]}
+            self.assertFalse(run_workflow._dependency_node_ready(repo_root, node, ["ir_ref"]))
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version="0.1.0")
+            self.assertTrue(run_workflow._dependency_node_ready(repo_root, node, ["ir_ref"]))
+
+    def test_an_edge_moved_between_direct_and_transitive_is_stale(self) -> None:
+        """Same nodes, same topo_levels, different SHAPE. `a` is certified against
+        `a->b, a->c (+ b->c)`; its deps.yaml then drops the direct `a->c` edge, leaving `c`
+        reachable only through `b`. Heights are 2/1/0 in both shapes, so `all_nodes` alone
+        cannot tell them apart — but `a`'s recorded resolution is no longer reproducible and
+        its IR's `direct_deps` no longer match, so it must re-certify."""
+        from tools.orchestration_runtime import (
+            _dependency_resolution_freshness, _load_spec_catalog, _verify_dep_stage)
+        from tools.dependency_graph import build_dependency_graph
+
+        def seed(root: Path, a_deps: list[str]) -> None:
+            reg = root / "spec" / "registry"
+            reg.mkdir(parents=True, exist_ok=True)
+            reg.joinpath("spec_catalog.yaml").write_text(
+                "catalog_version: 0.2.0\nspecs:\n" + "".join(
+                    f"  - spec_kind: component\n    spec_id: {s}\n    spec_version: 0.1.0\n"
+                    f"    deps_path: spec/component/{s}/deps.yaml\n" for s in ("a", "b", "c")),
+                encoding="utf-8")
+            for spec_id, kids in {"a": a_deps, "b": ["c"], "c": []}.items():
+                d = root / "spec" / "component" / spec_id
+                d.mkdir(parents=True, exist_ok=True)
+                comp = "  components: []\n" if not kids else "  components:\n" + "".join(
+                    f"    - component_id: {k}\n"
+                    '      version_constraint: ">=0.1.0 <1.0.0"\n' for k in kids)
+                (d / "deps.yaml").write_text(
+                    f"spec_id: {spec_id}\nspec_kind: component\ndependencies:\n{comp}"
+                    "  profiles: []\n", encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            seed(repo_root, ["b", "c"])
+            graph, err = build_dependency_graph(
+                repo_root, target_spec_ref="spec/component/a",
+                target_node_key="component/a@0.1.0")
+            self.assertIsNone(err)
+            ir_dir = repo_root / "workspace" / "ir" / "component__a__0.1.0" / "a_20260101_001"
+            ir_dir.mkdir(parents=True)
+            (ir_dir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            (ir_dir / "dependency_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+            self.assertEqual(
+                _dependency_resolution_freshness(repo_root, "component", "a", "0.1.0"),
+                (True, None))
+
+            seed(repo_root, ["b"])  # move a->c from a direct edge to a transitive one
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "a", "0.1.0")
+            self.assertFalse(fresh)
+            self.assertIn("same nodes but a different shape", detail)
+            self.assertIn("component/c@0.1.0", detail)
+            self.assertFalse(_verify_dep_stage(repo_root, "component", "a", "0.1.0", "ir_ref"))
+
+    def test_missing_sidecar_on_a_node_with_dependencies_is_stale(self) -> None:
+        from tools.orchestration_runtime import _dependency_resolution_freshness
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version=None)
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "b", "0.1.0")
+            self.assertFalse(fresh)
+            self.assertIn("records no dependency_graph.json sidecar", detail)
+
+    def test_malformed_sidecar_is_stale(self) -> None:
+        from tools.orchestration_runtime import _dependency_resolution_freshness
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version="0.1.0")
+            (repo_root / "workspace" / "ir" / "component__b__0.1.0" / "b_20260101_001"
+             / "dependency_graph.json").write_text("{ not json", encoding="utf-8")
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "b", "0.1.0")
+            self.assertFalse(fresh)
+            self.assertIn("unreadable or malformed", detail)
+
+    def test_a_leaf_is_fresh_without_a_sidecar(self) -> None:
+        # `c` has no dependencies, so it records no resolution that could drift. Demanding a
+        # sidecar of it would make every leaf permanently stale.
+        from tools.orchestration_runtime import _dependency_resolution_freshness
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version="0.1.0")
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "c", "0.1.0")
+            self.assertTrue(fresh)
+            self.assertIsNone(detail)
+
+    def test_unreadable_closure_is_not_reported_stale(self) -> None:
+        # An unreadable deps.yaml fails closed in its OWN gate. Freshness is a comparison;
+        # with no derivable right-hand side, claiming staleness would mask the real defect.
+        from tools.orchestration_runtime import _dependency_resolution_freshness
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version="0.1.0")
+            (repo_root / "spec" / "component" / "c" / "deps.yaml").unlink()
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "b", "0.1.0")
+            self.assertTrue(fresh)
+            self.assertIsNone(detail)
+
+    def test_irreconcilable_closure_is_stale(self) -> None:
+        # The registry WAS read and yields no valid closure: b's `>=0.1.0` edge to c matches
+        # nothing once the catalog only offers c@0.0.9. b's recorded resolution provably cannot
+        # be reproduced, so it is stale — not "fresh because we could not compare".
+        from tools.orchestration_runtime import (
+            _dependency_resolution_freshness, _load_spec_catalog, _verify_dep_stage)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.0.9", recorded_dep_version="0.1.0")
+            _load_spec_catalog.cache_clear()
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "b", "0.1.0")
+            self.assertFalse(fresh)
+            self.assertIn("no longer resolves", detail)
+            self.assertIn("dependency_unresolvable", detail)
+            self.assertFalse(_verify_dep_stage(repo_root, "component", "b", "0.1.0", "ir_ref"))
+
+    def test_a_cyclic_closure_is_stale(self) -> None:
+        from tools.orchestration_runtime import (
+            _dependency_resolution_freshness, _load_spec_catalog)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version="0.1.0")
+            (repo_root / "spec" / "component" / "c" / "deps.yaml").write_text(
+                "spec_id: c\nspec_kind: component\ndependencies:\n"
+                "  components:\n    - component_id: b\n"
+                '      version_constraint: ">=0.1.0 <1.0.0"\n'
+                "  profiles: []\n", encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "b", "0.1.0")
+            self.assertFalse(fresh)
+            self.assertIn("dependency_cycle", detail)
+
+    def _seed_consumer_a(self, repo_root: Path) -> None:
+        """`a` (problem) depends on the component `b` seeded by `_seed`."""
+        from tools.orchestration_runtime import _load_spec_catalog
+        catalog_path = repo_root / "spec" / "registry" / "spec_catalog.yaml"
+        catalog_path.write_text(
+            catalog_path.read_text(encoding="utf-8")
+            + "  - spec_kind: problem\n    spec_id: a\n    spec_version: 0.1.0\n"
+              "    deps_path: spec/problem/a/deps.yaml\n",
+            encoding="utf-8")
+        a_dir = repo_root / "spec" / "problem" / "a"
+        a_dir.mkdir(parents=True, exist_ok=True)
+        (a_dir / "deps.yaml").write_text(
+            "spec_id: a\nspec_kind: problem\ndependencies:\n"
+            "  components:\n    - component_id: b\n"
+            '      version_constraint: ">=0.1.0 <1.0.0"\n'
+            "  profiles: []\n", encoding="utf-8")
+        _load_spec_catalog.cache_clear()
+
+    def test_stale_details_names_the_drifted_dependency_of_a_consumer(self) -> None:
+        # `a` depends on `b`; `b` is certified but stale. The launch gate turns the opaque
+        # readiness failure into a message naming `b` and the remedy.
+        from tools.orchestration_runtime import _stale_dependency_details
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.2.0", recorded_dep_version="0.1.0")
+            self._seed_consumer_a(repo_root)
+            details = _stale_dependency_details(repo_root, "spec/problem/a")
+            self.assertEqual(len(details), 1, details)
+            self.assertIn("component/b@0.1.0 was certified against", details[0])
+
+    def test_stale_details_ignores_a_dependency_that_never_certified(self) -> None:
+        # An unbuilt dep is "not ready", a distinct condition with a distinct remedy — so it
+        # must not be reported as stale even though its recorded resolution has drifted.
+        from tools.orchestration_runtime import _stale_dependency_details
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.2.0", recorded_dep_version="0.1.0")
+            self._seed_consumer_a(repo_root)
+            (repo_root / "workspace" / "ir" / "component__b__0.1.0" / "b_20260101_001"
+             / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "fail"}), encoding="utf-8")
+            self.assertEqual(_stale_dependency_details(repo_root, "spec/problem/a"), [])
+
+    def test_recursion_error_does_not_crash_readiness(self) -> None:
+        # `build_dependency_graph`'s DFS is recursive. Readiness previously built no graph at
+        # all, so a pathologically deep closure must not turn `_certify_and_collect_dep_artifacts`
+        # (the launch gate's own recomputation) into an uncaught RecursionError.
+        import tools.dependency_graph as dg
+        from tools.orchestration_runtime import _dependency_resolution_freshness
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version="0.1.0")
+
+            def _boom(*_a, **_k):
+                raise RecursionError("maximum recursion depth exceeded")
+
+            with patch.object(dg, "build_dependency_graph", _boom):
+                self.assertEqual(
+                    _dependency_resolution_freshness(repo_root, "component", "b", "0.1.0"),
+                    (True, None))
+
+    def test_ambiguous_catalog_entry_is_stale_not_fresh(self) -> None:
+        # A duplicate catalog entry for one (kind, spec_id)@version pointing at two dirs makes
+        # `resolve_spec_ref_for` return None. Freshness must report that STALE (the registry was
+        # read but resolves no unique dir — a definitive defect the closure driver already
+        # fail-closes on with `dependency_spec_ref_unresolved`), never fresh — else the launch
+        # gate calls the dependency ready while `--with-deps` refuses to run on the same registry.
+        from tools.orchestration_runtime import (
+            _dependency_resolution_freshness, _load_spec_catalog, _verify_dep_stage,
+            _verify_dependency_readiness)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(json.dumps({
+                "specs": [
+                    {"spec_kind": "component", "spec_id": "foo", "spec_version": "1.0.0",
+                     "controlled_spec_path": "spec/a/foo/controlled_spec.md"},
+                    {"spec_kind": "component", "spec_id": "foo", "spec_version": "1.0.0",
+                     "controlled_spec_path": "spec/b/foo/controlled_spec.md"},
+                ]}), encoding="utf-8")
+            parent = repo_root / "spec" / "parent"
+            parent.mkdir(parents=True)
+            (parent / "deps.yaml").write_text(json.dumps({"dependencies": {
+                "components": [{"component_id": "foo", "version_constraint": "==1.0.0"}],
+                "profiles": []}}), encoding="utf-8")
+            ir = repo_root / "workspace" / "ir" / "component__foo__1.0.0" / "foo_20260101_001"
+            ir.mkdir(parents=True)
+            (ir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+
+            fresh, detail = _dependency_resolution_freshness(repo_root, "component", "foo", "1.0.0")
+            self.assertFalse(fresh)
+            self.assertIn("more than one spec directory", detail)
+            self.assertFalse(_verify_dep_stage(repo_root, "component", "foo", "1.0.0", "ir_ref"))
+            self.assertFalse(
+                _verify_dependency_readiness(repo_root, "spec/parent")["ir_ref_verified"])
+
+    def test_pathless_catalog_entry_stays_fresh(self) -> None:
+        # A version-only catalog entry (no deps_path / controlled_spec_path) resolves to ZERO
+        # spec dirs. That is absence, not ambiguity: there is no closure to compare, and it is a
+        # different defect its own gates own — so freshness must NOT manufacture staleness (which
+        # would false fail-close, exactly what broke 24 tests when the two were conflated).
+        from tools.orchestration_runtime import (
+            _dependency_resolution_freshness, _load_spec_catalog)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / "spec" / "registry").mkdir(parents=True)
+            (repo_root / "spec" / "registry" / "spec_catalog.yaml").write_text(json.dumps({
+                "specs": [{"spec_kind": "component", "spec_id": "bar", "spec_version": "1.0.0"}]}),
+                encoding="utf-8")
+            ir = repo_root / "workspace" / "ir" / "component__bar__1.0.0" / "bar_20260101_001"
+            ir.mkdir(parents=True)
+            (ir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            _load_spec_catalog.cache_clear()
+            self.assertEqual(
+                _dependency_resolution_freshness(repo_root, "component", "bar", "1.0.0"),
+                (True, None))
+
+    def test_launch_gate_certification_demotes_a_stale_dependency(self) -> None:
+        # The launch gate recomputes readiness through `_certify_and_collect_dep_artifacts`,
+        # which does NOT route through `_verify_dep_stage` — so freshness must be enforced
+        # there too, else a stale dep still passes `workflow-launch-check` on a single-node run.
+        from tools.orchestration_runtime import _certify_and_collect_dep_artifacts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed(repo_root, dep_version="0.1.0", recorded_dep_version="0.1.0")
+            self._seed_consumer_a(repo_root)
+            fresh_level = _certify_and_collect_dep_artifacts(
+                repo_root, "spec/problem/a")["certified_entries"][0][3]
+            self.assertGreaterEqual(fresh_level, 1)
+
+            self._seed(repo_root, dep_version="0.2.0", recorded_dep_version="0.1.0")
+            self._seed_consumer_a(repo_root)
+            stale_level = _certify_and_collect_dep_artifacts(
+                repo_root, "spec/problem/a")["certified_entries"][0][3]
+            self.assertEqual(stale_level, 0)
 
 
 if __name__ == "__main__":

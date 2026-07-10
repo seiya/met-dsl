@@ -1947,7 +1947,15 @@ def _dependency_node_ready(
     artifact chain across all required stages (the same version V must satisfy
     every stage). Kept module-level so the closure driver uses one consistent
     readiness rule for both the pre-run skip check and the post-run
-    verification."""
+    verification.
+
+    R6-lite rides on the same `_verify_dep_stage` call: its `ir_ref` stage also requires the
+    node's RECORDED dependency resolution (its `dependency_graph.json` sidecar) to match the
+    one today's `deps.yaml` + `spec_catalog.yaml` derive. So a node certified against an older
+    version of one of ITS dependencies (e.g. harness 0.2.1 after the catalog moved to 0.3.0)
+    reports not-ready here and this driver re-runs it — which is how "a dependency spec was
+    updated, so its dependents are regenerated" becomes a mechanism rather than an operator
+    ritual. No content-free version bump of the dependents is required."""
     from tools.orchestration_runtime import _verify_dep_stage
 
     kind, sid = node["spec_kind"], node["spec_id"]

@@ -22,7 +22,19 @@ over the runner's ``diagnostics.json``::
                 op: eq|ne|le|ge|lt|gt|includes
                 value: <scalar|bool|string|list>            # OR {per_case: {<case_id>: value}} for nx-dependent thresholds
                 per_case: <bool>          # optional: resolve `ref` inside each target case's diagnostics slice
+                case: <case_id>           # optional: resolve `ref` inside ONE target case's slice (excl. per_case)
                 na_allowed: <bool>        # optional: a null/absent lhs counts as satisfied (a "not applied" metric)
+
+A multi-target test (a convergence sweep, a base/shifted equivariance pair) ranges its
+``target_cases`` over several cases and picks its scope per condition:
+
+- ``per_case: true`` — the condition must hold in EVERY target case (e.g. positivity at
+  every resolution). Combine with a ``{per_case: {...}}`` value map for a per-case threshold.
+- ``case: <case_id>`` — the condition is resolved in exactly ONE target case's slice. This is
+  how a cross-case reduction is compared: the checks module accumulates across cases and emits
+  the derived metric (``convergence_order``, ``symmetry_h_l2_rel``) as a per-case metric of the
+  case where it first becomes computable, and the predicate reads it there.
+- neither — the condition resolves against the suite-level (top-level) diagnostics object.
 
 A ``ref`` resolves by its HEAD, over the same closed head vocabulary the Compile-stage gate
 (``_check_ref``) validates:
@@ -191,7 +203,11 @@ def _eval_condition(cond: dict[str, Any], diagnostics: dict[str, Any],
 
     A ``per_case`` condition holds iff it holds for EVERY target case; the first
     non-satisfying case fixes the kind (structural if the ref/case was absent, else
-    physics). ``na_allowed`` turns an absent lhs into a satisfied condition."""
+    physics). A ``case: <case_id>`` condition resolves ``ref`` inside that ONE case's
+    diagnostics slice — the scope a cross-case reduction (a convergence order, a
+    symmetry residual) is read at, since the checks module emits it as a per-case metric
+    of the case where it first becomes computable. ``na_allowed`` turns an absent lhs
+    into a satisfied condition."""
     ref = cond.get("ref")
     op = cond.get("op")
     # isinstance guards before the frozenset membership so an unhashable (list/map) op raises a
@@ -201,6 +217,19 @@ def _eval_condition(cond: dict[str, Any], diagnostics: dict[str, Any],
     per_case = bool(cond.get("per_case"))
     na_allowed = bool(cond.get("na_allowed"))
     value = cond.get("value")
+    # Keyed on PRESENCE, not on a non-None value: the schema gate rejects `case: null`, so the
+    # evaluator must too. Reading it as "absent" would silently widen the condition to
+    # suite-level scope — evaluating different data than the author wrote.
+    has_case = "case" in cond
+    case_sel = cond.get("case")
+    if has_case and (not isinstance(case_sel, str) or not case_sel.strip()):
+        raise PredicateError(f"condition `case` must be a non-empty string (got {case_sel!r})")
+    if per_case and has_case:
+        # `per_case` ranges over EVERY target case; `case` pins ONE. Together they express
+        # nothing coherent, and silently honoring one would evaluate a scope the author did
+        # not write. The Compile schema gate rejects the pair; this is the evaluator's mirror.
+        raise PredicateError(
+            f"condition sets both per_case and case={case_sel!r} (mutually exclusive scopes)")
 
     contexts: list[tuple[str | None, Any, bool]]
     if per_case:
@@ -215,6 +244,10 @@ def _eval_condition(cond: dict[str, Any], diagnostics: dict[str, Any],
         for cid in target_cases:
             present, sl = _case_slice(diagnostics, cid)
             contexts.append((cid, sl, present))
+    elif has_case:
+        cid = case_sel.strip()
+        present, sl = _case_slice(diagnostics, cid)
+        contexts = [(cid, sl, present)]
     else:
         contexts = [(None, diagnostics, True)]
 
@@ -429,6 +462,25 @@ def validate_predicate_schema(
             # gate instead of reporting an actionable violation for warm-resume repair.
             if not isinstance(op, str) or op not in _OPS:
                 v.append(f"{cloc}.op must be one of {sorted(_OPS)}")
+            # `case: <case_id>` pins the condition to ONE of the predicate's own target cases.
+            # It must name a case this predicate ranges over (a case outside `target_cases` is
+            # evidence the predicate does not own — the metrics-basis matrix would not carry it),
+            # and it is mutually exclusive with `per_case` (which ranges over all of them).
+            if "case" in cond:
+                case_sel = cond.get("case")
+                # Compare against — and report — the same list: the STRING members of
+                # `target_cases`. Stringifying a non-str member only for the message would print
+                # the offending case as if it were present ("'123' is not one of ['123', 'c2']").
+                # A non-str `target_cases` member is separately reported as an unknown case_id.
+                str_targets = [c for c in targets if isinstance(c, str)]
+                if not isinstance(case_sel, str) or not case_sel.strip():
+                    v.append(f"{cloc}.case must be a non-empty string")
+                elif case_sel not in str_targets:
+                    v.append(f"{cloc}.case {case_sel!r} is not one of this predicate's "
+                             f"target_cases ({sorted(str_targets)})")
+                if bool(cond.get("per_case")):
+                    v.append(f"{cloc} sets both `per_case` and `case` "
+                             "(mutually exclusive condition scopes)")
             if "value" not in cond or cond.get("value") is None:
                 # Every op needs a concrete rhs. A condition with no `value` (or an explicit
                 # null) would compare against None at execute and permanently fail its test —

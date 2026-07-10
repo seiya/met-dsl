@@ -132,6 +132,7 @@ io_contract:
             # WITH a decimal point: `1.0e-10` (NOT `1e-10`, which YAML 1.1 parses as a string and
             # the --stage compile gate rejects). `includes` takes a list-member literal.
             per_case: false                 # optional: resolve `ref` inside each target case's diagnostics slice
+            case: "<case_id>"               # optional: resolve `ref` inside ONE target case's slice (excludes per_case)
             na_allowed: false               # optional: a null/absent lhs counts as satisfied (a "not applied" metric)
   # test_predicates ref vocabulary (all resolvable at --stage compile):
   #   verdict.<field>   -> a diagnostics_contract.verdict.fields entry (overall/failed_checks)
@@ -139,6 +140,17 @@ io_contract:
   #   <metric address>  -> any other head (metrics.*/errors.*/cfl.*/convergence.*) MUST be pinned in
   #                        diagnostics_contract.metrics (below). The runner emits every numeric judgment
   #                        already reduced to a field, so predicates do no arithmetic.
+  # condition scope — the three ways a multi-target test compares its evidence:
+  #   (none)            -> resolve `ref` against the suite-level (top-level) diagnostics object.
+  #   per_case: true    -> the condition must hold in EVERY target case. Combine with a
+  #                        {per_case: {<case_id>: v}} value map when the threshold varies per case
+  #                        (e.g. an nx-dependent error bound). The map must cover every target case.
+  #   case: <case_id>   -> the condition is resolved in exactly ONE target case's slice; the case must
+  #                        be a member of this predicate's own target_cases, and it excludes per_case.
+  #                        This is how a CROSS-CASE reduction is read: the checks module accumulates
+  #                        across cases and emits the derived metric (convergence order, symmetry
+  #                        residual) as a per-case metric of the case where it first becomes computable
+  #                        (CHECKS_MODULE_CONTRACT.md §2/§3), and the predicate compares it there.
   # diagnostics_contract.metrics (OPTIONAL): per-case metric addresses the predicates reference; the
   # intermediate per-case addressing pin for problem specs (until R1 fixes the harness output shape). e.g.
   #   metrics: ["cfl.max", "metrics.mass_drift_rel", "errors.analytic_h.l2_rel_tend", "convergence.n32_to_n64.analytic_h_order"]
@@ -237,7 +249,8 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 - `io_contract.diagnostics_contract.checks[].id` covers every `checks.<id>` key named in `tests.md §3` (neither more nor less).
 - When any `tests.md §4` test's `pass_when` references `verdict.*`, `io_contract.diagnostics_contract.verdict.required=true` and `verdict.fields` covers the referenced keys (e.g. `overall` / `failed_checks`). When no test references `verdict.*`, `verdict.required=false` is allowed.
 - `io_contract.semantic_dependency.required_sources` is a non-empty string array.
-- **`io_contract.test_predicates` (R2) faithfully encodes every `tests.md §6/§7` pass rule.** The `--stage compile` gate (`_validate_test_predicates` → `verdict_evaluator.validate_predicate_schema`) enforces the schema mechanically (op/outcome enums, non-empty `pass_when.all`, `target_cases ⊆ case.test_case_set`, `ref` resolves against the declared `verdict.fields` / `checks[].id` / `diagnostics_contract.metrics` vocabulary, `test_id` set == `tests.md`); this V3 invariant is the SEMANTIC check `Compile.verify` owns: each predicate's conjunction is a truthful translation of that test's prose judgment (correct `op`/threshold direction, the right check/metric `ref`, per-case thresholds matching the nx map, `na_allowed` only where `tests.md` marks the metric "not applied"). A schema-valid but semantically-wrong predicate (e.g. `ge` where the prose says `le`) is a V3 `fail` — this is where the judge-time nondeterminism R2 removed becomes a reviewable compile-time artifact.
+- **`io_contract.test_predicates` (R2) faithfully encodes every `tests.md §6/§7` pass rule.** The `--stage compile` gate (`_validate_test_predicates` → `verdict_evaluator.validate_predicate_schema`) enforces the schema mechanically (op/outcome enums, non-empty `pass_when.all`, `target_cases ⊆ case.test_case_set`, a `case:` selector that is one of the predicate's own `target_cases` and is not combined with `per_case`, `ref` resolves against the declared `verdict.fields` / `checks[].id` / `diagnostics_contract.metrics` vocabulary, `test_id` set == `tests.md`); this V3 invariant is the SEMANTIC check `Compile.verify` owns: each predicate's conjunction is a truthful translation of that test's prose judgment (correct `op`/threshold direction, the right check/metric `ref`, per-case thresholds matching the nx map, `na_allowed` only where `tests.md` marks the metric "not applied"), **and each condition carries the scope the prose asks for** — `per_case` for "in every case", `case:` for a cross-case reduction read at the case that completes it, neither for a suite-level fact. A schema-valid but semantically-wrong predicate (e.g. `ge` where the prose says `le`, or a per-case bound written suite-level) is a V3 `fail` — this is where the judge-time nondeterminism R2 removed becomes a reviewable compile-time artifact.
+- **`target_cases` is also the evidence contract.** The runner records one `raw/metrics_basis.json` entry per (`test_id`, target `case_id`) pair, and `post_execute` pins that matrix in both directions. So a test's `target_cases` must list every case its judgment actually reads — a convergence sweep names all its resolutions, an equivariance test both members of the pair — and no case it does not.
 
 #### V4. dependency consistency
 The derived-closure invariants (former V4a `direct∪transitive == all_nodes`, V4b
@@ -268,9 +281,9 @@ These deterministic gates run in the conductor's `Compile.static` substep (`_com
     - no snapshot variable is named `t` / `case_id` / `step` (harness-reserved snapshot keys);
     - every snapshot variable a case emits declares `shape_expr` as `scalar` or the bracket form `[d1, ...]` of rank 1–4; the `(d1, ...)` paren form this grammar otherwise permits is rejected, as is rank > 4;
     - `diagnostics_contract.checks[]` is non-empty and `verdict.fields` ⊆ `{overall, failed_checks}` — the harness fold builds only those records;
-    - `case.test_case_set[]` is non-empty with pairwise-distinct `case_id` (duplicates render overlapping `select case` labels);
-    - `test_evidence_requirements[]` is non-empty, each `required_raw_variables` entry is a `state_snapshots` schema variable, and each `test_id` is targeted by exactly one distinct case across `test_predicates[].target_cases` (a multi-target metrics-basis test is outside the M3c-β renderer scope — `CHECKS_MODULE_CONTRACT.md` §2);
-    - no name the renderer embeds in the runner (`case_id`, snapshot variable, metric address, `test_id`, `target.class`) holds a control character, and no rendered line exceeds 100 columns — an over-long IR-sourced name is rejected rather than emitted as an unlintable runner.
+    - `case.test_case_set[]` is non-empty with pairwise-distinct `case_id`s (duplicates render overlapping `select case` labels), each ≤ 64 chars — the harness `case_id_len`, which `__parse_cases` truncates a longer id to, so the `select case` label could never match and every run would `error stop` despite compiling — and each matching `[A-Za-z0-9._-]` with no `..`: a case_id is concatenated into the per-case snapshot path (`raw/state_snapshots/<case_id>.json`), so a `/` or `..` would let the run write outside its directory;
+    - `test_evidence_requirements[]` is non-empty, each `required_raw_variables` entry is a `state_snapshots` schema variable, and each `test_id` is targeted by at least one case across `test_predicates[].target_cases` (a test with no target case has no metrics-basis row to record). A multi-target test is fully supported: the renderer emits one metrics-basis entry per (`test_id`, target `case_id`) pair — `CHECKS_MODULE_CONTRACT.md` §2;
+    - every name the renderer embeds in the runner (`case_id`, snapshot variable, metric address, `test_id`, `target.class`) is printable ASCII — a control character has no Fortran literal form, and a non-ASCII character makes the Fortran byte length disagree with the code-point length every render bound is measured in — and no rendered line exceeds 100 columns, so an over-long IR-sourced name is rejected rather than emitted as an unlintable runner.
   - Node-**identity** preconditions are excluded from that gate because re-authoring the IR cannot repair them: `spec_id` ≤ 55 characters (which keeps the derived `<spec_id>_runner` / `_checks` / `_model` identifiers within the f2008 63-character limit), and exactly one `infrastructure` direct dependency. The `spec_id` bound is enforced at spec-input and re-asserted at the render backstop; a node declaring more than one `infrastructure` dependency is not an M3c node, so its runner is never host-rendered.
 
 ## On-failure behavior

@@ -134,7 +134,7 @@ Place **0. Meta information** at the top. The subsequent sections are fixed per 
 - Required statement: state the `<spec_id>__*` operations a physics-node runner calls (e.g. case-set parse, per-case snapshot/JSON writers, rank-N array emitters, perf/diagnostics/metrics_basis writers), with each operation's argument roles.
 
 3. **Runner output contract produced**
-- Required statement: state the `diagnostics.json` / `perf.json` / `raw/*` (snapshot / `metrics_basis.json`) shapes the harness emits, and the numeric/boolean descriptor rules (per `docs/workflow/RUNNER_OUTPUT_CONTRACT.md`).
+- Required statement: state the `diagnostics.json` / `perf.json` / `raw/*` (snapshot / `metrics_basis.json`) shapes the harness emits, and the numeric/boolean descriptor rules (per `docs/workflow/RUNNER_OUTPUT_CONTRACT.md`). The `metrics_basis.json` index is keyed by (`test_id`, `case_id`) — one flat entry per case each test targets — so state which record component carries the `case_id`.
 
 4. **Failure conditions and constraints**
 - Required statement: state the guard behaviors (e.g. missing `--cases` aborts) and the invariants the harness enforces.

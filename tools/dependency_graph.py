@@ -34,8 +34,16 @@ def build_dependency_graph(
     *,
     target_spec_ref: str,
     target_node_key: str,
+    include_via: bool = True,
 ) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
     """Build the derived dependency graph for ``target_node_key``.
+
+    ``include_via=False`` returns the same ``all_nodes`` and the same ``transitive_deps``
+    membership, but leaves each ``via`` an empty list. Only the sidecar author needs the
+    ``via`` paths, and ``via_for`` enumerates every simple path — exponential on a wide
+    diamond closure. The R6-lite freshness comparison
+    (``orchestration_runtime._dependency_resolution_freshness``) needs the node sets but not
+    the paths, so skipping ``via`` keeps readiness linear in the closure size.
 
     Returns ``(graph, error)``:
       - ``graph``: on success, the sidecar dict
@@ -251,12 +259,13 @@ def build_dependency_graph(
         dfs(target_spec_ref)
         return list(best) if best is not None else []
 
+    # Membership is a cheap set difference; only `via_for` (simple-path enumeration) is costly.
     transitive: list[dict[str, Any]] = []
     for ref in done:
         nk = node_key_of(ref)
         if nk == self_nk or nk in direct_nks:
             continue
-        transitive.append({"node_key": nk, "via": via_for(ref)})
+        transitive.append({"node_key": nk, "via": via_for(ref) if include_via else []})
     transitive.sort(key=lambda d: d["node_key"])
 
     graph = {

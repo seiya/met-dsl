@@ -914,8 +914,14 @@ class LegacyLaunchPromptMarkerTests(unittest.TestCase):
         self.assertEqual(missing_en, [], f"english prompt rejected: {missing_en}")
 
 
-def _seed_metrics_basis_per_test_tree(repo_root: Path, metrics_basis: object) -> None:
-    """Seed a tree whose contract demands raw variables `h` and `time` for `test_a`."""
+def _seed_metrics_basis_per_test_tree(
+    repo_root: Path, metrics_basis: object, target_cases: list[str] | None = None
+) -> None:
+    """Seed a tree whose contract demands raw variables `h` and `time` for `test_a`.
+
+    `target_cases` is `test_a`'s predicate range — the (test_id, case_id) evidence rows the
+    metrics_basis is checked against. Defaults to the single-target `["case_a"]`."""
+    target_cases = ["case_a"] if target_cases is None else list(target_cases)
     _seed_shape_expr_schema_into(repo_root)
     tests_path = (
         repo_root
@@ -986,9 +992,115 @@ end program shallow_water2d_runner
                     "required_raw_variables": ["h", "time"],
                 }
             ],
+            # The (test_id, case_id) evidence matrix is anchored on target_cases, so a
+            # metrics_basis fixture must name the case each of its entries came from.
+            "test_predicates": [
+                {
+                    "test_id": "test_a",
+                    "expected_outcome": "pass",
+                    "target_cases": target_cases,
+                    "pass_when": {
+                        "all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]
+                    },
+                }
+            ],
         },
         metrics_basis=metrics_basis,
     )
+
+
+class MetricsBasisEvidenceMatrixTests(unittest.TestCase):
+    """R3-core: post_execute pins metrics_basis against the (test_id, target case_id) product.
+
+    The anchor is `io_contract.test_predicates[].target_cases` — the same field the
+    host-rendered runner emits its entries from (`runner_renderer._target_cases`), so the
+    gate mirrors the renderer instead of guessing.
+    """
+
+    _VARS = {"h": [[1.0, 1.0], [1.0, 1.0]], "time": 0.5}
+
+    def _violations_for(self, metrics_basis: object,
+                        target_cases: list[str] | None = None) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_metrics_basis_per_test_tree(repo_root, metrics_basis, target_cases)
+            return validate(repo_root=repo_root, workspace_root="workspace")
+
+    @classmethod
+    def _entry(cls, case_id: str) -> dict:
+        return {"test_id": "test_a", "case_id": case_id, **cls._VARS}
+
+    def _matrix_violations(self, violations: list[str]) -> list[str]:
+        return [v for v in violations if "per-test evidence for (test_id, case_id)" in v
+                or "per-test evidence (test_id, case_id)" in v]
+
+    def test_multi_target_test_needs_one_entry_per_target_case(self) -> None:
+        v = self._violations_for(
+            {"per_test": [self._entry("case_a"), self._entry("case_b")]},
+            target_cases=["case_a", "case_b"])
+        self.assertEqual(self._matrix_violations(v), [], v)
+
+    def test_missing_row_is_rejected(self) -> None:
+        # The old shape — one entry per test_id — silently dropped the second case.
+        v = self._violations_for({"per_test": [self._entry("case_a")]},
+                                 target_cases=["case_a", "case_b"])
+        matched = [x for x in v if "missing per-test evidence for (test_id, case_id)" in x]
+        self.assertEqual(len(matched), 1, v)
+        self.assertIn("('test_a', 'case_b')", matched[0])
+
+    def test_extra_row_is_rejected(self) -> None:
+        v = self._violations_for(
+            {"per_test": [self._entry("case_a"), self._entry("case_ghost")]},
+            target_cases=["case_a"])
+        matched = [x for x in v if "unknown per-test evidence (test_id, case_id)" in x]
+        self.assertEqual(len(matched), 1, v)
+        self.assertIn("('test_a', 'case_ghost')", matched[0])
+
+    def test_entry_without_case_id_is_rejected(self) -> None:
+        v = self._violations_for({"per_test": [{"test_id": "test_a", **self._VARS}]})
+        self.assertTrue(any("must carry a non-empty `case_id`" in x for x in v), v)
+
+    def test_duplicate_test_case_pair_is_rejected(self) -> None:
+        v = self._violations_for(
+            {"per_test": [self._entry("case_a"), self._entry("case_a")]})
+        self.assertTrue(
+            any("duplicated (test_id, case_id) ((test_a, case_a))" in x for x in v), v)
+
+    def test_tests_object_form_cannot_express_a_multi_target_test(self) -> None:
+        # Keyed by test_id, it physically cannot hold both rows. Say that, rather than
+        # reporting the second row as merely "missing".
+        v = self._violations_for(
+            {"tests": {"test_a": {"case_id": "case_a", **self._VARS}}},
+            target_cases=["case_a", "case_b"])
+        matched = [x for x in v if "deprecated `tests` object form" in x]
+        self.assertEqual(len(matched), 1, v)
+        self.assertIn("emit a `per_test` LIST with one entry per (test_id, case_id)", matched[0])
+        # It is reported INSTEAD of a bare missing-row message, not alongside it.
+        self.assertEqual(self._matrix_violations(v), [], v)
+
+    def test_tests_object_keys_that_normalize_to_one_test_id_are_rejected(self) -> None:
+        # JSON object keys are unique as written, but this reader strips them, so `"test_a"`
+        # and `" test_a "` name one entry. Silently keeping the last would let a malformed row
+        # (here, the one missing `time`) vanish.
+        v = self._violations_for({"tests": {
+            "test_a": {"case_id": "case_a", "h": self._VARS["h"]},
+            " test_a ": {"case_id": "case_a", **self._VARS},
+        }})
+        self.assertTrue(
+            any("tests has duplicated (test_id, case_id) ((test_a, case_a))" in x for x in v), v)
+
+    def test_tests_object_form_still_accepted_for_a_single_target_test(self) -> None:
+        v = self._violations_for({"tests": {"test_a": {"case_id": "case_a", **self._VARS}}})
+        self.assertEqual(self._matrix_violations(v), [], v)
+        self.assertEqual([x for x in v if "deprecated `tests` object form" in x], [], v)
+
+    def test_test_with_no_target_case_is_reported_not_silently_dropped(self) -> None:
+        # Without target_cases the expected rows cannot be derived; reporting them as
+        # "unknown" entries instead would blame the runner for an IR defect.
+        v = self._violations_for({"per_test": [self._entry("case_a")]}, target_cases=[])
+        self.assertTrue(
+            any("no io_contract.test_predicates[].target_cases" in x for x in v), v)
+        self.assertEqual(self._matrix_violations(v), [], v)
 
 
 class MetricsBasisWrapperGuidanceTests(unittest.TestCase):
@@ -1003,7 +1115,7 @@ class MetricsBasisWrapperGuidanceTests(unittest.TestCase):
     """
 
     _MISSING_PREFIX = (
-        "metrics_basis.json: test_id test_a missing required_raw_variables"
+        "metrics_basis.json: test_id test_a case_id case_a missing required_raw_variables"
     )
 
     def _violations_for(self, metrics_basis: object) -> list[str]:
@@ -1018,6 +1130,7 @@ class MetricsBasisWrapperGuidanceTests(unittest.TestCase):
                 "per_test": [
                     {
                         "test_id": "test_a",
+                        "case_id": "case_a",
                         "values": {
                             "h": [[1.0, 1.0], [1.0, 1.0]],
                             "time": 0.5,
@@ -1041,6 +1154,7 @@ class MetricsBasisWrapperGuidanceTests(unittest.TestCase):
                 "per_test": [
                     {
                         "test_id": "test_a",
+                        "case_id": "case_a",
                         "aa": {"h": [[1.0, 1.0], [1.0, 1.0]]},
                         "zz": {"time": 0.5},
                     }
@@ -1061,6 +1175,7 @@ class MetricsBasisWrapperGuidanceTests(unittest.TestCase):
                 "per_test": [
                     {
                         "test_id": "test_a",
+                        "case_id": "case_a",
                         "raw_variables": {"h": [[1.0, 1.0], [1.0, 1.0]]},
                     }
                 ]
@@ -1079,6 +1194,7 @@ class MetricsBasisWrapperGuidanceTests(unittest.TestCase):
                         "per_test": [
                             {
                                 "test_id": "test_a",
+                                "case_id": "case_a",
                                 field_name: {
                                     "h": [[1.0, 1.0], [1.0, 1.0]],
                                     "time": 0.5,
@@ -1097,6 +1213,7 @@ class MetricsBasisWrapperGuidanceTests(unittest.TestCase):
                 "per_test": [
                     {
                         "test_id": "test_a",
+                        "case_id": "case_a",
                         "h": [[1.0, 1.0], [1.0, 1.0]],
                         "time": 0.5,
                     }
@@ -5765,6 +5882,7 @@ end program shallow_water2d_runner
                     "test_evidence_requirements": [
                         {
                             "test_id": "test_a",
+                            "case_id": "case_a",
                             "required_raw_variables": ["h", "time"],
                         },
                         {
@@ -5792,6 +5910,7 @@ end program shallow_water2d_runner
                     "per_test": [
                         {
                             "test_id": "test_a",
+                            "case_id": "case_a",
                             "raw_variables": {
                                 "h": [[1.0, 1.0], [1.0, 1.0]],
                             },
@@ -5801,7 +5920,7 @@ end program shallow_water2d_runner
             )
             violations = validate(repo_root=repo_root, workspace_root="workspace")
             self.assertTrue(
-                any("metrics_basis.json: test_id test_a missing required_raw_variables (['time'])" in v for v in violations)
+                any("metrics_basis.json: test_id test_a case_id case_a missing required_raw_variables (['time'])" in v for v in violations)
             )
 
     def test_detects_snapshot_shape_mismatch_against_io_contract(self) -> None:
@@ -7471,6 +7590,43 @@ end program shallow_water2d_runner
             v = self._compile_with_io_contract(
                 Path(tmp), self._io_contract_with_predicates(preds))
             self.assertEqual(v, [])
+
+    def test_validate_compile_stage_rejects_a_traversal_case_id(self) -> None:
+        # Wiring test: a traversal case_id must be rejected THROUGH the full compile stage
+        # (`_validate_case_ids` is called from `_validate_compile_stage_impl`), not only when the
+        # gate is invoked directly. This is the non-M3c path — the minimal tree declares no
+        # infrastructure dep, so the M3c render precondition does not fire.
+        preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
+                  "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+                io_contract=self._io_contract_with_predicates(preds),
+                dependency_resolved={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+                    "transitive_deps": [], "topo_level": 1,
+                    "all_nodes": [
+                        {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
+                         "topo_level": 0},
+                        {"node_key": "problem/shallow_water2d@0.3.0", "topo_level": 1}]},
+            )
+            ir_path = (repo_root / "workspace/ir/problem__shallow_water2d__0.3.0"
+                       "/shallow-water2d_20260415_001/spec.ir.yaml")
+            doc = json.loads(ir_path.read_text())
+            doc["case"] = {"test_case_set": [{"case_id": "c1", "inputs": {}},
+                                             {"case_id": "../../evil", "inputs": {}}]}
+            ir_path.write_text(json.dumps(doc))
+            v = validate_compile_stage(
+                repo_root, "workspace",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001")
+            self.assertTrue(any("not safe tokens" in x and "raw/state_snapshots" in x for x in v), v)
 
     def _compile_with_io_contract(self, repo_root: Path, io_contract: dict):
         _seed_shape_expr_schema_into(repo_root)
@@ -12629,6 +12785,38 @@ class HarnessDependencyConsistencyTests(unittest.TestCase):
     def test_missing_target_class(self) -> None:
         v = self._run(hw_class="")
         self.assertTrue(any("cannot derive the expected harness id" in x for x in v), v)
+
+
+class CaseIdGrammarGateTests(unittest.TestCase):
+    """`_validate_case_ids` (compile stage): a case_id becomes the per-case snapshot PATH
+    (`raw/state_snapshots/<case_id>.json`) for EVERY node kind, so a `/` or `..` lets the run
+    write outside its directory. Unlike the M3c render precondition, this gate applies to
+    non-M3c (leaf-authored-runner) nodes too — the wider surface the review found open."""
+
+    def _run(self, case_ids: list) -> list[str]:
+        ir = {"case": {"test_case_set": [{"case_id": c} for c in case_ids]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp)
+            (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(ir))
+            v: list[str] = []
+            vps._validate_case_ids(ir_dir, v)
+            return v
+
+    def test_safe_ids_pass(self) -> None:
+        self.assertEqual(self._run(["c_a", "l0_v1.2-alpha", "n032", "case.dry_state"]), [])
+
+    def test_traversal_and_separator_rejected(self) -> None:
+        for bad in ("../../evil", "a/b", "..", "a..b", "x\\y", "l0_café"):
+            with self.subTest(bad=bad):
+                v = self._run(["c_ok", bad])
+                self.assertEqual(len(v), 1, v)
+                self.assertIn(repr(bad.strip()), v[0])
+                self.assertIn("raw/state_snapshots", v[0])
+
+    def test_applies_without_any_infrastructure_dep(self) -> None:
+        # The IR here has no `dependency` block at all (a non-M3c node), yet the gate fires —
+        # this is the gap `_validate_harness_render_preconditions` (M3c-only) left open.
+        self.assertEqual(len(self._run(["../escape"])), 1)
 
 
 class HarnessRenderPreconditionsTests(unittest.TestCase):
