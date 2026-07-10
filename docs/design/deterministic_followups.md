@@ -1696,3 +1696,60 @@ and the dedup / strip dropped all failing distinct tests; the routing split (M3c
 `HOST_RENDERED_RUNNER_UNREPAIRABLE` pinned as a literal so an over-inclusive edit cannot make the
 value-domain test vacuous; the C2 counter reset (dropping it sends the next value defect to the
 findings-less reopen); and the B2 deriver rejecting the new `_ir` reason.
+
+## B4 — the dev resume directive must not inject stale findings (IMPLEMENTED 2026-07-10)
+
+Found by the first live firing of B2, during billed dev E2E #4 (orch `…075057Z_89f9f59a`). The B3 gate
+fix landed as `852493a`; the operator then resumed the orchestration that had fail_closed under
+`81b9a63`. B2 behaved exactly as designed — it derived the directive, reopened Generate, warm-resumed
+the producer session, and rendered the failing gate's `failure_excerpt` into the slim repair prompt.
+The excerpt was the OLD gate's violation text. Reasoning from it as ground truth, the leaf concluded
+"Validate.execute's deliverable gate pins each snapshot against the declared `schema.variables` set, so
+no per-case snapshot can ever satisfy it … unsatisfiable in the leaf's write scope", declined to fabricate
+a repair, and attributed the defect to the IR. `generate.verify` graded that `critical`, F1 fail_closed
+as `dev_verify_critical`, and one Generate cycle was spent on a defect that no longer existed. Every
+component was correct; the input was false.
+
+The failure mode is general: a repair leaf treats injected findings as ground truth, so findings that
+outlive the source that produced them are worse than no findings at all — a blind restart re-derives
+reality, while a misinformed warm repair confidently does not.
+
+1. **Stamp.** `_execute_inproc` records `repo_revision` (`{commit, dirty}`, via the existing
+   `_capture_repo_revision`) into `trial_meta.json`, beside the `failure_excerpt` B1 already writes there.
+   No new file — a field on an artifact the execute substep already owns and `_validate_trial_meta`
+   already tolerates (it checks required fields, not an exact key set).
+2. **Gate.** `_derive_dev_validate_execute_resume_directive` reads the failing run's `trial_meta.json`
+   (resolved through its `launches/<arid>.request.json#allowed_output_paths`, as before) and emits the
+   directive only when that stamp equals the revision at resume time. An unreadable trial_meta, an
+   unstamped one (a pre-B4 run), or a repo that is not a git checkout all leave freshness unprovable, so
+   all decline.
+3. **The trigger must be the NEWEST execute attempt, not the one `failure_analysis.json` names.** The
+   canonical analysis is written once (`_atomic_write_json_exclusive`) at the first failure and preserved
+   across resumes, so `failed_agent_run` names the FIRST failing run forever. The deriver previously read
+   it first, which would have compared that run's stale stamp on every later resume and declined
+   permanently — converting the deadlock-breaker into the deadlock, precisely in the case this directive
+   exists for (a structural failure that still needs a Generate reopen after the source change).
+   `_dev_execute_failure_arid` therefore scans `agent_runs.jsonl` in append order and takes the newest
+   `validate.execute` substep run, declining when it passed (nothing to repair) or was already superseded
+   by a reopen. That record is also what `reopen_phase` validates the trigger against.
+4. **Why the stamp lives on the failing run, and why that makes the guard self-correcting.**
+   `orchestration_meta.repo_revision` is captured at the orchestration's FIRST start and deliberately
+   preserved across resumes (provenance), so comparing against it would diverge permanently after any
+   commit lands mid-run. The per-run stamp plus the newest-run trigger give the guard its liveness
+   property: when it declines, the plain resume re-runs the deterministic Validate.execute under the
+   current source, which either passes (the fix worked — and it costs no Generate cycle at all) or fails
+   again and appends a freshly-stamped attempt, so the NEXT resume's directive fires with truthful
+   findings. This is also what migrates an in-flight pre-B4 run, whose first `trial_meta` carries no stamp
+   at all: one deterministic re-run and the directive is live again.
+5. **Equality, not cleanliness.** A same-commit dirty-to-dirty resume still fires. Declining on `dirty`
+   alone could never self-correct — the re-run would re-stamp `dirty` again and decline forever, restoring
+   the deadlock B2 exists to break. The residual gap is a working tree edited between the failure and the
+   resume without a commit: `{commit, dirty}` compares equal and the findings are injected anyway. Closing
+   it would need a content digest of the dirty tree, which `_capture_repo_revision` does not compute.
+   Commit the fix before resuming when the findings must be invalidated.
+
+Replaying the incident against the guarded deriver returns `None` where it previously returned a directive
+carrying 1334 characters of stale findings. Suite green (2234); mutation-checked — removing the guard,
+removing the stamp, excluding `dirty` from the comparison, resolving the trigger from the FIRST execute
+run instead of the newest (the frozen-analysis bug), and dropping the newest-run-passed check each fail a
+distinct test.

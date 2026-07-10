@@ -4667,6 +4667,23 @@ class DeterministicBuildTest(unittest.TestCase):
             self.assertEqual(meta["failure_category"], "quality_check_mismatch")
             self.assertIn("[execute fail]", meta["failure_excerpt"])
 
+    def test_execute_inproc_stamps_the_repo_revision(self) -> None:
+        """B4: the revision that produced this run's evidence is recorded beside the excerpt, so
+        the dev resume directive can refuse to inject findings a later source change invalidated.
+        Stamped on the failing RUN (not read from orchestration_meta, which freezes at first
+        start), which is what lets the guard self-correct after a re-run."""
+        import tempfile
+        from unittest import mock
+        rev = {"commit": "c" * 40, "dirty": False}
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("tools.orchestration_runtime._capture_repo_revision",
+                            return_value=dict(rev)):
+                _o, meta = self._b1_execute(Path(td), self._B1_IR_MINIMAL,
+                                            gate_result=(1, "post_execute: bad shape"),
+                                            matching_diagnostics=True)
+            self.assertEqual(meta["repo_revision"], rev)
+            self.assertEqual(meta["failure_category"], "post_execute_violation")
+
     def test_execute_inproc_records_snapshot_deliverable_gap(self) -> None:
         # Gates clean and quality_check clean; the IR requires a per-case state snapshot the
         # runner never wrote -> snapshot_deliverable_gap, and the gap message is the excerpt.

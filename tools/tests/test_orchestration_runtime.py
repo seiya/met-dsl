@@ -26479,15 +26479,27 @@ class ReopenPhaseTest(unittest.TestCase):
 
 class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
     """B2: a dev `--resume` after F1 fail_closed a structural validate.execute failure
-    derives a directive that reopens Generate and carries the gate's violation text."""
+    derives a directive that reopens Generate and carries the gate's violation text.
+    B4: only when that text was produced by the source the repair will run against."""
 
     NODE_KEY = "component/foo@0.1.0"
     EXEC_ARID = "validate-exec-fail-1"
     EXCERPT = ("[execute fail]\npost_execute: metrics_basis entry 'l0_case' is missing "
                "required_raw_variables {'a1'}")
+    REVISION = {"commit": "a" * 40, "dirty": False}
+    _OMIT = object()
+
+    def setUp(self) -> None:
+        # The deriver compares the trial_meta stamp against the live repo revision; the tmp
+        # fixture dirs are not git checkouts, so pin the "current" revision.
+        p = patch("tools.orchestration_runtime._capture_repo_revision",
+                  return_value=dict(self.REVISION))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _seed(self, repo_root: Path, oid: str, *, status: str = "fail",
-              write_trial_meta: bool = True, write_request: bool = True) -> Path:
+              write_trial_meta: bool = True, write_request: bool = True,
+              trial_revision: object = _OMIT, trial_excerpt: object = _OMIT) -> Path:
         """An orchestration whose only failed run is a structural validate.execute substep."""
         root = repo_root / "workspace" / "orchestrations" / oid
         (root / "launches").mkdir(parents=True, exist_ok=True)
@@ -26515,14 +26527,20 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
                 encoding="utf-8",
             )
         if write_trial_meta:
+            doc: dict = {"run_id": "run_1", "node_key": self.NODE_KEY, "status": "fail",
+                         "failure_category": "post_execute_violation"}
+            if trial_revision is not self._OMIT:
+                doc["repo_revision"] = trial_revision
+            else:
+                doc["repo_revision"] = dict(self.REVISION)
+            if trial_excerpt is not self._OMIT:
+                if trial_excerpt is not None:
+                    doc["failure_excerpt"] = trial_excerpt
+            else:
+                doc["failure_excerpt"] = self.EXCERPT
             trial = repo_root / rundir / "trial_meta.json"
             trial.parent.mkdir(parents=True, exist_ok=True)
-            trial.write_text(
-                json.dumps({"run_id": "run_1", "node_key": self.NODE_KEY, "status": "fail",
-                            "failure_category": "post_execute_violation",
-                            "failure_excerpt": self.EXCERPT}),
-                encoding="utf-8",
-            )
+            trial.write_text(json.dumps(doc), encoding="utf-8")
         return root
 
     def test_directive_reopens_generate_with_trial_meta_findings(self) -> None:
@@ -26600,20 +26618,15 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
             self.assertIsNone(_derive_dev_validate_execute_resume_directive(
                 repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation"))
 
-    def test_directive_falls_back_to_step_result_and_stderr_log(self) -> None:
-        """No failure_analysis -> the newest non-pass validate step_result names the trigger;
-        no readable trial_meta -> the `[execute fail]` block of the substep's stderr log."""
+    def test_directive_falls_back_to_the_stderr_log_for_findings(self) -> None:
+        """A trial_meta with no `failure_excerpt` -> the `[execute fail]` block of the substep's
+        stderr log. (The trial_meta itself must still be present and freshly stamped: it is what
+        proves the findings describe the current source.)"""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             oid = "orch_dev_exec_fallback"
             init_orchestration(repo_root=repo_root, orchestration_id=oid)
-            root = self._seed(repo_root, oid, write_trial_meta=False)
-            (root / "failure_analysis.json").unlink()
-            sr = root / "steps" / _node_key_to_safe(self.NODE_KEY) / "validate" / "exec-1"
-            sr.mkdir(parents=True, exist_ok=True)
-            (sr / "step_result.json").write_text(
-                json.dumps({"status": "fail", "failed_substeps": [self.EXEC_ARID]}),
-                encoding="utf-8")
+            root = self._seed(repo_root, oid, trial_excerpt=None)
             dialogs = root / "agents" / self.EXEC_ARID / "dialogs"
             dialogs.mkdir(parents=True, exist_ok=True)
             (dialogs / "deterministic.stderr.log").write_text(
@@ -26624,25 +26637,168 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
             self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
             self.assertEqual(directive["repair_findings"], self.EXCERPT)
 
-    def test_directive_without_findings_when_no_evidence_survives(self) -> None:
-        """The directive still reopens Generate when neither trial_meta nor the stderr log
-        is readable — only the findings are lost (the repair degrades to a full prompt)."""
+    def _append_second_execute_failure(self, repo_root: Path, root: Path, oid: str, arid: str,
+                                       *, revision: dict, excerpt: str) -> None:
+        """A LATER validate.execute attempt (fresh arid, fresh run dir), as a plain resume
+        produces after the freshness gate declines."""
+        rundir = f"workspace/pipelines/{oid}/runs/run_2"
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "agent_run_id": arid, "agent_role": "substep", "step": "validate",
+                "substep": "execute", "status": "fail", "node_key": self.NODE_KEY}) + "\n")
+        (root / "launches" / f"{arid}.request.json").write_text(
+            json.dumps({"agent_run_id": arid, "step": "validate", "substep": "execute",
+                        "deterministic": True,
+                        "allowed_output_paths": [f"{rundir}/trial_meta.json"]}),
+            encoding="utf-8")
+        trial = repo_root / rundir / "trial_meta.json"
+        trial.parent.mkdir(parents=True, exist_ok=True)
+        trial.write_text(json.dumps({
+            "run_id": "run_2", "node_key": self.NODE_KEY, "status": "fail",
+            "failure_category": "post_execute_violation",
+            "repo_revision": revision, "failure_excerpt": excerpt}), encoding="utf-8")
+
+    def test_directive_uses_the_newest_execute_run_not_the_frozen_failure_analysis(self) -> None:
+        """`failure_analysis.json` is written once (O_CREAT|O_EXCL) at the FIRST failure and
+        preserved across resumes, so it names a stale run forever. The directive must resolve the
+        trigger from the newest `validate.execute` record instead.
+
+        This is what makes the B4 freshness gate self-correcting rather than a permanent
+        deadlock: resume 1 declines on a stale stamp, the plain resume re-runs Validate.execute
+        and appends a freshly-stamped attempt, and resume 2 fires on THAT one. Keyed to the
+        frozen analysis, resume 2 would re-read the stale stamp and decline forever."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_newest"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            # The first failure, stamped with a revision the operator has since moved past.
+            # failure_analysis.json (written by _seed) still names it.
+            root = self._seed(repo_root, oid,
+                              trial_revision={"commit": "b" * 40, "dirty": False},
+                              trial_excerpt="[execute fail]\nSTALE")
+            self.assertIsNone(
+                _derive_dev_validate_execute_resume_directive(
+                    repo_root, oid, "dev_phase_rollback",
+                    "validate_execute_post_execute_violation"),
+                "resume 1 must decline: the only attempt carries a stale stamp")
+
+            # The declined plain resume re-ran Validate.execute under the current source.
+            fresh_arid = "validate-exec-fail-2"
+            self._append_second_execute_failure(
+                repo_root, root, oid, fresh_arid,
+                revision=dict(self.REVISION), excerpt="[execute fail]\nFRESH")
+
+            directive = _derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation")
+            self.assertIsNotNone(directive, "resume 2 must fire on the freshly-stamped attempt")
+            self.assertEqual(directive["trigger_agent_run_id"], fresh_arid)
+            self.assertEqual(directive["repair_findings"], "[execute fail]\nFRESH")
+            # The frozen analysis still names the stale run; it must not have been consulted.
+            fa = json.loads((root / "failure_analysis.json").read_text(encoding="utf-8"))
+            self.assertEqual(fa["failed_agent_run"]["agent_run_id"], self.EXEC_ARID)
+
+    def test_directive_declines_when_the_newest_execute_run_passed(self) -> None:
+        """An older failed attempt is superseded by a later passing one; nothing to repair."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_newest_pass"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            root = self._seed(repo_root, oid)
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "validate-exec-ok", "agent_role": "substep",
+                    "step": "validate", "substep": "execute", "status": "pass",
+                    "node_key": self.NODE_KEY}) + "\n")
+            self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation"))
+
+    def test_directive_declines_when_the_repo_revision_moved(self) -> None:
+        """B4: the findings were produced by a source that is no longer checked out. A repair
+        leaf reasons from them as ground truth, so injecting them makes it confidently repair a
+        defect that may no longer exist. Emit nothing; the plain resume re-runs the
+        deterministic Validate.execute under the current source and re-stamps trial_meta, so the
+        NEXT resume's directive carries truthful findings."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_stale_rev"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid,
+                       trial_revision={"commit": "b" * 40, "dirty": False})
+            self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation"))
+
+    def test_directive_declines_on_a_dirty_tree_only_when_it_disagrees(self) -> None:
+        """Equality, not cleanliness, is the test. A same-commit dirty-to-dirty resume still
+        fires (declining on `dirty` alone could never self-correct — the re-run would re-stamp
+        `dirty` again and decline forever, restoring the deadlock)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_dirty"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            dirty = {"commit": "a" * 40, "dirty": True}
+            self._seed(repo_root, oid, trial_revision=dirty)
+            with patch("tools.orchestration_runtime._capture_repo_revision",
+                       return_value=dict(dirty)):
+                self.assertIsNotNone(_derive_dev_validate_execute_resume_directive(
+                    repo_root, oid, "dev_phase_rollback",
+                    "validate_execute_post_execute_violation"))
+            # A commit landing under the dirty tree still moves the revision -> decline.
+            with patch("tools.orchestration_runtime._capture_repo_revision",
+                       return_value={"commit": "a" * 40, "dirty": False}):
+                self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                    repo_root, oid, "dev_phase_rollback",
+                    "validate_execute_post_execute_violation"))
+
+    def test_directive_declines_when_the_revision_is_unknowable(self) -> None:
+        """A pre-B4 trial_meta (no stamp), and a repo that is not a git checkout (the live
+        revision is None), both leave freshness unprovable -> decline."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_unstamped"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid, trial_revision=None)
+            self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation"))
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_nogit"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid)
+            with patch("tools.orchestration_runtime._capture_repo_revision", return_value=None):
+                self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                    repo_root, oid, "dev_phase_rollback",
+                    "validate_execute_post_execute_violation"))
+
+    def test_directive_without_findings_when_no_excerpt_survives(self) -> None:
+        """A freshly-stamped trial_meta with no excerpt and no stderr log still reopens Generate;
+        only the findings are lost (the repair degrades to a full prompt)."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             oid = "orch_dev_exec_nofindings"
             init_orchestration(repo_root=repo_root, orchestration_id=oid)
-            self._seed(repo_root, oid, write_trial_meta=False, write_request=False)
+            self._seed(repo_root, oid, trial_excerpt=None)
             directive = _derive_dev_validate_execute_resume_directive(
                 repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation")
             self.assertEqual(directive["trigger_agent_run_id"], self.EXEC_ARID)
             self.assertNotIn("repair_findings", directive)
+
+    def test_directive_declines_when_trial_meta_is_unreachable(self) -> None:
+        """No launch request -> the trial_meta path cannot be resolved -> freshness is
+        unprovable, so the directive is withheld rather than emitted on unverifiable evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_dev_exec_norequest"
+            init_orchestration(repo_root=repo_root, orchestration_id=oid)
+            self._seed(repo_root, oid, write_trial_meta=False, write_request=False)
+            self.assertIsNone(_derive_dev_validate_execute_resume_directive(
+                repo_root, oid, "dev_phase_rollback", "validate_execute_post_execute_violation"))
 
     def test_findings_are_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             oid = "orch_dev_exec_bounded"
             init_orchestration(repo_root=repo_root, orchestration_id=oid)
-            root = self._seed(repo_root, oid, write_trial_meta=False)
+            root = self._seed(repo_root, oid, trial_excerpt=None)
             dialogs = root / "agents" / self.EXEC_ARID / "dialogs"
             dialogs.mkdir(parents=True, exist_ok=True)
             (dialogs / "deterministic.stderr.log").write_text(

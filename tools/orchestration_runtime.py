@@ -10904,117 +10904,97 @@ _EXECUTE_FAIL_MARKER = "[execute fail]"
 
 
 def _dev_execute_failure_arid(
-    repo_root: Path,
-    root: Path,
     runs: dict[str, dict[str, Any]],
     superseded: set[str],
 ) -> tuple[str, dict[str, Any]] | None:
-    """The failed `validate.execute` substep run of the prior dev attempt, or None.
+    """The MOST RECENT `validate.execute` substep run, when it is a fresh, unconsumed failure.
 
-    Primary source is `failure_analysis.json#failed_agent_run` (the host writes it on every
-    dev failure). Fallback is the last non-pass `steps/*/validate/*/step_result.json`'s final
-    `failed_substeps` entry — needed when the analysis is missing/stale (e.g. a re-collect
-    wrote a different run's record). Either way the candidate is re-validated against
-    `agent_runs.jsonl`, which is what supplies the authoritative node_key and is the same
-    record `reopen_phase` will check as a trigger.
+    Resolved from `agent_runs.jsonl` in append order, NOT from
+    `failure_analysis.json#failed_agent_run`. The canonical analysis is written once
+    (`_atomic_write_json_exclusive`) at the first failure and preserved across resumes, so it
+    names the FIRST failing run forever. Keying the B4 freshness gate to it would compare that
+    run's stamp on every later resume and, once the operator commits anything, decline
+    permanently — turning the deadlock-breaker into the deadlock. Reading the newest attempt is
+    what makes the gate self-correcting: a declined resume re-runs Validate.execute, appends a
+    freshly-stamped run, and the next resume sees it. `agent_runs.jsonl` is also the record
+    `reopen_phase` validates the trigger against, and it supplies the authoritative node_key.
 
-    An already-superseded arid (consumed by a prior reopen) is rejected: `reopen_phase` would
-    return `noop` for it, so a directive naming it would reopen nothing while claiming to —
-    the conductor would skip the still-checkpointed Generate and the repair would be silently
-    dropped. Better to emit no directive and let the plain resume run (same rationale as
+    Only the newest attempt is considered. If it PASSED there is nothing to repair (an older
+    failure is already superseded by that success). If a prior reopen already consumed it,
+    `reopen_phase` would return `noop`, reopening nothing while the conductor skips the
+    still-checkpointed Generate and silently drops the repair — so decline and let the plain
+    resume run (the same rationale as
     `_derive_unauthorized_write_resume_directive`'s superseded-candidate exclusion)."""
-
-    def _accept(arid: object) -> tuple[str, dict[str, Any]] | None:
-        if not (isinstance(arid, str) and arid.strip()):
-            return None
-        if arid.strip() in superseded:
-            return None
-        rec = runs.get(arid.strip())
-        if not isinstance(rec, dict):
-            return None
+    latest: tuple[str, dict[str, Any]] | None = None
+    for arid, rec in runs.items():
+        if not (isinstance(arid, str) and arid.strip() and isinstance(rec, dict)):
+            continue
         if str(rec.get("agent_role") or "").strip().lower() != "substep":
-            return None
+            continue
         if str(rec.get("step") or "").strip().lower() != "validate":
-            return None
+            continue
         if str(rec.get("substep") or "").strip().lower() != "execute":
-            return None
-        status = str(rec.get("status") or "").strip().lower()
-        if status not in TERMINAL_STATUSES or status == "pass":
-            return None
-        if not str(rec.get("node_key") or "").strip():
-            return None
-        return arid.strip(), rec
-
-    fa_path = root / "failure_analysis.json"
-    if fa_path.exists():
-        try:
-            fa = _read_json(fa_path)
-        except (OSError, json.JSONDecodeError):
-            fa = None
-        if isinstance(fa, dict) and isinstance(fa.get("failed_agent_run"), dict):
-            accepted = _accept(fa["failed_agent_run"].get("agent_run_id"))
-            if accepted is not None:
-                return accepted
-
-    # Fallback: the newest non-pass validate step_result names its failed substeps.
-    candidates = sorted(
-        root.glob("steps/*/validate/*/step_result.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for path in candidates:
-        try:
-            sr = _read_json(path)
-        except (OSError, json.JSONDecodeError):
             continue
-        if not isinstance(sr, dict):
-            continue
-        if str(sr.get("status") or "").strip().lower() == "pass":
-            continue
-        failed = sr.get("failed_substeps")
-        if not isinstance(failed, list) or not failed:
-            continue
-        accepted = _accept(failed[-1])
-        if accepted is not None:
-            return accepted
-    return None
+        latest = (arid.strip(), rec)
+    if latest is None:
+        return None
+    arid, rec = latest
+    if arid in superseded:
+        return None
+    status = str(rec.get("status") or "").strip().lower()
+    if status not in TERMINAL_STATUSES or status == "pass":
+        return None
+    if not str(rec.get("node_key") or "").strip():
+        return None
+    return arid, rec
 
 
-def _dev_execute_failure_findings(repo_root: Path, root: Path, arid: str) -> str | None:
-    """The failing gate's own violation text for the failed execute run `arid`.
+def _dev_execute_trial_meta(repo_root: Path, root: Path, arid: str) -> dict[str, Any] | None:
+    """The failed execute run's `trial_meta.json`, or None.
 
-    Canonical source is `trial_meta.json#failure_excerpt` (authored by `_execute_inproc` for
-    exactly the structural categories this directive gates on). Its path is not derivable from
-    the orchestration root alone — the run node dir lives under `workspace/pipelines/` — so it is
-    recovered from the run's own `launches/<arid>.request.json#allowed_output_paths`, which is
-    where the conductor declared it. Fallback is the `[execute fail]` block the conductor
-    persisted to the substep's `deterministic.stderr.log` (the same text, unbounded), used when
-    the run node dir was rotated away or the request is unreadable. None when neither survives —
-    the resumed repair then falls back to the full prompt, as an expired session already would."""
-    excerpt: str | None = None
+    Its path is not derivable from the orchestration root alone — the run node dir lives under
+    `workspace/pipelines/` — so it is recovered from the run's own
+    `launches/<arid>.request.json#allowed_output_paths`, which is where the conductor declared
+    it as an output."""
     try:
         request = _read_json(root / "launches" / f"{arid}.request.json")
     except (OSError, json.JSONDecodeError):
-        request = None
-    if isinstance(request, dict):
-        outs = request.get("allowed_output_paths")
-        trial_ref = next(
-            (
-                p
-                for p in (outs if isinstance(outs, list) else [])
-                if isinstance(p, str) and p.endswith("/trial_meta.json")
-            ),
-            None,
-        )
-        if trial_ref:
-            try:
-                trial = _read_json(repo_root / trial_ref)
-            except (OSError, json.JSONDecodeError):
-                trial = None
-            if isinstance(trial, dict) and str(trial.get("status") or "").strip() == "fail":
-                value = trial.get("failure_excerpt")
-                if isinstance(value, str) and value.strip():
-                    excerpt = value.strip()
+        return None
+    if not isinstance(request, dict):
+        return None
+    outs = request.get("allowed_output_paths")
+    trial_ref = next(
+        (
+            p
+            for p in (outs if isinstance(outs, list) else [])
+            if isinstance(p, str) and p.endswith("/trial_meta.json")
+        ),
+        None,
+    )
+    if not trial_ref:
+        return None
+    try:
+        trial = _read_json(repo_root / trial_ref)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return trial if isinstance(trial, dict) else None
+
+
+def _dev_execute_failure_findings(
+    repo_root: Path, root: Path, arid: str, trial: dict[str, Any] | None
+) -> str | None:
+    """The failing gate's own violation text for the failed execute run `arid`.
+
+    Canonical source is `trial_meta.json#failure_excerpt` (authored by `_execute_inproc` for
+    exactly the structural categories this directive gates on). Fallback is the `[execute fail]`
+    block the conductor persisted to the substep's `deterministic.stderr.log` (the same text,
+    unbounded), used when the excerpt field is absent. None when neither survives — the resumed
+    repair then falls back to the full prompt, as an expired session already would."""
+    excerpt: str | None = None
+    if isinstance(trial, dict) and str(trial.get("status") or "").strip() == "fail":
+        value = trial.get("failure_excerpt")
+        if isinstance(value, str) and value.strip():
+            excerpt = value.strip()
 
     if excerpt is None:
         log_path = root / "agents" / arid / "dialogs" / "deterministic.stderr.log"
@@ -11051,9 +11031,12 @@ def _derive_dev_validate_execute_resume_directive(
     prod's B1 retry would have carried. F1 itself is unchanged: an in-run automatic rollback
     still fail_closes; this fires only on an operator `--resume`.
 
-    Nothing new is persisted — the directive is a cache derived from `failure_analysis.json`,
-    `agent_runs.jsonl`, the launch request and `trial_meta.json`. Returns None (plain resume)
-    whenever the reason does not name a reuse-routed category or the evidence is incomplete."""
+    Nothing new is persisted — the directive is a cache derived from `agent_runs.jsonl`, the
+    failing run's launch request and its `trial_meta.json`. Returns None (plain resume)
+    whenever the reason does not name a reuse-routed category, the evidence is incomplete, or
+    the evidence is STALE (B4: `trial_meta.json#repo_revision` differs from the revision at
+    resume time — the source that produced the violation text is not the source that will now
+    be repaired against, so the findings may describe a defect that no longer exists)."""
     if not isinstance(reason_code, str) or reason_code.strip() != "dev_phase_rollback":
         return None
     detail = reason_detail.strip() if isinstance(reason_detail, str) else ""
@@ -11068,11 +11051,34 @@ def _derive_dev_validate_execute_resume_directive(
 
     root = _orchestration_root(repo_root, orchestration_id)
     found = _dev_execute_failure_arid(
-        repo_root, root, _load_run_records(root),
+        _load_run_records(root),
         _load_superseded_run_ids(repo_root, orchestration_id))
     if found is None:
         return None
     trigger_arid, rec = found
+
+    # B4 freshness gate. The directive's whole value is the violation text it carries; a repair
+    # leaf reasons from it as ground truth. When the operator fixes the gate (or any source) and
+    # then resumes, that text describes code which no longer exists, and the leaf confidently
+    # repairs a defect that is gone. Emit nothing rather than something false: the plain resume
+    # re-runs the deterministic Validate.execute under the CURRENT source, which either passes
+    # (the fix worked) or fails again and re-stamps `trial_meta` with the current revision, so
+    # the next resume's directive fires with truthful findings. Self-correcting, and it never
+    # drifts — unlike `orchestration_meta.repo_revision`, which is frozen at the first start.
+    # An unreadable trial_meta, an unstamped one (pre-B4 run), or a repo that is not a git
+    # checkout all decline, which costs one deterministic re-run and no correctness.
+    trial = _dev_execute_trial_meta(repo_root, root, trigger_arid)
+    if not isinstance(trial, dict):
+        return None
+    recorded_revision = trial.get("repo_revision")
+    current_revision = _capture_repo_revision(repo_root)
+    if not (
+        isinstance(recorded_revision, dict)
+        and isinstance(current_revision, dict)
+        and recorded_revision == current_revision
+    ):
+        return None
+
     directive: dict[str, Any] = {
         "reopen_from": "generate",
         "node_key": str(rec.get("node_key")).strip(),
@@ -11081,7 +11087,7 @@ def _derive_dev_validate_execute_resume_directive(
         "failure_category": category,
         "source": DEV_VALIDATE_EXECUTE_RESUME_SOURCE,
     }
-    findings = _dev_execute_failure_findings(repo_root, root, trigger_arid)
+    findings = _dev_execute_failure_findings(repo_root, root, trigger_arid, trial)
     if findings:
         directive["repair_findings"] = findings
     return directive

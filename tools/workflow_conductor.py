@@ -3140,9 +3140,18 @@ clean:
         (node_dir / "stdout.log").write_text(stdout, encoding="utf-8")
         (node_dir / "stderr.log").write_text(stderr, encoding="utf-8")
 
+        # The repo revision THIS run's evidence (and, on the structural-failure branch below,
+        # its `failure_excerpt`) was produced under. The dev `--resume` directive compares it
+        # against the revision at resume time and declines to inject findings that a later
+        # source change may have invalidated (B4). Stamped on the failing run rather than read
+        # from `orchestration_meta.repo_revision`, which is frozen at the orchestration's first
+        # start and would drift permanently once any commit lands mid-run.
+        from tools.orchestration_runtime import _capture_repo_revision
+
         trial_meta = {
             "run_id": refs.run_id,
             "node_key": refs.node_key,
+            "repo_revision": _capture_repo_revision(self.repo_root),
             "pipeline_id": refs.pipeline_id,
             "source_source_id": refs.source_id,
             "source_binary_id": refs.source_binary_id,
