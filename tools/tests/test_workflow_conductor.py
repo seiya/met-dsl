@@ -3734,7 +3734,23 @@ class WriteRunnerTest(unittest.TestCase):
         ir_dir.mkdir(parents=True, exist_ok=True)
         (ir_dir / "spec.ir.yaml").write_text(_yaml.safe_dump(ir), encoding="utf-8")
 
-    def _seed_harness_pipeline(self, repo: Path, *, tamper_source: bool = False) -> None:
+    def _seed_harness_pipeline(
+            self, repo: Path, *, tamper_source: bool = False,
+            ir_dirname: str = "harness-fortran-cpu_20260707_002",
+            ir_meta_status: str | None = "pass", write_ir_meta: bool = True,
+            extra_source_meta: dict | None = None, signatures: object = None,
+            no_public_api_signatures: bool = False,
+            binary_source_ir_id: str | None = "harness-fortran-cpu_20260707_002",
+            write_source_ir_id: bool = True) -> None:
+        """Seed a ready certified-harness pipeline + its certified IR dir.
+
+        `source_meta.json` is written CONTRACT-MINIMAL (no `ir_ref`): the pin resolves the IR
+        structurally, never from source_meta. `binary_meta.source_ir_id` (host-authored) binds the
+        certified binary to its origin IR dir under `workspace/ir/<safe>/<binary_source_ir_id>`;
+        `write_source_ir_id=False` omits it to exercise the legacy `_certified_ir_dir` fallback.
+        `ir_dirname` (the seeded IR dir) may diverge from the pipeline dir name (compile reopen
+        re-numbers ir_id independently). `extra_source_meta` merges extra keys into the (still
+        ir_ref-free) source_meta to prove they are ignored."""
         from tools.tests.test_runner_renderer import (
             _HARNESS_STUB, _harness_signatures)
         import yaml as _yaml
@@ -3748,17 +3764,24 @@ class WriteRunnerTest(unittest.TestCase):
                 "function harness_fortran_cpu__box(name, json) result(nv)",
                 "function harness_fortran_cpu__box(key, json) result(nv)")
         (src_dir / "harness_fortran_cpu_model.f90").write_text(source, encoding="utf-8")
-        harness_ir_ref = "workspace/ir/" + safe + "/harness-fortran-cpu_20260707_002"
+        smeta: dict = dict(extra_source_meta or {})  # contract-minimal: NO ir_ref
         (src_dir.parent / "source_meta.json").write_text(
-            json.dumps({"ir_ref": harness_ir_ref}), encoding="utf-8")
+            json.dumps(smeta), encoding="utf-8")
         (pipe / "binary" / "bin_20260707_001").mkdir(parents=True, exist_ok=True)
+        bmeta: dict = {"source_source_id": "src_20260707_002"}
+        if write_source_ir_id and binary_source_ir_id is not None:
+            bmeta["source_ir_id"] = binary_source_ir_id
         (pipe / "binary" / "bin_20260707_001" / "binary_meta.json").write_text(
-            json.dumps({"source_source_id": "src_20260707_002"}), encoding="utf-8")
-        hir_dir = repo / harness_ir_ref
+            json.dumps(bmeta), encoding="utf-8")
+        hir_dir = repo / "workspace" / "ir" / safe / ir_dirname
         hir_dir.mkdir(parents=True, exist_ok=True)
+        sigs = _harness_signatures() if signatures is None else signatures
+        pub = {} if no_public_api_signatures else {"signatures": sigs}
         (hir_dir / "spec.ir.yaml").write_text(
-            _yaml.safe_dump({"public_api": {"signatures": _harness_signatures()}}),
-            encoding="utf-8")
+            _yaml.safe_dump({"public_api": pub}), encoding="utf-8")
+        if write_ir_meta:
+            (hir_dir / "ir_meta.json").write_text(
+                json.dumps({"verification_status": ir_meta_status}), encoding="utf-8")
 
     def test_conductor_authors_runner_truth_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3838,6 +3861,218 @@ class WriteRunnerTest(unittest.TestCase):
             self._seed_harness_pipeline(repo, tamper_source=True)
             with self.assertRaises(RenderError):
                 self._conductor(repo)._write_runner(refs)
+
+    def test_write_runner_pins_without_source_meta_ir_ref(self) -> None:
+        # Regression for E2E #4: a contract-minimal source_meta.json (no `ir_ref`, as a
+        # harness-0.3.0 leaf writes) must still resolve the certified IR structurally and pin.
+        from tools.runner_renderer import render_runner
+        from tools.tests.test_runner_renderer import _boundary_ir
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(repo)  # source_meta has NO ir_ref
+            self._conductor(repo)._write_runner(refs)
+            runner = repo / refs.source_dir() / "src" / f"{self.SID}_runner.f90"
+            ir = _boundary_ir()
+            ir["dependency"]["direct_deps"] = [
+                {"node_key": "infrastructure/harness_fortran_cpu@0.2.0"}]
+            self.assertEqual(runner.read_text(encoding="utf-8"),
+                             render_runner(ir, self.SID, "harness_fortran_cpu"))
+
+    def test_write_runner_ignores_source_meta_ir_ref(self) -> None:
+        # Even a present-but-bogus `ir_ref` must be entirely disregarded: the field is no
+        # longer read, so a dangling path cannot break (or steer) resolution.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(
+                repo, extra_source_meta={"ir_ref": "workspace/ir/does/not/exist"})
+            self._conductor(repo)._write_runner(refs)  # renders successfully regardless
+            self.assertTrue(
+                (repo / refs.source_dir() / "src" / f"{self.SID}_runner.f90").is_file())
+
+    def test_write_runner_fail_closed_on_uncertified_harness_ir(self) -> None:
+        # ir_meta absent or verification_status != pass -> transport fail_closed (RuntimeError),
+        # NOT a RenderError (this is a build precondition, not interface drift).
+        from tools.runner_renderer import RenderError
+        for kwargs in ({"ir_meta_status": "fail"}, {"write_ir_meta": False}):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                refs = self._refs()
+                self._write_consumer_ir(repo, refs, infra=1)
+                self._seed_harness_pipeline(repo, **kwargs)
+                with self.assertRaises(RuntimeError) as cm:
+                    self._conductor(repo)._write_runner(refs)
+                self.assertNotIsInstance(cm.exception, RenderError)
+                self.assertIn("--with-deps", str(cm.exception))
+
+    def test_write_runner_resolves_ir_divergent_from_pipeline_id(self) -> None:
+        # Compile reopen re-numbers ir_id independently of pipeline_id: the certified IR dir
+        # (`_003`, bound by binary_meta.source_ir_id) need not match the pipeline dir name.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(
+                repo, ir_dirname="harness-fortran-cpu_20260707_003",
+                binary_source_ir_id="harness-fortran-cpu_20260707_003")
+            self._conductor(repo)._write_runner(refs)
+            self.assertTrue(
+                (repo / refs.source_dir() / "src" / f"{self.SID}_runner.f90").is_file())
+
+    def test_write_runner_pins_ir_bound_to_binary_not_latest(self) -> None:
+        # Codex P1 regression: after a same-version compile reopen the globally-LATEST passing IR
+        # can diverge from the IR the certified binary's source was built from. The pin must bind
+        # to binary_meta.source_ir_id (`_002`), NOT the newer `_004` whose TAMPERED signatures
+        # would raise a spurious drift even though source+binary are internally consistent.
+        import yaml as _yaml
+        from tools.tests.test_runner_renderer import _harness_signatures
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            # binary bound to _002 (default ir_dirname + default binary_source_ir_id).
+            self._seed_harness_pipeline(repo)
+            # A NEWER passing IR (_004) with corrupt signatures — latest-passing selection would
+            # wrongly pick it; the source_ir_id binding must ignore it.
+            safe = "infrastructure__harness_fortran_cpu__0.2.0"
+            newer = repo / "workspace" / "ir" / safe / "harness-fortran-cpu_20260707_004"
+            newer.mkdir(parents=True, exist_ok=True)
+            bad_sigs = [dict(e) for e in _harness_signatures()]
+            bad_sigs[0]["interface"] = "subroutine bogus()\nend subroutine"
+            (newer / "spec.ir.yaml").write_text(
+                _yaml.safe_dump({"public_api": {"signatures": bad_sigs}}), encoding="utf-8")
+            (newer / "ir_meta.json").write_text(
+                json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            self._conductor(repo)._write_runner(refs)  # binds to _002 -> renders, no false drift
+            self.assertTrue(
+                (repo / refs.source_dir() / "src" / f"{self.SID}_runner.f90").is_file())
+
+    def test_write_runner_falls_back_to_latest_ir_without_source_ir_id(self) -> None:
+        # A binary predating source_ir_id (legacy / the pending E2E-recovery harness) must still
+        # resolve via _certified_ir_dir (latest certified IR), so the pin keeps working.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(repo, write_source_ir_id=False)
+            self._conductor(repo)._write_runner(refs)
+            self.assertTrue(
+                (repo / refs.source_dir() / "src" / f"{self.SID}_runner.f90").is_file())
+
+    def test_write_runner_binds_source_and_ir_from_one_binary_snapshot(self) -> None:
+        # TOCTOU guard: the model source (source_source_id) and its provenance (source_ir_id) must
+        # come from ONE latest-binary selection, so a binary published between two selections can't
+        # pair a source with a mismatched IR lineage. Assert the latest-binary meta is selected
+        # exactly once on the bound path (two selections would be the racy pattern).
+        from unittest import mock
+        from tools import orchestration_runtime as ortime
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(repo)
+            real = ortime._latest_meta_under
+            binary_selects = {"n": 0}
+
+            def counting(root, pattern):
+                if pattern == "binary/*/binary_meta.json":
+                    binary_selects["n"] += 1
+                return real(root, pattern)
+
+            with mock.patch.object(ortime, "_latest_meta_under", counting):
+                self._conductor(repo)._write_runner(refs)
+            self.assertEqual(binary_selects["n"], 1)
+            self.assertTrue(
+                (repo / refs.source_dir() / "src" / f"{self.SID}_runner.f90").is_file())
+
+    def test_write_runner_legacy_fallback_pin_failure_hints_rebuild(self) -> None:
+        # On the legacy-fallback path (no source_ir_id) a pin failure must carry the operator
+        # hint (rebuild --with-deps to stamp source_ir_id) so a contract-violation-window drift
+        # reads as actionable, not a misdiagnosis. Bound (source_ir_id present) failures do not.
+        from tools.runner_renderer import RenderError
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            # legacy binary (no source_ir_id) + tampered source -> genuine pin drift.
+            self._seed_harness_pipeline(repo, tamper_source=True, write_source_ir_id=False)
+            with self.assertRaises(RenderError) as cm:
+                self._conductor(repo)._write_runner(refs)
+            self.assertIn("source_ir_id", str(cm.exception))
+            self.assertIn("--with-deps", str(cm.exception))
+
+    def test_write_runner_bound_pin_failure_has_no_legacy_hint(self) -> None:
+        # The reciprocal: with source_ir_id present the pin drift is NOT annotated with the
+        # legacy-rebuild hint (it is already bound to the exact origin IR).
+        from tools.runner_renderer import RenderError
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(repo, tamper_source=True)  # bound (default source_ir_id)
+            with self.assertRaises(RenderError) as cm:
+                self._conductor(repo)._write_runner(refs)
+            self.assertNotIn("legacy harness binary", str(cm.exception))
+
+    def test_write_runner_fail_closed_on_unresolvable_source_ir_id(self) -> None:
+        # A PRESENT-but-unresolvable source_ir_id (dangling dir, or an unsafe token) is corrupt
+        # lineage: it must fail closed with RuntimeError, NOT silently fall back to the latest IR
+        # (which would reintroduce the false-drift the binding exists to prevent). The valid IR
+        # dir (`_002`) is seeded to prove the fallback is NOT taken.
+        from tools.runner_renderer import RenderError
+        for bad_id in ("harness-fortran-cpu_20260707_999", "../evil"):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                refs = self._refs()
+                self._write_consumer_ir(repo, refs, infra=1)
+                self._seed_harness_pipeline(repo, binary_source_ir_id=bad_id)
+                with self.assertRaises(RuntimeError) as cm:
+                    self._conductor(repo)._write_runner(refs)
+                self.assertNotIsInstance(cm.exception, RenderError)
+                self.assertIn("source_ir_id", str(cm.exception))
+
+    def test_write_runner_present_null_source_ir_id_is_not_legacy_fallback(self) -> None:
+        # A PRESENT key with an explicit JSON null is NOT a legacy binary (which lacks the key):
+        # it is corrupt lineage and must fail closed, not take the latest-IR fallback. Locks the
+        # presence-keyed branch (a value-is-None check would wrongly fall back here).
+        from tools.runner_renderer import RenderError
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            self._write_consumer_ir(repo, refs, infra=1)
+            self._seed_harness_pipeline(repo)  # valid _002 IR present (fallback would render)
+            bpath = (repo / "workspace" / "pipelines"
+                     / "infrastructure__harness_fortran_cpu__0.2.0"
+                     / "harness-fortran-cpu_20260707_002" / "binary" / "bin_20260707_001"
+                     / "binary_meta.json")
+            bpath.write_text(
+                json.dumps({"source_source_id": "src_20260707_002", "source_ir_id": None}),
+                encoding="utf-8")
+            with self.assertRaises(RuntimeError) as cm:
+                self._conductor(repo)._write_runner(refs)
+            self.assertNotIsInstance(cm.exception, RenderError)
+            self.assertIn("source_ir_id", str(cm.exception))
+
+    def test_write_runner_no_signatures_in_certified_ir_fails_closed(self) -> None:
+        # Certified IR present + pass, but its public_api carries no USABLE signatures
+        # (missing list, or a non-empty list of all-malformed entries) -> RuntimeError
+        # (re-certify), never a RenderError — so the conductor precondition, not the pin's
+        # drift path, classifies an incomplete certified artifact.
+        from tools.runner_renderer import RenderError
+        for kwargs in ({"no_public_api_signatures": True},
+                       {"signatures": [{"garbage": 1}]},
+                       {"signatures": [{"symbol": " ", "interface": ""}]}):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                refs = self._refs()
+                self._write_consumer_ir(repo, refs, infra=1)
+                self._seed_harness_pipeline(repo, **kwargs)
+                with self.assertRaises(RuntimeError) as cm:
+                    self._conductor(repo)._write_runner(refs)
+                self.assertNotIsInstance(cm.exception, RenderError)
 
     def test_run_phase_routes_render_failure_to_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4089,6 +4324,40 @@ class DeterministicBuildTest(unittest.TestCase):
                 c._build_inproc(refs, "child-1", "captok")
 
             self.assertIn("BIN=spec_x_runner", captured["extra_args"])
+
+    def test_build_inproc_stamps_source_ir_id(self) -> None:
+        # binary_meta.json records the origin ir_id (refs.ir_id) alongside source_source_id
+        # (refs.source_id). `_write_runner` binds the harness pin to source_ir_id, so a wrong
+        # constant here (e.g. source_id) would silently break the binding — distinct ir_id vs
+        # source_id values catch a swap.
+        import sys
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = wc.Conductor(repo_root=repo, orchestration_id="t",
+                             orchestration_agent_run_id="x", backend="claude", env={})
+            refs = wc.NodeRefs(
+                node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                ir_id="ir_20260707_007", pipeline_id="x_1",
+                source_id="src_20260707_003", binary_id="bin_1")
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.source_dir() / "src").mkdir(parents=True, exist_ok=True)
+
+            def fake_compile(args):
+                (repo / refs.binary_dir() / "bin").mkdir(parents=True, exist_ok=True)
+                (repo / refs.binary_dir() / "bin" / "spec_x_runner").write_text("x")
+                return {"ok": True, "return_code": 0, "command_id": "cid"}
+
+            with mock.patch.object(build_runtime_server, "tool_compile_project", fake_compile):
+                c._build_inproc(refs, "child-1", "captok")
+
+            meta = json.loads((repo / refs.binary_dir() / "binary_meta.json").read_text())
+            self.assertEqual(meta["source_ir_id"], "ir_20260707_007")
+            self.assertEqual(meta["source_source_id"], "src_20260707_003")
 
     def test_execute_inproc_injects_spec_and_cases_env(self) -> None:
         # Validate.execute must run `make test` with the SAME runner argv run_program uses

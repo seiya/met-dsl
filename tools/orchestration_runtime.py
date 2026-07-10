@@ -829,7 +829,8 @@ def _latest_pipeline_dir(safe_root: Path) -> Path | None:
 
 def _certified_ir_dir(repo_root: Path, kind: str, spec_id: str, version: str) -> Path | None:
     """The IR phase-root directory of the CURRENT certified IR for `(kind, id, version)` —
-    the one `_verify_dep_stage`'s `ir_ref` stage evaluates (latest `*/ir_meta.json` by mtime).
+    the one `_verify_dep_stage`'s `ir_ref` stage evaluates (latest `*/ir_meta.json` by parsed
+    canonical `(date, seq)` from the enclosing ir_id dir name, via `_latest_meta_under`).
     `None` when the versioned workspace root or the meta is absent."""
     if not (
         _is_safe_path_token(kind)
@@ -1184,6 +1185,41 @@ def _verify_dep_stage(
     raise ValueError(f"unknown readiness stage: {stage!r}")
 
 
+def _certified_binary_meta(pipe_dir: Path) -> tuple[Path, dict[str, Any]] | None:
+    """The certified binary's ``(binary_meta.json path, parsed dict)`` — the SINGLE latest-binary
+    selection (``_latest_meta_under(.../binary/*/binary_meta.json)``) that ``_certified_model_source``
+    and the harness-pin provenance both key off. Returning the parsed meta lets a caller read
+    ``source_source_id`` and ``source_ir_id`` from ONE snapshot instead of re-selecting the latest
+    binary twice (which a concurrent build could race, pairing a source with a mismatched IR
+    lineage). Pure and NEVER raises; ``None`` on any missing / unparseable / non-dict meta."""
+    try:
+        binary_meta_path = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
+        if binary_meta_path is None:
+            return None
+        binary_meta = json.loads(binary_meta_path.read_text(encoding="utf-8"))
+        if not isinstance(binary_meta, dict):
+            return None
+        return binary_meta_path, binary_meta
+    except Exception:
+        return None
+
+
+def _model_source_from_binary_meta(
+        pipe_dir: Path, spec_id: str, binary_meta: dict[str, Any]) -> Path | None:
+    """The certified ``<spec_id>_model.f90`` for an already-selected ``binary_meta`` (its
+    ``source_source_id`` source), or ``None`` if unresolvable. Split out of
+    ``_certified_model_source`` so the harness pin can bind the source AND its ``source_ir_id``
+    from the same selected binary meta. Pure and NEVER raises."""
+    try:
+        source_id = binary_meta.get("source_source_id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            return None
+        model_src = pipe_dir / "source" / source_id.strip() / "src" / f"{spec_id}_model.f90"
+        return model_src if model_src.is_file() else None
+    except Exception:
+        return None
+
+
 def _certified_model_source(pipe_dir: Path, spec_id: str) -> Path | None:
     """Resolve the certified Fortran model source for a dependency pipeline — the EXACT
     `<spec_id>_model.f90` Build stages/links — or ``None`` if it cannot be resolved.
@@ -1201,23 +1237,10 @@ def _certified_model_source(pipe_dir: Path, spec_id: str) -> Path | None:
     ``source_source_id``, no source file) yields ``None``. Callers decide the policy —
     the orientation hint skips the dep; Build re-raises its fail-closed precondition.
     """
-    try:
-        binary_meta_path = _latest_meta_under(pipe_dir, "binary/*/binary_meta.json")
-        if binary_meta_path is None:
-            return None
-        try:
-            binary_meta = json.loads(binary_meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        if not isinstance(binary_meta, dict):
-            return None
-        source_id = binary_meta.get("source_source_id")
-        if not isinstance(source_id, str) or not source_id.strip():
-            return None
-        model_src = pipe_dir / "source" / source_id.strip() / "src" / f"{spec_id}_model.f90"
-        return model_src if model_src.is_file() else None
-    except Exception:
+    sel = _certified_binary_meta(pipe_dir)
+    if sel is None:
         return None
+    return _model_source_from_binary_meta(pipe_dir, spec_id, sel[1])
 
 
 # `subroutine` header opener: optional prefixes (pure / elemental / recursive / impure /

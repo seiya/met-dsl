@@ -1965,3 +1965,70 @@ gate, a bounded failure, rather than writing out of bounds). The M3c renderer ga
 existing spec case_ids satisfy the grammar. (A related NIT the same review found: `_validate_test_predicates` built
 its case_id set unstripped while every runtime reader strips — fixed, so a whitespace-padded case_id no longer desyncs
 predicate membership from the runtime identity.)
+
+## Harness pin — resolve the certified IR structurally, not from `source_meta.ir_ref` (IMPLEMENTED 2026-07-11)
+
+Canonical plan: `~/.claude/plans/sprightly-wibbling-turtle.md`. E2E #4 (`shallow_water2d --with-deps`) fail-closed
+the consumer `dynamics_shallow_water_flux_2d_rusanov_p0` at generate start with `generate_runner_render_failed`:
+"certified harness IR public_api.signatures omits `harness_fortran_cpu__parse_cases` … recert drift". **The
+message was a misdiagnosis** — the harness 0.3.0 certified IR carried all 18 signatures. The real cause:
+`_write_runner` resolved the certified harness IR for the signature pin (`assert_harness_pin`) via the certified
+harness SOURCE's `source_meta.json` `ir_ref` field. But `ir_ref` is a leaf-authored **optional** field — absent
+from `required_meta_keys_for_step("generate")`, the generate SKILL, and the docs. A 0.3.0 leaf wrote a
+contract-minimal `source_meta` with no `ir_ref` → `harness_signatures=None` → empty `ir_iface` → the pin misfired
+on the first symbol with the drift message → conductor render fail-close killed the workflow. 0.2.1-era leaves
+happened to write a richer `source_meta`, so E2E #2′/#3 passed by luck; M3c-α (commit `a740f0b`) introduced the
+hidden dependency on a non-required field.
+
+**Fix.** (1) `_write_runner` now resolves the harness IR **structurally** and **bound to the linked source's
+lineage**. `_build_inproc` stamps `binary_meta.source_ir_id` (host-authored) — the `ir_id` the certified binary's
+source was generated from — and `_write_runner` reads it from the same certified binary snapshot the source comes
+from, pinning against THAT IR. The binary is selected ONCE (`_certified_binary_meta` → both `source_source_id` and
+`source_ir_id`, with `_certified_model_source` refactored to delegate to it), so a binary published between two
+latest-binary selections cannot pair a source with a mismatched IR lineage (a TOCTOU a split source-vs-provenance
+lookup would allow). This is not the globally-latest passing IR: a same-version **compile reopen**
+re-numbers `ir_id` under the SAME `pipeline_id` (`_ensure_fresh_producer_id`), so the latest certified IR can
+advance past the certified binary, and pinning it would raise a *false* interface drift even though source+binary
+are internally consistent (the P1 Codex round caught this — the `ir_ref` and `pipeline_ref` readiness stages are
+evaluated independently, `orchestration_runtime.py:1136-1162`, so a consumer can reach `_write_runner` in that
+mixed state). Binaries predating the field (`source_ir_id` ABSENT) fall back to `_certified_ir_dir` (latest certified IR), which
+equals the source's origin IR whenever no reopen skew exists — so the pending E2E-recovery harness (no
+`source_ir_id`) still resolves correctly without a re-cert. Only ABSENCE falls back: a PRESENT-but-unresolvable
+`source_ir_id` (unsafe token / dangling dir) is corrupt lineage and fails closed with `RuntimeError`, never masked
+behind the latest-IR fallback (which would reintroduce the skew).
+
+**Same-version signature invariant — the legacy fallback's safety basis.** At a fixed spec version the
+controlled_spec §5.1 canonical interface is fixed, and the IR validator (`_validate_ir_signatures_against_section51`)
+pins EVERY certified IR's `public_api.signatures` == §5.1. So all passing certified IRs at the same
+`(kind, id, version)` carry IDENTICAL signatures, and the pin compares those signatures against the renderer's
+embedded interface — hence WHICH same-version passing IR the fallback picks cannot change the pin verdict. A
+signature divergence between two same-version passing IRs can arise ONLY from a §5.1 edit without a version bump
+(a version-discipline contract violation R6-lite freshness governs), not normal operation. The `source_ir_id`
+binding is exact-provenance defense-in-depth ON TOP of this invariant, not a substitute for it; the invariant is
+why the earlier P1 concern (a compile-reopen advancing the latest IR past the certified binary) is a false-drift
+only in that contract-violating window, and why the legacy fallback is safe. This is also the reason the fix does
+NOT reintroduce a read of the leaf-authored `source_meta.json` `ir_ref` for legacy binaries (the Codex round-3
+suggestion): it would re-add the very leaf dependency whose absence was the original bug, would not help the
+0.3.0 recovery harness (which lacks that field), and buys nothing the invariant does not already guarantee. As a
+belt-and-suspenders operator aid, a pin failure taken via the legacy fallback appends a hint naming the fallback
+and pointing at `--with-deps` (rebuild → stamp `source_ir_id`), so even a contract-violation-window failure reads
+as actionable rather than as a misdiagnosed interface drift. `source_ir_id` is a genuine host-authored structural link (a source→IR
+binding not otherwise recoverable), so it does not fall under [feedback: no redundant persistence] (which bans
+persisting values recoverable from existing artifacts) — that same feedback is why the earlier leaf-`ir_ref`-stamp
+idea was rejected. The IR is never read from the leaf-authored OPTIONAL `source_meta.json` `ir_ref`. No certified
+IR / no *usable* `public_api.signatures` (missing / empty / all-malformed list) now raises a `RuntimeError` (a
+build precondition — "run `--with-deps` first"), distinctly routed from a `RenderError` drift;
+`assert_harness_pin`'s own empty-signatures guard remains defense-in-depth for any caller. "Usable" mirrors BOTH
+the pin's `ir_iface` build AND the IR validator's non-empty-field rule
+(`_validate_ir_signatures_against_section51`): an entry needs a NON-BLANK str `symbol` and a NON-BLANK str
+`interface`. A blank-field-only list (`{"symbol": " ", "interface": ""}`) — which that validator rejects — must
+therefore route to the missing-artifact path, not seed a `""` key that `assert_harness_pin` would later surface as
+a bogus per-symbol "omits … recert drift" (the same misclassification the whole fix removes).
+(2) `assert_harness_pin` gained an early guard: no usable signatures
+at all (None / `[]` / non-list / all entries malformed) fails closed as "no usable public_api.signatures — missing
+artifact, NOT interface drift", so the per-symbol "omits … recert drift" message only fires when real signatures
+ARE present but one specific symbol is missing (a true drift). `ir_id != pipeline_id` (Compile reopen re-numbers
+ir_id independently), so deriving the IR dir from the pipeline dir name is unsound — the structural resolver keys
+on `(kind, id, version)` and picks the latest by parsed canonical `(date, seq)`. Lesson (shared with the metric
+address fix): host deterministic code silently depending on a leaf-authored non-required field surfaces as a
+failure under LLM output variance; resolve ground truth structurally / host-authored.

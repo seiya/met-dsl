@@ -1036,8 +1036,12 @@ def assert_harness_pin(
     fail_closed with the recert-drift hint), never a Generate content retry.
 
     ``harness_signatures`` is the certified harness IR's ``public_api.signatures``
-    (a list of ``{symbol, interface}``); ``harness_source`` is the text of the
-    certified ``<harness_spec_id>_model.f90`` (resolved via ``_certified_model_source``).
+    (a list of ``{symbol, interface}``), which the conductor resolves STRUCTURALLY via
+    ``_certified_ir_dir`` (the latest passing certified IR for the harness
+    ``(kind, id, version)``), not from any leaf-authored source-meta field; ``harness_source``
+    is the text of the certified ``<harness_spec_id>_model.f90`` (resolved via
+    ``_certified_model_source``). Signatures that resolve to nothing usable (None / empty /
+    malformed) fail closed as a missing-artifact error, distinctly from interface drift.
     """
     from tools.validate_pipeline_semantics import (
         _fortran_logical_lines, _parse_interface_stanzas, _stanza_atoms, _stanza_line_set,
@@ -1073,9 +1077,25 @@ def assert_harness_pin(
     # Certified IR signatures, keyed by symbol.
     ir_iface: dict[str, str] = {}
     for entry in (harness_signatures if isinstance(harness_signatures, list) else []):
+        # A usable entry has a NON-BLANK str symbol and interface — the same rule the IR
+        # validator (`_validate_ir_signatures_against_section51`) pins, so a blank-field entry
+        # (which that validator rejects) is skipped here rather than seeding a bogus `""` key
+        # that would later masquerade as per-symbol interface drift.
         if isinstance(entry, dict) and isinstance(entry.get("symbol"), str) \
-                and isinstance(entry.get("interface"), str):
+                and entry["symbol"].strip() and isinstance(entry.get("interface"), str) \
+                and entry["interface"].strip():
             ir_iface[entry["symbol"].strip()] = entry["interface"]
+
+    # No usable signatures at all (None / [] / non-list / every entry malformed) is an
+    # absent-or-incomplete certified-IR artifact — or a caller that failed to resolve it —
+    # NOT interface drift. Fail closed here so the per-symbol "omits ... recert drift" message
+    # below only ever fires when real signatures ARE present but a specific one is missing.
+    if not ir_iface:
+        raise RenderError(
+            f"certified harness IR carries no usable public_api.signatures "
+            f"(got {type(harness_signatures).__name__}) — a missing/incomplete certified-IR "
+            "artifact (or a caller that failed to resolve it), NOT interface drift; re-certify "
+            "the harness IR (run_workflow.py --with-deps) so its public_api.signatures is present")
 
     src_ops, src_types, _src_errs = _parse_interface_stanzas(harness_source or "")
 

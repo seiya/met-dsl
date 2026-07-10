@@ -1567,17 +1567,26 @@ class Conductor:
 
         Resolves the single infrastructure dependency's CERTIFIED harness — the exact
         `<harness>_model.f90` Build stages/links (`_certified_model_source`) and the IR
-        `public_api.signatures` that source was certified against (the IR the certified binary
-        was built from, via the source's `source_meta.json` `ir_ref`) — runs the signature pin
+        `public_api.signatures` that source was certified against — runs the signature pin
         (`assert_harness_pin`), then renders the runner from the IR alone (`render_runner`).
+        The certified harness IR is resolved STRUCTURALLY and BOUND to the linked source's
+        lineage — via `binary_meta.source_ir_id` (the host-authored ir_id the certified binary's
+        source was generated from), falling back to the latest certified IR (`_certified_ir_dir`)
+        for binaries predating that field. Never from a leaf-authored `source_meta.json` field.
+        Binding to the binary's origin IR (not the globally-latest passing IR) prevents a false
+        interface-drift failure when a same-version compile reopen advances the latest IR past the
+        certified binary; the pin exact-matches the resolved IR's embedded interface
+        (drift ⇒ fail, identical ⇒ pass).
 
         Raises RuntimeError on an unresolvable/unbuilt harness (a build precondition — run
         `--with-deps` first), a harness-interface drift (the pin), or an unrenderable IR (the
         render-error matrix). run_phase routes the raise to transport fail_closed (operator
         `--resume`), NOT a Generate content retry. Mirrors `_write_makefile` (host-authored,
         runtime-owned, before the substeps run so the write is outside the FS-diff window)."""
-        from tools.runner_renderer import render_runner, assert_harness_pin
-        from tools.orchestration_runtime import _certified_model_source, _latest_pipeline_dir
+        from tools.runner_renderer import render_runner, assert_harness_pin, RenderError
+        from tools.orchestration_runtime import (
+            _certified_binary_meta, _certified_ir_dir, _is_safe_path_token,
+            _latest_pipeline_dir, _model_source_from_binary_meta)
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         infra = self._infra_direct_deps(ir)
         if len(infra) != 1:
@@ -1593,30 +1602,109 @@ class Conductor:
                 f"harness dependency {harness_nk}: no ready pipeline under "
                 f"workspace/pipelines/{safe} to render {refs.spec_id}_runner.f90 against "
                 f"(build the dependency closure first, e.g. run_workflow.py --with-deps)")
-        model_src = _certified_model_source(pipe_dir, harness_sid)
+        # Select the certified binary ONCE: `source_text` (the model source) and `source_ir_id`
+        # (its IR provenance) both come from this single snapshot, so a binary published between
+        # two selections cannot pair a source with a mismatched IR lineage (the TOCTOU a split
+        # `_certified_model_source` + separate latest-binary lookup would allow).
+        bsel = _certified_binary_meta(pipe_dir)
+        model_src = _model_source_from_binary_meta(pipe_dir, harness_sid, bsel[1]) \
+            if bsel is not None else None
         if model_src is None:
             raise RuntimeError(
                 f"harness dependency {harness_nk}: cannot resolve certified "
                 f"{harness_sid}_model.f90 under {self._rel(pipe_dir)} (harness not built ready — "
                 f"run_workflow.py --with-deps first)")
         source_text = model_src.read_text(encoding="utf-8")
-        # The certified harness IR (public_api.signatures) is the IR the certified binary's source
-        # was generated from — pinned in the source's source_meta.json (`ir_ref`), so the pin uses
-        # the IR that matches the exact source Build links.
-        harness_signatures: Any = None
-        meta_path = model_src.parent.parent / "source_meta.json"
-        if meta_path.is_file():
-            try:
-                smeta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                smeta = {}
-            ir_ref = smeta.get("ir_ref") if isinstance(smeta, dict) else None
-            if isinstance(ir_ref, str) and ir_ref.strip():
-                harness_ir = _read_yaml(self.repo_root / ir_ref.strip() / "spec.ir.yaml") or {}
-                pub = harness_ir.get("public_api") if isinstance(harness_ir, dict) else None
-                if isinstance(pub, dict):
-                    harness_signatures = pub.get("signatures")
-        assert_harness_pin(ir, refs.spec_id, harness_sid, harness_signatures, source_text)
+        bmeta = bsel[1]  # the SAME binary meta the source came from — one snapshot, no TOCTOU
+        # The certified harness IR (public_api.signatures) to pin against is resolved STRUCTURALLY
+        # (never from the leaf-authored OPTIONAL `source_meta.json` `ir_ref`, absent from the
+        # required-meta contract) AND bound to the linked source's lineage. `binary_meta.source_ir_id`
+        # (host-authored at Build) is the ir_id the certified binary's source was generated from;
+        # pinning against THAT IR — not the globally-latest passing IR — keeps the pinned IR and
+        # the pinned source in the same generation, so a same-version compile reopen that advances
+        # the latest IR past the certified binary cannot raise a false interface drift. Binaries
+        # predating the field fall back to `_certified_ir_dir` (latest certified IR), which equals
+        # the source's origin IR whenever no such reopen skew exists.
+        kind_rest, _, harness_ver = harness_nk.partition("@")
+        harness_kind = kind_rest.partition("/")[0]
+        harness_ir_dir: Path | None = None
+        # Legacy binaries predate the field (KEY ABSENT) and fall back; a binary that carries the
+        # key AT ALL is bound strictly — a null / non-string / unresolvable value is corrupt
+        # lineage, not a legacy binary. Keying on presence (not `is None`) keeps a `null` value
+        # out of the fallback branch, matching the "ONLY absence falls back" invariant.
+        has_source_ir_id = "source_ir_id" in bmeta
+        src_ir_id = bmeta.get("source_ir_id")
+        if not has_source_ir_id:
+            # Legacy binary predating the field: fall back to the latest certified IR.
+            # SAFETY INVARIANT: at a fixed version the controlled_spec §5.1 interface is fixed, and
+            # the IR validator (`_validate_ir_signatures_against_section51`) pins every certified
+            # IR's `public_api.signatures` == §5.1. So ALL passing certified IRs at the same
+            # `(kind, id, version)` carry IDENTICAL signatures, and the pin compares those against
+            # the renderer's embedded interface — hence WHICH same-version passing IR the fallback
+            # picks cannot change the pin verdict. A signature divergence between two same-version
+            # passing IRs can arise ONLY from a §5.1 edit without a version bump (a version-
+            # discipline contract violation governed by R6-lite freshness), not normal operation.
+            # The `source_ir_id` binding above is exact-provenance defense-in-depth on top of this.
+            harness_ir_dir = _certified_ir_dir(
+                self.repo_root, harness_kind, harness_sid, harness_ver)
+        else:
+            # A PRESENT source_ir_id must resolve to a real IR dir. A present-but-unresolvable
+            # link (unsafe token, or a dir that does not exist) is corrupt lineage, NOT an
+            # occasion to silently fall back to the globally-latest IR — that would reintroduce
+            # the exact false-drift the binding prevents. Fail closed instead.
+            if isinstance(src_ir_id, str) and _is_safe_path_token(src_ir_id.strip()):
+                cand = self.repo_root / "workspace" / "ir" / safe / src_ir_id.strip()
+                if cand.is_dir():
+                    harness_ir_dir = cand
+            if harness_ir_dir is None:
+                raise RuntimeError(
+                    f"harness dependency {harness_nk}: certified binary records "
+                    f"source_ir_id={src_ir_id!r} but no IR dir resolves at "
+                    f"workspace/ir/{safe}/<source_ir_id> (corrupt lineage) — re-certify the "
+                    f"harness (run_workflow.py --with-deps)")
+        ir_meta = _read_json(harness_ir_dir / "ir_meta.json") \
+            if harness_ir_dir is not None else None
+        if not (isinstance(ir_meta, dict)
+                and str(ir_meta.get("verification_status", "")).strip().lower() == "pass"):
+            # A build precondition, NOT interface drift: no certified IR to pin against.
+            raise RuntimeError(
+                f"harness dependency {harness_nk}: no certified IR (ir_meta.json "
+                f"verification_status=pass) bound to the linked source under workspace/ir/{safe} "
+                f"to pin {refs.spec_id}_runner.f90 against — run_workflow.py --with-deps first")
+        harness_ir = _read_yaml(harness_ir_dir / "spec.ir.yaml") or {}
+        pub = harness_ir.get("public_api") if isinstance(harness_ir, dict) else None
+        harness_signatures: Any = pub.get("signatures") if isinstance(pub, dict) else None
+        # "Usable" mirrors both assert_harness_pin's ir_iface build AND the validator's
+        # non-empty-field rule (_validate_ir_signatures_against_section51): at least one entry
+        # with a NON-BLANK str `symbol` and a NON-BLANK str `interface` (a blank field is
+        # malformed under that contract, not a real signature). A missing / empty / all-malformed
+        # list is an incomplete certified artifact (a build precondition), routed here as
+        # RuntimeError so the pin's RenderError stays reserved for genuine interface drift (a
+        # present, usable signature that no longer matches).
+        if not (isinstance(harness_signatures, list) and any(
+                isinstance(e, dict)
+                and isinstance(e.get("symbol"), str) and e["symbol"].strip()
+                and isinstance(e.get("interface"), str) and e["interface"].strip()
+                for e in harness_signatures)):
+            raise RuntimeError(
+                f"harness dependency {harness_nk}: certified IR under "
+                f"{self._rel(harness_ir_dir)} carries no usable public_api.signatures to pin "
+                f"against (re-certify the harness)")
+        try:
+            assert_harness_pin(ir, refs.spec_id, harness_sid, harness_signatures, source_text)
+        except RenderError as e:
+            # A pin failure on the LEGACY-fallback path (no source_ir_id) matched against the
+            # latest certified IR, not a provenance-bound one. Per the same-version signature
+            # invariant that can only mislead under a version-bump contract violation — but name
+            # the fallback so this reads as an actionable hint, never a misdiagnosis: rebuilding
+            # the harness stamps source_ir_id and binds the pin to the exact origin IR.
+            if not has_source_ir_id:
+                raise RenderError(
+                    f"{e} [legacy harness binary carries no source_ir_id, so the pin matched the "
+                    f"latest certified IR under {self._rel(harness_ir_dir)}; if this is a "
+                    f"stale-IR false drift, rebuild the harness (run_workflow.py --with-deps) to "
+                    f"stamp source_ir_id and bind the pin to the source's origin IR]") from e
+            raise
         runner_text = render_runner(ir, refs.spec_id, harness_sid)
         path = self.repo_root / refs.source_dir() / "src" / f"{refs.spec_id}_runner.f90"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2420,6 +2508,10 @@ clean:
             "status": "pass" if ok else "fail",
             "validation_stage": "post_build",
             "source_source_id": refs.source_id,
+            # The ir_id the linked source was generated from (a compile reopen re-numbers ir_id
+            # under the SAME pipeline, so this binds this binary to its exact origin IR — read by
+            # `_write_runner` to pin a consumer's harness runner against the same-lineage IR).
+            "source_ir_id": refs.ir_id,
             "build_system": build_system,
             "compiler": result.get("compiler") or "",
             "binary_artifact_ref": f"binary/{refs.binary_id}/bin/{exe}",

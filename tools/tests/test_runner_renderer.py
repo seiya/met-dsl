@@ -1222,12 +1222,19 @@ class HarnessPinTest(unittest.TestCase):
             assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, pruned, self.src)
 
     def test_empty_signatures_fail_closed(self) -> None:
-        # An uncertified / absent harness IR (empty or None public_api.signatures) must
-        # NOT false-pass the pin — the whole safety net rests on this.
-        with self.assertRaises(RenderError):
-            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, [], self.src)
-        with self.assertRaises(RenderError):
-            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, None, self.src)
+        # An uncertified / absent harness IR (empty, None, or non-list public_api.signatures)
+        # must NOT false-pass the pin — the whole safety net rests on this. The failure is the
+        # distinct "no usable public_api.signatures" (missing artifact), NOT the per-symbol
+        # "omits ... recert drift" message (which is reserved for a real single-symbol drift).
+        # Blank symbol/interface fields are malformed under the IR validator's non-empty rule,
+        # so they must NOT seed a bogus "" key that later reads as per-symbol drift.
+        for sigs in ([], None, "not-a-list", 42, [{"symbol": "x"}],
+                     [{"symbol": " ", "interface": ""}],
+                     [{"symbol": "harness_fortran_cpu__box", "interface": "   "}]):
+            with self.assertRaises(RenderError) as cm:
+                assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, sigs, self.src)
+            self.assertIn("no usable public_api.signatures", str(cm.exception))
+            self.assertNotIn("omits", str(cm.exception))
 
     def test_empty_source_fail_closed(self) -> None:
         with self.assertRaises(RenderError):
