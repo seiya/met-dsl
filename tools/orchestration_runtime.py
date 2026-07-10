@@ -15775,6 +15775,10 @@ def write_step_result(
     step_token = step.strip().lower()
     root = _orchestration_root(repo_root, orchestration_id)
     result_path = root / "steps" / node_safe / step_token / agent_run_id / "step_result.json"
+    # Read once: nothing below appends to agent_runs.jsonl, and all three consumers
+    # (the backfill guards, the executor-role guard, the overwrite orphan filter) need
+    # the same snapshot.
+    run_records = _load_run_records(root)
 
     if backfill:
         # Backfill writes a step_result for an already-terminal step agent that
@@ -15791,8 +15795,7 @@ def write_step_result(
                 f"write_step_result --backfill: step_result already exists for "
                 f"agent_run_id={agent_run_id} (backfill only fills a genuine gap, never overwrites)"
             )
-        runs = _load_run_records(root)
-        record = runs.get(agent_run_id.strip())
+        record = run_records.get(agent_run_id.strip())
         if not isinstance(record, dict):
             raise RuntimeError(
                 f"write_step_result --backfill: no agent_runs.jsonl record for agent_run_id={agent_run_id}"
@@ -15863,7 +15866,6 @@ def write_step_result(
         # run the executor is always recorded (orchestration row at init, step agent via
         # record-agent-run), so the recurrence case — a recorded wrong-role arid — is
         # fully covered here.
-        run_records = _load_run_records(_orchestration_root(repo_root, orchestration_id))
         executor_role = str(run_records.get(agent_run_id.strip(), {}).get("agent_role") or "").strip().lower()
         if executor_role:
             if step_token in SUBSTEP_AWARE_STEPS:
@@ -15900,9 +15902,122 @@ def write_step_result(
         payload=result,
     )
 
-    _write_json(result_path, result)
+    # A pre-existing step_result here means the phase re-ran WITHOUT reopen_phase
+    # archiving the prior attempt aside. Every in-run re-run route goes through
+    # reopen_phase (archive + supersede) or the skip-write+tombstone branches; the
+    # one route that lands here is a plain `--resume` re-running a phase whose prior
+    # attempt terminalized with a WRITTEN fail step_result. For substep-aware phases
+    # the path is keyed by the constant orchestration executor arid, so writing
+    # in place would silently drop the prior attempt's vouch and strand its substep
+    # arids in agent_runs.jsonl — _validate_orchestration_completion_for_pass then
+    # blocks the final pass on the orphans ("missing substep_agent_run_ids entry").
+    # Keep the invariant the way reopen_phase does: move the prior file aside (a
+    # distinct `.overwritten.` name so it can never collide with — or be clobbered
+    # by — reopen's `.superseded.<reopen_seq>.` renames) and tombstone its
+    # now-unvouched substep arids. Tombstoning re-arms the completion check's
+    # reopened-phase rule for this (node, phase); the replacement it demands is
+    # supplied by the resumed attempt's own freshly-recorded substep runs, which the
+    # step_result written here vouches for (the write itself cannot satisfy the rule
+    # — it is keyed by the orchestration arid, and only `step`/`substep` roles count).
+    # An idempotent re-write whose prior substep set is fully contained in the new one
+    # (e.g. a crash-retry of the SAME attempt) overwrites in place; an unreadable prior
+    # file is archived without a tombstone so the completion check still fails closed on
+    # whatever runs relied on it.
+    #
+    # Only ids whose RECORDED run is a substep of exactly this node/step are
+    # tombstoned: a fail step_result's substep list is not payload-validated (the
+    # substep verification runs on pass only), so an id that is unrecorded (it can
+    # never block completion — the validator iterates recorded runs) or that belongs
+    # to another node/phase (its own step_result must keep vouching for it) must not
+    # be superseded on the strength of a malformed prior list.
+    def _recorded_substep_ids(path: Path) -> tuple[list[str], bool]:
+        """`(substep_agent_run_ids, well_formed)` for an on-disk step_result."""
+        try:
+            data = _read_json(path)
+        except (OSError, ValueError):
+            # ValueError covers json.JSONDecodeError and the UnicodeDecodeError that
+            # a corrupted (non-UTF-8) file raises out of `Path.read_text`.
+            return [], False
+        if not isinstance(data, dict):
+            return [], False
+        raw = data.get("substep_agent_run_ids")
+        if not isinstance(raw, list):
+            return [], True
+        return [s.strip() for s in raw if isinstance(s, str) and s.strip()], True
 
+    # Ids stranded by an EARLIER overwrite whose tombstone never landed. The supersede
+    # below is the last step and is not atomic with the write, so a crash (or an I/O
+    # error) between the two would otherwise orphan those arids forever: the next
+    # attempt reads only the already-replaced step_result.json and can no longer see
+    # them. Read the archives before this write adds one of its own.
+    archived_prior_path: Path | None = None
+    orphaned: list[str] = []
+    stranded: list[str] = []
+    for sibling in sorted(result_path.parent.glob("step_result.overwritten.*.json")):
+        stranded.extend(_recorded_substep_ids(sibling)[0])
+
+    prior_exists = result_path.exists()
+    if prior_exists or stranded:
+        new_subs = {
+            s.strip() for s in (result.get("substep_agent_run_ids") or [])
+            if isinstance(s, str) and s.strip()
+        }
+
+        def _is_this_phase_substep(arid: str) -> bool:
+            rec = run_records.get(arid)
+            return (
+                isinstance(rec, dict)
+                and str(rec.get("agent_role") or "").strip().lower() == "substep"
+                and str(rec.get("node_key") or "").strip() == node_key.strip()
+                and str(rec.get("step") or "").strip().lower() == step_token
+            )
+
+        def _unvouched(ids: list[str]) -> list[str]:
+            # Deduped by the caller, which folds both sources into one dict.fromkeys.
+            return [s for s in ids if s not in new_subs and _is_this_phase_substep(s)]
+
+        prior_unvouched: list[str] = []
+        if prior_exists:
+            prior_subs, prior_well_formed = _recorded_substep_ids(result_path)
+            prior_unvouched = _unvouched(prior_subs)
+            if prior_unvouched or not prior_well_formed:
+                seq = 1
+                while (archived_prior_path := result_path.with_name(
+                        f"step_result.overwritten.{seq}.json")).exists():
+                    seq += 1
+                result_path.rename(archived_prior_path)
+
+        # "Unvouched" has to mean unvouched by ANY live step_result, not merely absent
+        # from the payload being written. The completion check's vouch map is keyed by
+        # substep id across every live file regardless of which node/phase wrote it, and
+        # a FAIL payload's substep list is never validated — so another phase's malformed
+        # fail step_result can still reference this phase's substep ids. Tombstoning one
+        # of those would exempt a live-vouched run from the terminal-status and
+        # launch-ref checks it must still pass. Archived (`.overwritten.` /
+        # `.superseded.`) files are not live and are correctly absent from this glob.
+        #
+        # Skipping `result_path` is belt-and-braces rather than load-bearing: when it
+        # was archived above it is already gone from the glob, and when it was NOT
+        # archived `prior_unvouched` was empty — i.e. every this-phase substep id it
+        # holds is in `new_subs` — so it could only contribute ids `_unvouched` already
+        # drops. Stating it keeps the set honest if the archive predicate ever changes.
+        vouched_elsewhere: set[str] = set()
+        for live_path in _iter_step_result_paths(root):
+            if live_path != result_path:
+                vouched_elsewhere.update(_recorded_substep_ids(live_path)[0])
+
+        # Drop what an earlier call already tombstoned: `add_superseded_run_ids` is
+        # set-idempotent, but every call appends an audit line — skip the no-op.
+        already_superseded = _load_superseded_run_ids(repo_root, orchestration_id)
+        orphaned = [
+            s for s in dict.fromkeys(prior_unvouched + _unvouched(stranded))
+            if s not in already_superseded and s not in vouched_elsewhere
+        ]
+
+    committed_new = False
     try:
+        _write_json(result_path, result)
+        committed_new = True
         post_phase_complete(
             repo_root,
             orchestration_id,
@@ -15911,12 +16026,41 @@ def write_step_result(
             agent_run_id=agent_run_id,
             payload=result,
         )
-    except RuntimeError:
-        try:
-            result_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    except BaseException:
+        # Roll the overwrite back whole, so a retry sees the exact pre-write state.
+        # `_write_json` must stay inside this guard — after the rename the prior attempt
+        # exists ONLY under its archive name, so letting a failed write escape would
+        # leave result_path absent and the next attempt blind to the prior substep ids.
+        # BaseException, not RuntimeError: a KeyboardInterrupt or an OSError mid-write
+        # must restore just as a rejected hook does.
+        #
+        # Unlink ONLY what this call committed. `_write_json` is atomic (temp file +
+        # os.replace), so when it is what raised, result_path still holds the prior
+        # content — unlinking unconditionally would destroy a file the failed write had
+        # preserved, and in the no-archive branch there would be nothing to restore it
+        # from. Nothing has been tombstoned yet (that happens only after the hook passes).
+        if committed_new:
+            try:
+                result_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if archived_prior_path is not None:
+            try:
+                archived_prior_path.rename(result_path)
+            except OSError:
+                pass
         raise
+
+    # Tombstone only after the write is committed (hook passed): superseding the
+    # prior attempt's arids is justified exactly when the fresh attempt's
+    # step_result has actually replaced its vouch.
+    if orphaned:
+        add_superseded_run_ids(
+            repo_root,
+            orchestration_id,
+            run_ids=orphaned,
+            reason=f"step_result_overwrite_orphan:{node_safe}/{step_token}",
+        )
 
     # Backfill never advances the phase state — it accounts for a terminal agent
     # whose `child_finished` authority is gone, so consuming a transition would

@@ -9336,6 +9336,563 @@ shell_tool                       stable             true
                 },
             )
 
+    # -- step_result overwrite orphan handling (resume re-run of a failed phase) ----
+
+    def _reset_phase_child_finished(self, repo_root: Path, step: str) -> None:
+        """Re-arm the phase gate so a second write_step_result (the resumed re-run)
+        is accepted, as `cmd_init --resume-from-checkpoint` does in a real resume."""
+        phase_state_path = repo_root / "workspace/orchestrations/orch_001/phase_state.json"
+        phase_state = json.loads(phase_state_path.read_text(encoding="utf-8"))
+        phase_state["node_states"]["problem__shallow_water2d__0.3.0"][step] = "child_finished"
+        phase_state_path.write_text(
+            json.dumps(phase_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _append_substep_run(self, repo_root: Path, arid: str, *, step: str,
+                            status: str, substep: str = "generate",
+                            node_key: str = "problem/shallow_water2d@0.3.0",
+                            agent_role: str = "substep") -> None:
+        runs_path = repo_root / "workspace/orchestrations/orch_001/agent_runs.jsonl"
+        if any(
+            json.loads(line).get("agent_run_id") == arid
+            for line in runs_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ):
+            return
+        with runs_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "agent_run_id": arid,
+                "parent_agent_run_id": "orch_run_001",
+                "agent_role": agent_role,
+                "node_key": node_key,
+                "step": step,
+                "substep": substep,
+                "status": status,
+                "agent_backend": "claude",
+            }) + "\n")
+
+    @staticmethod
+    def _passing_compile_payload() -> dict:
+        return {
+            "status": "pass",
+            "required_outputs": [
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
+            ],
+            "failed_substeps": [],
+            "substep_agent_run_ids": ["fresh_compile_generate_001"],
+            "validation_stage": "compile",
+        }
+
+    def _seed_fresh_compile_substep(self, repo_root: Path) -> None:
+        """The fresh (resumed) compile attempt's prerequisites: a recorded pass substep
+        + valid ir_meta on disk (with output_refs so the pass-path substep verification
+        accepts it)."""
+        runs_path = repo_root / "workspace/orchestrations/orch_001/agent_runs.jsonl"
+        record = {
+            "agent_run_id": "fresh_compile_generate_001",
+            "parent_agent_run_id": "orch_run_001",
+            "agent_role": "substep",
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "step": "compile",
+            "substep": "generate",
+            "status": "pass",
+            "agent_backend": "claude",
+            "output_refs": [
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/ir_meta.json",
+            ],
+        }
+        if not any(
+            json.loads(line).get("agent_run_id") == record["agent_run_id"]
+            for line in runs_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ):
+            with runs_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+        ir_meta_path = (repo_root / "workspace" / "ir" / "problem__shallow_water2d__0.3.0"
+                        / "shallow-water2d_20260415_001" / "ir_meta.json")
+        ir_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        ir_meta_path.write_text(json.dumps(self._valid_ir_meta()), encoding="utf-8")
+
+    def _write_passing_compile_step_result(self, repo_root: Path) -> None:
+        """The fresh (resumed) compile attempt, written through the real
+        write_step_result pass path."""
+        self._seed_fresh_compile_substep(repo_root)
+        write_step_result(
+            repo_root=repo_root,
+            orchestration_id="orch_001",
+            node_key="problem/shallow_water2d@0.3.0",
+            step="compile",
+            agent_run_id="orch_run_001",
+            payload=self._passing_compile_payload(),
+        )
+
+    def _write_failing_compile_step_result(
+        self, repo_root: Path, *, substep_ids: list[str], failed_substeps: list[str],
+    ) -> None:
+        """The prior (pre-resume) compile attempt that terminalized with a written FAIL."""
+        write_step_result(
+            repo_root=repo_root,
+            orchestration_id="orch_001",
+            node_key="problem/shallow_water2d@0.3.0",
+            step="compile",
+            agent_run_id="orch_run_001",
+            payload={
+                "status": "fail",
+                "required_outputs": [],
+                "failed_substeps": failed_substeps,
+                "substep_agent_run_ids": substep_ids,
+                "validation_stage": "compile",
+            },
+        )
+
+    @staticmethod
+    def _step_result_dir(repo_root: Path) -> Path:
+        return (repo_root / "workspace/orchestrations/orch_001/steps"
+                / "problem__shallow_water2d__0.3.0/compile/orch_run_001")
+
+    @staticmethod
+    def _superseded_ids(repo_root: Path) -> list[str]:
+        path = (repo_root
+                / "workspace/orchestrations/orch_001/reopen/superseded_runs.json")
+        if not path.exists():
+            return []
+        return sorted(json.loads(path.read_text(encoding="utf-8"))
+                      ["superseded_agent_run_ids"])
+
+    def test_write_step_result_overwrite_archives_and_supersedes_prior_substeps(self) -> None:
+        """A resumed re-run overwriting a prior FAIL step_result archives it aside and
+        tombstones its now-unvouched substep arids — otherwise
+        _validate_orchestration_completion_for_pass blocks the final pass on the orphans
+        (E2E #4: orch_20260710T030911Z_9c3eb219, `missing substep_agent_run_ids entry`)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._append_substep_run(repo_root, "stale_pre_pass", step="compile", status="pass")
+            self._append_substep_run(repo_root, "stale_exec_fail", step="compile", status="fail")
+            self._write_failing_compile_step_result(
+                repo_root,
+                substep_ids=["stale_pre_pass", "stale_exec_fail"],
+                failed_substeps=["stale_exec_fail"],
+            )
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._write_passing_compile_step_result(repo_root)
+
+            sr_dir = self._step_result_dir(repo_root)
+            fresh = json.loads((sr_dir / "step_result.json").read_text(encoding="utf-8"))
+            self.assertEqual(fresh["substep_agent_run_ids"], ["fresh_compile_generate_001"])
+            archived = json.loads(
+                (sr_dir / "step_result.overwritten.1.json").read_text(encoding="utf-8"))
+            self.assertEqual(archived["substep_agent_run_ids"],
+                             ["stale_pre_pass", "stale_exec_fail"])
+            superseded = self._superseded_ids(repo_root)
+            self.assertEqual(superseded, ["stale_exec_fail", "stale_pre_pass"])
+            self.assertNotIn("orch_run_001", superseded)
+            self.assertNotIn("fresh_compile_generate_001", superseded)
+            log_lines = [
+                json.loads(line) for line in
+                (repo_root / "workspace/orchestrations/orch_001/reopen/reopen_log.jsonl")
+                .read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+            self.assertTrue(any(
+                entry.get("event") == "add_superseded_runs"
+                and entry.get("reason")
+                == "step_result_overwrite_orphan:problem__shallow_water2d__0.3.0/compile"
+                for entry in log_lines
+            ))
+            # The completion invariant the fix exists for: every recorded substep is
+            # either vouched by a live step_result or superseded — the exact scan
+            # _validate_orchestration_completion_for_pass performs before pass.
+            orch_root = repo_root / "workspace/orchestrations/orch_001"
+            vouched = set()
+            for sr_path in (orch_root / "steps").glob("*/*/*/step_result.json"):
+                vouched.update(
+                    json.loads(sr_path.read_text(encoding="utf-8"))
+                    .get("substep_agent_run_ids") or [])
+            for line in (orch_root / "agent_runs.jsonl").read_text(
+                    encoding="utf-8").splitlines():
+                rec = json.loads(line)
+                if rec.get("agent_role") != "substep":
+                    continue
+                self.assertTrue(
+                    rec["agent_run_id"] in vouched or rec["agent_run_id"] in superseded,
+                    f"orphaned substep: {rec['agent_run_id']}")
+
+    def test_write_step_result_overwrite_does_not_tombstone_foreign_or_unrecorded_ids(self) -> None:
+        """A prior FAIL step_result's substep list is not payload-validated, so ids that
+        are unrecorded, or recorded for another phase, must never be superseded on its
+        strength (Codex finding 1): the other phase's step_result keeps vouching for its
+        own run, and an unrecorded id cannot block completion in the first place."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._append_substep_run(repo_root, "foreign_generate_substep",
+                                     step="generate", status="pass")
+            self._write_failing_compile_step_result(
+                repo_root,
+                substep_ids=["foreign_generate_substep", "ghost_unrecorded"],
+                failed_substeps=["ghost_unrecorded"],
+            )
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._write_passing_compile_step_result(repo_root)
+
+            sr_dir = self._step_result_dir(repo_root)
+            fresh = json.loads((sr_dir / "step_result.json").read_text(encoding="utf-8"))
+            self.assertEqual(fresh["substep_agent_run_ids"], ["fresh_compile_generate_001"])
+            self.assertEqual(self._superseded_ids(repo_root), [])
+
+    def test_write_step_result_hook_rejection_rolls_back_overwrite(self) -> None:
+        """A post_phase_complete rejection of the fresh write restores the prior
+        step_result and tombstones nothing (Codex finding 2), so a retry sees the exact
+        pre-write state."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._append_substep_run(repo_root, "stale_pre_pass", step="compile", status="pass")
+            self._append_substep_run(repo_root, "stale_exec_fail", step="compile", status="fail")
+            self._write_failing_compile_step_result(
+                repo_root,
+                substep_ids=["stale_pre_pass", "stale_exec_fail"],
+                failed_substeps=["stale_exec_fail"],
+            )
+            self._reset_phase_child_finished(repo_root, "compile")
+            # Arm a post_phase_complete violation for the fresh write: a launch
+            # request/response pair for the executor arid whose agent_session_ids
+            # disagree.
+            launches = repo_root / "workspace/orchestrations/orch_001/launches"
+            launches.mkdir(parents=True, exist_ok=True)
+            (launches / "orch_run_001.request.json").write_text(
+                json.dumps({"agent_session_id": "sess-a"}), encoding="utf-8")
+            (launches / "orch_run_001.response.json").write_text(
+                json.dumps({"agent_session_id": "sess-b"}), encoding="utf-8")
+            self._seed_fresh_compile_substep(repo_root)
+            with self.assertRaisesRegex(RuntimeError, "post_phase_complete denied"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="compile",
+                    agent_run_id="orch_run_001",
+                    payload=self._passing_compile_payload(),
+                )
+
+            sr_dir = self._step_result_dir(repo_root)
+            restored = json.loads((sr_dir / "step_result.json").read_text(encoding="utf-8"))
+            self.assertEqual(restored["substep_agent_run_ids"],
+                             ["stale_pre_pass", "stale_exec_fail"])
+            self.assertEqual(list(sr_dir.glob("step_result.overwritten.*.json")), [])
+            self.assertEqual(self._superseded_ids(repo_root), [])
+
+    def test_write_step_result_write_failure_restores_archived_prior(self) -> None:
+        """`_write_json` failing AFTER the archive rename must restore the prior
+        step_result. Otherwise result_path is gone, the next attempt's `prior_exists`
+        check finds nothing, and the prior attempt's substep arids are stranded
+        unvouched forever — the very deadlock the archiver exists to prevent."""
+        from tools import orchestration_runtime as ort
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._append_substep_run(repo_root, "stale_pre_pass", step="compile", status="pass")
+            self._append_substep_run(repo_root, "stale_exec_fail", step="compile", status="fail")
+            self._write_failing_compile_step_result(
+                repo_root,
+                substep_ids=["stale_pre_pass", "stale_exec_fail"],
+                failed_substeps=["stale_exec_fail"],
+            )
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._seed_fresh_compile_substep(repo_root)
+
+            sr_dir = self._step_result_dir(repo_root)
+            result_path = sr_dir / "step_result.json"
+            real_write_json = ort._write_json
+
+            def _fail_on_result_path(path: Path, payload: Any) -> None:
+                if Path(path) == result_path:
+                    raise OSError(28, "No space left on device")
+                real_write_json(path, payload)
+
+            with patch.object(ort, "_write_json", side_effect=_fail_on_result_path):
+                with self.assertRaises(OSError):
+                    write_step_result(
+                        repo_root=repo_root,
+                        orchestration_id="orch_001",
+                        node_key="problem/shallow_water2d@0.3.0",
+                        step="compile",
+                        agent_run_id="orch_run_001",
+                        payload=self._passing_compile_payload(),
+                    )
+
+            restored = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(restored["substep_agent_run_ids"],
+                             ["stale_pre_pass", "stale_exec_fail"])
+            self.assertEqual(list(sr_dir.glob("step_result.overwritten.*.json")), [])
+            self.assertEqual(self._superseded_ids(repo_root), [])
+
+    def test_write_step_result_hook_rejection_removes_unarchived_new_file(self) -> None:
+        """When no archive was taken, the rollback's unlink is the only thing that stops
+        a hook-REJECTED step_result from persisting on disk (there is no archive whose
+        rename-back would overwrite it). A rejected payload left at result_path would
+        later be read as a real vouch by the completion check."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._write_failing_compile_step_result(
+                repo_root, substep_ids=[], failed_substeps=[])
+            self._reset_phase_child_finished(repo_root, "compile")
+            launches = repo_root / "workspace/orchestrations/orch_001/launches"
+            launches.mkdir(parents=True, exist_ok=True)
+            (launches / "orch_run_001.request.json").write_text(
+                json.dumps({"agent_session_id": "sess-a"}), encoding="utf-8")
+            (launches / "orch_run_001.response.json").write_text(
+                json.dumps({"agent_session_id": "sess-b"}), encoding="utf-8")
+            self._seed_fresh_compile_substep(repo_root)
+
+            with self.assertRaisesRegex(RuntimeError, "post_phase_complete denied"):
+                write_step_result(
+                    repo_root=repo_root,
+                    orchestration_id="orch_001",
+                    node_key="problem/shallow_water2d@0.3.0",
+                    step="compile",
+                    agent_run_id="orch_run_001",
+                    payload=self._passing_compile_payload(),
+                )
+
+            sr_dir = self._step_result_dir(repo_root)
+            self.assertFalse((sr_dir / "step_result.json").exists())
+            self.assertEqual(list(sr_dir.glob("step_result.overwritten.*.json")), [])
+            self.assertEqual(self._superseded_ids(repo_root), [])
+
+    def test_write_step_result_write_failure_preserves_unarchived_prior(self) -> None:
+        """`_write_json` is atomic (temp + os.replace), so when it raises, result_path
+        still holds the PRIOR content. The rollback must not unlink it: in the
+        no-archive branch (prior substeps already ⊆ the new payload's) there is no
+        archive to restore it from, so an unconditional unlink would destroy a file the
+        failed write had preserved."""
+        from tools import orchestration_runtime as ort
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            # A prior FAIL attempt with no substep ids: nothing of its own is left
+            # unvouched, so the fresh write would overwrite it in place (no archive).
+            self._write_failing_compile_step_result(
+                repo_root, substep_ids=[], failed_substeps=[])
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._seed_fresh_compile_substep(repo_root)
+
+            sr_dir = self._step_result_dir(repo_root)
+            result_path = sr_dir / "step_result.json"
+            real_write_json = ort._write_json
+
+            def _fail_on_result_path(path: Path, payload: Any) -> None:
+                if Path(path) == result_path:
+                    raise OSError(28, "No space left on device")
+                real_write_json(path, payload)
+
+            with patch.object(ort, "_write_json", side_effect=_fail_on_result_path):
+                with self.assertRaises(OSError):
+                    write_step_result(
+                        repo_root=repo_root,
+                        orchestration_id="orch_001",
+                        node_key="problem/shallow_water2d@0.3.0",
+                        step="compile",
+                        agent_run_id="orch_run_001",
+                        payload=self._passing_compile_payload(),
+                    )
+
+            preserved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(preserved["status"], "fail")
+            self.assertEqual(list(sr_dir.glob("step_result.overwritten.*.json")), [])
+            self.assertEqual(self._superseded_ids(repo_root), [])
+
+    def test_write_step_result_heals_archive_whose_tombstone_never_landed(self) -> None:
+        """The supersede is the last, non-atomic step: a crash between the committed
+        write and it leaves an archived prior whose substep arids were never tombstoned.
+        The next write must re-derive them from the `.overwritten.*` archives — reading
+        only the (already-replaced) step_result.json would strand them forever. Repeating
+        the write must not re-append a second audit line for ids already tombstoned."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._append_substep_run(repo_root, "stale_pre_pass", step="compile", status="pass")
+            self._append_substep_run(repo_root, "stale_exec_fail", step="compile", status="fail")
+            # Post-crash state: a hard kill (so the rollback handler never ran) landed
+            # between the archive rename and the end of the tombstone, leaving the prior
+            # attempt only under its archive name with nothing superseded.
+            sr_dir = self._step_result_dir(repo_root)
+            sr_dir.mkdir(parents=True, exist_ok=True)
+            (sr_dir / "step_result.overwritten.1.json").write_text(
+                json.dumps({
+                    "status": "fail",
+                    "substep_agent_run_ids": ["stale_pre_pass", "stale_exec_fail"],
+                }), encoding="utf-8")
+
+            self._write_passing_compile_step_result(repo_root)
+            self.assertEqual(self._superseded_ids(repo_root),
+                             ["stale_exec_fail", "stale_pre_pass"])
+            # The heal did not archive again: the committed step_result was already the
+            # fresh one, so nothing of its own was left unvouched.
+            self.assertEqual(
+                [p.name for p in sorted(sr_dir.glob("step_result.overwritten.*.json"))],
+                ["step_result.overwritten.1.json"])
+
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._write_passing_compile_step_result(repo_root)
+            self.assertEqual(self._superseded_ids(repo_root),
+                             ["stale_exec_fail", "stale_pre_pass"])
+            log_lines = [
+                json.loads(line) for line in
+                (repo_root / "workspace/orchestrations/orch_001/reopen/reopen_log.jsonl")
+                .read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+            self.assertEqual(
+                sum(1 for e in log_lines if e.get("event") == "add_superseded_runs"), 1)
+
+    def test_write_step_result_identical_rewrite_does_not_archive(self) -> None:
+        """A crash-retry re-write of the SAME attempt (identical substep set) overwrites
+        in place: no archive, no tombstone."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._write_passing_compile_step_result(repo_root)
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._write_passing_compile_step_result(repo_root)
+
+            sr_dir = self._step_result_dir(repo_root)
+            self.assertTrue((sr_dir / "step_result.json").exists())
+            self.assertEqual(list(sr_dir.glob("step_result.overwritten.*.json")), [])
+            self.assertEqual(self._superseded_ids(repo_root), [])
+
+    def test_write_step_result_unreadable_prior_archives_without_tombstone(self) -> None:
+        """An unparsable prior step_result is archived aside (evidence preserved) but
+        nothing is tombstoned — the completion check stays fail-closed on whatever
+        runs relied on it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            sr_dir = self._step_result_dir(repo_root)
+            sr_dir.mkdir(parents=True, exist_ok=True)
+            (sr_dir / "step_result.json").write_text("not json", encoding="utf-8")
+            self._write_passing_compile_step_result(repo_root)
+
+            self.assertEqual(
+                (sr_dir / "step_result.overwritten.1.json").read_text(encoding="utf-8"),
+                "not json")
+            fresh = json.loads((sr_dir / "step_result.json").read_text(encoding="utf-8"))
+            self.assertEqual(fresh["substep_agent_run_ids"], ["fresh_compile_generate_001"])
+            self.assertEqual(self._superseded_ids(repo_root), [])
+
+    def test_write_step_result_non_utf8_prior_archives_without_crashing(self) -> None:
+        """A prior step_result with invalid UTF-8 bytes makes `Path.read_text` raise
+        UnicodeDecodeError, which is a ValueError but neither JSONDecodeError nor
+        OSError. It must be treated as unreadable (archive, no tombstone), not crash
+        the write."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            sr_dir = self._step_result_dir(repo_root)
+            sr_dir.mkdir(parents=True, exist_ok=True)
+            (sr_dir / "step_result.json").write_bytes(b'{"status": "\xff\xfe"}')
+            self._write_passing_compile_step_result(repo_root)
+
+            self.assertEqual(
+                (sr_dir / "step_result.overwritten.1.json").read_bytes(),
+                b'{"status": "\xff\xfe"}')
+            fresh = json.loads((sr_dir / "step_result.json").read_text(encoding="utf-8"))
+            self.assertEqual(fresh["substep_agent_run_ids"], ["fresh_compile_generate_001"])
+            self.assertEqual(self._superseded_ids(repo_root), [])
+
+    def test_write_step_result_overwrite_does_not_clobber_existing_archive(self) -> None:
+        """The `.overwritten.<seq>.` sequence exists so a second overwrite cannot destroy
+        the first archive's evidence: the new archive takes the next free seq and the
+        existing one is left byte-identical."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            sr_dir = self._step_result_dir(repo_root)
+            sr_dir.mkdir(parents=True, exist_ok=True)
+            # Unparsable, so it contributes no stranded ids — this test isolates the
+            # sequence numbering from the archive-heal path.
+            (sr_dir / "step_result.overwritten.1.json").write_text(
+                "earlier archive", encoding="utf-8")
+            self._append_substep_run(repo_root, "stale_pre_pass", step="compile", status="pass")
+            self._write_failing_compile_step_result(
+                repo_root, substep_ids=["stale_pre_pass"], failed_substeps=[])
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._write_passing_compile_step_result(repo_root)
+
+            self.assertEqual(
+                (sr_dir / "step_result.overwritten.1.json").read_text(encoding="utf-8"),
+                "earlier archive")
+            archived = json.loads(
+                (sr_dir / "step_result.overwritten.2.json").read_text(encoding="utf-8"))
+            self.assertEqual(archived["substep_agent_run_ids"], ["stale_pre_pass"])
+            self.assertEqual(self._superseded_ids(repo_root), ["stale_pre_pass"])
+
+    def test_write_step_result_overwrite_keeps_ids_vouched_by_another_live_step_result(self) -> None:
+        """`_validate_step_result_payload` never checks a FAIL payload's substep list, so
+        another phase's fail step_result can legitimately still reference this phase's
+        substep id. The completion check's vouch map is keyed by substep id across every
+        live step_result, so tombstoning such an id would exempt a still-vouched run from
+        the terminal-status and launch-ref checks it must pass. Only ids no live
+        step_result references may be superseded (Codex round-3 finding 3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._append_substep_run(repo_root, "shared_substep", step="compile", status="pass")
+            self._append_substep_run(repo_root, "lonely_substep", step="compile", status="fail")
+            # A live step_result for ANOTHER phase whose (unvalidated) fail payload
+            # references this phase's `shared_substep`.
+            other = (repo_root / "workspace/orchestrations/orch_001/steps"
+                     / "problem__shallow_water2d__0.3.0/generate/some_step_arid")
+            other.mkdir(parents=True, exist_ok=True)
+            (other / "step_result.json").write_text(json.dumps({
+                "status": "fail",
+                "executor_agent_run_id": "some_step_arid",
+                "substep_agent_run_ids": ["shared_substep"],
+            }), encoding="utf-8")
+
+            self._write_failing_compile_step_result(
+                repo_root,
+                substep_ids=["shared_substep", "lonely_substep"],
+                failed_substeps=["lonely_substep"],
+            )
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._write_passing_compile_step_result(repo_root)
+
+            sr_dir = self._step_result_dir(repo_root)
+            self.assertTrue((sr_dir / "step_result.overwritten.1.json").exists())
+            # `lonely_substep` lost its only vouch -> tombstoned. `shared_substep` is
+            # still referenced by the other live step_result -> must survive.
+            self.assertEqual(self._superseded_ids(repo_root), ["lonely_substep"])
+
+    def test_write_step_result_overwrite_tombstones_only_same_node_substep_role(self) -> None:
+        """The orphan filter must discriminate on all three recorded dimensions. Only a
+        run recorded as a `substep` of exactly this node AND this phase may be
+        tombstoned: another node's compile substep is still vouched by its own
+        step_result, a `step`-role run is vouched by its own step_result file, and an
+        unrecorded id can never block completion (the validator iterates recorded runs)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._setup_preflight_and_orch_agent(repo_root)
+            self._append_substep_run(repo_root, "same_phase_orphan",
+                                     step="compile", status="fail")
+            self._append_substep_run(repo_root, "other_node_compile", step="compile",
+                                     status="pass", node_key="problem/advdiff1d@0.1.0")
+            self._append_substep_run(repo_root, "step_role_run", step="compile",
+                                     status="pass", agent_role="step")
+            self._write_failing_compile_step_result(
+                repo_root,
+                substep_ids=["same_phase_orphan", "other_node_compile",
+                             "step_role_run", "ghost_unrecorded"],
+                failed_substeps=["same_phase_orphan"],
+            )
+            self._reset_phase_child_finished(repo_root, "compile")
+            self._write_passing_compile_step_result(repo_root)
+
+            sr_dir = self._step_result_dir(repo_root)
+            self.assertTrue((sr_dir / "step_result.overwritten.1.json").exists())
+            self.assertEqual(self._superseded_ids(repo_root), ["same_phase_orphan"])
+
     def test_record_agent_run_normalizes_backend_to_lowercase(self) -> None:
         """An agent_backend with mixed case and surrounding spaces is normalized to lowercase and trimmed."""
         cases = [
