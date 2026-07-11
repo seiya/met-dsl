@@ -762,6 +762,16 @@ def tool_run_linter(args: dict[str, Any]) -> dict[str, Any]:
 # (e.g. Fujitsu frt, which would `-c` with objects discarded into the scratch dir) fits
 # the same interface. Module files are compiler-/version-specific formats: every call
 # gets its own scratch dir and must never share Build's $(OBJDIR).
+#
+# Two warning classes are promoted to errors over the whole staged set:
+# unused-dummy-argument and unused-variable. A dummy an interface fixes but the algorithm
+# never consumes (an inert input, an ABI-fixed `name` / `case_id`) must stay a live dummy
+# bound by `associate (unused_<name> => <name>); end associate` — the canonical idiom is
+# docs/workflow/CHECKS_MODULE_CONTRACT.md §5, and this gate is what makes it load-bearing
+# rather than advisory. Only these two classes are promoted: promoting -Wall/-Wextra
+# wholesale would reject correct-as-written sources — -Wcompare-reals fires on the harness
+# self-test runner's deliberate bitwise equality comparisons, which are the point of the
+# assertion.
 
 _FORTRAN_SYNTAX_SOURCE_SUFFIXES = (".f90", ".f95", ".f03", ".f08")
 _SYNTAX_SCRATCH_DIR_NAME = ".mods"
@@ -770,7 +780,12 @@ _SYNTAX_SCRATCH_DIR_NAME = ".mods"
 def _gfortran_syntax_argv(
     std: str, scratch_dir: str, openmp: bool, sources: list[str]
 ) -> list[str]:
-    argv = ["gfortran", "-fsyntax-only", f"-std={std}", "-J", scratch_dir, "-I", scratch_dir]
+    argv = [
+        "gfortran", "-fsyntax-only", f"-std={std}",
+        # `-Werror=<class>` self-enables the warning, so no companion `-W<class>` is needed.
+        "-Werror=unused-dummy-argument", "-Werror=unused-variable",
+        "-J", scratch_dir, "-I", scratch_dir,
+    ]
     if openmp:
         argv.append("-fopenmp")
     return argv + list(sources)
@@ -783,6 +798,16 @@ _SYNTAX_COMPILER_ADAPTERS: dict[str, dict[str, Any]] = {
         "version_argv": ["gfortran", "--version"],
     },
 }
+
+# A source valid under every Fortran standard the adapters accept. `std` reaches the gate
+# from the LLM-authored IR (`impl_defaults.toolchain.standard`) and goes straight into
+# `-std=<value>`: a value the driver does not know (`-std=2008` — the elided-`f` form)
+# makes it reject the COMMAND LINE, so no source is ever parsed and every file in the
+# invocation "fails" at once. Compiling this canary with the same argv separates a broken
+# invocation from broken sources by the compiler's own verdict, without enumerating the
+# stds a given compiler version happens to accept (`f2023` exists on GCC>=13 but not
+# before, so any hard-coded set is wrong on some machine).
+SYNTAX_CANARY_SOURCE = "module metdsl_syntax_canary\n  implicit none\nend module metdsl_syntax_canary\n"
 
 # `module <name>` definitions (excluding submodule-procedure headers) and `use <name>`
 # references, scanned to order the staged sources so each module is compiled before its

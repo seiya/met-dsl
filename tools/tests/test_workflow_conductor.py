@@ -5405,10 +5405,15 @@ class DeterministicSyntaxTest(unittest.TestCase):
             refs = self._refs()
             self._seed(repo, refs)
             c = self._conductor(repo)
-            with self._patch_syntax(
-                lambda args: {"ok": False, "return_code": 1, "command_id": "sid",
-                              "skipped": False,
-                              "stderr": "Error: IMPLICIT NONE with spec list"}):
+
+            def fake(args):
+                if self._call_kind(args) == "canary":
+                    return {"ok": True, "skipped": False, "command_id": "canary"}
+                return {"ok": False, "return_code": 1, "command_id": "sid",
+                        "skipped": False,
+                        "stderr": "Error: IMPLICIT NONE with spec list"}
+
+            with self._patch_syntax(fake):
                 out = c._syntax_inproc(refs, "child-1", "captok")
             self.assertEqual(out["returncode"], 0)  # content fail, not transport
             meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
@@ -5528,6 +5533,200 @@ class DeterministicSyntaxTest(unittest.TestCase):
                 with self._patch_syntax(lambda args: {"ok": True, "skipped": False}):
                     with self.assertRaises(RuntimeError):
                         c._syntax_inproc(refs, "child-1", "captok")
+
+    DEP_REF = "workspace/pipelines/component__dep__0.1.0/p_1/source/s_1/src/dep_model.f90"
+
+    def _with_dep(self, c: "wc.Conductor"):
+        """Patch the conductor so one dependency-closure `dep_model.f90` is staged."""
+        from unittest import mock
+
+        def stage(_refs, obj_dir):
+            obj_dir.mkdir(parents=True, exist_ok=True)
+            (obj_dir / "dep_model.f90").write_text(
+                "module dep_model\nend module dep_model\n", encoding="utf-8")
+            return [self.DEP_REF]
+
+        return (mock.patch.object(c, "_stage_dependency_sources", side_effect=stage),
+                mock.patch.object(c, "_dependency_closure_nodes",
+                                  return_value=["component/dep@0.1.0"]))
+
+    def _call_kind(self, args: dict) -> str:
+        """Classify a run_syntax_check call as the staged run, the invocation canary, or the
+        dependency attribution probe — asserting each attribution run's INPUT SET, which is
+        its load-bearing property. A probe that also recompiled the node's own src would
+        reproduce every node-caused failure and turn each one into a permanent fail_closed
+        (the exact over-trigger attribution exists to avoid), and a canary carrying anything
+        but the canary source would stop being a viability test — both while still satisfying
+        a test that only branched on the directory name."""
+        d = Path(args["project_dir"])
+        staged = {p.name for p in d.iterdir() if p.is_file() and p.suffix == ".f90"}
+        if d.name.endswith("_canary"):
+            self.assertEqual(staged, {"metdsl_syntax_canary.f90"})
+            return "canary"
+        if d.name.endswith("_deps_probe"):
+            self.assertEqual(staged, {"dep_model.f90"})
+            return "probe"
+        return "stage"
+
+    def test_syntax_inproc_dependency_source_finding_fails_closed_not_loops(self) -> None:
+        # The gate compiles the node's src TOGETHER with the certified dependency-closure
+        # `<dep>_model.f90`. A failure the DEPENDENCY sources cause is unfixable by this
+        # node's leaf (they lie outside its src/ and its write_roots), so routing it as a
+        # content syntax_error would warm-resume generate.generate into a futile loop that
+        # burns the retry budget and blames the wrong node. It must fail CLOSED naming the
+        # dependency to re-certify. Reachable whenever a dependency was certified before a
+        # gate rule existed (the promoted -Werror=unused-* classes).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            # The staged run AND the deps-alone attribution probe both fail => the dependency
+            # closure is what is broken.
+            fail = {"ok": False, "return_code": 1, "command_id": "sid", "skipped": False,
+                    "stderr": "dep_model.f90:4:25:\n\nError: Unused dummy argument 'z_b' "
+                              "at (1) [-Werror=unused-dummy-argument]\n"}
+
+            def fake(args):
+                kind = self._call_kind(args)  # also asserts each run's input set
+                if kind == "canary":
+                    return {"ok": True, "skipped": False, "command_id": "canary"}
+                return fail
+
+            stage_p, closure_p = self._with_dep(c)
+            with stage_p, closure_p, self._patch_syntax(fake):
+                with self.assertRaises(RuntimeError) as ctx:
+                    c._syntax_inproc(refs, "child-1", "captok")
+            self.assertIn(self.DEP_REF, str(ctx.exception))
+            self.assertIn("Unused dummy argument", str(ctx.exception))
+            # no content-fail deliverable is authored on a transport fail_closed
+            self.assertFalse((repo / refs.source_dir() / "syntax_meta.json").exists())
+
+    def test_syntax_inproc_node_source_finding_with_deps_staged_still_content_fail(self) -> None:
+        # The mirror of the test above: with a dependency staged, a finding in the NODE's own
+        # source stays a content failure (warm-resume). The attribution probe must not
+        # over-trigger and turn every syntax finding on a node with deps into fail_closed.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+
+            def fake(args):
+                if self._call_kind(args) in ("canary", "probe"):
+                    return {"ok": True, "skipped": False, "command_id": "sub"}
+                return {"ok": False, "return_code": 1, "command_id": "sid", "skipped": False,
+                        "stderr": "spec_x_model.f90:4:25:\n\nError: Unused dummy argument "
+                                  "'z_b' at (1) [-Werror=unused-dummy-argument]\n"}
+
+            stage_p, closure_p = self._with_dep(c)
+            with stage_p, closure_p, self._patch_syntax(fake):
+                out = c._syntax_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)  # content fail, routed to generate
+            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
+            self.assertEqual(meta["syntax_status"], "fail")
+            self.assertEqual(meta["failure_category"], "syntax_error")
+
+    def test_syntax_inproc_unviable_invocation_fails_closed_not_blaming_deps(self) -> None:
+        # `std` comes from the LLM-authored IR and is passed verbatim as `-std=<value>`. An
+        # unknown value (`2008`, the elided-`f` form the IMPL_PLAN_SPEC example once showed)
+        # makes the driver reject the COMMAND LINE: no source is parsed and every file fails
+        # at once — including the dependency closure, which would otherwise be blamed and sent
+        # for a pointless re-certification (it passes its own gate; every --resume would fail
+        # again). The canary, valid under every standard, fails too — which is what identifies
+        # the invocation as the culprit. The leaf does not author the IR: fail_closed, no retry.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            # every run fails identically — the driver never got as far as reading a source
+            unviable = {"ok": False, "return_code": 1, "command_id": "sid", "skipped": False,
+                        "stderr": "gfortran: error: unrecognized command-line option "
+                                  "'-std=2008'; did you mean '-std=f2008'?\n"}
+            stage_p, closure_p = self._with_dep(c)
+            with stage_p, closure_p, self._patch_syntax(lambda args: unviable):
+                with self.assertRaises(RuntimeError) as ctx:
+                    c._syntax_inproc(refs, "child-1", "captok")
+            msg = str(ctx.exception)
+            self.assertIn("not viable", msg)
+            self.assertIn("toolchain.standard", msg)
+            self.assertNotIn(self.DEP_REF, msg)  # the dependency must NOT be blamed
+
+    def test_syntax_inproc_dep_failure_message_names_both_causes(self) -> None:
+        # A closure failing under this node's std has two possible causes, and the leaf can
+        # fix NEITHER, so both take the same fail_closed: the dependency's certified source is
+        # defective, OR this node's declared standard is narrower than the sound closure needs.
+        # The message must name both and attach the compiler's diagnostics (which say which),
+        # and must not prescribe one remedy. A permissive-standard re-check would look like a
+        # cheap discriminator but is unsound: `-std=gnu` accepts what the gate means to reject
+        # (a non-constant STOP code, `implicit none (external)`, GNU extensions), so a
+        # genuinely defective dependency would be reported as sound and the operator sent to
+        # widen this node's standard to accommodate nonconforming code.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+
+            def fake(args):
+                if self._call_kind(args) == "canary":
+                    return {"ok": True, "skipped": False, "command_id": "canary"}
+                return {"ok": False, "return_code": 1, "command_id": "sid", "skipped": False,
+                        "stderr": "dep_model.f90:12:5:\n\nError: Fortran 2008: The symbol "
+                                  "'real64', referenced at (1), is not in the selected "
+                                  "standard\n"}
+
+            stage_p, closure_p = self._with_dep(c)
+            with stage_p, closure_p, self._patch_syntax(fake):
+                with self.assertRaises(RuntimeError) as ctx:
+                    c._syntax_inproc(refs, "child-1", "captok")
+            msg = str(ctx.exception)
+            self.assertIn("re-certify", msg)          # cause 1: a defective dependency
+            self.assertIn("toolchain.standard", msg)  # cause 2: this node's standard
+            self.assertIn(self.DEP_REF, msg)          # what was staged
+            self.assertIn("not in the selected standard", msg)  # the diagnostics decide
+
+    def test_syntax_inproc_dep_warning_beside_node_error_is_content_fail(self) -> None:
+        # The attribution probe asks the compiler ("does the dependency closure pass on its
+        # own?"), never the diagnostics text. A clean dependency still PRINTS default-on
+        # warnings (-Wampersand / -Wtabs / -Wunderflow) that name its file, and gfortran emits
+        # them in the same run whose only Error is in the node's own source. Attributing by
+        # "the dep's filename appears in the output" would convert that self-repairable
+        # finding into a permanent fail_closed (re-certifying the dep would pass, so every
+        # --resume would fail again). It must stay a content failure.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+
+            def fake(args):
+                if self._call_kind(args) == "canary":
+                    return {"ok": True, "skipped": False, "command_id": "canary"}
+                if self._call_kind(args) == "probe":
+                    # the dep compiles clean on its own: the warning does not fail its gate
+                    return {"ok": True, "skipped": False, "command_id": "probe",
+                            "stderr": "dep_model.f90:8:12:\n\nWarning: Missing '&' in "
+                                      "continued character constant [-Wampersand]\n"}
+                return {"ok": False, "return_code": 1, "command_id": "sid", "skipped": False,
+                        "stderr": "dep_model.f90:8:12:\n\nWarning: Missing '&' in continued "
+                                  "character constant [-Wampersand]\n"
+                                  "spec_x_model.f90:7:8:\n\nError: Function 'undefined_thing' "
+                                  "at (1) has no IMPLICIT type\n"}
+
+            stage_p, closure_p = self._with_dep(c)
+            with stage_p, closure_p, self._patch_syntax(fake):
+                out = c._syntax_inproc(refs, "child-1", "captok")
+            self.assertEqual(out["returncode"], 0)  # content fail, routed to generate
+            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
+            self.assertEqual(meta["syntax_status"], "fail")
+            self.assertIn("no IMPLICIT type", meta["failure_excerpt"])
 
     def test_syntax_inproc_unregistered_optional_compiler_skipped(self) -> None:
         # An optional METDSL_SYNTAX_COMPILERS entry with no registered adapter is recorded

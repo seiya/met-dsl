@@ -2687,13 +2687,20 @@ clean:
         heuristics that could only mimic gfortran one observed failure at a time.
 
         Compiler findings are a CONTENT failure (syntax_status=fail, rc 0) routed by
-        classify_syntax_failure back to generate.generate via a warm-resume reopen. A
-        missing MANDATORY gfortran (or a genuine tool/infra error) raises and surfaces as
-        a transport fail_closed — an environment problem, not something the generate
-        retry loop could fix. Optional additional stages from METDSL_SYNTAX_COMPILERS
-        (comma-separated adapter ids, e.g. "gfortran,frt" — the future target-compiler
-        second stage) are recorded as skipped when their binary is not installed, so one
-        configuration runs on machines with and without the target compiler.
+        classify_syntax_failure back to generate.generate via a warm-resume reopen — UNLESS
+        the failure is one the leaf cannot fix. A failing stage is attributed by re-running
+        the compiler over isolated source sets and reading its VERDICT (never the diagnostics
+        text): a canary valid under every standard (fails => the invocation itself is
+        unviable, typically a toolchain.standard the driver rejects), then the staged
+        dependency closure alone (fails => the closure is at fault — either a defective
+        certified source or a node standard too narrow for it). Both are a transport
+        fail_closed naming what to fix, since the leaf authors neither the IR nor a
+        dependency's certified source. A missing MANDATORY gfortran (or a genuine tool/infra
+        error) raises and surfaces as a transport fail_closed likewise — an environment
+        problem, not something the generate retry loop could fix. Optional additional stages
+        from METDSL_SYNTAX_COMPILERS (comma-separated adapter ids, e.g. "gfortran,frt" — the
+        future target-compiler second stage) are recorded as skipped when their binary is not
+        installed, so one configuration runs on machines with and without the target compiler.
 
         Staging: each compiler stage gets its own throwaway dir under
         workspace/tmp/<child_arid>/syntax/<compiler>/ holding the node's src *.f90 plus
@@ -2708,6 +2715,7 @@ clean:
         from build_runtime_server import (
             _FORTRAN_SYNTAX_SOURCE_SUFFIXES,
             _SYNTAX_COMPILER_ADAPTERS,
+            SYNTAX_CANARY_SOURCE,
             tool_run_syntax_check,
         )
         from tools.hooks.syntax_evidence import write_syntax_evidence
@@ -2832,10 +2840,129 @@ clean:
                     "command_log_ref": command_log_ref,
                 })
                 if not stage_ok:
-                    ok = False
-                    failure_category = "syntax_error"
                     excerpt = ((result.get("stdout", "") or "")
                                + (result.get("stderr", "") or ""))
+
+                    def _sub_check(sub_dir: Path) -> dict[str, Any]:
+                        """Re-run THIS stage's adapter+flags over an isolated source set, to
+                        attribute the failure by the compiler's own verdict. The command log
+                        stays in the throwaway dir (no command_log_path override): these runs
+                        certify nothing, so keeping them out of the node's canonical
+                        <src>/command_log.jsonl keeps that log the record of the gate proper."""
+                        return tool_run_syntax_check({
+                            "compiler": compiler,
+                            "std": tc["standard"],
+                            "openmp": tc["backend"] == "openmp",
+                            "project_dir": str(sub_dir),
+                            "repo_root": str(self.repo_root),
+                            "capture_limit": _FULL_CAPTURE_LIMIT,
+                            "orchestration_id": self.orchestration_id,
+                            "agent_run_id": child_arid,
+                            "capability_token": cap_token,
+                        })
+
+                    # Attribution step 1 — is the INVOCATION itself viable? `std` comes from
+                    # the LLM-authored IR (impl_defaults.toolchain.standard) and goes straight
+                    # into `-std=<value>`: an unknown value (`-std=2008`, the elided-`f` form)
+                    # makes the driver reject the command line, so no source is ever parsed and
+                    # every file "fails" at once. Compiling a canary valid under every standard
+                    # tells the two apart by the compiler's own verdict — no enumeration of the
+                    # stds a given compiler VERSION accepts (`f2023` exists on GCC>=13 only, so
+                    # any hard-coded set is wrong on some machine). The leaf cannot rewrite the
+                    # IR, so a broken invocation is a transport fail_closed, never a retry; and
+                    # attributing it to the dependency closure (which fails the same broken argv
+                    # for the same reason) would send the operator to re-certify healthy nodes.
+                    canary_dir = (self.repo_root / "workspace" / "tmp" / child_arid
+                                  / "syntax" / f"{compiler}_canary")
+                    canary_dir.mkdir(parents=True, exist_ok=True)
+                    (canary_dir / "metdsl_syntax_canary.f90").write_text(
+                        SYNTAX_CANARY_SOURCE, encoding="utf-8")
+                    canary = _sub_check(canary_dir)
+                    if not canary.get("skipped") and not canary.get("ok"):
+                        canary_excerpt = ((canary.get("stdout", "") or "")
+                                          + (canary.get("stderr", "") or ""))
+                        raise RuntimeError(
+                            f"generate.syntax: the {compiler} invocation is not viable — it "
+                            f"rejects even a canary source valid under every standard, so the "
+                            f"failure is the invocation, not the sources. Check "
+                            f"impl_defaults.toolchain.standard={tc['standard']!r} (it is passed "
+                            f"verbatim as -std=<value>; spell it the way the compiler names it, "
+                            f"e.g. `f2008`, not `2008`) and the compiler installation. The leaf "
+                            f"does not author the IR, so no retry of this node can clear it.\n"
+                            + "\n".join(canary_excerpt.splitlines()[-20:]))
+
+                    # Attribution step 2 —
+                    # A failure the STAGED DEPENDENCY sources cause is not a content failure
+                    # this node's leaf can repair: `<dep>_model.f90` is the dependency's
+                    # CERTIFIED source, outside source/<source_id>/src/ and outside the leaf's
+                    # write_roots. Warm-resuming generate.generate would regenerate the node's
+                    # own files and hit the identical finding — the same futile loop the
+                    # non-make staging branch above already fails closed on. The dependency
+                    # itself must be regenerated / re-certified (its own Generate.syntax gate
+                    # enforces the same rules), which is an operator decision, not a retry.
+                    # Reachable because a dependency certified BEFORE a gate rule was added
+                    # (e.g. the promoted -Werror=unused-* classes) is not clean by induction —
+                    # only a dependency certified under the current gate is.
+                    #
+                    # Attribution re-runs the SAME adapter over the dependency closure ALONE
+                    # (it is self-contained: `_stage_dependency_sources` stages the transitive
+                    # closure, so every `use` among the deps resolves within the set). Deciding
+                    # this by the compiler's own verdict rather than by reading the diagnostics
+                    # keeps it exact and format-agnostic: a dep basename merely APPEARING in
+                    # the excerpt proves nothing (gfortran prints default-on warnings —
+                    # -Wampersand, -Wtabs, -Wunderflow — for a dep that is perfectly clean,
+                    # while the sole Error sits in the node's own leaf-fixable source), and
+                    # mistaking that for a dependency defect would convert a self-repairable
+                    # finding into a permanent fail_closed. A future adapter with a different
+                    # diagnostic format needs no change here.
+                    #
+                    # Residual: the OTHER staged file the leaf cannot write is the M3c
+                    # host-rendered `<spec_id>_runner.f90` — it sits inside src/ (so it is a
+                    # node source here) yet outside allowed_output_paths. It gets no probe:
+                    # it `use`s the leaf-authored checks module, so it is not self-contained
+                    # and cannot be compiled alone. It is held clean at the source instead —
+                    # tools/tests/test_runner_renderer.py compiles the rendered runner under
+                    # these exact promoted flags, so a renderer edit that emitted an unused
+                    # dummy or local could not ship green.
+                    if staged_deps and dep_files:
+                        probe_dir = (self.repo_root / "workspace" / "tmp" / child_arid
+                                     / "syntax" / f"{compiler}_deps_probe")
+                        probe_dir.mkdir(parents=True, exist_ok=True)
+                        for p in dep_files:
+                            shutil.copy2(p, probe_dir / p.name)
+                        probe = _sub_check(probe_dir)
+                        if not probe.get("skipped") and not probe.get("ok"):
+                            probe_excerpt = ((probe.get("stdout", "") or "")
+                                             + (probe.get("stderr", "") or ""))
+                            # Two causes put a failure here, and the leaf can fix NEITHER, so
+                            # both take this one fail_closed: the dependency's certified source
+                            # is defective (certified before a gate rule existed), or this
+                            # node's declared standard is narrower than the sound closure needs.
+                            # The message names both and attaches the compiler's diagnostics,
+                            # which say which ("Unused dummy argument …" vs "Fortran 2008: The
+                            # symbol 'real64' … is not in the selected standard"). Deciding it
+                            # here would take the dependency's OWN certified standard — what its
+                            # certification actually asserted. A permissive-standard re-check is
+                            # NOT a substitute: `-std=gnu` also accepts what the gate means to
+                            # reject (a non-constant STOP code, `implicit none (external)`, GNU
+                            # extensions), so a genuinely defective dependency would pass it and
+                            # be reported as sound, sending the operator to widen this node's
+                            # standard to accommodate nonconforming code.
+                            raise RuntimeError(
+                                f"generate.syntax: the certified dependency closure does not "
+                                f"pass the {compiler} gate under this node's "
+                                f"impl_defaults.toolchain.standard={tc['standard']!r}, and this "
+                                f"node's leaf can fix neither the closure (it lies outside "
+                                f"source/<source_id>/src/) nor the IR. Either the dependency's "
+                                f"certified source is defective — regenerate and re-certify it, "
+                                f"its own Generate.syntax gate enforces the same rules — or this "
+                                f"node's declared standard rejects a sound closure, in which "
+                                f"case fix toolchain.standard (Build would compile the same "
+                                f"closure under the same -std). The diagnostics below say which. "
+                                f"Staged: {', '.join(staged_deps)}\n"
+                                + "\n".join(probe_excerpt.splitlines()[-40:]))
+                    ok = False
+                    failure_category = "syntax_error"
                     tail = "\n".join(excerpt.splitlines()[-80:])
                     failure_excerpt = (
                         f"[{compiler} {tc['standard']} syntax check fail]\n{tail}"

@@ -86,11 +86,15 @@ class RunSyntaxCheckTests(unittest.TestCase):
         argv = self.mod._gfortran_syntax_argv("f2008", ".mods", False, ["a.f90", "b.f90"])
         self.assertEqual(
             argv,
-            ["gfortran", "-fsyntax-only", "-std=f2008", "-J", ".mods", "-I", ".mods",
+            ["gfortran", "-fsyntax-only", "-std=f2008",
+             "-Werror=unused-dummy-argument", "-Werror=unused-variable",
+             "-J", ".mods", "-I", ".mods",
              "a.f90", "b.f90"])
         argv = self.mod._gfortran_syntax_argv("f2018", ".mods", True, ["x.f90"])
         self.assertIn("-fopenmp", argv)
         self.assertIn("-std=f2018", argv)
+        self.assertIn("-Werror=unused-dummy-argument", argv)
+        self.assertIn("-Werror=unused-variable", argv)
         # sources stay last so the compiler reads them after the mod-dir flags
         self.assertEqual(argv[-1], "x.f90")
 
@@ -178,6 +182,8 @@ class RunSyntaxCheckTests(unittest.TestCase):
         argv = run_mock.call_args_list[0].args[0]
         self.assertEqual(argv[:3], ["gfortran", "-fsyntax-only", "-std=f2008"])
         self.assertIn("-fopenmp", argv)
+        self.assertIn("-Werror=unused-dummy-argument", argv)
+        self.assertIn("-Werror=unused-variable", argv)
         self.assertEqual(argv[-2:], ["m.f90", "p.f90"])  # topological order
         self.assertTrue(result["ok"])
         self.assertFalse(result["skipped"])
@@ -208,9 +214,10 @@ class RunSyntaxCheckTests(unittest.TestCase):
 class RunSyntaxCheckGfortranSmokeTests(unittest.TestCase):
     """Real-compiler smoke: the gate must catch, with the actual gfortran front-end,
     the error classes the retired post_generate text heuristics used to mimic
-    (identifier > 63 chars / implicit none spec-list / non-constant STOP code), and
-    must pass a valid two-file module dependency (define-before-use via .mod written
-    by -fsyntax-only)."""
+    (identifier > 63 chars / implicit none spec-list / non-constant STOP code) plus the
+    two promoted warning classes (unused dummy argument / unused variable), and must pass
+    a valid two-file module dependency (define-before-use via .mod written by
+    -fsyntax-only) as well as the associate binding that sanctions an inert dummy."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -253,6 +260,79 @@ class RunSyntaxCheckGfortranSmokeTests(unittest.TestCase):
                        "  error stop 'unknown case_id: '//cid\nend program bad\n",
         })
         self.assertFalse(result["ok"])
+
+    def test_unused_dummy_argument_fails(self) -> None:
+        # A dummy the interface fixes but the body never reads is a dead dummy: the gate
+        # must reject it so the leaf binds it with the associate idiom instead.
+        result = self._check({
+            "m.f90": "module m\n  implicit none\ncontains\n"
+                     "  subroutine step(z_b, y)\n"
+                     "    real, intent(in) :: z_b\n    real, intent(out) :: y\n"
+                     "    y = 1.0\n  end subroutine step\n"
+                     "end module m\n",
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("unused-dummy-argument", result["stderr"])
+
+    def test_unused_variable_fails(self) -> None:
+        result = self._check({
+            "bad.f90": "program bad\n  implicit none\n  integer :: leftover\n"
+                       "  print *, 1\nend program bad\n",
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("unused-variable", result["stderr"])
+
+    def test_canary_source_is_valid_under_every_standard_and_detects_a_bad_std(self) -> None:
+        # The conductor compiles SYNTAX_CANARY_SOURCE with the failing stage's own argv to
+        # tell a broken INVOCATION (an `-std=` value the driver rejects, so no source is ever
+        # parsed) apart from broken sources. Both halves of that must hold against the real
+        # compiler: the canary passes under each standard a node may target — were it invalid
+        # Fortran, EVERY failing stage would be misattributed to an unviable invocation and
+        # nothing would ever reach the leaf — and it fails when the std is not one the driver
+        # knows, which is the signal the attribution keys on.
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "metdsl_syntax_canary.f90").write_text(
+            self.mod.SYNTAX_CANARY_SOURCE, encoding="utf-8")
+        # every standard a node may declare — a canary that failed any one of these would
+        # fail_closed every ordinary syntax finding on a node targeting it
+        for std in ("f95", "f2003", "f2008", "f2018", "gnu", "legacy"):
+            result = self.mod.tool_run_syntax_check({"project_dir": str(d), "std": std})
+            self.assertTrue(result["ok"], msg=f"{std}: {result.get('stderr')}")
+        bad = self.mod.tool_run_syntax_check({"project_dir": str(d), "std": "2008"})
+        self.assertFalse(bad["ok"])
+        self.assertFalse(bad["skipped"])
+
+    def test_default_on_warning_names_its_file_without_failing_the_gate(self) -> None:
+        # Only the two promoted classes are errors. Other default-on warnings (-Wampersand
+        # here) still print, anchored to their file, on a source the gate PASSES. The
+        # conductor's dependency attribution (`_syntax_inproc`) relies on exactly this: a
+        # staged dependency's filename appearing in a failing stage's output proves nothing
+        # about whose defect it is, so attribution asks the compiler (does the dependency
+        # closure pass on its own?) instead of reading the diagnostics.
+        result = self._check({
+            "noisy.f90": "module noisy\n  implicit none\ncontains\n"
+                         "  subroutine msg(u)\n    integer, intent(in) :: u\n"
+                         "    write (u, '(a)') 'a message that is &\n"
+                         "      continued'\n"
+                         "  end subroutine msg\nend module noisy\n",
+        })
+        self.assertTrue(result["ok"], msg=result.get("stderr"))
+        self.assertIn("noisy.f90", result["stderr"])
+        self.assertIn("Wampersand", result["stderr"])
+
+    def test_associate_binding_suppresses_unused_dummy(self) -> None:
+        # Pins the sanctioned escape hatch: the very idiom CHECKS_MODULE_CONTRACT §5
+        # mandates must pass this gate, so gate and doc cannot drift apart.
+        result = self._check({
+            "m.f90": "module m\n  implicit none\ncontains\n"
+                     "  subroutine step(z_b, y)\n"
+                     "    real, intent(in) :: z_b\n    real, intent(out) :: y\n"
+                     "    associate (unused_z_b => z_b)\n    end associate\n"
+                     "    y = 1.0\n  end subroutine step\n"
+                     "end module m\n",
+        })
+        self.assertTrue(result["ok"], msg=result.get("stderr"))
 
 
 if __name__ == "__main__":  # pragma: no cover

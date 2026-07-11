@@ -26109,7 +26109,8 @@ class ChildContextDocSizeTests(unittest.TestCase):
     # (docs/design/leaf_must_read_restructure.md) the leaf-read files are:
     #   - AGENT_CONTRACT.md          (every leaf)
     #   - RUNNER_OUTPUT_CONTRACT.md  (validate.judge + non-M3c runner-authoring generate; M3d)
-    #   - CHECKS_MODULE_CONTRACT.md  (generate.generate / generate.verify — M3c checks ABI)
+    #   - CHECKS_MODULE_CONTRACT.md  (generate.generate / generate.verify — §1-4 the M3c
+    #                                 checks ABI, §5 the Fortran gate guards of ANY node)
     #   - phase_01_compile.md        (compile.generate / compile.verify — IR schema)
     #   - skills/workflow-<step>-<substep>/SKILL.md  (each read by its own substep leaf)
     # WORKFLOW_CORE.md, phase_02/03/04, PERFORMANCE_DIAGNOSTICS.md, and
@@ -26176,7 +26177,19 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # accumulator may only consume cases whose case_id sorts BEFORE the emitting case's
         # (argv is sorted). All three lived only in tool code, and an M3c leaf reads this doc,
         # not RUNNER_OUTPUT_CONTRACT.md.
-        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 11100,
+        # Bumped 11100->13700: §5 gains the intentionally-unused dummy-argument rule (bind an
+        # inert / ABI-fixed dummy with `associate (unused_x => x); end associate`; no `0*x`, no
+        # `! allow(...)`). The idiom is a language convention, not spec-local, so it belongs in
+        # a generate force-read doc rather than travelling through the IR — a Compile authoring
+        # wobble dropped it from the IR and the leaf, which never reads controlled_spec, then
+        # emitted a dead dummy (orch_20260711T002216Z_5abd1c53). The same bump widens §5's
+        # scope banner to every generate leaf that authors Fortran (sections 1-4 stay
+        # M3c-only) — the doc is force-read by EVERY generate leaf, and a non-M3c leaf that
+        # hand-authors its runner is exactly the one with ABI-fixed unused dummies — and adds
+        # the unset-`intent(out)` case, which `-Werror=unused-dummy-argument` promotes too,
+        # and the delete-don't-bind rule for a dummy no interface fixes (binding one in the
+        # leaf's own private helper would freeze dead surface).
+        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 13700,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).
         # Bumped 17000->18200: documented the deterministic Compile.static substep (G2,
@@ -26305,7 +26318,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 29950->30500: R3-core — a leaf-authored runner (the infra self-test, a legacy
         # no-harness node) must emit metrics_basis as the (test_id, case_id) matrix, one entry
         # per case each test targets. The old "one entry per test_id" shape now fails post_execute.
-        "skills/workflow-generate-generate/SKILL.md": 30500,
+        # Bumped 30500->31400: the Generate.syntax gate promotes -Werror=unused-dummy-argument /
+        # -Werror=unused-variable over the whole staged set, so the checklist carries the
+        # associate binding for an intentionally-unused dummy plus the two forbidden workarounds
+        # (`0*x`, `! allow(...)`).
+        "skills/workflow-generate-generate/SKILL.md": 31400,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
@@ -26324,7 +26341,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # regenerate loop).
         # Bumped 24000->24400: the deterministic Generate.syntax gate — verify must not run
         # run_syntax_check and post_generate certifies the syntax evidence alongside lint.
-        "skills/workflow-generate-verify/SKILL.md": 24400,
+        # Bumped 24400->24900: the benign `associate (unused_x => x)` binding of an
+        # intentionally-unused dummy is a sanctioned idiom, not an "additional operation" — the
+        # verify leaf must not fail a source for carrying it (its absence is the defect).
+        "skills/workflow-generate-verify/SKILL.md": 24900,
         # Bumped 10000->10400: documented the verdict.json#per_test entry schema
         # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
         # called out as conductor-derived not judge-written) so the judge leaf no longer
@@ -28285,6 +28305,23 @@ class R5ExemplarSelectorTests(unittest.TestCase):
         self.assertEqual(_build_exemplar({"step": "generate", "substep": "generate",
                                           "deterministic": True, "exemplar": exemplar}), "")
         self.assertEqual(_build_exemplar({"step": "generate", "substep": "generate"}), "")
+
+    def test_build_exemplar_warns_that_prior_art_may_predate_a_gate_rule(self) -> None:
+        # The exemplar is a sibling certified under the gates in force AT ITS TIME. Every
+        # checks module certified before Generate.syntax promoted -Werror=unused-dummy-argument
+        # leaves its ABI-fixed `name` / `case_id` unreferenced — the exact shape the gate now
+        # rejects — so the injected prior art actively demonstrates an illegal pattern. The
+        # preamble is the only thing that stops the leaf copying it: it must keep saying the
+        # contract wins, and name the binding that replaces it.
+        from tools.orchestration_runtime import _build_exemplar
+        out = _build_exemplar({
+            "step": "generate", "substep": "generate",
+            "exemplar": {"node_key": "component/sib@0.1.0", "spec_id": "sib",
+                         "sources": [{"filename": "sib_checks.f90", "text": "module x\nend"}]},
+        })
+        self.assertIn("the contract wins", out)
+        self.assertIn("associate (unused_<name> => <name>)", out)
+        self.assertIn("CHECKS_MODULE_CONTRACT.md", out)
 
     def test_exemplar_source_cannot_forge_the_fence(self) -> None:
         # A certified source line beginning with `--- END EXEMPLAR ` (a legal Fortran comment,

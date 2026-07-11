@@ -525,6 +525,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
                 "tool_name": "run_syntax_check",
                 "command": [
                     "gfortran", "-fsyntax-only", "-std=f2008",
+                    "-Werror=unused-dummy-argument", "-Werror=unused-variable",
                     "-J", ".mods", "-I", ".mods",
                     "shallow_water2d_model.f90", "shallow_water2d_runner.f90",
                 ],

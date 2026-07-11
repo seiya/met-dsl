@@ -9,6 +9,12 @@
 > host-rendered by the conductor (`tools/runner_renderer.py` /
 > `_write_makefile`) and are outside the leaf's `allowed_output_paths`. This is
 > not read by `Validate.judge`.
+>
+> **§5 (Fortran legality and gate guards) is the one section with a wider
+> scope**: it binds **every** `Generate` leaf that authors Fortran — including a
+> non-M3c node (an `infrastructure` harness self-test, a legacy node with no
+> harness dependency) that hand-authors its own `<spec_id>_runner.f90`. Sections
+> 1-4 (the checks-module ABI) apply to an M3c node only.
 
 The rendered runner is glue: it drives this module's callbacks and emits the
 standard runner outputs **through the certified `harness_fortran_cpu` plumbing**,
@@ -179,15 +185,40 @@ value (`found=.true.`), and `found=.false.` for the earlier cases.
   even as a comment or example string. Emission is the harness's exclusive job;
   the checks module only computes.
 
-## 5. Fortran legality guards
+## 5. Fortran legality and gate guards
+
+This section applies to every leaf-authored Fortran source of any `Generate` node
+(the model, this checks module, and a hand-authored runner on a non-M3c node).
 
 - **`intent(out)` character dummies** must be fixed-length (`character(len=32)`)
   or a deferred-length allocatable (`character(len=:), allocatable`) — an
   assumed-length `intent(out)` (`character(len=*)`) is illegal, matching the
   harness's own rule.
 - **`spec_id` ≤ 55 characters** so the derived `<spec_id>_checks` / `_runner` /
-  `_model` identifiers stay within the f2008 63-character limit (the renderer
-  fails closed above this).
+  `_model` identifiers stay within the f2008 63-character limit (on an M3c node the
+  renderer fails closed above this).
 - Author lint-clean f2008 (`use ..., only:`, the inline `! allow(C003)` directive
   before `implicit none`, ≤100-column lines) — the deterministic `Generate.lint`
-  substep lints the whole `src/` tree, this module included.
+  substep lints the whole `src/` tree, every leaf-authored source included.
+- **Intentionally-unused dummy arguments.** The deterministic `Generate.syntax` substep
+  compiles the whole staged source set with
+  `-Werror=unused-dummy-argument -Werror=unused-variable`, so an unreferenced dummy
+  argument in any leaf-authored source is a compile failure. When an **interface fixes**
+  the dummy — an inert input the algorithm defines as unused, an ABI-fixed argument such
+  as `name` / `case_id` — it stays a live `intent(in)` dummy and is bound immediately
+  after its declarations with `associate (unused_<name> => <name>); end associate`. An
+  arithmetic no-op (`0*<name>` and equivalents) is forbidden as the binding. `! allow(...)`
+  does not suppress this class: fortitude has no unused-symbol rule, and an unknown-rule
+  allow is itself rejected under FORT001 / FORT002 (`! allow(C003)` is the only legitimate
+  allow directive).
+- **A dummy argument no interface fixes is deleted, not bound.** The `associate` binding
+  exists only to keep a signature no leaf owns intact. In a private helper the leaf itself
+  declared, an unused dummy is removed from the signature and from every call site; binding
+  it would freeze dead surface. An unused local variable is likewise not declared at all.
+- **`intent(out)` dummies the body never sets** are the same promoted class
+  (`-Werror=unused-dummy-argument` also rejects *"Dummy argument … was declared INTENT(OUT)
+  but was not set"*). Every `intent(out)` dummy of every leaf-authored procedure is assigned
+  on every path, including the degenerate one: an interface-fixed getter for a rank this
+  node owns no variable at reports `found = .false.` **and** still allocates its array
+  (`allocate (arr(0, 0, 0))`), and a `metric_compute` with no metric still assigns `val` /
+  `is_na` / `reason_na`.

@@ -9557,7 +9557,13 @@ def _build_exemplar(request_payload: dict[str, Any]) -> str:
         "parsing, the case loop, JSON/snapshot/perf emission). Author THIS node's own physics "
         "and per-test logic from ITS `controlled_spec.md` / `tests.md` / `io_contract` — do NOT "
         "copy the exemplar's physics or checks. It is orientation, never a gate and never this "
-        "node's spec.",
+        "node's spec. It was certified under the gates in force AT ITS TIME, so it may predate "
+        "a rule now in your contracts: where the exemplar and a contract disagree, the contract "
+        "wins. In particular, an exemplar certified before the `Generate.syntax` gate promoted "
+        "`-Werror=unused-dummy-argument` / `-Werror=unused-variable` can show an ABI-fixed dummy "
+        "(`name` / `case_id`) left unreferenced — that shape now fails the gate; bind it with "
+        "`associate (unused_<name> => <name>); end associate` per "
+        "`docs/workflow/CHECKS_MODULE_CONTRACT.md` §5.",
     ]
     for src in sources:
         if not isinstance(src, dict):
@@ -9992,10 +9998,15 @@ def leaf_contract_doc_refs(step: str | None, *, is_m3c_physics: bool = False) ->
     - Compile: + phase_01 (its IR schema is the contract the compile SKILL defers to).
     - Validate.judge: + the consolidated runner-output contract (§1/§3 are what the
       judge recomputes against the runner's emitted diagnostics.json / raw evidence).
-    - Generate: + the checks-module ABI contract (R1/M3c-β — an M3c physics node's
-      generate leaf authors `<spec_id>_checks.f90` against it; the SKILL branches on
-      whether the node is M3c). validate.judge never sees the checks source, so it is
-      NOT carried there.
+    - Generate: + the checks-module contract, for EVERY generate leaf (not only M3c).
+      Its §1-4 are the checks-module ABI an M3c physics node's leaf authors
+      `<spec_id>_checks.f90` against (R1/M3c-β; the SKILL branches on whether the node
+      is M3c), but its §5 (Fortran legality and gate guards — the `associate` binding of
+      an intentionally-unused dummy the deterministic Generate.syntax gate rejects) binds
+      every leaf-authored Fortran source of any node, and the non-M3c leaf that
+      hand-authors its own runner is the one with ABI-fixed unused dummies. Do NOT gate
+      this injection on `is_m3c_physics`. validate.judge never sees the checks source, so
+      it is NOT carried there.
       (Build / Validate.execute are deterministic — no leaf reaches here.)
 
     M3d: the runner-output contract is dropped from a **physics** generate leaf's

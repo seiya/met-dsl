@@ -26,7 +26,7 @@ This structure satisfies the following.
 - `target.backend` (e.g. `cpu_fortran_reference`, `cuda_fortran`)
 - `target.architecture` (e.g. `x86_64`, `aarch64`, `nvidia_sm80`)
 - `toolchain.language` (e.g. `fortran`, `cpp`, `cuda_fortran`)
-- `toolchain.standard` (e.g. `2008`, `c++17`)
+- `toolchain.standard` (the language standard spelled the way the compiler names it — e.g. `f2008`, `c++17`; it is passed verbatim as `-std=<value>`, so `2008` is rejected by the compiler driver)
 - `toolchain.build_system` (e.g. `make`, `cmake`, `meson`, `ninja`)
 - `abstract` (language-independent knobs)
 - `backend_overrides` (language/backend-dependent knobs)

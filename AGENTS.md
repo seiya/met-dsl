@@ -9,10 +9,10 @@ Conventions every agent (Codex / Claude Code) working in this repository must fo
 
 ## MCP execution rules
 - Always run `compile` / `run` / `quality check` through the MCP server.
-- The standard server is `mcp_servers/build_runtime_server.py`; use `detect_build_system` / `compile_project` / `run_program` / `run_quality_checks` / `run_linter`.
+- The standard server is `mcp_servers/build_runtime_server.py`; use `detect_build_system` / `compile_project` / `run_program` / `run_quality_checks` / `run_linter` / `run_syntax_check`.
 - When `compile` handles `fortran` / `c` / `cpp` / `mixed` families, only allow standard build tools that can handle dependencies. The default is `make`.
 - Forbid one-off builds that call `gcc` / `clang` / `gfortran` directly.
-- `Generate` runs `static lint` via the MCP `run_linter`. `run_linter` is a separate step from builds via `compile` / `compile_project` / `toolchain.build_system`, and is outside the scope of the rule that requires `compile` to go through a standard build tool.
+- `Generate` runs `static lint` via the MCP `run_linter`, and its deterministic `Generate.syntax` gate runs a compiler front-end in syntax-only mode (producing no build artifacts) via the MCP `run_syntax_check`. Both are separate steps from builds via `compile` / `compile_project` / `toolchain.build_system`, and both are outside the scope of the rule that requires `compile` to go through a standard build tool (and outside the ban on calling `gfortran` directly, which targets builds).
 - For processing other than `compile` / `run` where MCP applies (e.g. build system detection, test execution, check execution), implement MCP tools likewise and avoid direct shell execution.
 - For MCP client configuration, refer to `mcp_servers/mcp_servers.example.json`; for operational details, `mcp_servers/README.md`.
 

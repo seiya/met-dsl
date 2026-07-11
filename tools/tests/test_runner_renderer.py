@@ -1397,6 +1397,41 @@ class GfortranSmokeTest(unittest.TestCase):
             self.assertIn("\"a3\"", snap)
             self.assertIn("\"a4\"", snap)
 
+    def _assert_runner_clean_under_promoted_warnings(
+            self, ir: dict, sid: str, checks_stub: str) -> None:
+        """The Generate.syntax gate promotes unused-dummy-argument / unused-variable to
+        errors over the whole staged set. The runner is host-rendered, so such a warning is
+        unfixable by the leaf and would spin a futile warm-repair loop — the rendered
+        artifact must be clean under both. The stubs are compiled WITHOUT the flags: only
+        the runner, the artifact the renderer owns, is held to them."""
+        runner = render_runner(ir, sid, HARNESS)
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            mods = d / "mods"
+            mods.mkdir()
+            (d / "harness_fortran_cpu_model.f90").write_text(_HARNESS_STUB)
+            (d / f"{sid}_checks.f90").write_text(checks_stub)
+            (d / f"{sid}_runner.f90").write_text(runner)
+            pre = subprocess.run(
+                ["gfortran", "-fsyntax-only", "-std=f2008", "-J", str(mods),
+                 "harness_fortran_cpu_model.f90", f"{sid}_checks.f90"],
+                cwd=d, capture_output=True, text=True)
+            self.assertEqual(pre.returncode, 0, pre.stderr)
+            r = subprocess.run(
+                ["gfortran", "-fsyntax-only", "-std=f2008",
+                 "-Werror=unused-dummy-argument", "-Werror=unused-variable",
+                 "-J", str(mods), "-I", str(mods), f"{sid}_runner.f90"],
+                cwd=d, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_rendered_runner_clean_under_promoted_unused_warnings(self) -> None:
+        self._assert_runner_clean_under_promoted_warnings(
+            _boundary_ir(), BOUNDARY_SID, _CHECKS_STUB)
+
+    def test_rendered_metrics_runner_clean_under_promoted_unused_warnings(self) -> None:
+        self._assert_runner_clean_under_promoted_warnings(
+            _rank34_metrics_ir(), RANK_SID, _RANK_CHECKS_STUB)
+
 
 if __name__ == "__main__":
     unittest.main()
