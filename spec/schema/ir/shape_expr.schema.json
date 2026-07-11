@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "spec/schema/plan/shape_expr.schema.json",
+  "$id": "spec/schema/ir/shape_expr.schema.json",
   "title": "shape_expr representation rule",
   "description": "Canonical representation rule for shape_expr fields appearing in algorithm.resolved.yaml (temporaries[].shape_expr, state_variables[].shape_expr) and derived_contract.json (io_contract.inputs[].shape_expr, io_contract.outputs[].shape_expr). The validator tools/validate_pipeline_semantics.py loads this schema at module init and rejects any value that does not match one of the oneOf branches. Function-call style notations such as vector(N), matrix(M,N), tensor are explicitly forbidden; use [N] or (M,N) instead.",
   "type": "string",

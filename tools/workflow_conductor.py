@@ -544,6 +544,22 @@ _ESCALATE_PERSONA_FALLBACK = (
 _escalate_persona_cache: dict[str, str] = {}
 
 
+# The floor an artifact keeps in the diagnosis prompt even when many artifacts compete for the
+# total budget: enough to identify it and read its leading fields.
+_MIN_ARTIFACT_BUDGET = 400
+
+# The artifacts a failed phase's own leaf authored — its primary evidence. They lead the diagnosis
+# context, and `_bounded_context_json` spends its budget greedily in order, so leading is what wins
+# them the large slices.
+_PHASE_PRIMARY_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    "compile": ("ir_meta.json",),
+    "generate": ("source_meta.json",),
+    "build": ("binary_meta.json",),
+    "validate": ("verdict.json", "semantic_review.json", "aggregate_verdict.json",
+                 "post_judge_meta.json", "pre_judge_meta.json"),
+}
+
+
 def _load_escalate_persona(repo_root: Path) -> str:
     """Return the workflow-escalate SKILL body (frontmatter stripped), memoized per repo_root,
     falling back to _ESCALATE_PERSONA_FALLBACK if the file is absent/unreadable."""
@@ -567,10 +583,75 @@ def _load_escalate_persona(repo_root: Path) -> str:
     return persona
 
 
+_TRUNCATION_MARKER = "\n…[truncated]"
+
+
+def _serialized_len(text: str) -> int:
+    """The cost of `text` once it is embedded in the output as a JSON string.
+
+    A truncated artifact is carried as a STRING, so the final `json.dumps` escapes it a second
+    time: every `"`, `\\` and newline in it doubles. Budgeting against the raw slice length would
+    therefore undercount quote-dense content by up to ~2x.
+    """
+    return len(json.dumps(text, ensure_ascii=False))
+
+
+def _truncate_to_serialized_budget(body: str, allowance: int) -> str:
+    """The longest prefix of `body` whose SERIALIZED form, marker included, fits `allowance`."""
+    if _serialized_len(body) <= allowance:
+        return body
+    lo, hi = 0, len(body)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _serialized_len(body[:mid] + _TRUNCATION_MARKER) <= allowance:
+            lo = mid
+        else:
+            hi = mid - 1
+    return body[:lo] + _TRUNCATION_MARKER
+
+
+def _bounded_context_json(context: dict[str, Any], per_artifact: int = 6000,
+                          total: int = 12000) -> str:
+    """The failure artifacts as JSON, budgeted per artifact so every one of them appears.
+
+    Truncating the whole dump at a single offset silently drops whichever artifacts happen to sort
+    last — and the primary evidence of the failed phase is exactly what the diagnostician then
+    cannot see, so it concludes "insufficient evidence" and fails closed on a leaf that was right.
+
+    The budget is spent GREEDILY IN ORDER, which is what makes the caller's ordering meaningful:
+    each artifact may take up to `per_artifact`, but never so much that a later one drops below
+    `_MIN_ARTIFACT_BUDGET`. So the failed phase's own artifacts (which `_gather_failure_context`
+    puts first) get the large slices, and every remaining artifact still appears — truncated to a
+    marked string rather than dropped. A lone artifact gets the full `per_artifact`, so this never
+    yields less evidence than the flat cap it replaced. The result is always valid JSON.
+
+    Both the truncation and the accounting are done in SERIALIZED characters — what the prompt
+    actually pays — so a quote- or newline-dense artifact cannot blow past the budget by escaping.
+    """
+    items = list(context.items())
+    if not items:
+        return "{}"
+    bounded: dict[str, Any] = {}
+    spent = 0
+    for idx, (name, value) in enumerate(items):
+        reserved = (len(items) - idx - 1) * _MIN_ARTIFACT_BUDGET
+        allowance = max(_MIN_ARTIFACT_BUDGET, min(per_artifact, total - spent - reserved))
+        body = json.dumps(value, indent=1, ensure_ascii=False)
+        if len(body) <= allowance:
+            # Kept verbatim as JSON — no second escaping pass, so it costs its own length.
+            bounded[name] = value
+            spent += len(body)
+        else:
+            truncated = _truncate_to_serialized_budget(body, allowance)
+            bounded[name] = truncated
+            spent += _serialized_len(truncated)
+    return json.dumps(bounded, indent=1, ensure_ascii=False)
+
+
 def _diagnosis_prompt(node_key: str, phase: str, failed_arids: list[str],
                       context: dict[str, Any], workflow_mode: str,
                       persona: str = _ESCALATE_PERSONA_FALLBACK) -> str:
-    ctx_json = json.dumps(context, indent=1, ensure_ascii=False)[:6000]
+    ctx_json = _bounded_context_json(context)
     return (
         f"{persona}\n\n"
         f"node_key: {node_key}\n"
@@ -1091,6 +1172,92 @@ class ProcResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+# A leaf that dies on an LLM-infrastructure error exits nonzero with no artifacts, which the
+# conductor can only report as `leaf_transport_error: leaf_exit=1` — indistinguishable from a crash,
+# an OOM, or a genuine transport fault. The leaf's own stdout/stderr (which the conductor already
+# pipes and persists) names the cause, so classify it into a tag the [FAIL] line can carry. Reading
+# the leaf's `~/.claude` transcript is deliberately NOT an option here (access boundary); the piped
+# output is the only evidence source.
+#
+# The patterns must not fire on ordinary leaf output. A bare `429` / `529` substring matches a
+# traceback frame (`File "x.py", line 429`) or any duration/token count, which would mislabel a
+# routine crash as a quota event — so an HTTP-ish status code is recognized only next to an
+# error/status word, and the words that carry meaning on their own are matched on word boundaries.
+# A status code counts only next to an error/status word: a bare `429` / `529` also matches a
+# traceback frame, a duration, or a token count. `(?<!line )` then excludes the remaining reading
+# the context word cannot rule out — a compiler's `gfortran: error at line 429 of model.f90`.
+_STATUS_CODE_CONTEXT = r"(?:api error|error|http|status(?:_code)?|rejected)\D{0,12}(?<!line )"
+
+# Ordered MOST severe first — the tuple index is the severity rank (see `_classify_leaf_infra_error`).
+# A usage limit is a hard stop that costs hours; a rate limit or an overload is transient. Reporting
+# the hard stop as the transient one sends the operator back to a run that cannot start.
+#
+# The patterns are matched against a failed leaf's captured output, which for a `claude -p` leaf is
+# mostly the MODEL'S OWN PROSE — so every one of them has to survive a leaf that writes "the
+# rate-limiting step", "the generic interface is overloaded across ranks", or "Newton iteration
+# limit reached", and a compiler that writes "call of overloaded 'update(double)'". Hence the word
+# boundaries, the required error context, and the qualifier on `limit reached`.
+_LEAF_INFRA_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # `(?<!not your )` — the CLI's 429 message literally reads "Server is temporarily limiting
+    # requests (not your usage limit)". Tagging that a usage limit would be exactly backwards.
+    ("llm_usage_limit", re.compile(
+        r"(?<!not your )\busage limit\b|\bsession limit\b"
+        r"|\b(?:usage|session|weekly|hourly|\d+-hour)\s+limit reached\b"
+        r"|\bcredit balance is too low\b|\bquota\b[^\n]{0,20}exceed")),
+    # `overloaded` needs an error context or a line of its own: bare, it fires on this repo's own
+    # prose ("Overloaded the `__box` generic so ranks 0..3 share one writer"). The trailing
+    # lookahead additionally keeps out a C++ diagnostic — `error: call of overloaded
+    # 'update(double)' is ambiguous` — which the error context alone cannot do.
+    ("llm_overloaded", re.compile(
+        rf"\boverloaded_error\b|{_STATUS_CODE_CONTEXT}\b529\b"
+        r"|\berror\b[^\n]{0,20}\boverloaded\b(?!\s*(?:function|operator|method|['‘’\"]))"
+        r"|^\s*overloaded\s*$|\bexperiencing high load\b")),
+    ("llm_rate_limit", re.compile(
+        rf"\brate[ _-]?limit(?:ed|s|_error)?(?![a-z])|{_STATUS_CODE_CONTEXT}\b429\b"
+        r"|\btoo many requests\b|\btemporarily limiting requests\b")),
+    ("llm_permission_probe_unavailable", re.compile(
+        r"temporarily unavailable, so auto mode cannot determine")),
+)
+
+# A TRANSIENT retry notice — the CLI prints `API Error (429 …) · Retrying in 1 seconds… (attempt
+# 1/10)` and then RECOVERS. Blaming a recovered retry for a leaf that actually died of a hook
+# denial is the same misdiagnosis this classifier exists to prevent, only inverted. Matched
+# narrowly on the notice's own shape: a TERMINAL message may still mention retries (codex emits
+# `exceeded retry limit, last status: 429 Too Many Requests`) and must stay classifiable.
+_LEAF_RETRY_NOTICE_RE = re.compile(r"\bretrying\b|attempt \d+/\d+")
+
+
+def _classify_leaf_infra_error(stderr: str, stdout: str = "") -> tuple[str, str] | None:
+    """(tag, evidence_line) when a failed leaf's captured output names an LLM-infrastructure
+    cause; None when nothing matches (the caller then keeps its generic reporting).
+
+    `stderr` is searched before `stdout`: stdout carries a `claude -p` leaf's own prose, which may
+    well discuss "the rate-limiting step" of a numerical scheme, while stderr carries a transport
+    error. Within a stream the MOST SEVERE tag wins (a usage limit outranks a transient rate limit
+    that the same run may have logged), and among equally severe matches the LAST one — the
+    terminal message, not one the run went on to survive.
+    """
+    for stream in (stderr, stdout):
+        lines = (stream or "").splitlines()
+        best: tuple[int, str, str] | None = None
+        for idx, line in enumerate(lines):
+            # Skip the notice itself AND the line it continues from: the banner is sometimes wrapped
+            # as `API Error (429 ...)` / `· Retrying in 1 seconds... (attempt 1/10)`.
+            nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+            if _LEAF_RETRY_NOTICE_RE.search(line.lower()) or _LEAF_RETRY_NOTICE_RE.search(
+                    nxt.lower()):
+                continue
+            lowered = line.lower()
+            for rank, (tag, pattern) in enumerate(_LEAF_INFRA_ERROR_PATTERNS):
+                if pattern.search(lowered):
+                    if best is None or rank <= best[0]:
+                        best = (rank, tag, " ".join(line.split())[:160])
+                    break
+        if best is not None:
+            return best[1], best[2]
+    return None
 
 
 @dataclass
@@ -3673,9 +3840,11 @@ clean:
         # live in the canonical artifacts (ir_meta/verdict.json) that classify_failure
         # reads for routing.
         result_summary: str | None = None
+        infra_error: tuple[str, str] | None = None
         if proc.returncode != 0:
             status = "fail"
             result_summary = self._leaf_failure_summary(proc)
+            infra_error = _classify_leaf_infra_error(proc.stderr or "", proc.stdout or "")
         elif status != "pass":
             result_summary = f"substep_fail: {phase}" + (f".{substep}" if substep else "")
         reply = f"status: {status}\noutput_refs: {len(output_refs)}\nleaf rc={proc.returncode}"
@@ -3685,7 +3854,8 @@ clean:
             child_arid, token, reply,
             self._agent_run_json(refs, phase, substep, child_arid, status,
                                  output_refs, result_summary))
-        return SubstepOutcome(child_arid, status, output_refs, proc.returncode)
+        return SubstepOutcome(child_arid, status, output_refs, proc.returncode,
+                              infra_error)
 
     def _persist_leaf_output(self, child_arid: str, proc: ProcResult,
                              prefix: str = "leaf") -> None:
@@ -3699,10 +3869,20 @@ clean:
     @staticmethod
     def _leaf_failure_summary(proc: ProcResult) -> str:
         """A terse one-line reason from a failed leaf's output tail (stderr first,
-        else stdout), bounded so the reply/summary stays well under the budget."""
-        tail = (proc.stderr.strip() or proc.stdout.strip() or "")[-400:]
-        tail = " ".join(tail.split())
-        return f"leaf_exit={proc.returncode}; {tail}".strip()
+        else stdout), bounded so the reply/summary stays well under the budget.
+
+        An LLM-infrastructure marker (usage limit, rate limit, overload) found in EITHER stream is
+        PREPENDED to that tail, never substituted for it: the tail is the leaf's real error and
+        must survive, while a marker that landed on stdout would otherwise be buried under a noisy
+        stderr. A misfiring classifier can then only add noise, never destroy evidence."""
+        infra = _classify_leaf_infra_error(proc.stderr or "", proc.stdout or "")
+        tail = " ".join((proc.stderr.strip() or proc.stdout.strip() or "")[-400:].split())
+        parts = [f"leaf_exit={proc.returncode}"]
+        if infra is not None:
+            parts.append(f"{infra[0]}: {infra[1]}")
+        if tail:
+            parts.append(tail)
+        return "; ".join(parts)
 
     # -- phase + conduct ------------------------------------------------------
 
@@ -4453,14 +4633,22 @@ clean:
         transport = (next((oc for oc in outcomes if oc.leaf_returncode != 0), None)
                      if status != "pass" else None)
         if transport is not None:
+            # Name the cause when the leaf's captured output identified one (an LLM usage limit is
+            # the common case, and a bare `leaf_exit=1` sends the operator hunting for a bug that
+            # is not there). The `leaf_transport_error` PREFIX is load-bearing: set_status maps the
+            # fail_closed reason to a reason_code by prefix match, so the tag only ever appends.
+            # The evidence is clipped so the whole reason survives set_status's reason_detail[:200].
+            infra = transport.infra_error
+            suffix = f" (tag: {infra[0]}; {infra[1][:120]})" if infra else ""
             orphan_arids = [oc.agent_run_id for oc in outcomes]
             if orphan_arids:
                 self._add_superseded_run_ids(
                     orphan_arids,
-                    reason=f"leaf_transport_error_orphan: leaf_exit={transport.leaf_returncode}")
+                    reason=(f"leaf_transport_error_orphan: "
+                            f"leaf_exit={transport.leaf_returncode}{suffix}"))
             decision = RouteDecision(
                 "fail_closed",
-                reason=f"leaf_transport_error: leaf_exit={transport.leaf_returncode}")
+                reason=f"leaf_transport_error: leaf_exit={transport.leaf_returncode}{suffix}")
             return PhaseOutcome(phase, status, substep_arids, failed, decision)
 
         # G4: the deterministic validate gate substeps (pre_judge / post_judge) fail the phase
@@ -4546,7 +4734,11 @@ clean:
     def _gather_failure_context(self, refs: NodeRefs, phase: str) -> dict[str, Any]:
         """Collect the canonical status artifacts of a failed phase so the
         diagnostician reasons over their CONTENT (no filesystem read by the leaf,
-        sidestepping the read-manifest guard for an unregistered reasoning agent)."""
+        sidestepping the read-manifest guard for an unregistered reasoning agent).
+
+        The FAILED phase's own artifacts lead the result: the prompt budgets the context per
+        artifact in insertion order, so the evidence that explains this failure must not sit behind
+        an unrelated 11k-character ir_meta."""
         candidates = {
             "verdict.json": f"{refs.run_node_dir()}/verdict.json",
             "semantic_review.json": f"{refs.run_node_dir()}/semantic_review.json",
@@ -4560,9 +4752,12 @@ clean:
             "ir_meta.json": f"{refs.ir_ref}/ir_meta.json",
             "source_meta.json": f"{refs.source_dir()}/source_meta.json",
         }
+        primary = _PHASE_PRIMARY_ARTIFACTS.get(phase, ())
+        ordered = [name for name in primary if name in candidates]
+        ordered += [name for name in candidates if name not in ordered]
         ctx: dict[str, Any] = {}
-        for name, rel in candidates.items():
-            data = _read_json(self.repo_root / rel)
+        for name in ordered:
+            data = _read_json(self.repo_root / candidates[name])
             if data is not None:
                 ctx[name] = data
         return ctx
@@ -5100,6 +5295,11 @@ class SubstepOutcome:
     # limit, OOM, transport) — not a content failure the decision tables can
     # classify — so run_phase routes it straight to fail_closed.
     leaf_returncode: int = 0
+    # (tag, evidence_line) when the failed leaf's captured output named an LLM-infrastructure
+    # cause. Carried STRUCTURALLY so the phase-level transport branch can name WHY the leaf died:
+    # re-deriving it there from the already-truncated result_summary would silently lose the tag
+    # whenever the marker sat past the truncation point.
+    infra_error: tuple[str, str] | None = None
 
 
 @dataclass
@@ -5192,9 +5392,20 @@ def resume_node_refs(conductor: "Conductor", node_key: str, spec_path: str) -> N
     ir_id = (_read_json(res_dir / "compile.json") or {}).get("reserved_ir_id")
     pipeline_id = (_read_json(res_dir / "generate.json") or {}).get("reserved_ir_id")
     if not ir_id or not pipeline_id:
+        # A resume re-resolves the node_key from the CURRENT catalog, so a spec_version bump
+        # since the orchestration started makes it look for reservations under a node_key that
+        # orchestration never held. That is not a corrupt run — the respec invalidated it — but
+        # the bare "missing reservation" reads as one, so name the likely cause.
+        reservations_root = orch_dir / "reservations"
+        held = sorted(p.name for p in reservations_root.glob("*")) if (
+            reservations_root.is_dir()) else []
+        hint = ""
+        if held and safe not in held:
+            hint = (f"; this orchestration reserved {held} — if the spec_version was bumped, its "
+                    f"node_key changed and the orchestration cannot be resumed: start a new run")
         raise ValueError(
             f"conductor resume: missing ir/pipeline reservation for {node_key} in "
-            f"{conductor.orchestration_id}")
+            f"{conductor.orchestration_id}{hint}")
 
     source_id = binary_id = run_id = None
     checkpoint = _read_json(orch_dir / "orchestration_checkpoint.json") or {}

@@ -2032,3 +2032,35 @@ ir_id independently), so deriving the IR dir from the pipeline dir name is unsou
 on `(kind, id, version)` and picks the latest by parsed canonical `(date, seq)`. Lesson (shared with the metric
 address fix): host deterministic code silently depending on a leaf-authored non-required field surfaces as a
 failure under LLM output variance; resolve ground truth structurally / host-authored.
+
+## Problem state-array usage — a dormant gate, and the accessor bug class behind it (OPEN, filed 2026-07-12)
+
+`_validate_problem_state_array_usage` (`tools/validate_pipeline_semantics.py`) has never fired. It resolves its
+contract with `_algorithm_contract_for_execution`, which returns the WHOLE `spec.ir.yaml` document, and then hands
+that to `_algorithm_state_contract`, which looks for the 4 contract keys (`state_variables` /
+`required_update_paths` / `diagnostics_from_state` / `fallback_policy`) at the TOP level — while every real IR
+nests them under `algorithm:`. The `isinstance(kernel_contract, dict)` guard is therefore always false and the body
+is unreachable. Found by review while fixing `_plan_dependency_node_key`, which carried the identical bug (a lookup
+against a shape no real IR has) and which had likewise silenced the multidimensional `state_contract` checks at
+Compile for every node.
+
+**Decided 2026-07-12: do NOT revive it by unwrapping the section.** The gate selects its candidates by "a
+`subroutine` with >= 3 `intent(out)` dummy arguments" and then demands that every `state_variables[].name` appear in
+it as an array reference. That predicate cannot separate the true positive it wants (a fabricated metric-only kernel
+that emits 3+ diagnostics without ever touching the state) from a false positive (a legitimately decomposed helper —
+a flux-divergence or reconstruction routine with 3 `intent(out)` results — which is the shape a real model has).
+Both present the same signature, so no threshold tuning fixes it. Enabling it as-is would fail-close honest models.
+The current commit therefore changes NO behavior: it only records the dormancy in the function's docstring.
+
+Follow-up work, after the billed E2E:
+1. **Re-anchor the check structurally, not heuristically.** Identify the update path by the node's PUBLISHED entry
+   point (`<spec_id>__apply` / the entry realizing `io_contract.outputs`) rather than by counting `intent(out)`
+   dummies. The role must be identified by contract, not guessed from a signature.
+2. **Analyze the overlap with the two gates that already live here** — `_validate_problem_model_dependency_dataflow`
+   (the dependency-result → `intent(out)` chain) and `_validate_problem_metric_only_scalar_kernel` (the metric-only
+   kernel). If the revived check adds nothing they do not already cover, DELETE it rather than repair it.
+3. **Class-kill the accessor bug (this is the third instance).** Centralize contract access so a caller cannot pass
+   the whole document where the `algorithm` section is expected, and adopt the testing rule that a gate must be
+   exercised against a fixture with the REAL IR shape. Every one of these three bugs was green under a suite whose
+   fixtures used a shape the pipeline never produces — a passing test proved only that the gate could fire, never
+   that it does.

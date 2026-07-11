@@ -7683,6 +7683,196 @@ end program shallow_water2d_runner
             "test_predicates": predicates,
         }
 
+    def _compile_with_state_contract(self, repo_root: Path, state_contract: object):
+        """Run the full compile stage over a multidimensional problem node whose algorithm
+        carries `state_contract`, so the node_key-conditioned gate is exercised through the
+        real wiring (`_plan_dependency_node_key` -> `_validate_algorithm_contract_file`)."""
+        _seed_shape_expr_schema_into(repo_root)
+        preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
+                  "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}]
+        _create_minimal_execution_tree(
+            repo_root,
+            dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+            model_text="module m\nimplicit none\nend module m\n",
+            runner_text="program r\nimplicit none\nend program r\n",
+            run_command=["x", "y"],
+            io_contract=self._io_contract_with_predicates(preds),
+            algorithm_contract={
+                "algorithm_id": "shallow_water2d_test_algorithm",
+                "execution_mode": "sequence",
+                "steps": [{"step_id": "compute_flux", "step_kind": "flux_compute",
+                           "operation_ref": "dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux",
+                           "inputs": ["h", "hu", "hv"], "outputs": ["h", "hu", "hv"]}],
+                "ordering": [],
+                "control_condition": [],
+                "iteration_contract": {"kind": "none"},
+                "update_semantics": {"mode": "in_place"},
+                "temporaries": [],
+                "derived_field_rules": [],
+                "invariants": [],
+                "splitting_policy": {"kind": "none"},
+                "state_contract": state_contract,
+            },
+            dependency_resolved={
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+                "transitive_deps": [],
+                "topo_level": 1,
+                "all_nodes": [
+                    {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
+                     "topo_level": 0},
+                    {"node_key": "problem/shallow_water2d@0.3.0", "topo_level": 1},
+                ],
+            },
+        )
+        ir_path = (repo_root / "workspace/ir/problem__shallow_water2d__0.3.0"
+                   "/shallow-water2d_20260415_001/spec.ir.yaml")
+        doc = json.loads(ir_path.read_text())
+        doc["case"] = {"test_case_set": [{"case_id": "c1", "inputs": {}}]}
+        ir_path.write_text(json.dumps(doc))
+        return validate_compile_stage(
+            repo_root, "workspace",
+            "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001")
+
+    def _valid_state_contract(self) -> dict:
+        return {
+            "state_variables": [{"name": "h", "shape_expr": "[2,2]"},
+                                {"name": "hu", "shape_expr": "[2,2]"},
+                                {"name": "hv", "shape_expr": "[2,2]"}],
+            "required_update_paths": ["h", "hu", "hv"],
+            "diagnostics_from_state": True,
+            "fallback_policy": "fail_closed",
+        }
+
+    def test_compile_stage_rejects_object_form_required_update_paths(self) -> None:
+        """Regression (E2E #4): Compile authored `required_update_paths` as a list of
+        `{target, path}` objects. The gate demanding a list of state-variable NAMES is wired into
+        the compile stage, but `_plan_dependency_node_key` read a top-level `node_key` that no real
+        IR has — so the gate never fired at Compile and the violation only surfaced at the tail of
+        Validate, where dev-mode cross-phase rollback kills the workflow."""
+        with tempfile.TemporaryDirectory() as tmp:
+            contract = self._valid_state_contract()
+            contract["required_update_paths"] = [
+                {"target": "h", "path": ["step_01_boundary_apply", "step_07_state_commit"]},
+                {"target": "hu", "path": ["step_01_boundary_apply", "step_07_state_commit"]},
+            ]
+            v = self._compile_with_state_contract(Path(tmp), contract)
+            self.assertTrue(
+                any("state_contract.required_update_paths must be non-empty string list" in x
+                    for x in v),
+                f"compile stage must reject object-form required_update_paths; got: {v}",
+            )
+
+    def test_compile_stage_accepts_string_form_required_update_paths(self) -> None:
+        """Negative twin: the canonical string-list form passes the compile stage cleanly, so the
+        gate the previous test relies on is not simply rejecting everything."""
+        with tempfile.TemporaryDirectory() as tmp:
+            v = self._compile_with_state_contract(Path(tmp), self._valid_state_contract())
+            self.assertEqual(v, [])
+
+    def test_compile_stage_rejects_missing_state_contract_on_multidim_node(self) -> None:
+        """The gate is reached at all only because the node_key now resolves: a 2D problem node
+        with no state_contract must fail at Compile."""
+        with tempfile.TemporaryDirectory() as tmp:
+            v = self._compile_with_state_contract(Path(tmp), None)
+            self.assertTrue(
+                any("state_contract must be object for multidimensional problem node" in x
+                    for x in v),
+                f"expected missing-state_contract violation; got: {v}",
+            )
+
+    def _compile_with_flat_contract(self, repo_root: Path, overrides: dict):
+        """The FLAT placement — the 5 contract fields as direct children of `algorithm`. This is
+        what every real IR authors and what the docs mandate, so it is the shape that must be
+        pinned; a suite that only ever nests them under `state_contract` tests a shape nothing
+        produces."""
+        contract = dict(self._valid_state_contract())
+        contract.update(overrides)
+        v = self._compile_with_state_contract(repo_root, None)  # seeds the tree, no nested block
+        del v
+        ir_path = (repo_root / "workspace/ir/problem__shallow_water2d__0.3.0"
+                   "/shallow-water2d_20260415_001/spec.ir.yaml")
+        doc = json.loads(ir_path.read_text())
+        doc["algorithm"].pop("state_contract", None)
+        doc["algorithm"].update(contract)  # direct children of `algorithm`
+        ir_path.write_text(json.dumps(doc))
+        return validate_compile_stage(
+            repo_root, "workspace",
+            "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001")
+
+    def test_compile_stage_accepts_the_flat_contract_placement(self) -> None:
+        """The canonical placement (direct children of `algorithm`) passes cleanly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._compile_with_flat_contract(Path(tmp), {}), [])
+
+    def test_compile_stage_rejects_object_form_in_the_flat_placement(self) -> None:
+        """The E2E #4 failure verbatim: the object form authored as a direct child of `algorithm`
+        (which is how the real IR carried it) must be caught at Compile."""
+        with tempfile.TemporaryDirectory() as tmp:
+            v = self._compile_with_flat_contract(Path(tmp), {
+                "required_update_paths": [
+                    {"target": "h", "path": ["step_01_boundary_apply", "step_07_state_commit"]}],
+            })
+            self.assertTrue(
+                any("state_contract.required_update_paths must be non-empty string list" in x
+                    for x in v),
+                f"the flat object form must be rejected; got: {v}",
+            )
+
+    def test_compile_stage_rejects_an_empty_required_update_paths(self) -> None:
+        """`all()` over an empty list is True, so `required_update_paths: []` used to pass a check
+        whose own message says "non-empty" — a multidimensional problem declaring it updates no
+        state at all. The hole was unreachable while the gate was dormant; it is live now."""
+        with tempfile.TemporaryDirectory() as tmp:
+            v = self._compile_with_flat_contract(Path(tmp), {"required_update_paths": []})
+            self.assertTrue(
+                any("state_contract.required_update_paths must be non-empty string list" in x
+                    for x in v),
+                f"an empty required_update_paths must be rejected; got: {v}",
+            )
+
+    def test_compile_stage_rejects_an_update_path_that_names_no_state_variable(self) -> None:
+        """The string-list rule alone accepts any non-empty token, so a typo — or a diagnostic /
+        temporary — passes as an update target. That is an update contract nothing can fulfil, and
+        it would surface only at Generate, when the name resolves to nothing. Every token must name
+        a declared `state_variables[]` entry."""
+        with tempfile.TemporaryDirectory() as tmp:
+            v = self._compile_with_flat_contract(Path(tmp), {
+                "required_update_paths": ["h", "hu", "hv", "eta"],  # eta is not a state variable
+            })
+            self.assertTrue(
+                any("required_update_paths must name declared state_variables" in x
+                    and "eta" in x for x in v),
+                f"an update path naming no state variable must be rejected; got: {v}",
+            )
+
+    def test_compile_stage_does_not_cascade_when_state_variables_are_invalid(self) -> None:
+        """When the declared set is itself malformed, report THAT — do not also accuse every update
+        path of naming nothing, which would bury the real cause under noise."""
+        with tempfile.TemporaryDirectory() as tmp:
+            v = self._compile_with_flat_contract(Path(tmp), {"state_variables": []})
+            self.assertTrue(any("state_variables must be non-empty list" in x for x in v), v)
+            self.assertFalse(
+                any("must name declared state_variables" in x for x in v),
+                f"the membership check must not cascade off an invalid declared set; got: {v}",
+            )
+
+    def test_update_semantics_shadows_the_flat_contract(self) -> None:
+        """`_algorithm_state_contract` resolves `state_contract` -> `update_semantics` (when THAT
+        holds any contract key) -> the flat direct children. So a single contract key mislaid under
+        `update_semantics` makes the gate resolve the whole contract there and IGNORE perfectly
+        good flat fields. This is the doc<->validator drift class that produced E2E #4, so the
+        shadowing is pinned here and documented in the SKILLs, phase_01, and the 2D example."""
+        with tempfile.TemporaryDirectory() as tmp:
+            v = self._compile_with_flat_contract(Path(tmp), {
+                # The flat fields stay correct; only `update_semantics` gains a contract key.
+                "update_semantics": {"mode": "in_place", "required_update_paths": ["h"]},
+            })
+            self.assertTrue(
+                any("state_contract.state_variables must be non-empty list" in x for x in v),
+                f"update_semantics must shadow the correct flat fields; got: {v}",
+            )
+
     def test_compile_predicate_gate_accepts_valid_dsl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             # Note: the ordered-op threshold must be a YAML float (a decimal point). Bare
@@ -9747,6 +9937,36 @@ end program shallow_water2d_runner
             any("temporaries[" in v for v in violations),
             f"Unexpected temporaries violation: {[v for v in violations if 'temporaries[' in v]}",
         )
+
+    def _node_key_of(self, doc: dict) -> str | None:
+        from tools.validate_pipeline_semantics import _plan_dependency_node_key
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp)
+            (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
+            return _plan_dependency_node_key(ir_dir)
+
+    def test_plan_dependency_node_key_reads_the_real_ir_placements(self) -> None:
+        """Regression: the compile stage resolves the node_key of the IR under validation, and a
+        real IR carries it under `dependency` and `meta` — never at the top level. Reading only the
+        top level returned None for every real node, silently disabling the node_key-conditioned
+        multidimensional state_contract checks at Compile and deferring them to Validate."""
+        nk = "problem/shallow_water2d@0.3.0"
+        self.assertEqual(self._node_key_of({"dependency": {"node_key": nk}}), nk)
+        self.assertEqual(self._node_key_of({"meta": {"node_key": nk}}), nk)
+        self.assertEqual(self._node_key_of({"node_key": nk}), nk)  # top level stays supported
+        # dependency wins when several are present, and blank/absent sections fall through.
+        self.assertEqual(
+            self._node_key_of({
+                "dependency": {"node_key": nk},
+                "meta": {"node_key": "component/other@0.1.0"},
+                "node_key": "component/other@0.1.0",
+            }),
+            nk,
+        )
+        self.assertEqual(
+            self._node_key_of({"dependency": {"node_key": "  "}, "meta": {"node_key": nk}}), nk
+        )
+        self.assertIsNone(self._node_key_of({"dependency": {}, "meta": {}}))
 
 
 class ParseMakefileRulesTest(unittest.TestCase):

@@ -10,7 +10,7 @@
 The structural rules of the whole artifact continue to use `docs/workflow/phases/phase_*.md` as the canonical source, and the schema in this directory bears the declarative expression of a part of them.
 
 ## Placement rules
-- 1 schema = 1 file in the form `spec/schema/<phase>/<field>.schema.json` (e.g. `spec/schema/plan/shape_expr.schema.json`).
+- 1 schema = 1 file in the form `spec/schema/<phase>/<field>.schema.json` (e.g. `spec/schema/ir/shape_expr.schema.json`).
 - Use JSON Schema draft-07. It has no dependency on the `jsonschema` library, and the validator interprets `pattern` with the standard `re` module.
 - State "when and where the rule is applied" in the `description` field.
 - Note the validator-side entry point in `x-canonical-validator` (extension).
@@ -39,4 +39,4 @@ In other words, the schema can declare the grammar of shape_expr that the valida
 - The only legitimate reference targets when an agent derives a rule are `docs/` / `spec/` / `skill_must_read_refs` (the validator code is under `tools/`, so referencing it is forbidden). `spec/schema/` is under `spec/`, so it can be referenced.
 
 ## Current schema
-- `plan/shape_expr.schema.json` — the notation rules for `temporaries[].shape_expr` etc. Limited to the 3 forms `scalar` / `[d1,...]` / `(d1,...)`.
+- `ir/shape_expr.schema.json` — the notation rules for `temporaries[].shape_expr` etc. Limited to the 3 forms `scalar` / `[d1,...]` / `(d1,...)`.

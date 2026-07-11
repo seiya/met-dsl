@@ -198,7 +198,7 @@ The host directly-required set is `{all_nodes} − {self} − {transitive_deps}`
 gate cross-checks it against the IR's `direct_deps`.
 
 ### `shape_expr` allowed forms
-`spec/schema/plan/shape_expr.schema.json` is the canonical source. Limited to the 3 forms `scalar` (case-insensitive) / `[d1, d2, ...]` / `(d1, d2, ...)`. Function-call notation such as `vector(N)` / `matrix(M,N)` / `tensor` is forbidden and is a `Compile fail`.
+`spec/schema/ir/shape_expr.schema.json` is the canonical source. Limited to the 3 forms `scalar` (case-insensitive) / `[d1, d2, ...]` / `(d1, d2, ...)`. Function-call notation such as `vector(N)` / `matrix(M,N)` / `tensor` is forbidden and is a `Compile fail`.
 
 ### `algorithm.steps[].inputs` and `algorithm.steps[].outputs`
 A list of non-empty strings (e.g. `["U_L", "U_R"]`); the object form (`[{name: ..., source: ...}]`) is forbidden.
@@ -236,9 +236,11 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 - The `sweep` / `refinement` instructions of `tests.md` are reflected in `case.sweeps` / `case.refinements`.
 
 #### V2. algorithm completeness
-- The union of each `step.outputs` set of `algorithm.steps[]` covers the state variables targeted for update by `algorithm.update_semantics`.
+- The union of each `step.outputs` set of `algorithm.steps[]` covers the state variables targeted for update by `algorithm.update_semantics` (whose own vocabulary is `target_variables` / `update_order` / …).
 - `algorithm.ordering` is a valid ordering relation over `algorithm.steps[].step_id` (no cycles, no references to undefined step_id).
 - `algorithm.iteration_contract` is not an empty object when `algorithm.execution_mode=iterative`.
+- **Multi-dimensional `problem` contract.** For a `problem` `node` whose `spec_id` contains `2d` / `3d`, `algorithm` additionally holds the 4 contract keys `state_variables[]` (each with `name` + `shape_expr`), `required_update_paths`, `diagnostics_from_state=true`, and `fallback_policy=fail_closed`, as **direct children of `algorithm`**. `required_update_paths` is a **list of non-empty strings**, each one a `state_variables[].name` (`["h", "hu", "hv"]`); the object form (`[{target: ..., path: [...]}]`) is a `fail`, because `ordering` / `steps[].step_id` already carry the update order.
+- **Placement of the multi-dimensional contract (resolution order).** `--stage compile` resolves the contract from the FIRST of these that exists, and validates only that one: (1) `algorithm.state_contract` — **any** mapping wins, even an empty one; (2) `algorithm.update_semantics` — wins if it holds **any** of the 4 contract keys; (3) the direct children of `algorithm`. Author (3) and nothing else: an `algorithm.state_contract` key, or one contract key strayed into `algorithm.update_semantics` (whose own vocabulary is `target_variables` / `update_order` / …), **shadows** the direct children so that they are never read and fail as if absent. Every finding is named `state_contract.<field>` after the RESOLVED contract, not after where the field was authored. Reference form: `docs/examples/spec_ir_algorithm_2d_problem_contract.example.yaml`.
 
 #### V3. io_contract consistency
 - Every `io_contract.inputs[]` entry holds a non-empty `evidence_ref` string (same form as `outputs[].evidence_ref`, e.g. `raw/state_snapshots`); an input with a missing or empty `evidence_ref` is a `fail`.

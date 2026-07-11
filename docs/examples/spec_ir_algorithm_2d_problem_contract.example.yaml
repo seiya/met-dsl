@@ -1,0 +1,139 @@
+# algorithm section of spec.ir.yaml for a multi-dimensional problem node — sample of the correct format
+#
+# This file is a reference format showing the `algorithm:` section part of the spec.ir.yaml that the
+# Compile phase outputs for a `problem`-type node whose `spec_id` contains "2d" or "3d". It shows the
+# structure required by the `workflow-compile-generate` / `workflow-compile-verify` skills (and the
+# `validate_pipeline_semantics --stage compile` gate).
+#
+# This file is written as an excerpt of only the algorithm section; in an actual spec.ir.yaml, place
+# this block as the value of the `algorithm:` key, alongside the `case` / `impl_defaults` /
+# `io_contract` / `dependency` sections.
+#
+# `docs/examples/spec_ir_algorithm_section.example.yaml` is the companion sample for a component
+# node. It is the canonical reference for the rules common to every node kind (the string-list form
+# of steps[].inputs/outputs, the token binding convention, the shape_expr notation). This file adds
+# ONLY the extra contract a multi-dimensional problem node carries.
+#
+# The 4 extra contract keys are direct children of `algorithm:`:
+#   state_variables (each entry with `name` + `shape_expr`) / required_update_paths /
+#   diagnostics_from_state (= true) / fallback_policy (= fail_closed)
+#
+# Important: required_update_paths is a "list of the state-variable NAMES that the algorithm updates".
+#   OK: ["h", "hu", "hv"]
+#   NG: [{target: h, path: [step_01_boundary_apply, step_07_state_commit]}, ...]   ← object lists are forbidden
+# Every token must be the `name` of a `state_variables[]` entry. The update ORDER is already carried
+# by `ordering` and `steps[].step_id`; required_update_paths does not restate it.
+#
+# PLACEMENT / SHADOWING — the gate resolves the contract from the FIRST of these three placements
+# that exists, and validates only that one:
+#   1. `algorithm.state_contract:`   — ANY mapping wins here, even an empty one
+#   2. `algorithm.update_semantics:` — wins if it holds ANY of the 4 contract keys
+#   3. the direct children of `algorithm:` (this sample's form)
+# Author 3 and nothing else. Writing an `algorithm.state_contract:` key at all, or letting one of
+# the 4 contract keys stray into `algorithm.update_semantics:`, makes the gate resolve the whole
+# contract THERE and never read the correctly-authored direct children — which then fail as if they
+# were absent. Keep `update_semantics` to its own vocabulary (target_variables / update_order / ...),
+# as this sample does.
+#
+# The gate names its findings after the RESOLVED contract, so every violation message is prefixed
+# `state_contract.` regardless of where the fields were authored:
+#   "...:state_contract.required_update_paths must be non-empty string list"
+# refers to `algorithm.required_update_paths` in this sample's form.
+#
+# state_variables[].name is a binding identifier downstream: Generate cannot read controlled_spec,
+# so these names are what the model's state arrays are called. Name them as the controlled_spec
+# names them.
+
+algorithm_id: example_shallow_water_problem
+execution_mode: sequence
+
+steps:
+  - step_id: step_01_boundary_apply
+    step_kind: boundary_apply
+    operation_ref: example_boundary_2d_periodic__apply
+    inputs: ["h", "hu", "hv"]
+    outputs: ["h", "hu", "hv"]
+
+  - step_id: step_02_flux_compute
+    step_kind: flux_compute
+    operation_ref: example_flux_2d_rusanov__compute
+    # nx / ny are bound by derived_field_rules (see below), so they are traceable tokens.
+    inputs: ["h", "hu", "hv", "g", "nx", "ny"]
+    outputs: ["F_h", "F_hu", "F_hv"]
+
+  - step_id: step_03_time_integrate
+    step_kind: time_integrate
+    operation_ref: example_time_update_2d_ssprk2__advance
+    inputs: ["h", "hu", "hv", "F_h", "F_hu", "F_hv", "dt"]
+    outputs: ["h", "hu", "hv"]
+
+ordering:
+  - step_01_boundary_apply
+  - step_02_flux_compute
+  - step_03_time_integrate
+
+control_condition: ""
+
+iteration_contract: {}
+
+update_semantics:
+  target_variables: ["h", "hu", "hv"]
+  update_order: sequential
+
+temporaries:
+  - name: F_h
+    shape_expr: "[nx, ny]"
+  - name: F_hu
+    shape_expr: "[nx, ny]"
+  - name: F_hv
+    shape_expr: "[nx, ny]"
+
+# derived_field_rules: quantities that are not direct spec variables but are derived from them.
+# A grid extent used inside a shape_expr (nx / ny) is bound here; a token that appears in
+# steps[].inputs/outputs without such a binding is an "undefined binding" Compile fail.
+derived_field_rules:
+  - name: nx
+    rule: "number of cells along x, derived from the case parameters (grid.nx)"
+  - name: ny
+    rule: "number of cells along y, derived from the case parameters (grid.ny)"
+
+invariants:
+  - "total mass sum(h) is conserved up to round-off under periodic boundaries"
+
+splitting_policy:
+  kind: none
+
+# ---------------------------------------------------------------------------
+# The multi-dimensional problem contract (this block is what distinguishes this
+# sample from the component sample).
+# ---------------------------------------------------------------------------
+
+# state_variables: the prognostic state the problem advances in time. Each entry carries `name` and
+# `shape_expr`. The shape_expr notation is limited to the 3 allowed forms of
+# spec/schema/ir/shape_expr.schema.json ("scalar" / "[d1, d2]" / "(d1, d2)").
+state_variables:
+  - name: h
+    shape_expr: "[nx, ny]"
+  - name: hu
+    shape_expr: "[nx, ny]"
+  - name: hv
+    shape_expr: "[nx, ny]"
+
+# required_update_paths: the state variables the algorithm is required to update, as a list of
+# non-empty strings. Each token is a `state_variables[].name`.
+required_update_paths: ["h", "hu", "hv"]
+
+# NG form — an object list is rejected by `--stage compile` with
+#   "state_contract.required_update_paths must be non-empty string list":
+# required_update_paths:
+#   - target: "h"
+#     path: ["step_01_boundary_apply", "step_03_time_integrate"]
+#   - target: "hu"
+#     path: ["step_01_boundary_apply", "step_03_time_integrate"]
+
+# diagnostics_from_state: a multi-dimensional problem derives every diagnostic from the state
+# snapshots, so this is always true.
+diagnostics_from_state: true
+
+# fallback_policy: a multi-dimensional problem has no silent fallback, so this is always fail_closed.
+fallback_policy: fail_closed

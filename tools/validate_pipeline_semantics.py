@@ -852,6 +852,23 @@ def _validate_problem_state_array_usage(
     lowered: str,
     violations: list[str],
 ) -> None:
+    """DORMANT — this gate never fires, deliberately left so pending a redesign.
+
+    `_algorithm_contract_for_execution` returns the WHOLE IR document, but `_algorithm_state_contract`
+    looks for the contract keys at the top level, while every real IR nests them under `algorithm:`.
+    So `kernel_contract` is always None and the body below is unreachable. (The same class of bug as
+    the one `_plan_dependency_node_key` carried: a lookup against a shape no real IR has.)
+
+    It is NOT revived by simply unwrapping the section, because the `>= 3 intent(out)` predicate below
+    cannot tell the true positive (a fabricated metric-only kernel) from the false positive (a
+    legitimately decomposed helper such as a flux-divergence routine) — both present the same
+    signature, so no threshold fixes it. Reviving it needs a structural anchor on the node's published
+    entry point instead of a shape heuristic, plus an overlap analysis against the two live gates that
+    already cover part of this ground (`_validate_problem_model_dependency_dataflow` and
+    `_validate_problem_metric_only_scalar_kernel`). Canonical: the "problem state-array usage" entry of
+    `docs/design/deterministic_followups.md`. Do not "fix" the early return in isolation: that silently
+    turns on a gate with a known false-positive class.
+    """
     if not _is_multidim_problem_node(execution):
         return
 
@@ -860,7 +877,7 @@ def _validate_problem_state_array_usage(
         return
     kernel_contract = _algorithm_state_contract(contract)
     if not isinstance(kernel_contract, dict):
-        return
+        return  # DORMANT: always taken on a real IR — see the docstring.
 
     raw_state_variables = kernel_contract.get("state_variables")
     if not isinstance(raw_state_variables, list):
@@ -6902,6 +6919,7 @@ def _validate_algorithm_contract_file(
             return
 
         state_variables = state_contract.get("state_variables")
+        declared_state_names: set[str] = set()
         if not isinstance(state_variables, list) or not state_variables:
             violations.append(
                 f"{contract_path}:state_contract.state_variables must be non-empty list"
@@ -6919,6 +6937,8 @@ def _validate_algorithm_contract_file(
                     violations.append(
                         f"{contract_path}:state_contract.state_variables[{idx}].name must be non-empty string"
                     )
+                else:
+                    declared_state_names.add(name.strip())
                 if not isinstance(shape_expr, str) or not shape_expr.strip():
                     violations.append(
                         f"{contract_path}:state_contract.state_variables[{idx}].shape_expr must be non-empty string"
@@ -6929,12 +6949,32 @@ def _validate_algorithm_contract_file(
                     )
 
         update_paths = state_contract.get("required_update_paths")
-        if not isinstance(update_paths, list) or not all(
-            isinstance(token, str) and token.strip() for token in update_paths
+        # `not update_paths` is load-bearing: `all()` over an empty list is True, so without it an
+        # empty `required_update_paths: []` passed a check whose own message says "non-empty" — a
+        # multidimensional problem that declares it updates nothing. The hole was unreachable while
+        # the gate was dormant (see `_plan_dependency_node_key`); it is live now.
+        if (
+            not isinstance(update_paths, list)
+            or not update_paths
+            or not all(isinstance(token, str) and token.strip() for token in update_paths)
         ):
             violations.append(
                 f"{contract_path}:state_contract.required_update_paths must be non-empty string list"
             )
+        elif declared_state_names:
+            # Each token NAMES a state variable — the shape rule alone would accept a typo, or a
+            # diagnostic/temporary, as an update target: an update contract nothing can fulfil,
+            # discovered only when Generate cannot resolve the name. Skipped when the declared set
+            # is itself invalid, so the cause is reported once rather than cascading.
+            unknown = [
+                token.strip() for token in update_paths
+                if token.strip() not in declared_state_names
+            ]
+            if unknown:
+                violations.append(
+                    f"{contract_path}:state_contract.required_update_paths must name declared "
+                    f"state_variables ({sorted(set(unknown))})"
+                )
 
         diagnostics_from_state = state_contract.get("diagnostics_from_state")
         if diagnostics_from_state is not True:
@@ -9135,6 +9175,13 @@ def _resolve_pipeline_dir_for_stage(
 
 
 def _plan_dependency_node_key(ir_dir: Path) -> str | None:
+    """The node_key of the node this IR belongs to, as the compile stage sees it.
+
+    The unified IR carries its own node_key under ``dependency.node_key`` and ``meta.node_key``;
+    nothing writes it at the top level. Reading only the top level silently returned None for every
+    real IR, which disabled every node_key-conditioned compile gate (notably the multidimensional
+    problem state_contract checks) and deferred those violations to Validate.
+    """
     dep_path = ir_dir / "spec.ir.yaml"
     if not dep_path.exists():
         return None
@@ -9142,8 +9189,17 @@ def _plan_dependency_node_key(ir_dir: Path) -> str | None:
         data = _read_yaml(dep_path)
     except yaml.YAMLError:
         return None
-    if isinstance(data, dict):
-        nk = data.get("node_key")
+    if not isinstance(data, dict):
+        return None
+    sections: list[Any] = [
+        data.get("dependency"),
+        data.get("meta"),
+        data,
+    ]
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        nk = section.get("node_key")
         if isinstance(nk, str) and nk.strip():
             return nk.strip()
     return None

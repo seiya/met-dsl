@@ -26237,7 +26237,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # reopened the same truncation wedge; and the case_id path-safety token ([A-Za-z0-9._-],
         # no ".."), because a case_id is concatenated into the snapshot path and `../` escaped
         # the run directory.
-        "docs/workflow/phases/phase_01_compile.md": 33150,
+        # Bumped 33150->34800: V2 gains the multi-dimensional `problem` contract (the 4 direct
+        # children of `algorithm`, the string-list form of required_update_paths, and the
+        # update_semantics shadowing order). phase_01 is the canonical IR-schema doc and is
+        # force-read by every compile leaf, so a gate that can fail Compile cannot live only
+        # in the SKILLs.
+        "docs/workflow/phases/phase_01_compile.md": 34800,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -26268,13 +26273,29 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 17000->18100: R3-core — the condition-scope choice (none / per_case / `case:`)
         # and the rule that `target_cases` is also the (test_id, case_id) evidence contract.
         # This leaf authors test_predicates, so the scope vocabulary must be here.
-        "skills/workflow-compile-generate/SKILL.md": 18100,
+        # Bumped 18100->19800: the SHAPE of the multidim problem contract — required_update_paths
+        # is a list of state-variable NAMES, and the 5 fields are direct children of `algorithm`.
+        # E2E #4 authored an object list ([{target, path}]) and the shape existed only in the
+        # validator + its tests (doc zero), so the leaf had no way to get it right. Also the
+        # single-shape rule for a snapshot-referencing io_contract.outputs entry. This leaf
+        # authors both sections and does not read the validator, so the rules must be here.
+        # Plus the PLACEMENT rule: `_algorithm_state_contract` resolves the contract from
+        # `algorithm.state_contract` (ANY mapping, even empty) -> `algorithm.update_semantics`
+        # (if it holds any of the 4 contract keys) -> the direct children. Either of the first
+        # two SHADOWS correct direct children, which are then never read and fail as if absent
+        # — the same doc<->validator drift class that produced E2E #4.
+        "skills/workflow-compile-generate/SKILL.md": 19800,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
         # check (the prose→predicate translation is this design's first-priority risk); the gate
         # does the mechanical schema, the leaf verifies faithfulness.
-        "skills/workflow-compile-verify/SKILL.md": 13100,
+        # Bumped 13100->13900: the 2D/3D `problem` contract, scoped to what this leaf may add —
+        # a SEMANTIC check against controlled_spec (are these the right state variables?). Its
+        # structural shape is certified by Compile.static, and re-checking that here would both
+        # contradict the "does NOT re-run --stage compile" rule above and risk false-rejecting a
+        # gate-clean IR.
+        "skills/workflow-compile-verify/SKILL.md": 13900,
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
         # generate.generate no longer force-reads) to avoid a lint/build round-trip.
@@ -26322,7 +26343,14 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # -Werror=unused-variable over the whole staged set, so the checklist carries the
         # associate binding for an intentionally-unused dummy plus the two forbidden workarounds
         # (`0*x`, `! allow(...)`).
-        "skills/workflow-generate-generate/SKILL.md": 31400,
+        # Bumped 31400->32700: the Generate.static dependency-dataflow rule — a `problem` node's
+        # updated state must be `intent(out)` and reached by an assignment chain from the
+        # dependency-op results. An `intent(inout)` in-place update leaves no chain the gate can
+        # trace and fails; E2E #4 burned a self-repair cycle rediscovering that from the
+        # violation text alone. The rule states when the gate ACTUALLY fires: it inspects only a
+        # subroutine that declares >=1 intent(out) dummy (one with none is skipped outright), so
+        # "intent(inout) is a Generate fail" would have been simply false.
+        "skills/workflow-generate-generate/SKILL.md": 32700,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare

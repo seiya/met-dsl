@@ -1464,6 +1464,182 @@ class TransportFailureTest(unittest.TestCase):
         self.assertEqual(sup[0]["--run-ids"], ["child-1", "child-2", "child-3"])
         self.assertIn("leaf_transport_error_orphan", sup[0]["--reason"])
 
+    def test_transport_failure_reason_names_an_llm_usage_limit(self) -> None:
+        """A leaf killed by an LLM usage limit exits 1 with no artifacts, and the conductor could
+        only report `leaf_transport_error: leaf_exit=1` — which reads as a crash and sends the
+        operator hunting for a bug that is not there. The cause is in the leaf's captured output,
+        so the fail_closed reason (and the orphan tombstone reason) must carry it."""
+        c = self._conductor()
+        c.spawn_leaf = lambda *a, **k: wc.ProcResult(  # type: ignore[assignment]
+            1, "", "Claude AI usage limit reached|1752200000")
+        oc = c.run_phase(self._refs(), "validate")
+        reason = oc.decision.reason
+        # The prefix is load-bearing: set_status maps fail_closed reasons to an allowlisted
+        # reason_code by prefix match, so the tag may only ever append.
+        self.assertTrue(reason.startswith("leaf_transport_error: leaf_exit=1"))
+        self.assertIn("llm_usage_limit", reason)
+        self.assertIn("usage limit reached", reason)
+        # reason_detail is truncated at 200 chars by set_status; the tag must survive that.
+        self.assertLessEqual(len(reason), 200)
+        sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertIn("llm_usage_limit", sup[0]["--reason"])
+
+    def test_transport_failure_reason_is_unchanged_without_an_infra_marker(self) -> None:
+        """Negative twin: an ordinary crash carries no tag, so the reason keeps its current form."""
+        c = self._conductor()
+        c.spawn_leaf = lambda *a, **k: wc.ProcResult(  # type: ignore[assignment]
+            1, "", "Traceback (most recent call last): ValueError: boom")
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertEqual(oc.decision.reason, "leaf_transport_error: leaf_exit=1")
+        self.assertNotIn("tag:", oc.decision.reason)
+
+    def test_classify_leaf_infra_error_tags_each_known_cause(self) -> None:
+        cases = [
+            ("Claude AI usage limit reached", "llm_usage_limit"),
+            ("You've hit your session limit; resets at 5pm", "llm_usage_limit"),
+            ("API Error: rate limit exceeded", "llm_rate_limit"),
+            ("API Error: 429 Too Many Requests", "llm_rate_limit"),
+            ("Error: Overloaded", "llm_overloaded"),
+            ("API Error: 529 overloaded_error", "llm_overloaded"),
+            ("Permission checking is temporarily unavailable, so auto mode cannot determine "
+             "whether this is safe", "llm_permission_probe_unavailable"),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                got = wc._classify_leaf_infra_error(text)
+                self.assertIsNotNone(got, f"expected a tag for {text!r}")
+                self.assertEqual(got[0], expected)
+                self.assertTrue(got[1], "the evidence line must be non-empty")
+        self.assertIsNone(wc._classify_leaf_infra_error("Traceback: ValueError: boom"))
+        self.assertIsNone(wc._classify_leaf_infra_error(""))
+
+    def test_classify_leaf_infra_error_does_not_fire_on_ordinary_leaf_output(self) -> None:
+        """A bare `429` / `529` substring matches a traceback frame or any duration/token count.
+        Mislabelling a routine crash as a quota event is worse than not labelling it at all — it
+        sends the operator hunting an outage that never happened. An HTTP-ish status code counts
+        only next to an error/status word, and the word patterns must survive being fed a leaf's
+        own prose and a C++ compiler's diagnostics."""
+        benign = [
+            '  File "/repo/tools/thing.py", line 429, in run',
+            "  File \"/repo/x.py\", line 529, in main",
+            "stats: duration_ms: 5291 cost_usd 0.02",
+            "total input tokens 4293",
+            "gfortran: error at line 429 of model.f90",   # a compiler line number, not HTTP
+            "I analysed the scheme: diffusion is the rate-limiting process here.",
+            "error: call of overloaded 'update(double)' is ambiguous",
+            "error: call of overloaded ‘advance’ is ambiguous",   # gcc's unicode quotes
+        ]
+        for text in benign:
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    wc._classify_leaf_infra_error(text),
+                    f"must not tag ordinary leaf output: {text!r}")
+
+    def test_classify_leaf_infra_error_ignores_a_recovered_retry_notice(self) -> None:
+        """The CLI prints `API Error (429 ...) - Retrying in 1s... (attempt 1/10)` and then
+        RECOVERS. Tagging that would blame the quota for a leaf that actually died of a hook
+        denial — the very misdiagnosis this classifier exists to prevent, inverted. A TERMINAL
+        message may still mention retries, and must stay classifiable."""
+        recovered = ("API Error (429 rate_limit_error) - Retrying in 1 seconds... (attempt 1/10)\n"
+                     "API Error (Overloaded) - Retrying in 2 seconds... (attempt 2/10)\n"
+                     "RuntimeError: hook denied write outside write_roots")
+        self.assertIsNone(wc._classify_leaf_infra_error(recovered))
+        # ...but codex's terminal give-up, which names retries, still classifies.
+        terminal = "stream error: exceeded retry limit, last status: 429 Too Many Requests"
+        got = wc._classify_leaf_infra_error(terminal)
+        self.assertIsNotNone(got)
+        self.assertEqual(got[0], "llm_rate_limit")
+
+    def test_classify_leaf_infra_error_prefers_stderr_over_the_leafs_own_prose(self) -> None:
+        """On a `claude -p` leaf stdout carries the model's final message, which can discuss the
+        "rate-limiting step" of a scheme. stderr carries the real transport error, so it wins."""
+        got = wc._classify_leaf_infra_error(
+            "Claude AI usage limit reached|1752200000",                     # stderr
+            "the rate limit of the reaction is set by diffusion")           # stdout
+        self.assertEqual(got[0], "llm_usage_limit")
+
+    def test_classify_leaf_infra_error_covers_the_other_real_quota_messages(self) -> None:
+        cases = [
+            ("Your credit balance is too low to make this request", "llm_usage_limit"),
+            ("5-hour limit reached; resets at 12pm", "llm_usage_limit"),
+            ("quota exceeded for this organization", "llm_usage_limit"),
+            ("stream disconnected: Too Many Requests", "llm_rate_limit"),
+            ('API Error: 529 {"type":"overloaded_error","message":"Overloaded"}', "llm_overloaded"),
+            # Strings carried verbatim by the shipped claude CLI:
+            ("Request rejected (429) · this may be a temporary capacity issue.", "llm_rate_limit"),
+            ("rate limited — wait and retry", "llm_rate_limit"),
+            ("Opus is experiencing high load, please use another model", "llm_overloaded"),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                got = wc._classify_leaf_infra_error(text)
+                self.assertIsNotNone(got, f"expected a tag for {text!r}")
+                self.assertEqual(got[0], expected)
+
+    def test_classify_leaf_infra_error_does_not_invert_the_clis_not_your_usage_limit(self) -> None:
+        """The CLI's own 429 message reads "Server is temporarily limiting requests (not your usage
+        limit)". Tagging that `llm_usage_limit` is exactly backwards: the operator would sit out a
+        5-hour quota reset that never happened. It is a rate limit, and must be reported as one."""
+        got = wc._classify_leaf_infra_error(
+            "Server is temporarily limiting requests (not your usage limit) · this may be a "
+            "temporary capacity issue.")
+        self.assertIsNotNone(got)
+        self.assertEqual(got[0], "llm_rate_limit")
+
+    def test_classify_leaf_infra_error_does_not_fire_on_the_leafs_own_prose(self) -> None:
+        """A failed `claude -p` leaf writes its output to STDOUT, so the classifier is fed the
+        model's own prose and the compiler's diagnostics. Generic words must not tag them."""
+        benign = [
+            "Newton iteration limit reached; the solver did not converge",
+            "Context limit reached",                       # a prompt-size failure, not a quota
+            "Subagent nesting limit reached (depth 3)",
+            "The generic __box interface is overloaded across ranks 0..3",
+            "Overloaded the `__box` generic so ranks 0..3 share one writer.",
+            "the rate-limiting step of the reaction is diffusion",
+        ]
+        for text in benign:
+            with self.subTest(text=text):
+                self.assertIsNone(wc._classify_leaf_infra_error(text),
+                                  f"must not tag the leaf's own prose: {text!r}")
+
+    def test_classify_leaf_infra_error_prefers_the_most_severe_tag(self) -> None:
+        """A usage limit is a hard stop costing hours; a rate limit is transient. When a run logged
+        both, reporting the transient one sends the operator back to a run that cannot start."""
+        got = wc._classify_leaf_infra_error(
+            "Claude AI usage limit reached|1752307200\nAPI Error: 429 rate_limit_error")
+        self.assertEqual(got[0], "llm_usage_limit")
+
+    def test_classify_leaf_infra_error_ignores_a_wrapped_retry_banner(self) -> None:
+        """The retry banner is sometimes wrapped across two lines, putting the error on one and the
+        `Retrying...` on the next. A line-scoped skip alone would still tag the recovered retry."""
+        self.assertIsNone(wc._classify_leaf_infra_error(
+            "API Error (429 rate_limit_error)\n"
+            "  · Retrying in 1 seconds... (attempt 1/10)\n"
+            "RuntimeError: hook denied write outside write_roots"))
+
+    def test_leaf_failure_summary_keeps_the_real_error_and_adds_the_marker(self) -> None:
+        """The marker can land on either stream, so it is lifted out of whichever carries it — but
+        it is PREPENDED to the stderr tail, never substituted for it. Substituting would let a
+        misfiring classifier destroy the leaf's actual error, which is the opposite of the point."""
+        proc = wc.ProcResult(1, "Claude AI usage limit reached|1752200000",
+                             "RuntimeError: hook denied write to src/foo.f90")
+        summary = wc.Conductor._leaf_failure_summary(proc)
+        # The `leaf_exit=` prefix is relied on by the agent_runs result_summary assertions.
+        self.assertTrue(summary.startswith("leaf_exit=1"))
+        self.assertIn("usage limit reached", summary)   # the stdout-side marker survives...
+        self.assertIn("hook denied write", summary)     # ...and so does the real stderr error
+
+    def test_transport_tag_survives_a_marker_beyond_the_summary_truncation(self) -> None:
+        """The tag is carried structurally on the outcome, not re-derived from the (already
+        truncated) summary text: a backend that emits the limit message deep inside one long line
+        would otherwise lose the tag exactly when it is needed."""
+        long_line = "codex exec failed: " + "context " * 40 + "Claude AI usage limit reached"
+        c = self._conductor()
+        c.spawn_leaf = lambda *a, **k: wc.ProcResult(1, "", long_line)  # type: ignore[assignment]
+        oc = c.run_phase(self._refs(), "validate")
+        self.assertIn("llm_usage_limit", oc.decision.reason)
+        self.assertTrue(oc.decision.reason.startswith("leaf_transport_error: leaf_exit=1"))
+
     def test_non_transport_content_fail_writes_and_routes(self) -> None:
         # judge returns rc 0 but content-fails -> normal classify_failure routing, NOT transport:
         # write-step-result IS called and no tombstone is written.
@@ -2231,6 +2407,109 @@ class DiagnosticianTest(unittest.TestCase):
         # Missing SKILL -> inline fallback (never crashes escalate).
         self.assertEqual(
             wc._load_escalate_persona(Path("/no/such/repo")), wc._ESCALATE_PERSONA_FALLBACK)
+
+    def test_diagnosis_prompt_keeps_every_artifact_under_a_large_context(self) -> None:
+        """Regression (E2E #4 run 1): the prompt truncated the whole context dump at 6000 chars,
+        which silently dropped whichever artifacts sorted last — including source_meta.json, the
+        primary evidence of the failed generate phase. The diagnostician then reported
+        "insufficient evidence" and fail-closed a leaf whose decline was correct. Every artifact
+        must survive, bounded individually."""
+        # ir_meta alone busts the old 6000-char budget, as it did in the real run.
+        context = {
+            "source_meta.json": {"decline_reason": "lake_at_rest cannot be satisfied",
+                                 "evidence": "max_velocity 3.2e-2 with a non-well-balanced scheme"},
+            "ir_meta.json": {"filler": ["x" * 200 for _ in range(60)]},
+            "verdict.json": {"overall": "fail"},
+        }
+        prompt = wc._diagnosis_prompt("n", "generate", [], context, "dev")
+        for name in context:
+            self.assertIn(name, prompt, f"{name} must appear in the diagnosis prompt")
+        self.assertIn("lake_at_rest cannot be satisfied", prompt)
+        self.assertIn("[truncated]", prompt)  # the oversized artifact is marked, not dropped
+
+    def test_bounded_context_json_is_valid_json_and_bounded(self) -> None:
+        big = {"k": "y" * 50000}
+        out = wc._bounded_context_json({"a.json": big, "b.json": {"small": 1}})
+        parsed = json.loads(out)  # a truncated artifact must not corrupt the JSON
+        self.assertEqual(sorted(parsed), ["a.json", "b.json"])
+        self.assertEqual(parsed["b.json"], {"small": 1})  # under budget -> kept verbatim
+        self.assertIsInstance(parsed["a.json"], str)      # over budget -> truncated string
+        self.assertTrue(parsed["a.json"].endswith("[truncated]"))
+        self.assertEqual(wc._bounded_context_json({}), "{}")
+
+    def test_bounded_context_json_shrinks_the_allowance_as_artifacts_multiply(self) -> None:
+        """Many artifacts share the total budget, but each keeps at least the floor — nothing is
+        dropped no matter how many compete. The floor, like the budget, is denominated in SERIALIZED
+        characters: that is what the prompt actually pays for a truncated artifact."""
+        context = {f"a{i}.json": {"k": "z" * 20000} for i in range(20)}
+        parsed = json.loads(wc._bounded_context_json(context))
+        self.assertEqual(len(parsed), 20)
+        for name, body in parsed.items():
+            self.assertTrue(body.endswith("[truncated]"), name)
+            # The search takes the largest prefix that FITS, so it lands within a char or two of
+            # the floor rather than exactly on it.
+            self.assertGreaterEqual(
+                wc._serialized_len(body), wc._MIN_ARTIFACT_BUDGET - 2, name)
+
+    def test_bounded_context_json_never_starves_a_lone_artifact(self) -> None:
+        """A per-artifact cap that ignores how FEW artifacts there are would hand the diagnostician
+        less evidence than the flat 6000-char dump it replaced — a regression dressed as a fix. A
+        compile failure whose only artifact is an 11k ir_meta is exactly that case."""
+        big = {"k": "y" * 50000}
+        lone = json.loads(wc._bounded_context_json({"ir_meta.json": big}))["ir_meta.json"]
+        self.assertGreaterEqual(wc._serialized_len(lone), 6000 - 2)
+
+    def test_bounded_context_json_spends_the_budget_in_order(self) -> None:
+        """Ordering only means something if the budget is spent greedily in order. The failed
+        phase's own artifact leads, so it must get the LARGE slice while the trailing ones keep the
+        floor — otherwise `_gather_failure_context`'s reordering is decorative and the primary
+        evidence is truncated just as hard as the noise behind it."""
+        oversized = {"k": "y" * 50000}
+        parsed = json.loads(wc._bounded_context_json(
+            {f"a{i}.json": dict(oversized) for i in range(6)}))
+        costs = [wc._serialized_len(parsed[f"a{i}.json"]) for i in range(6)]
+        self.assertGreater(costs[0], costs[-1],
+                           f"the leading artifact must win the budget; got {costs}")
+        self.assertGreaterEqual(min(costs), wc._MIN_ARTIFACT_BUDGET - 2)
+
+    def test_bounded_context_json_holds_the_total_budget_against_escaping(self) -> None:
+        """A truncated artifact is carried as a STRING, so the outer `json.dumps` escapes it a
+        SECOND time: every quote, backslash and newline doubles. Budgeting against the raw slice
+        undercounted quote-dense content by ~2x — 8 such artifacts emitted 22k characters against a
+        nominal 12k, quietly inflating the diagnosis prompt. Both truncation and accounting must
+        therefore work in serialized characters."""
+        dense = {f"a{i}.json": {"k": '"\\\n' * 4000} for i in range(8)}
+        out = wc._bounded_context_json(dense)
+        parsed = json.loads(out)               # escaping must not corrupt the JSON
+        self.assertEqual(len(parsed), 8)       # ...and must not drop an artifact either
+        plain = wc._bounded_context_json({f"a{i}.json": {"k": "y" * 20000} for i in range(8)})
+        # Escape-dense content must cost no more than plain content of the same budget; the only
+        # excess over `total` is the wrapper (keys, braces, indent), which is identical for both.
+        self.assertLessEqual(len(out), len(plain) + 64,
+                             f"escaping blew the budget: {len(out)} vs plain {len(plain)}")
+        self.assertLess(len(out), 13000, f"emitted {len(out)} chars against a 12000 budget")
+
+    def test_gather_failure_context_leads_with_the_failed_phase_artifacts(self) -> None:
+        """The per-artifact budget is applied in insertion order, so the failed phase's own
+        evidence must come first — a generate failure leads with source_meta, not with the 11k
+        ir_meta that merely happens to be enumerated earlier."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            for rel, doc in (
+                (f"{refs.ir_ref}/ir_meta.json", {"a": 1}),
+                (f"{refs.source_dir()}/source_meta.json", {"b": 2}),
+                (f"{refs.run_node_dir()}/verdict.json", {"c": 3}),
+            ):
+                p = repo / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps(doc), encoding="utf-8")
+            c = _FakeConductor(repo_root=repo, orchestration_id="o",
+                               orchestration_agent_run_id="ORCH", backend="claude", env={})
+            self.assertEqual(list(c._gather_failure_context(refs, "generate"))[0],
+                             "source_meta.json")
+            self.assertEqual(list(c._gather_failure_context(refs, "compile"))[0], "ir_meta.json")
+            self.assertEqual(list(c._gather_failure_context(refs, "validate"))[0], "verdict.json")
 
     def test_escalate_routes_from_diagnostician(self) -> None:
         c = self._conductor()

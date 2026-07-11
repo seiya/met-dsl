@@ -25,7 +25,8 @@
 #
 # Do not include "2d"/"3d" in algorithm_id: the 2D/3D required contract of a problem-type node
 #   (state_variables / required_update_paths / diagnostics_from_state=true) is
-#   not shown in this sample. A contract example for a 2D problem will be added separately under docs/examples/.
+#   not shown in this sample. Reference form for a 2D problem:
+#   docs/examples/spec_ir_algorithm_2d_problem_contract.example.yaml.
 
 algorithm_id: example_flux_compute
 execution_mode: sequence
@@ -60,7 +61,7 @@ update_semantics:
 
 # temporaries: intermediate variables that live only between steps (outside spec, outside target)
 #
-# spec/schema/plan/shape_expr.schema.json is the canonical source for the shape_expr notation rules.
+# spec/schema/ir/shape_expr.schema.json is the canonical source for the shape_expr notation rules.
 # Only the following 3 allowed forms exist:
 #   - "scalar" (case-insensitive)              … 0-dimensional
 #   - "[d1, d2, ...]"  (bracket list form)     … e.g. "[3]", "[nx, ny]"

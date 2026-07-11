@@ -181,7 +181,7 @@ workspace/
 
 | path | generating phase | writer | reader | note |
 |---|---|---|---|---|
-| `workspace/ir/.../<ir_id>/spec.ir.yaml` | Compile/generate | substep agent (Edit/Write) | all of Generate onward | the single structural IR. The notation rules for `temporaries[].shape_expr` etc. are `spec/schema/plan/shape_expr.schema.json` |
+| `workspace/ir/.../<ir_id>/spec.ir.yaml` | Compile/generate | substep agent (Edit/Write) | all of Generate onward | the single structural IR. The notation rules for `temporaries[].shape_expr` etc. are `spec/schema/ir/shape_expr.schema.json` |
 | `workspace/ir/.../<ir_id>/ir_meta.json` | Compile/generate / verify | substep agent (Edit/Write) | runtime / validator | `verification_status` is assigned only when verify passes |
 | `workspace/ir/.../<ir_id>/compile_static_meta.json` | Compile (`Compile.static`) | conductor (deterministic in-process; `_compile_static_inproc`) | conductor routing | records the `--stage compile` / `check_artifact_syntax` / `workspace_root` verdict; the leaf cannot write it |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/src/` | Generate | substep agent | subsequent phases | |
