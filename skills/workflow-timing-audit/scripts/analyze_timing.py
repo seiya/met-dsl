@@ -6,7 +6,10 @@ Breaks a completed (or interrupted) orchestration run down into:
     conductor's in-process deterministic steps (Build / Validate.execute),
   - inside each LLM leaf: model-generation latency vs. tool-execution latency,
     output tokens, generation throughput, and the dominant turns,
-  - node- and run-level rollups.
+  - node- and run-level rollups,
+  - an ANOMALIES section: turns truncated by `max_tokens` (thinking that
+    produced nothing), leaf API/transport errors, stale terminal records, and
+    warm-resume replays.
 
 Multiple-counting is handled structurally (see MULTIPLE-COUNTING below), so the
 output tokens and latencies are not inflated.
@@ -35,11 +38,32 @@ MULTIPLE-COUNTING (why naive sums are wrong, and how this script avoids it):
      leaves. -> Timing comes only from phase_state_log launch/terminal pairs,
      keyed by agent_run_id; the role/substep label is taken from the matching
      session_run_index / agent_runs entry, not re-derived.
+  4) A WARM-RESUMED leaf's transcript REPLAYS the producer leaf's messages
+     verbatim (same `message.id`, same usage). Summing per-leaf tokens then
+     counts the producer's work twice — measured at ~13% inflation on a real
+     closure (162k tokens across 3 resumed leaves). -> Message ids are deduped
+     GLOBALLY across the run in launch order: the first leaf to emit an id owns
+     it, and a later leaf that replays it reports only its NEW responses. The
+     replayed span is reported separately, never summed into the totals.
+  5) A leaf whose child DIED (transport error, crash) has its
+     `record_agent_run_terminal` stamped when the conductor next runs — i.e. at
+     the operator's `--resume`, HOURS later. Its `child_launched ->
+     record_agent_run_terminal` elapsed therefore contains the human fix window,
+     not leaf activity (observed: 6.9h elapsed for a leaf with 129s of
+     transcript). -> When a leaf's elapsed exceeds its transcript wall by more
+     than STALE_GAP_S, the transcript wall is used as the effective elapsed and
+     the excess is reported separately as a stale gap. It is never added to the
+     LLM/deterministic split.
 """
 import json
 import os
 import sys
 from datetime import datetime
+
+# A leaf's elapsed may legitimately exceed its transcript wall by process
+# startup/teardown (seconds). Beyond this, the excess is a stale terminal record
+# (see MULTIPLE-COUNTING 5), not leaf activity.
+STALE_GAP_S = 600.0
 
 
 def ts(s):
@@ -124,10 +148,13 @@ def load_labels(orch_path):
     return labels
 
 
-def analyze_transcript(path):
-    """Collapse a session transcript by message.id (handles multiple-counting).
+def read_transcript(path):
+    """Per-response records from a session transcript, collapsed by message.id.
 
     Returns None if the transcript has no model turns (deterministic step).
+    Aggregation is deliberately NOT done here: a warm-resumed leaf replays the
+    producer's responses, so which of them count is a RUN-level question that
+    only `summarize` (with the globally-seen id set) can answer.
     """
     events = []
     for line in open(path):
@@ -141,46 +168,54 @@ def analyze_transcript(path):
         return None
     events.sort(key=lambda d: d["timestamp"])
 
-    responses = []          # one entry per distinct message.id
-    tool_time = 0.0
-    tool_by = {}            # name -> [count, secs]
-    pending = {}            # tool_use_id -> (name, ts)
+    # Keyed by message.id, NOT by a consecutive run of lines: a response that
+    # makes PARALLEL tool calls has its `tool_use` lines interleaved with the
+    # `tool_result` user lines that answer them, so the same message.id reappears
+    # after a user line. Tracking "the current id" and closing it on a user line
+    # splits such a response in two and counts its output_tokens TWICE (measured:
+    # +20,659 tok on one node). The id is the identity; nothing else is.
+    responses = {}          # message.id -> record (insertion-ordered)
+    api_errors = []
+    pending = {}            # tool_use_id -> (name, ts, owning response)
     cache_reads = []
     last_event_t = ts(events[0]["timestamp"])
-    cur_id = None
-    cur = None
-
-    def close_cur():
-        nonlocal cur, cur_id
-        if cur is not None:
-            responses.append(cur)
-        cur = None
-        cur_id = None
 
     for d in events:
         T = ts(d["timestamp"])
         typ = d.get("type")
         msg = d.get("message", {}) if isinstance(d.get("message"), dict) else {}
         content = msg.get("content") or []
+        if d.get("isApiErrorMessage"):
+            # The claude CLI reports a transport/API fault as a normal assistant
+            # line flagged with isApiErrorMessage. This is the ONLY in-transcript
+            # evidence that a leaf died of infrastructure rather than of its own
+            # reasoning, so surface it instead of letting it look like prose.
+            txt = " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text")
+            api_errors.append({"ts": d["timestamp"], "text": " ".join(txt.split())[:200]})
         if typ == "assistant":
             mid = msg.get("id")
             usage = msg.get("usage") or {}
             blocks = [b.get("type") for b in content if isinstance(b, dict)]
-            if mid != cur_id:
-                close_cur()
-                cur = {
+            cur = responses.get(mid)
+            if cur is None:
+                cur = responses[mid] = {
+                    "id": mid,
                     "lat": max(0.0, (T - last_event_t).total_seconds()),
                     "out": usage.get("output_tokens", 0),
+                    "stop_reason": msg.get("stop_reason"),
                     "blocks": set(blocks),
                     "text_chars": 0,
                     "tooluse_chars": 0,
+                    "tool_s": 0.0,
                 }
-                cur_id = mid
             else:
                 # same API response continued on another line: keep one usage,
                 # merge block kinds, do NOT add output_tokens again.
                 cur["out"] = usage.get("output_tokens", cur["out"])
                 cur["blocks"].update(blocks)
+                cur["stop_reason"] = msg.get("stop_reason") or cur["stop_reason"]
             cr = usage.get("cache_read_input_tokens")
             if cr:
                 cache_reads.append(cr)
@@ -193,32 +228,56 @@ def analyze_transcript(path):
                     # the serialized tool input is the *visible* generated output
                     # for this block (e.g. the file content written by Write/Edit)
                     cur["tooluse_chars"] += len(json.dumps(b.get("input", {})))
-                    pending[b.get("id")] = (b.get("name"), T)
+                    pending[b.get("id")] = (b.get("name"), T, cur)
             last_event_t = T
         elif typ == "user":
-            close_cur()
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
                     tid = b.get("tool_use_id")
                     if tid in pending:
-                        name, tu = pending.pop(tid)
+                        name, tu, owner = pending.pop(tid)
                         dt = (T - tu).total_seconds()
-                        tool_time += dt
-                        e = tool_by.setdefault(name, [0, 0.0])
-                        e[0] += 1
-                        e[1] += dt
+                        # Attribute tool time to the RESPONSE that made the call,
+                        # so a replayed response's tool time drops out with it.
+                        owner["tool_s"] += dt
+                        owner.setdefault("tools", []).append((name, dt))
             last_event_t = T
-    close_cur()
 
-    gen_time = sum(r["lat"] for r in responses)
-    out_tok = sum(r["out"] for r in responses)
+    wall = (ts(events[-1]["timestamp"]) - ts(events[0]["timestamp"])).total_seconds()
+    return {
+        "wall_s": wall,
+        "responses": list(responses.values()),
+        "api_errors": api_errors,
+        "cache_read_min": min(cache_reads) if cache_reads else 0,
+        "cache_read_max": max(cache_reads) if cache_reads else 0,
+    }
+
+
+def summarize(raw, seen_ids):
+    """Aggregate one leaf's transcript over the responses it actually PRODUCED.
+
+    `seen_ids` is the set of message ids already owned by an earlier leaf; any
+    response whose id is in it is a warm-resume REPLAY of that leaf's work and
+    is excluded from every total (see MULTIPLE-COUNTING 4). It mutates seen_ids
+    with this leaf's new ids, so callers must walk leaves in LAUNCH order.
+    """
+    fresh, replayed = [], []
+    for r in raw["responses"]:
+        (replayed if r["id"] in seen_ids else fresh).append(r)
+    seen_ids.update(r["id"] for r in fresh)
+
+    def vis(r):
+        return (r["text_chars"] + r["tooluse_chars"]) // 4
+
+    gen_time = sum(r["lat"] for r in fresh)
+    tool_time = sum(r["tool_s"] for r in fresh)
+    out_tok = sum(r["out"] for r in fresh)
     # Token attribution: usage.output_tokens INCLUDES extended-thinking tokens,
     # which are billed/counted as output but never appear in the written files.
     # Estimate the visible share (text + serialized tool inputs, ~4 chars/token)
     # so "output tokens" is not mistaken for "source emitted".
-    visible_tok = sum((r["text_chars"] + r["tooluse_chars"]) for r in responses) // 4
+    visible_tok = sum(vis(r) for r in fresh)
     thinking_tok = max(0, out_tok - visible_tok)
-    wall = (ts(events[-1]["timestamp"]) - ts(events[0]["timestamp"])).total_seconds()
 
     def kind(r):
         b = r["blocks"]
@@ -228,35 +287,56 @@ def analyze_transcript(path):
             return "think_only"
         return "tool_only"
 
-    buckets = {}
-    for r in responses:
-        k = kind(r)
-        e = buckets.setdefault(k, [0, 0.0])
+    buckets, tool_by = {}, {}
+    for r in fresh:
+        e = buckets.setdefault(kind(r), [0, 0.0])
         e[0] += 1
         e[1] += r["lat"]
+        for name, dt in r.get("tools", []):
+            te = tool_by.setdefault(name, [0, 0.0])
+            te[0] += 1
+            te[1] += dt
 
-    top = sorted(responses, key=lambda r: -r["lat"])[:5]
+    def resp_json(r):
+        return {"lat_s": r["lat"], "out_tokens": r["out"], "visible_tokens": vis(r),
+                "thinking_tokens": max(0, r["out"] - vis(r)),
+                "rate": (r["out"] / r["lat"]) if r["lat"] > 0 else 0,
+                "stop_reason": r["stop_reason"], "blocks": sorted(r["blocks"])}
+
+    # A turn the API cut off at the output ceiling. When its blocks are thinking
+    # ONLY, the leaf spent the whole ceiling reasoning and emitted NOTHING — no
+    # text, no tool call — and the next turn redoes the work. Observed twice in a
+    # real closure: 64000 tok / ~747s each, ~9% of the run's leaf time, for zero
+    # output. The fix is more room (CLAUDE_CODE_MAX_OUTPUT_TOKENS), not less
+    # thinking: thinking tokens count toward max_tokens.
+    truncated = [resp_json(r) for r in fresh if r["stop_reason"] == "max_tokens"]
+
     return {
-        "wall_s": wall,
-        "n_responses": len(responses),
+        "wall_s": raw["wall_s"],
+        "n_responses": len(fresh),
+        # TOKENS survive a warm resume exactly (usage is replayed verbatim), but LATENCIES
+        # do not: the replayed lines are re-stamped at resume time, which compresses the
+        # producer's timeline and makes the first fresh turn's latency (measured against a
+        # replayed line) meaningless. Everything derived from a latency — model_gen_s,
+        # gen%, tok/s — is therefore reported but NOT trusted for a resumed leaf; the
+        # renderer blanks those columns rather than printing a plausible-looking lie
+        # (observed: 835 tok/s, ~10x the physical floor).
+        "latency_reliable": not replayed,
         "model_gen_s": gen_time,
         "tool_exec_s": tool_time,
         "out_tokens": out_tok,
         "visible_tokens": visible_tok,
         "thinking_tokens": thinking_tok,
         "gen_rate_tok_s": (out_tok / gen_time) if gen_time > 0 else 0,
-        "cache_read_min": min(cache_reads) if cache_reads else 0,
-        "cache_read_max": max(cache_reads) if cache_reads else 0,
+        "cache_read_min": raw["cache_read_min"],
+        "cache_read_max": raw["cache_read_max"],
         "buckets": buckets,
         "tool_by": tool_by,
-        "top_responses": [
-            {"lat_s": r["lat"], "out_tokens": r["out"],
-             "visible_tokens": (r["text_chars"] + r["tooluse_chars"]) // 4,
-             "thinking_tokens": max(0, r["out"] - (r["text_chars"] + r["tooluse_chars"]) // 4),
-             "rate": (r["out"] / r["lat"]) if r["lat"] > 0 else 0,
-             "blocks": sorted(r["blocks"])}
-            for r in top
-        ],
+        "top_responses": [resp_json(r) for r in sorted(fresh, key=lambda r: -r["lat"])[:5]],
+        "truncated_turns": truncated,
+        "api_errors": raw["api_errors"],
+        "replayed_responses": len(replayed),
+        "replayed_tokens": sum(r["out"] for r in replayed),
     }
 
 
@@ -283,18 +363,40 @@ def main():
     durations = load_leaf_durations(orch_path)
     labels = load_labels(orch_path)
 
+    # Read every transcript first, then summarize in LAUNCH order: the global
+    # message-id dedupe (MULTIPLE-COUNTING 4) must attribute a replayed response
+    # to the leaf that first produced it, which is the earlier-launched one.
+    raws = {}
+    for row in durations:
+        tpath = os.path.join(project_dir, row["run_id"] + ".jsonl")
+        raws[row["run_id"]] = read_transcript(tpath) if os.path.exists(tpath) else None
+
+    seen_ids = set()
+    summaries = {}
+    for row in sorted(durations, key=lambda r: r["t0"]):
+        raw = raws[row["run_id"]]
+        summaries[row["run_id"]] = summarize(raw, seen_ids) if raw else None
+
     leaves = []
     for row in durations:
         rid = row["run_id"]
         lab = labels.get(rid, {"role": "", "substep": "", "status": ""})
         sub = lab["substep"]
         name = f"{row['step']}.{sub}" if sub else row["step"]
-        tpath = os.path.join(project_dir, rid + ".jsonl")
-        tr = analyze_transcript(tpath) if os.path.exists(tpath) else None
+        tr = summaries[rid]
+        elapsed = row["dur_s"]
+        # Stale terminal record (MULTIPLE-COUNTING 5): the leaf died and its
+        # terminal event was stamped at the operator's --resume. Use the
+        # transcript wall as the effective elapsed and report the excess.
+        stale_gap = 0.0
+        if tr is not None and elapsed - tr["wall_s"] > STALE_GAP_S:
+            stale_gap = elapsed - tr["wall_s"]
+            elapsed = tr["wall_s"]
         leaves.append({
             "run_id": rid, "step": row["step"], "name": name,
             "role": lab["role"], "status": lab["status"],
-            "elapsed_s": row["dur_s"], "is_llm": tr is not None,
+            "elapsed_s": elapsed, "raw_elapsed_s": row["dur_s"], "stale_gap_s": stale_gap,
+            "is_llm": tr is not None,
             "transcript": tr,
         })
 
@@ -317,12 +419,14 @@ def main():
 
 def render(r):
     llm = [l for l in r["leaves"] if l["is_llm"]]
-    det = [l for l in r["leaves"] if not l["is_llm"]]
     total = sum(l["elapsed_s"] for l in r["leaves"])
     llm_total = sum(l["elapsed_s"] for l in llm)
     out_total = sum(l["transcript"]["out_tokens"] for l in llm)
     think_total = sum(l["transcript"]["thinking_tokens"] for l in llm)
     vis_total = sum(l["transcript"]["visible_tokens"] for l in llm)
+    stale_total = sum(l["stale_gap_s"] for l in r["leaves"])
+    replay_tok = sum(l["transcript"]["replayed_tokens"] for l in llm)
+    replay_leaves = [l for l in llm if l["transcript"]["replayed_responses"]]
 
     print(f"orchestration: {r['orchestration_id']}  ({r.get('status')})")
     print(f"spec: {r.get('spec_ref')}")
@@ -336,6 +440,12 @@ def render(r):
           f"+ visible {vis_total} ({pct(vis_total,out_total)})")
     print("    NOTE output_tokens includes extended thinking (billed as output, not in "
           "the files); visible = text + serialized tool inputs (the emitted source).")
+    if stale_total:
+        print(f"  EXCLUDED stale gap:   {stale_total:6.0f}s = {stale_total/3600:.1f}h  "
+              f"(dead leaf's terminal record stamped at --resume; not leaf activity)")
+    if replay_tok:
+        print(f"  EXCLUDED replay:      {replay_tok} tok across {len(replay_leaves)} warm-resumed "
+              f"leaf(s) (producer's turns, already counted once)")
     print()
     print("per-leaf:")
     hdr = (f"  {'step.substep':24s} {'elapsed':>8s} {'kind':>6s} {'gen%':>5s} {'tool%':>6s} "
@@ -344,26 +454,71 @@ def render(r):
     for l in r["leaves"]:
         if l["is_llm"]:
             t = l["transcript"]
+            flags = ""
+            if l["stale_gap_s"]:
+                flags += f"  [+{l['stale_gap_s']/3600:.1f}h stale gap dropped]"
+            if t["replayed_responses"]:
+                flags += (f"  [warm resume: {t['replayed_responses']} replayed turns dropped; "
+                          f"latencies unreliable]")
+            reliable = t["latency_reliable"]
+            gen = pct(t["model_gen_s"], t["wall_s"]) if reliable else "—"
+            tool = pct(t["tool_exec_s"], t["wall_s"]) if reliable else "—"
+            rate = f"{t['gen_rate_tok_s']:.0f}" if reliable else "—"
             print(f"  {l['name']:24s} {l['elapsed_s']:7.0f}s {'LLM':>6s} "
-                  f"{pct(t['model_gen_s'],t['wall_s']):>5s} {pct(t['tool_exec_s'],t['wall_s']):>6s} "
+                  f"{gen:>5s} {tool:>6s} "
                   f"{t['out_tokens']:>8d} {pct(t['thinking_tokens'],t['out_tokens']):>7s} "
-                  f"{t['visible_tokens']:>8d} {t['gen_rate_tok_s']:>6.0f} {t['n_responses']:>5d}")
+                  f"{t['visible_tokens']:>8d} {rate:>6s} {t['n_responses']:>5d}"
+                  f"{flags}")
         else:
             print(f"  {l['name']:24s} {l['elapsed_s']:7.0f}s {'det':>6s} {'—':>5s} {'—':>6s} "
                   f"{'—':>8s} {'—':>7s} {'—':>8s} {'—':>6s} {'—':>5s}")
     print()
+    render_anomalies(r, llm)
     print("dominant turns inside LLM leaves (multiple-counting collapsed by message.id):")
     for l in sorted(llm, key=lambda x: -x["transcript"]["model_gen_s"]):
         t = l["transcript"]
         bk = ", ".join(f"{k}:{v[0]}t/{v[1]:.0f}s" for k, v in
                        sorted(t["buckets"].items(), key=lambda x: -x[1][1]))
+        warn = "" if t["latency_reliable"] else "  (WARM RESUME: latencies unreliable)"
         print(f"  {l['name']}  model_gen={t['model_gen_s']:.0f}s tool={t['tool_exec_s']:.1f}s "
-              f"cache_read={t['cache_read_min']}..{t['cache_read_max']}")
+              f"cache_read={t['cache_read_min']}..{t['cache_read_max']}{warn}")
         print(f"     by-kind: {bk}")
         for tr in t["top_responses"][:3]:
             print(f"     top: {tr['lat_s']:6.1f}s  {tr['out_tokens']:6d} tok "
                   f"(think {tr['thinking_tokens']} / vis {tr['visible_tokens']})  "
                   f"{tr['rate']:5.0f} tok/s  {tr['blocks']}")
+
+
+def render_anomalies(r, llm):
+    """Failure/waste signals that a pure time-and-token table hides."""
+    trunc = [(l, t) for l in llm for t in l["transcript"]["truncated_turns"]]
+    errs = [(l, e) for l in llm for e in l["transcript"]["api_errors"]]
+    if not trunc and not errs:
+        return
+    print("anomalies:")
+    if trunc:
+        waste_tok = sum(t["out_tokens"] for _, t in trunc)
+        waste_s = sum(t["lat_s"] for _, t in trunc)
+        blind = [(l, t) for l, t in trunc if t["blocks"] == ["thinking"]]
+        print(f"  turns cut off by max_tokens: {len(trunc)}  "
+              f"({waste_tok} out_tok, {waste_s:.0f}s = {waste_s/60:.1f} min)")
+        for l, t in sorted(trunc, key=lambda x: -x[1]["lat_s"]):
+            zero = "  <- THINKING ONLY: zero visible output, the work is REDONE next turn" \
+                if t["blocks"] == ["thinking"] else ""
+            print(f"    {l['name']:22s} {t['lat_s']:6.0f}s  {t['out_tokens']:6d} tok "
+                  f"(think {t['thinking_tokens']} / vis {t['visible_tokens']})  "
+                  f"blocks={t['blocks']}{zero}")
+        if blind:
+            print("    => thinking tokens count toward max_tokens. The lever is MORE ROOM "
+                  "(CLAUDE_CODE_MAX_OUTPUT_TOKENS, 128000 on Opus 4.8), not less thinking.")
+    if errs:
+        print(f"  leaf API/transport errors: {len(errs)}")
+        for l, e in errs:
+            print(f"    {l['name']:22s} {e['ts']}  {e['text']}")
+        print("    => the leaf died of infrastructure, not of its own reasoning. Cross-check "
+              "the conductor's reason_code (leaf_transport_error) and the persisted "
+              "agents/<arid>/dialogs/leaf.stdout.log.")
+    print()
 
 
 def pct(a, b):
