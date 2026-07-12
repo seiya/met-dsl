@@ -513,9 +513,17 @@ re-run confirming Build passes on attempt 1 (operator-gated).
   Behavior unchanged; covered by `test_recurring_execute_failure_escalates_to_compile`.
 - **L4** `_impl_is_leaf_node` disagrees with the YAML parser only for **invalid** YAML
   (tab-indented `direct_deps`) — benign/unreachable (fails compile), not worth fixing.
-- **L5** A judge session/usage-limit now ends as a clean resumable `fail_closed`
-  (`leaf_transport_error`) but still requires a **manual `--resume`** after the quota
-  resets — no auto-retry/scheduling. By design; revisit if it becomes operationally painful.
+- **L5 — PARTIALLY CLOSED (2026-07-12).** A leaf that dies of an LLM-infrastructure fault ends as
+  a clean resumable `fail_closed` (`leaf_transport_error`). The split is now by infra tag:
+  - **Transient faults auto-recover.** `llm_transport_flake` / `llm_overloaded` / `llm_rate_limit`
+    are retried in place by the conductor (at most 2 retries, per-tag backoff; canonical:
+    `docs/ORCHESTRATION.md` "leaf transient retry"). Driver: in E2E #4 a `compile.verify` leaf left
+    only `API Error: Connection closed mid-response.`, which matched no infra pattern, fail-closed
+    the run, and cost **6.8 hours** of idle wall-clock until a human `--resume`d. That message now
+    classifies (`llm_transport_flake`) and self-heals.
+  - **`llm_usage_limit` remains a manual `--resume` after the quota resets. By design** — it is a
+    hard stop lasting hours, so an automatic re-launch would spend the budget in seconds and only
+    delay the operator. Revisit only if scheduled resumption becomes an operational requirement.
 - **L6 — GUARDED (2026-06-25).** The dependency build (Model B) keys staged source filenames and
   Makefile object rules on the bare `spec_id_of(node_key)` (`_dependency_closure` /
   `_stage_dependency_sources`), dropping `kind` and `@version`. A closure containing two deps that

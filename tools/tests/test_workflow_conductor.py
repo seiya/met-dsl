@@ -1464,6 +1464,9 @@ class TransportFailureTest(unittest.TestCase):
 
     def test_judge_transport_failure_fails_closed_and_tombstones(self) -> None:
         c = self._conductor()
+        # A usage limit is NOT retryable, so this stub also serves as the tripwire for that: adding
+        # `llm_usage_limit` to _RETRYABLE_LEAF_INFRA_TAGS would spawn 3 judge leaves and break the
+        # single-tombstone / three-arid assertions below.
         # pre_judge + execute are deterministic (rc 0, pass); the judge leaf hits a session limit.
         c.spawn_leaf = lambda *a, **k: wc.ProcResult(1, "", "Claude usage limit reached")  # type: ignore[assignment]
         oc = c.run_phase(self._refs(), "validate")
@@ -1543,6 +1546,10 @@ class TransportFailureTest(unittest.TestCase):
             "I analysed the scheme: diffusion is the rate-limiting process here.",
             "error: call of overloaded 'update(double)' is ambiguous",
             "error: call of overloaded ‘advance’ is ambiguous",   # gcc's unicode quotes
+            # ...and the same for the transport tag: a 5xx-looking integer next to a bare
+            # `error` is a subscript or a line number, never an HTTP status.
+            "error: index 502 out of bounds for array u(500)",
+            "gfortran: error at line 504 of model.f90",
         ]
         for text in benign:
             with self.subTest(text=text):
@@ -1611,6 +1618,13 @@ class TransportFailureTest(unittest.TestCase):
             "The generic __box interface is overloaded across ranks 0..3",
             "Overloaded the `__box` generic so ranks 0..3 share one writer.",
             "the rate-limiting step of the reaction is diffusion",
+            # The transport tag is fed the same prose, and its vocabulary (connection, stream,
+            # network, timed out) is exactly the vocabulary of a numerical model's own writing.
+            "the solver timed out after 500 iterations without converging",
+            "the connection between cells 3 and 4 carries the upwind flux",
+            "open(unit=10, file=snap, access='stream', form='unformatted')",
+            "the MPI network topology is a 2D torus",
+            "Context limit exceeded while reading the IR",
         ]
         for text in benign:
             with self.subTest(text=text):
@@ -1631,6 +1645,194 @@ class TransportFailureTest(unittest.TestCase):
             "API Error (429 rate_limit_error)\n"
             "  · Retrying in 1 seconds... (attempt 1/10)\n"
             "RuntimeError: hook denied write outside write_roots"))
+
+    def test_classify_leaf_infra_error_tags_a_transient_transport_flake(self) -> None:
+        """The line that cost E2E #4 6.8 hours: a `compile.verify` leaf died leaving ONLY this,
+        it matched no pattern, and the run fail-closed until a human `--resume`d. It — and the
+        other shapes a dropped connection takes — must tag `llm_transport_flake`, which is what
+        makes the substep retryable."""
+        cases = [
+            # the real incident, verbatim from agents/<arid>/dialogs/leaf.stdout.log
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+            "Error: socket hang up",
+            "read ECONNRESET",
+            "connect ETIMEDOUT 160.79.104.10:443",
+            "API Error: 502 Bad Gateway",
+            "stream disconnected",
+            "TypeError: terminated",
+            "TypeError: fetch failed",
+            "Error: Premature close",
+            "API Error: 503 Service Unavailable",
+            "Error: request timed out",
+            # the catch-all: a transport wording we have not seen yet still self-heals, because
+            # the CLI only ever opens a LINE with `API Error:` for an API/transport fault.
+            "API Error: something entirely new went wrong at the edge",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                got = wc._classify_leaf_infra_error(text)
+                self.assertIsNotNone(got, f"expected a tag for {text!r}")
+                self.assertEqual(got[0], "llm_transport_flake")
+                self.assertTrue(got[1], "the evidence line must be non-empty")
+        self.assertIn("llm_transport_flake", wc._RETRYABLE_LEAF_INFRA_TAGS)
+
+    def test_classify_leaf_infra_error_transport_does_not_fire_on_numerics_prose(self) -> None:
+        """A false transport tag is not a cosmetic mislabel: it ARMS A RETRY, so a deterministic
+        failure (a crash, a hook denial, a compiler error) would be re-run three times and cost
+        three times the wall-clock to reach the same dead end. The tag's whole vocabulary —
+        connection, stream, network, timed out, 5xx — is also a numerical model's vocabulary."""
+        benign = [
+            "the solver timed out after 500 iterations",
+            "the connection between cells 3 and 4",
+            "error: index 502 out of bounds",
+            "gfortran: error at line 504 of model.f90",
+            "open(unit=7, access='stream')",
+            "the MPI network is a fat tree",
+            "context limit exceeded",
+            "Traceback (most recent call last): ValueError: boom",
+            # the transport library's phrases, but continued into a sentence: the leaf is
+            # DESCRIBING something, not reporting a dropped connection. A comma, a semicolon or a
+            # colon CONTINUES a sentence — only the end of the line ends one, which is why the
+            # phrase patterns anchor there and not on punctuation generally.
+            "write(*,*) 'stream error estimate', err",
+            "write(*,*) 'stream error: ', err_est",
+            "The premature close of the file unit truncated the snapshot.",
+            "A premature close, or a missing flush, truncates the snapshot.",
+            "the fetch failed for the dependency facts, so I re-read the IR",
+            "If the fetch failed, I fall back to the IR dependency facts.",
+            "Internal server error: out of scope for this node, see the checks module.",
+            "A bad gateway: not applicable here; the harness is in-process.",
+            "gfortran Error: interface is overloaded; use a specific binding.",
+            # `rate limit` unqualified is ordinary technical English; only the bare form that ENDS
+            # the line (or opens the CLI's `rate limited — wait and retry` dash clause) counts.
+            "The CFL condition sets the rate limit.",
+            "The scheme is rate-limited, so dt shrinks.",
+            "The stream function psi is diagnosed from the vorticity.",
+            "iostat = 5001 on unit 10",   # a gfortran iostat code, not an HTTP 5xx
+            "The service unavailable state is represented by flag X.",
+            "Internal server error handling is outside the scope of this module.",
+            "The bad gateway approximation is not used in this scheme.",
+            # `status` is THIS REPO'S vocabulary (gate status, verdict status, step_result status),
+            # so a 5xx-looking number beside it is not an HTTP status...
+            "status: 500 checks failed",
+            "status 500 iterations completed",
+            # ...and the port of a URL is not one either
+            "endpoint https://mcp.internal:443/sse is configured",
+            # `API Error` INSIDE a sentence is the model talking about one, not the CLI
+            # reporting one — only a line that OPENS with it is the CLI's own banner.
+            "I hit an API error while reading the docs, but recovered and continued.",
+        ]
+        for text in benign:
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    wc._classify_leaf_infra_error(text),
+                    f"must not arm a retry on ordinary leaf output: {text!r}")
+
+    def test_classify_leaf_infra_error_prefers_a_quota_tag_over_the_generic_transport_tag(
+            self) -> None:
+        """Severity order is a contract, not an accident: the transport tag sits LAST, so a
+        message that names a quota keeps its specific tag. It decides the retry policy — a usage
+        limit is never retried, a transport flake always is — so a quota message demoted to
+        `llm_transport_flake` would spend the budget re-launching into a hard stop."""
+        cases = [
+            # each of these ALSO matches the generic transport pattern
+            ("API Error: 429 Too Many Requests", "llm_rate_limit"),
+            ("stream disconnected: Too Many Requests", "llm_rate_limit"),
+            ('API Error: 529 {"type":"overloaded_error"}', "llm_overloaded"),
+            ("API Error: Claude AI usage limit reached|1752200000", "llm_usage_limit"),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(wc._classify_leaf_infra_error(text)[0], expected)
+        # and across lines, the most severe still wins
+        self.assertEqual(
+            wc._classify_leaf_infra_error(
+                "API Error: Connection closed mid-response.\n"
+                "Claude AI usage limit reached|1752307200")[0],
+            "llm_usage_limit")
+
+    def test_classify_leaf_infra_error_promotes_only_the_terminal_tags_out_of_stdout(self) -> None:
+        """The tag now decides the RETRY POLICY, which makes the stream priority load-bearing in
+        both directions.
+
+        The CLI reports an infrastructure failure as its RESULT TEXT — on stdout, often with an
+        empty stderr (that is exactly how the E2E #4 incident line arrived). So the two
+        NON-RETRYABLE tags must be able to override a stderr transport match: retrying a usage
+        limit re-launches into a multi-hour hard stop, and retrying a 4xx re-sends a request the
+        API rejects identically every time. Promoting them can only ever REMOVE a launch.
+
+        Nothing else from stdout may override stderr, because stdout is also the model's own
+        prose. If any prose match could outrank stderr, a leaf that happened to write "rate limits
+        the timestep" while the connection actually dropped would silently retag — or worse,
+        suppress — the retry, re-arming the 6.8-hour incident with the leaf's own writing."""
+        self.assertEqual(wc._CROSS_STREAM_PROMOTING_TAGS,
+                         {"llm_usage_limit", "llm_client_error"})
+        for stdout_line, expected in (
+                ("Claude AI usage limit reached|1752307200", "llm_usage_limit"),
+                ('API Error: 400 {"type":"invalid_request_error"}', "llm_client_error")):
+            with self.subTest(stdout=stdout_line):
+                got = wc._classify_leaf_infra_error(
+                    "connect ETIMEDOUT 160.79.104.10:443", stdout_line)   # stderr: transient
+                self.assertEqual(got[0], expected)
+                self.assertNotIn(got[0], wc._RETRYABLE_LEAF_INFRA_TAGS)
+        # Any other stdout match leaves stderr's verdict — and its retry — standing.
+        for prose in ("Newton's method diverged in 1200 cells",
+                      "diffusion rate limits the timestep",
+                      "Opus is experiencing high load"):
+            with self.subTest(prose=prose):
+                got = wc._classify_leaf_infra_error(
+                    "API Error: Connection closed mid-response.", prose)
+                self.assertEqual(got[0], "llm_transport_flake")
+                self.assertIn(got[0], wc._RETRYABLE_LEAF_INFRA_TAGS)
+        # On equal severity stderr also wins.
+        got = wc._classify_leaf_infra_error("Error: socket hang up", "API Error: 502 Bad Gateway")
+        self.assertEqual(got[1], "Error: socket hang up")
+
+    def test_classify_leaf_infra_error_tags_a_4xx_as_a_non_retryable_client_error(self) -> None:
+        """A 4xx means the REQUEST is wrong (bad credential, unsupported parameter, oversized
+        prompt): every re-launch sends the same request and gets the same rejection. Without its
+        own tag the `^api error` catch-all would swallow it into `llm_transport_flake`, retry a
+        deterministic misconfiguration three times, and then report it to the operator as a
+        provider outage to wait out. The case this repo can cause itself is the first one: a leaf
+        model whose output ceiling is below LEAF_MAX_OUTPUT_TOKENS."""
+        cases = [
+            'API Error: 400 {"type":"invalid_request_error","message":"max_tokens: 128000 > '
+            '64000, which is the maximum allowed number of output tokens"}',
+            'API Error: 401 {"type":"authentication_error","message":"invalid x-api-key"}',
+            "API Error: 403 Forbidden",
+            "API Error: 413 request_too_large",
+            # The CLI also renders a 4xx with NO status code at all. Without these the `^api error`
+            # catch-all would take the line and RETRY a deterministic rejection. The first is the
+            # other failure this repo can inflict on itself: the conductor injects the R5 exemplar,
+            # the dependency facts and the must-read docs into a cold generate prompt.
+            "API Error: prompt is too long: 235000 tokens > 200000 maximum",
+            "API Error: Invalid API key · Please run /login",
+            "API Error: OAuth token has expired.",
+            "API Error: Request body too large",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                got = wc._classify_leaf_infra_error(text)
+                self.assertEqual(got[0], "llm_client_error")
+                self.assertNotIn("llm_client_error", wc._RETRYABLE_LEAF_INFRA_TAGS)
+        # Two 4xx are NOT client errors and must stay RETRYABLE: 429 (a rate limit) and 408
+        # (Request Timeout — a genuinely transient fault, the very thing the retry exists for).
+        # Excluding them from this tag is only half the job: they must also MATCH a retryable one,
+        # in every rendering — not just the `API Error:`-prefixed line that the catch-all covers.
+        for text, expected in (("API Error: 429 Too Many Requests", "llm_rate_limit"),
+                               ("Request rejected (429)", "llm_rate_limit"),
+                               ("API Error: 408 Request Timeout", "llm_transport_flake"),
+                               ("HTTP 408 Request Timeout", "llm_transport_flake"),
+                               ("status_code: 408 request timeout", "llm_transport_flake"),
+                               ("stream error: exceeded retry limit, last status: 408 Request "
+                                "Timeout", "llm_transport_flake")):
+            with self.subTest(text=text):
+                got = wc._classify_leaf_infra_error(text)
+                self.assertEqual(got[0], expected)
+                self.assertIn(got[0], wc._RETRYABLE_LEAF_INFRA_TAGS)
+        # ...and a leaf's own 4xx-looking numbers are not API status codes
+        for benign in ("error: index 404 out of bounds", "the loop runs 400 steps"):
+            self.assertIsNone(wc._classify_leaf_infra_error(benign), benign)
 
     def test_leaf_failure_summary_keeps_the_real_error_and_adds_the_marker(self) -> None:
         """The marker can land on either stream, so it is lifted out of whichever carries it — but
@@ -2244,6 +2446,405 @@ class TransportFailureTest(unittest.TestCase):
         sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
         self.assertEqual(len(sup), 1)
         self.assertEqual(sup[0]["--run-ids"], ["child-1"])  # the build step agent
+
+
+class LeafChildEnvTest(unittest.TestCase):
+    """WI-A: the leaf's output ceiling is part of the CONDUCTOR'S leaf contract (it lives in
+    _child_env, not in `.claude/settings.json`, so it cannot leak into the operator's own
+    interactive sessions). Thinking tokens are billed against max_tokens, so the CLI default
+    truncates a hard leaf mid-think — a fully billed turn that emits nothing at all."""
+
+    def _conductor(self, backend: str) -> wc.Conductor:
+        return wc.Conductor(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+                            orchestration_agent_run_id="ORCH", backend=backend, env={})
+
+    def test_child_env_sets_leaf_max_output_tokens_for_claude(self) -> None:
+        env = self._conductor("claude")._child_env("child-1")
+        self.assertEqual(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], str(wc.LEAF_MAX_OUTPUT_TOKENS))
+        self.assertEqual(wc.LEAF_MAX_OUTPUT_TOKENS, 128000)  # the Opus 4.8 synchronous ceiling
+        # the pre-existing leaf env is untouched
+        self.assertEqual(env["METDSL_ORCHESTRATION_ID"], "orch_x")
+        self.assertTrue(env["TMPDIR"].endswith("/workspace/tmp/child-1"))
+
+    def test_child_env_does_not_set_leaf_max_output_tokens_for_codex(self) -> None:
+        # codex configures its model limits on a different surface; a CLAUDE_* var there is at
+        # best inert and at worst confusing.
+        env = self._conductor("codex")._child_env("child-1")
+        self.assertNotIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS", env)
+
+
+class LeafTransientRetryTest(unittest.TestCase):
+    """WI-B: a leaf killed by a TRANSIENT LLM-infrastructure failure (a connection dropped
+    mid-response, an overload, a rate limit) is re-launched in place, bounded and with backoff,
+    instead of fail-closing the run for a human to `--resume` hours later — the E2E #4 incident
+    cost 6.8 hours of wall-clock waiting for exactly that.
+
+    The retry loop lives INSIDE run_substep (run_phase's `outcomes` is positionally aligned with
+    SUBSTEPS[phase]), so these drive run_substep/run_phase directly and assert the launch
+    bookkeeping: one arid per attempt, every dead attempt tombstoned (an un-vouched terminal arid
+    is an orphan edge that fails the completion check), and the warm-resume target preserved."""
+
+    class _C(_FakeConductor):
+        # scripted per-attempt leaf results + a recorded (not slept) backoff schedule
+        procs: list = []
+        slept: list = []
+        spawns: list = []
+        resume_target: str | None = None
+
+        def _write_lineage(self, refs):  # type: ignore[override]
+            return []
+
+        def _resolve_reuse_resume(self, repair, phase, substep):  # type: ignore[override]
+            return self.resume_target
+
+        def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+            self.spawns.append(dict(kwargs))
+            idx = len(self.spawns) - 1
+            return self.procs[min(idx, len(self.procs) - 1)]
+
+        def _sleep_backoff(self, seconds):  # type: ignore[override]
+            self.slept.append(seconds)
+
+    _FLAKE = "API Error: Connection closed mid-response. The response above may be incomplete."
+
+    def _conductor(self, procs: list, repo: Path | None = None, **kw) -> "_C":
+        c = self._C(repo_root=repo or Path("/tmp/repo"), orchestration_id="orch_x",
+                    orchestration_agent_run_id="ORCH", backend="claude", env={}, **kw)
+        c.calls, c.procs, c.slept, c.spawns = [], procs, [], []
+        return c
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1_001",
+            binary_id="bin_1_001", run_id="run_1_001", source_binary_id="bin_1_001")
+
+    def _flake(self) -> wc.ProcResult:
+        # the real incident's shape: rc!=0, the message on STDOUT, stderr empty
+        return wc.ProcResult(1, self._FLAKE, "")
+
+    def test_transient_leaf_failure_is_retried_and_recovers(self) -> None:
+        c = self._conductor([self._flake(), wc.ProcResult(0, "done", "")])
+        with redirect_stdout(io.StringIO()):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(oc.attempts, 2)
+        self.assertEqual(len(c.spawns), 2)
+        # one arid per attempt, and the outcome carries the SURVIVING one (the arid run_phase
+        # will vouch in substep_agent_run_ids)
+        launched = [cap["--request-json"]["agent_run_id"]
+                    for s, cap in c.calls if s == "record-launch"]
+        self.assertEqual(launched, ["child-1", "child-2"])
+        self.assertEqual(oc.agent_run_id, "child-2")
+        # the dead attempt is tombstoned: terminalized but never vouched, it would otherwise be
+        # an orphan edge that fails _validate_orchestration_completion_for_pass at the end of an
+        # otherwise-passing run
+        sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertEqual(len(sup), 1)
+        self.assertEqual(sup[0]["--run-ids"], ["child-1"])
+        self.assertIn("leaf_transient_retry_orphan", sup[0]["--reason"])
+        self.assertIn("llm_transport_flake", sup[0]["--reason"])
+        # Ordering: record-launch -> finalize-child -> add-superseded-runs -> next record-launch.
+        # finalize-child MUST come first (see test_tombstone_writes_are_outside_the_leafs_write_
+        # window below: the tombstone's own files land in the child's FS diff otherwise, and the
+        # dying leaf is rejected for the conductor's writes), and it must precede the next launch
+        # (the runtime fail-closes a launch while a child of this parent is still active).
+        subs = [s for s, _ in c.calls]
+        self.assertLess(subs.index("finalize-child"), subs.index("add-superseded-runs"))
+        self.assertLess(subs.index("add-superseded-runs"),
+                        len(subs) - 1 - subs[::-1].index("record-launch"))
+
+    def test_recovered_retry_vouches_only_the_survivor_in_the_step_result(self) -> None:
+        """The phase-level shape of a recovered retry, and the invariant that makes the whole
+        feature safe to leave running: the `step_result.json` vouches ONLY the surviving attempt,
+        the dead one is tombstoned instead, and no arid is left in neither set. An un-vouched,
+        un-tombstoned terminal arid is an orphan edge — the run would sail through every phase and
+        then fail the completion check at the very end."""
+        procs = [self._flake(), wc.ProcResult(0, "done", "")]   # compile.generate dies once
+        c = self._conductor(procs)
+        c.procs = procs + [wc.ProcResult(0, "ok", "")] * 4      # remaining substeps are clean
+        with redirect_stdout(io.StringIO()):
+            oc = c.run_phase(self._refs(), "compile")
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(oc.decision.action, "advance")
+        sr = next(cap["--result-json"] for s, cap in c.calls if s == "write-step-result")
+        launched = [cap["--request-json"]["agent_run_id"]
+                    for s, cap in c.calls if s == "record-launch"]
+        tombstoned = [rid for s, cap in c.calls if s == "add-superseded-runs"
+                      for rid in cap["--run-ids"]]
+        dead, *survivors = launched
+        self.assertEqual(tombstoned, [dead])                    # the dead attempt only...
+        self.assertNotIn(dead, sr["substep_agent_run_ids"])     # ...and it vouches nothing
+        self.assertEqual(sr["substep_agent_run_ids"], survivors)
+        # every arid the loop minted is accounted for by exactly one of the two sets
+        self.assertEqual(sorted(sr["substep_agent_run_ids"] + tombstoned), sorted(launched))
+        # an infra retry is not a content retry: the phase records no repair decision
+        self.assertIsNone(sr["retry_decisions"])
+
+    def test_transient_retry_budget_exhaustion_fails_closed_with_the_attempt_count(self) -> None:
+        c = self._conductor([self._flake()])  # every attempt dies
+        with redirect_stdout(io.StringIO()):
+            oc = c.run_phase(self._refs(), "compile")
+        self.assertEqual(len(c.spawns), wc.MAX_LEAF_TRANSIENT_RETRIES + 1)
+        self.assertEqual(oc.decision.action, "fail_closed")
+        reason = oc.decision.reason
+        # the prefix stays load-bearing (set_status maps it to a reason_code), the tag names the
+        # cause, and `attempts=3` tells the operator the outage outlasted every backoff — do not
+        # `--resume` straight into it
+        self.assertTrue(reason.startswith("leaf_transport_error: leaf_exit=1"))
+        self.assertIn("llm_transport_flake", reason)
+        self.assertIn("[attempts=3]", reason)
+        self.assertLessEqual(len(reason), 200)  # set_status truncates reason_detail at 200
+        # the orphan-edge invariant: the tombstoned set == every arid the loop minted. The two
+        # dead retries are tombstoned by run_substep, the last one by run_phase's transport branch.
+        launched = {cap["--request-json"]["agent_run_id"]
+                    for s, cap in c.calls if s == "record-launch"}
+        tombstoned = {rid for s, cap in c.calls if s == "add-superseded-runs"
+                      for rid in cap["--run-ids"]}
+        self.assertEqual(tombstoned, launched)
+        self.assertEqual(len(launched), wc.MAX_LEAF_TRANSIENT_RETRIES + 1)
+        self.assertNotIn("write-step-result", [s for s, _ in c.calls])
+
+    def test_a_retried_leaf_that_then_hits_a_usage_limit_reports_the_usage_limit(self) -> None:
+        """Attempts can MIX tags, and the tag — not the `[attempts=N]` suffix — is what the
+        operator routes on. A transport flake retried into a quota stop must terminalize as
+        `llm_usage_limit` (wait for the reset) even though the suffix is present, and it must stop
+        at once rather than spending the remaining budget re-launching into the hard stop."""
+        c = self._conductor([self._flake(),
+                             wc.ProcResult(1, "", "Claude AI usage limit reached|1752200000")])
+        with redirect_stdout(io.StringIO()):
+            oc = c.run_phase(self._refs(), "compile")
+        self.assertEqual(len(c.spawns), 2)                    # the quota stop is NOT retried
+        self.assertEqual(oc.decision.action, "fail_closed")
+        self.assertIn("llm_usage_limit", oc.decision.reason)  # the LAST attempt's cause
+        self.assertNotIn("llm_transport_flake", oc.decision.reason)
+        self.assertIn("[attempts=2]", oc.decision.reason)     # ...and the launch count is honest
+        self.assertLessEqual(len(oc.decision.reason), 200)
+
+    def test_usage_limit_is_never_retried(self) -> None:
+        """A usage limit is a HARD STOP lasting hours. Retrying it burns the budget in seconds
+        and only delays the operator's resume — it stays terminal by design."""
+        c = self._conductor([wc.ProcResult(1, "", "Claude AI usage limit reached|1752200000")])
+        oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(len(c.spawns), 1)
+        self.assertEqual(oc.attempts, 1)
+        self.assertEqual(oc.infra_error[0], "llm_usage_limit")
+        self.assertEqual(c.slept, [])
+        self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
+
+    def test_client_error_is_never_retried(self) -> None:
+        """The WI-A interlock: if the configured leaf model's output ceiling is below
+        LEAF_MAX_OUTPUT_TOKENS, EVERY launch is rejected with the same 400. Retrying it would
+        triple the wall-clock and then report a local misconfiguration as a provider outage; the
+        run must stop at once, with the API's own message in the reason."""
+        c = self._conductor([wc.ProcResult(
+            1, 'API Error: 400 {"type":"invalid_request_error","message":"max_tokens: 128000 > '
+               '64000, which is the maximum allowed number of output tokens"}', "")])
+        with redirect_stdout(io.StringIO()):
+            oc = c.run_phase(self._refs(), "compile")
+        self.assertEqual(len(c.spawns), 1)
+        self.assertEqual(c.slept, [])
+        self.assertEqual(oc.decision.action, "fail_closed")
+        self.assertIn("llm_client_error", oc.decision.reason)
+        self.assertIn("max_tokens", oc.decision.reason)   # the operator sees the actual cause
+        self.assertNotIn("[attempts=", oc.decision.reason)
+
+    def test_unclassifiable_leaf_crash_is_never_retried(self) -> None:
+        """A crash / OOM / hook denial is deterministic: retrying it hides the same failure
+        behind three times the wall-clock."""
+        c = self._conductor([wc.ProcResult(
+            1, "", "RuntimeError: hook denied write outside write_roots")])
+        oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(len(c.spawns), 1)
+        self.assertEqual(oc.attempts, 1)
+        self.assertIsNone(oc.infra_error)
+        self.assertEqual(c.slept, [])
+
+    def test_deterministic_substep_is_never_retried(self) -> None:
+        """A deterministic substep runs in-process — there is no leaf and no transport, so a
+        failure there is a real defect (and its "stdout" is a gate report, not an API message)."""
+        c = self._conductor([])
+        c._run_deterministic_substep = (  # type: ignore[assignment]
+            lambda refs, phase, substep, child_arid, request: wc.ProcResult(1, self._FLAKE, ""))
+        oc = c.run_substep(self._refs(), "build", None)
+        self.assertEqual(oc.attempts, 1)
+        self.assertEqual(len([s for s, _ in c.calls if s == "record-launch"]), 1)
+        self.assertEqual(c.slept, [])
+
+    def test_transient_retry_backoff_is_per_tag_and_bounded(self) -> None:
+        # a transport flake is usually gone on the next connection...
+        c = self._conductor([self._flake()])
+        with redirect_stdout(io.StringIO()):
+            c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(c.slept, list(wc._LEAF_RETRY_BACKOFF_SECONDS["llm_transport_flake"]))
+        # ...an overload needs the server side to recover, so it waits materially longer before
+        # spending another billed launch
+        c = self._conductor([wc.ProcResult(1, "", "API Error: 529 overloaded_error")])
+        with redirect_stdout(io.StringIO()):
+            c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(c.slept, list(wc._LEAF_RETRY_BACKOFF_SECONDS["llm_overloaded"]))
+        # bounded, and no sleep after the LAST attempt (nothing follows it to wait for)
+        self.assertEqual(len(c.slept), wc.MAX_LEAF_TRANSIENT_RETRIES)
+        self.assertEqual(len(c.spawns), wc.MAX_LEAF_TRANSIENT_RETRIES + 1)
+        # ...and a rate limit waits longer still, before spending the next billed launch
+        c = self._conductor([wc.ProcResult(1, "", "API Error: 429 Too Many Requests")])
+        with redirect_stdout(io.StringIO()):
+            c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(c.slept, list(wc._LEAF_RETRY_BACKOFF_SECONDS["llm_rate_limit"]))
+        # Every retryable tag must have a schedule. If one is ever added without one, the loop
+        # falls back rather than raising KeyError mid-phase — which would crash the conductor
+        # AFTER the dead attempt was already finalized and tombstoned, instead of failing closed.
+        self.assertEqual(set(wc._LEAF_RETRY_BACKOFF_SECONDS), set(wc._RETRYABLE_LEAF_INFRA_TAGS))
+        self.assertEqual(
+            wc._LEAF_RETRY_BACKOFF_SECONDS.get("a_tag_with_no_schedule",
+                                               wc._DEFAULT_LEAF_RETRY_BACKOFF),
+            wc._DEFAULT_LEAF_RETRY_BACKOFF)
+
+    def test_transient_retry_preserves_the_warm_resume_target(self) -> None:
+        """The retry must NOT cold-start: build_launch_request only sends the slim findings-only
+        repair turn when warm_resume is True, so a cold retry would silently drop the findings the
+        repair exists to act on. Forking the producer session again is idempotent."""
+        c = self._conductor([self._flake(), wc.ProcResult(0, "done", "")])
+        c.resume_target = "SESSION-PRODUCER"
+        repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "child-0",
+                  "repair_reason": "generate_static_violation",
+                  "repair_findings": "static: diagnostics are constant-heavy"}
+        with redirect_stdout(io.StringIO()):
+            oc = c.run_substep(self._refs(), "generate", "generate", repair=repair)
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual([s["resume_session_id"] for s in c.spawns],
+                         ["SESSION-PRODUCER", "SESSION-PRODUCER"])
+        # ...but each attempt is its own child (its own session to write into)
+        self.assertEqual([s["session_id"] for s in c.spawns], ["child-1", "child-2"])
+        reqs = [cap["--request-json"] for s, cap in c.calls if s == "record-launch"]
+        self.assertEqual(len(reqs), 2)
+        for req in reqs:  # both attempts send the slim repair turn, findings included
+            self.assertTrue(req["warm_resume"])
+            self.assertEqual(req["skill_must_read_refs"], "")
+            self.assertIn("constant-heavy", req["repair_findings"])
+
+    def test_transient_retry_uses_a_fresh_launch_request_and_min_mtime_per_attempt(self) -> None:
+        """Each attempt re-takes its launch instant, so a half-written artifact left behind by the
+        leaf that died is OLDER than the retry's window and cannot fake the retry's pass."""
+        seen: list[float] = []
+
+        c = self._conductor([self._flake(), wc.ProcResult(0, "done", "")])
+
+        def _status(refs, phase, substep, allowed, min_mtime=0.0):
+            seen.append(min_mtime)
+            return ("pass", ["out.json"])
+
+        c.determine_substep_status = _status  # type: ignore[assignment]
+        with redirect_stdout(io.StringIO()):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(len(seen), 2)
+        self.assertGreater(seen[1], seen[0])       # the retry's window starts later...
+        self.assertEqual(oc.launched_at, seen[1])  # ...and the outcome carries the LIVE one
+        # every attempt gets its own request.json (its own arid), so nothing is overwritten
+        reqs = [cap["--request-json"] for s, cap in c.calls if s == "record-launch"]
+        self.assertEqual([r["agent_run_id"] for r in reqs], ["child-1", "child-2"])
+
+    def test_tombstone_writes_are_outside_the_leafs_write_window(self) -> None:
+        """WHY finalize-child must precede add-superseded-runs.
+
+        `record-launch` snapshots an FS baseline for the child, and `record-agent-run` (inside
+        finalize-child) re-walks the live workspace and rejects every changed path outside the
+        child's write_roots as an unauthorized write. The tombstone writes
+        `<orch_root>/reopen/{superseded_runs.json,reopen_log.jsonl}`, and — unlike `launches/`,
+        `agents/` and `violations/` — those are NOT runtime-ignored. Tombstoning while the window
+        is still open would therefore charge the conductor's own two writes to the dying leaf: the
+        attempt is rejected, finalize-child exits nonzero, `runtime()` raises, and the retry never
+        launches. The retry loop is the only tombstone caller that runs mid-window, so the
+        ordering — not an ignore rule — is what keeps it out of the diff."""
+        from tools.orchestration_runtime import _should_ignore_runtime_snapshot_path as ignored
+        for path in ("workspace/orchestrations/orch_x/reopen/superseded_runs.json",
+                     "workspace/orchestrations/orch_x/reopen/reopen_log.jsonl"):
+            self.assertFalse(
+                ignored(path, orchestration_id="orch_x", agent_run_id="child-1"),
+                f"{path} is visible in a child's FS diff — the tombstone must not run inside "
+                f"a child's write window")
+        # ...and the loop honours that: no tombstone is issued between a record-launch and its
+        # matching finalize-child.
+        c = self._conductor([self._flake(), wc.ProcResult(0, "done", "")])
+        with redirect_stdout(io.StringIO()):
+            c.run_substep(self._refs(), "compile", "verify")
+        open_window = False
+        for sub, _cap in c.calls:
+            if sub == "record-launch":
+                open_window = True
+            elif sub == "finalize-child":
+                open_window = False
+            elif sub == "add-superseded-runs":
+                self.assertFalse(open_window, "tombstoned inside an open child write window")
+
+    def test_retried_judge_cannot_certify_the_dead_attempts_semantic_review(self) -> None:
+        """The retry must not let a leaf that NEVER COMPLETED certify the node.
+
+        The run dir is not rotated between attempts of one phase, so a judge that authored
+        `semantic_review.json` with `decision: "pass"` and only THEN died on a dropped connection
+        leaves a complete, passing artifact behind. The retry (a cold leaf, same run dir) can find
+        it, rewrite nothing and exit 0 — and the phase would certify on an artifact authored by a
+        tombstoned attempt and vouch it to an arid that never wrote it. Freshness (`min_mtime`) is
+        what forbids that, and `validate.judge` was the one LLM substep not gated on it."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            rundir = repo / refs.run_node_dir()
+            rundir.mkdir(parents=True, exist_ok=True)
+
+            class _C(self._C):
+                # the REAL freshness-aware status resolver, not the fake's blanket "pass"
+                def determine_substep_status(self, refs, phase, substep, allowed,
+                                             min_mtime=0.0):  # type: ignore[override]
+                    return wc.Conductor.determine_substep_status(
+                        self, refs, phase, substep, allowed, min_mtime=min_mtime)
+
+                def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+                    self.spawns.append(dict(kwargs))
+                    if len(self.spawns) == 1:
+                        # attempt 1: author a PASSING review, then die of a transport fault
+                        (rundir / "semantic_review.json").write_text(
+                            json.dumps({"decision": "pass", "findings": []}), encoding="utf-8")
+                        return wc.ProcResult(1, LeafTransientRetryTest._FLAKE, "")
+                    # attempt 2: a cold leaf finds the file already there and writes nothing
+                    return wc.ProcResult(0, "nothing to do", "")
+
+            c = _C(repo_root=repo, orchestration_id="orch_x",
+                   orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c.calls, c.procs, c.slept, c.spawns = [], [], [], []
+            with redirect_stdout(io.StringIO()):
+                oc = c.run_substep(refs, "validate", "judge")
+            self.assertEqual(len(c.spawns), 2)          # it did retry...
+            self.assertEqual(oc.status, "fail")         # ...but the stale artifact cannot pass
+            self.assertEqual(oc.attempts, 2)
+            # sanity: the same review REWRITTEN inside the retry's window does pass, so the gate
+            # is freshness and not the file's content
+            def _reauthoring_judge(prompt_text, child_env, **kwargs):
+                (rundir / "semantic_review.json").write_text(
+                    json.dumps({"decision": "pass", "findings": []}), encoding="utf-8")
+                return wc.ProcResult(0, "re-authored", "")
+
+            c2 = _C(repo_root=repo, orchestration_id="orch_x",
+                    orchestration_agent_run_id="ORCH", backend="claude", env={})
+            c2.calls, c2.procs, c2.slept, c2.spawns = [], [], [], []
+            c2.spawn_leaf = _reauthoring_judge  # type: ignore[assignment]
+            self.assertEqual(c2.run_substep(refs, "validate", "judge").status, "pass")
+
+    def test_transient_retry_persists_every_attempts_leaf_output(self) -> None:
+        """The dead attempt's stdout is the ONLY evidence of what killed it — the diagnosis of the
+        E2E #4 incident came from exactly this file. A retry must not overwrite it (each attempt
+        has its own arid, hence its own dialogs dir)."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._conductor([self._flake(), wc.ProcResult(0, "done", "")], repo=repo)
+            with redirect_stdout(io.StringIO()):
+                oc = c.run_substep(self._refs(), "compile", "verify")
+            self.assertEqual(oc.status, "pass")
+            agents = repo / "workspace" / "orchestrations" / "orch_x" / "agents"
+            dead = (agents / "child-1" / "dialogs" / "leaf.stdout.log").read_text()
+            live = (agents / "child-2" / "dialogs" / "leaf.stdout.log").read_text()
+            self.assertEqual(dead, self._FLAKE)
+            self.assertEqual(live, "done")
 
 
 class NodeAllocationTest(unittest.TestCase):
@@ -7091,6 +7692,67 @@ class TransportTombstoneRealCliTest(unittest.TestCase):
             c._add_superseded_run_ids(["child-2"], reason="leaf_transport_error_orphan: leaf_exit=1")
             self.assertEqual(
                 _load_superseded_run_ids(repo, oid), {"child-1", "child-2"})
+
+    def test_transient_retry_tombstone_reaches_the_real_superseded_file(self) -> None:
+        """The same seam for the WI-B transient retry, driven through the REAL run_substep loop
+        (real `runtime()` subprocess, real `new_agent_run_id`, real FS): a leaf dies of a dropped
+        connection, the loop re-launches it, and the DEAD attempt must land in the actual
+        `reopen/superseded_runs.json` the completion check reads. If it does not, the recovered
+        run passes every phase and then fails at the very end on an orphaned agent_graph edge —
+        the failure mode the tombstone exists to prevent."""
+        flake = "API Error: Connection closed mid-response. The response above may be incomplete."
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo_with_real_tools(tmp)
+            oid = "orch_t2"
+            (repo / "workspace" / "orchestrations" / oid).mkdir(parents=True)
+            spawned: list[str] = []
+
+            class _C(wc.Conductor):
+                # Only the bookkeeping calls that need a fully-provisioned orchestration
+                # (capability tokens, prompt rendering, return tokens) are stubbed; the
+                # tombstone goes through the real CLI, and the leaf output through the real FS.
+                def record_launch(self, child_arid, request):  # type: ignore[override]
+                    return {"launch_prompt_text": "PROMPT"}
+
+                def read_parent_return_token(self, child_arid):  # type: ignore[override]
+                    return "rtok"
+
+                def finalize_child(self, child_arid, return_token, reply_text,
+                                   agent_run_json):  # type: ignore[override]
+                    return {}
+
+                def determine_substep_status(self, refs, phase, substep, allowed,
+                                             min_mtime=0.0):  # type: ignore[override]
+                    return "pass", ["out.json"]
+
+                def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+                    spawned.append(kwargs["child_arid"])
+                    return (wc.ProcResult(1, flake, "") if len(spawned) == 1
+                            else wc.ProcResult(0, "done", ""))
+
+                def _sleep_backoff(self, seconds):  # type: ignore[override]
+                    pass
+
+            c = _C(repo_root=repo, orchestration_id=oid, orchestration_agent_run_id="ORCH",
+                   backend="claude", env=os.environ.copy())
+            refs = wc.NodeRefs(
+                node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+                ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1_001",
+                binary_id="bin_1_001", run_id="run_1_001", source_binary_id="bin_1_001")
+            with redirect_stdout(io.StringIO()):
+                oc = c.run_substep(refs, "compile", "verify")
+
+            self.assertEqual(oc.status, "pass")
+            self.assertEqual(oc.attempts, 2)
+            dead, live = spawned
+            self.assertNotEqual(dead, live)
+            self.assertEqual(oc.agent_run_id, live)
+            from tools.orchestration_runtime import _load_superseded_run_ids
+            self.assertEqual(_load_superseded_run_ids(repo, oid), {dead})
+            # and the dead attempt's output survives — it is the only evidence of what killed it
+            agents = repo / "workspace" / "orchestrations" / oid / "agents"
+            self.assertEqual((agents / dead / "dialogs" / "leaf.stdout.log").read_text(), flake)
+            self.assertEqual((agents / live / "dialogs" / "leaf.stdout.log").read_text(), "done")
 
 
 class CodexFeatureCacheTest(unittest.TestCase):

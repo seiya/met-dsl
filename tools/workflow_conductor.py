@@ -1196,6 +1196,25 @@ def build_launch_request(
 # --- runtime CLI + leaf spawn primitives --------------------------------------
 
 
+# The output-token ceiling handed to a claude leaf (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), = the
+# synchronous output limit of the current frontier models. THINKING TOKENS COUNT AGAINST
+# max_tokens: at the CLI's default (measured: 64,000) a leaf that thinks hard about a hard node
+# hits the ceiling and is cut off having emitted thinking ONLY — no text, no tool_use — a fully
+# billed, fully wasted turn. Two such turns (`stop_reason=max_tokens`, thinking-only) cost 24.9
+# minutes and 128k tokens in the E2E #4 audit. Raising the ceiling does not make a leaf spend
+# more; it only stops a leaf that needed the room from being truncated into nothing.
+#
+# The conductor does NOT pin the leaf model (`leaf_command` passes no `--model`; the leaf runs
+# whatever the operator's claude config resolves to). 128,000 is the ceiling of the Opus 4.8 /
+# Sonnet 5 tier; a model whose output limit is lower (Haiku 4.5 caps at 64,000) rejects this
+# value, and rejects it on EVERY launch: `API Error: 400 {"type":"invalid_request_error",
+# "message":"max_tokens: 128000 > 64000 ..."}`. That failure is deliberately classified
+# `llm_client_error` (deterministic, never retried) so it surfaces at once with the API's own
+# message rather than as a phantom outage. Lower this constant to the ceiling of the model the
+# leaves actually run.
+LEAF_MAX_OUTPUT_TOKENS = 128000
+
+
 @dataclass
 class ProcResult:
     returncode: int
@@ -1210,14 +1229,29 @@ class ProcResult:
 # the leaf's `~/.claude` transcript is deliberately NOT an option here (access boundary); the piped
 # output is the only evidence source.
 #
-# The patterns must not fire on ordinary leaf output. A bare `429` / `529` substring matches a
-# traceback frame (`File "x.py", line 429`) or any duration/token count, which would mislabel a
-# routine crash as a quota event — so an HTTP-ish status code is recognized only next to an
-# error/status word, and the words that carry meaning on their own are matched on word boundaries.
-# A status code counts only next to an error/status word: a bare `429` / `529` also matches a
-# traceback frame, a duration, or a token count. `(?<!line )` then excludes the remaining reading
-# the context word cannot rule out — a compiler's `gfortran: error at line 429 of model.f90`.
-_STATUS_CODE_CONTEXT = r"(?:api error|error|http|status(?:_code)?|rejected)\D{0,12}(?<!line )"
+# The patterns must not fire on ordinary leaf output. A bare `429` / `529` / `5xx` substring
+# matches a traceback frame (`File "x.py", line 429`), an array subscript, a duration or a token
+# count, so a status code is recognized only next to a word that makes it an API STATUS — and the
+# words that carry meaning on their own are matched on word boundaries.
+#
+# A bare `error` is deliberately NOT such a word, though it reads like one: `error: index 429 out
+# of bounds for array u(500)` and `gfortran: error at line 504 of model.f90` both satisfy it. That
+# was survivable while the tags only decorated a fail_closed reason; it is not now that they decide
+# whether to RE-LAUNCH the leaf, because a deterministic compiler error or crash would be retried
+# three times and then reported as a provider outage. `status` is out for the same reason — it is
+# this repo's own vocabulary (gate status, verdict status, step_result status), so `status: 500
+# checks failed` would read as an HTTP 500. `\bhttp\b` is word-bounded so it does not match inside
+# `https://host:443`, whose port would otherwise be read as a status code.
+_API_STATUS_CONTEXT = (
+    r"(?:api error|\bhttp\b|\bstatus_code\b|\brejected\b)\D{0,12}")
+
+# "...is the whole message": the phrase ENDS THE LINE (bar a closing quote/bracket and a final
+# period). Anchored to end-of-line and not to punctuation generally, because `,` `;` `:` continue a
+# sentence rather than closing one — `write(*,*) 'stream error: ', err_est` and `A premature close,
+# or a missing flush, truncates the snapshot.` are leaf prose, and a retry armed by them would
+# re-run a deterministic failure three times. A transport library's report has nothing after the
+# phrase (`Error: Premature close`, `TypeError: fetch failed`).
+_TERMINAL = r"\b(?=[.'\")\]]*\s*$)"
 
 # Ordered MOST severe first — the tuple index is the severity rank (see `_classify_leaf_infra_error`).
 # A usage limit is a hard stop that costs hours; a rate limit or an overload is transient. Reporting
@@ -1235,20 +1269,139 @@ _LEAF_INFRA_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"(?<!not your )\busage limit\b|\bsession limit\b"
         r"|\b(?:usage|session|weekly|hourly|\d+-hour)\s+limit reached\b"
         r"|\bcredit balance is too low\b|\bquota\b[^\n]{0,20}exceed")),
-    # `overloaded` needs an error context or a line of its own: bare, it fires on this repo's own
-    # prose ("Overloaded the `__box` generic so ranks 0..3 share one writer"). The trailing
-    # lookahead additionally keeps out a C++ diagnostic — `error: call of overloaded
-    # 'update(double)' is ambiguous` — which the error context alone cannot do.
+    # `overloaded` is a WORD, not a marker: this repo's own prose ("Overloaded the `__box` generic
+    # so ranks 0..3 share one writer") and every compiler's overload diagnostic (`error: call of
+    # overloaded 'update(double)' is ambiguous`, `Error: Type mismatch; overloaded generic __box`)
+    # contain it, usually next to `error`. Only the API's own terse forms count: the error-type
+    # token, a 529 in an API status context, `Overloaded` AS the whole message, and the CLI's
+    # capacity notice. `{_TERMINAL}` is what separates `Error: Overloaded` (the API) from `error:
+    # call of overloaded 'update(double)' ...` (the compiler) — the sentence continues.
     ("llm_overloaded", re.compile(
-        rf"\boverloaded_error\b|{_STATUS_CODE_CONTEXT}\b529\b"
-        r"|\berror\b[^\n]{0,20}\boverloaded\b(?!\s*(?:function|operator|method|['‘’\"]))"
+        rf"\boverloaded_error\b|{_API_STATUS_CONTEXT}\b529\b"
+        rf"|\berror\b[^\n]{{0,20}}\boverloaded{_TERMINAL}"
         r"|^\s*overloaded\s*$|\bexperiencing high load\b")),
+    # Same discipline for the rate limit. `rate limit` unqualified is ordinary technical English —
+    # "diffusion rate limits the timestep", "the scheme is rate limited by diffusion" — so the bare
+    # form counts only when it IS the message (`{_TERMINAL}`), and otherwise an explicit API shape
+    # is required. A genuine rate limit worded some other way still falls through to the
+    # `^api error` catch-all (retryable, only with a shorter backoff), so tightening here can cost
+    # a backoff schedule but never a retry; a false positive, by contrast, costs three re-launches
+    # of a deterministic failure.
     ("llm_rate_limit", re.compile(
-        rf"\brate[ _-]?limit(?:ed|s|_error)?(?![a-z])|{_STATUS_CODE_CONTEXT}\b429\b"
+        r"\brate[ _-]?limit_error\b"
+        r"|\brate[ _-]?limit(?:ed|s)?\b[^\n]{0,12}\b(?:exceeded|error|reached|hit)\b"
+        # The bare form only when it ENDS the line, or opens a dash clause (the CLI's `rate
+        # limited — wait and retry`). Not before `.` or `,`: `The CFL condition sets the rate
+        # limit.` and `The scheme is rate-limited, so dt shrinks.` are ordinary technical English.
+        r"|\brate[ _-]?limit(?:ed)?\b(?=\s*(?:$|[—–-]\s))"
+        rf"|{_API_STATUS_CONTEXT}\b429\b"
         r"|\btoo many requests\b|\btemporarily limiting requests\b")),
+    # A 4xx from the API: the REQUEST is wrong (a bad/expired credential, an unsupported
+    # parameter, an oversized prompt), so every re-launch reproduces it byte-for-byte. Ranked
+    # ABOVE the transport tag and deliberately kept OUT of _RETRYABLE_LEAF_INFRA_TAGS: without
+    # it the `^api error` catch-all below would swallow a 4xx and retry it three times, then
+    # report a deterministic misconfiguration as a provider outage the operator should wait out.
+    # The concrete case this repo can cause itself: a leaf model whose output ceiling is below
+    # LEAF_MAX_OUTPUT_TOKENS answers every launch with
+    # `API Error: 400 {"type":"invalid_request_error","message":"max_tokens: 128000 > 64000 ..."}`.
+    # Two 4xx are NOT client errors and are excluded so they fall through to a retryable tag:
+    # 429 (a rate limit — already matched at a more severe rank above) and 408 (Request Timeout —
+    # genuinely transient, and the exact fault the transient retry exists for).
+    # The plain-English forms are load-bearing, not decoration: the CLI often renders a 4xx with no
+    # status code at all (`API Error: prompt is too long: 235000 tokens > 200000 maximum`), and
+    # without them the `^api error` catch-all below would take it and RETRY it. `prompt is too
+    # long` is the second failure this repo can inflict on itself — the conductor injects the R5
+    # exemplar, the dependency facts and the must-read docs into a cold generate prompt, and an
+    # oversized prompt reproduces byte-for-byte on every re-launch.
+    ("llm_client_error", re.compile(
+        rf"{_API_STATUS_CONTEXT}\b4(?!08\b|29\b)\d\d\b"
+        r"|\binvalid_request_error\b|\bauthentication_error\b|\bpermission_error\b"
+        r"|\bnot_found_error\b|\brequest_too_large\b"
+        r"|\bprompt is too long\b|\brequest body too large\b"
+        r"|\binvalid (?:api key|x-api-key|bearer token)\b"
+        r"|\boauth token (?:has )?expired\b|\bplease run /login\b")),
     ("llm_permission_probe_unavailable", re.compile(
         r"temporarily unavailable, so auto mode cannot determine")),
+    # LEAST severe, and deliberately LAST: a transient transport fault (the connection to the
+    # API died mid-stream). It is a strict fallback — the quota/overload patterns above are
+    # matched first, so `stream disconnected: Too Many Requests` stays `llm_rate_limit` and only
+    # an otherwise-unnamed transport failure lands here.
+    #
+    # A real incident this exists for: a `compile.verify` leaf left exactly one line —
+    # `API Error: Connection closed mid-response. The response above may be incomplete.` — which
+    # matched nothing above, fail-closed the whole run, and cost 6.8 hours until a human
+    # `--resume`d. The tag makes it retryable (_RETRYABLE_LEAF_INFRA_TAGS).
+    #
+    # The trailing `^\s*api error\b` is a deliberate CATCH-ALL for transport wording we have not
+    # seen yet: the claude CLI opens a LINE with `API Error:` only when the API/transport layer
+    # failed, and a leaf's Fortran prose does not open a line that way. It is anchored (not a
+    # substring match) precisely so a model sentence that merely mentions an API error cannot arm
+    # a retry, and the `llm_client_error` tag above intercepts the deterministic 4xx subset before
+    # it reaches here. Everything before it is word-bounded / error-context-qualified for the same
+    # reason as the patterns above — the leaf's captured output is mostly the MODEL'S OWN PROSE, so
+    # `the solver timed out after 500 iterations`, `the connection between cells 3 and 4`, and
+    # `access='stream'` must all stay unmatched.
+    # `{_TERMINAL}` = the phrase ENDS the line. Applied to the phrases a leaf's own prose can also
+    # open with — `the premature close of the file unit`, `the fetch failed for the dependency
+    # facts`, `write(*,*) 'stream error: ', err_est` — so only the transport library's terse form
+    # (`Error: Premature close`, `TypeError: fetch failed`) matches. `read timed out` is
+    # deliberately absent for the same reason: it is too close to ordinary English to earn a retry
+    # on its own.
+    ("llm_transport_flake", re.compile(
+        r"\bconnection closed mid-response\b"
+        r"|\bconnection (?:reset|refused|aborted|closed unexpectedly)\b"
+        r"|\b(?:econnreset|econnrefused|econnaborted|epipe|etimedout|enotfound|eai_again)\b"
+        r"|\bsocket hang up\b"
+        rf"|\bfetch failed{_TERMINAL}|\bpremature close{_TERMINAL}"
+        rf"|\bstream (?:disconnected|interrupted|aborted)\b|\bstream error{_TERMINAL}"
+        r"|\bnetwork (?:error|is unreachable)\b"
+        r"|\b(?:request|connection|socket|upstream|gateway) timed out\b"
+        rf"|\bbad gateway{_TERMINAL}|\bservice unavailable{_TERMINAL}"
+        rf"|\binternal server error{_TERMINAL}"
+        r"|\btypeerror: terminated\b"
+        # 408 Request Timeout is transient and is excluded from `llm_client_error` — but that
+        # exclusion only makes it RETRYABLE if it matches here. Without these two alternatives a
+        # 408 rendered without the `API Error:` line prefix (`HTTP 408`, codex's `last status: 408
+        # Request Timeout`) would match nothing at all and fail the run closed.
+        rf"|{_API_STATUS_CONTEXT}\b408\b|\brequest timeout{_TERMINAL}"
+        rf"|{_API_STATUS_CONTEXT}\b5\d\d\b"
+        r"|^\s*api error\b")),
 )
+
+# Infra tags the conductor RETRIES in place (bounded, with backoff) instead of fail-closing the
+# run. Everything else stays terminal, and each exclusion is deliberate:
+#   - `llm_usage_limit` is a hard stop lasting hours. Retrying it burns the budget in seconds and
+#     only delays the operator's `--resume`. (Manual BY DESIGN; see deterministic_followups L5.)
+#   - `llm_client_error` (4xx) is a rejected REQUEST: an expired credential, an unsupported
+#     parameter, an oversized prompt. Every re-launch sends the same request and gets the same 4xx.
+#   - `llm_permission_probe_unavailable` needs an operator/config fix, not another attempt.
+#   - an UNCLASSIFIABLE nonzero exit (crash, OOM, hook denial) is deterministic: retrying it just
+#     hides the same failure behind 3x the wall-clock.
+_RETRYABLE_LEAF_INFRA_TAGS = frozenset({
+    "llm_transport_flake", "llm_overloaded", "llm_rate_limit"})
+MAX_LEAF_TRANSIENT_RETRIES = 2  # => at most 3 launches of the same substep
+# Per-tag backoff, indexed by the 0-based attempt that just died. A transport flake is usually
+# gone on the next connection; an overload/rate limit needs the server side to recover, so it
+# waits materially longer before spending another (billed) launch. `_DEFAULT` keeps a tag added to
+# _RETRYABLE_LEAF_INFRA_TAGS without a schedule here from raising KeyError mid-phase (which would
+# crash the conductor AFTER the dead attempt was already finalized, instead of failing closed).
+_DEFAULT_LEAF_RETRY_BACKOFF: tuple[float, ...] = (10.0, 30.0)
+_LEAF_RETRY_BACKOFF_SECONDS: dict[str, tuple[float, ...]] = {
+    "llm_transport_flake": (2.0, 10.0),
+    "llm_overloaded": (15.0, 60.0),
+    "llm_rate_limit": (30.0, 90.0),
+}
+
+# Tags that may be promoted OUT OF STDOUT over a match already found in stderr. Deliberately just
+# these two: stdout is a `claude -p` leaf's own prose, so letting it outrank stderr in general
+# would hand the retry decision to whatever the model happened to write. These two are the
+# exception because (a) the CLI reports both as its RESULT TEXT — i.e. on stdout, with stderr
+# often empty (the E2E #4 incident line arrived exactly that way) — and (b) both are
+# NON-RETRYABLE, so promoting them can only ever remove a re-launch, never add one:
+#   - a usage limit retried is three re-launches into a multi-hour hard stop, burning the budget
+#     the post-reset resume needs;
+#   - a 4xx retried is three re-launches of a request the API rejects identically every time.
+_CROSS_STREAM_PROMOTING_TAGS = frozenset({"llm_usage_limit", "llm_client_error"})
 
 # A TRANSIENT retry notice — the CLI prints `API Error (429 …) · Retrying in 1 seconds… (attempt
 # 1/10)` and then RECOVERS. Blaming a recovered retry for a leaf that actually died of a hook
@@ -1262,15 +1415,20 @@ def _classify_leaf_infra_error(stderr: str, stdout: str = "") -> tuple[str, str]
     """(tag, evidence_line) when a failed leaf's captured output names an LLM-infrastructure
     cause; None when nothing matches (the caller then keeps its generic reporting).
 
-    `stderr` is searched before `stdout`: stdout carries a `claude -p` leaf's own prose, which may
-    well discuss "the rate-limiting step" of a numerical scheme, while stderr carries a transport
-    error. Within a stream the MOST SEVERE tag wins (a usage limit outranks a transient rate limit
-    that the same run may have logged), and among equally severe matches the LAST one — the
-    terminal message, not one the run went on to survive.
+    Within a stream the MOST SEVERE tag wins (a usage limit outranks a transient rate limit the
+    same run may also have logged), and among equally severe matches the LAST one — the terminal
+    message, not one the run went on to survive.
+
+    `stderr` is authoritative: stdout carries a `claude -p` leaf's OWN PROSE, which may well
+    discuss "the rate-limiting step" of a numerical scheme, so a stdout match may override a
+    stderr match only for a tag in _CROSS_STREAM_PROMOTING_TAGS. Otherwise stdout is consulted
+    solely when stderr named nothing — which is the common case, since the CLI reports an
+    infrastructure failure as its result text (the E2E #4 incident had an empty stderr).
     """
-    for stream in (stderr, stdout):
+    best: tuple[int, str, str] | None = None
+    best_stream: int | None = None
+    for stream_idx, stream in enumerate((stderr, stdout)):
         lines = (stream or "").splitlines()
-        best: tuple[int, str, str] | None = None
         for idx, line in enumerate(lines):
             # Skip the notice itself AND the line it continues from: the banner is sometimes wrapped
             # as `API Error (429 ...)` / `· Retrying in 1 seconds... (attempt 1/10)`.
@@ -1281,12 +1439,20 @@ def _classify_leaf_infra_error(stderr: str, stdout: str = "") -> tuple[str, str]
             lowered = line.lower()
             for rank, (tag, pattern) in enumerate(_LEAF_INFRA_ERROR_PATTERNS):
                 if pattern.search(lowered):
-                    if best is None or rank <= best[0]:
+                    same_stream = stream_idx == best_stream
+                    if best is None:
+                        wins = True
+                    elif same_stream:
+                        # The last equally-or-more severe line of the stream: the terminal message.
+                        wins = rank <= best[0]
+                    else:
+                        # stdout over a stderr match: only a promoting tag, and only upward.
+                        wins = rank < best[0] and tag in _CROSS_STREAM_PROMOTING_TAGS
+                    if wins:
                         best = (rank, tag, " ".join(line.split())[:160])
+                        best_stream = stream_idx
                     break
-        if best is not None:
-            return best[1], best[2]
-    return None
+    return (best[1], best[2]) if best is not None else None
 
 
 @dataclass
@@ -2182,6 +2348,14 @@ clean:
         env = dict(self.env)
         env["METDSL_ORCHESTRATION_ID"] = self.orchestration_id
         env["TMPDIR"] = str(self.repo_root / "workspace" / "tmp" / child_arid)
+        # Lift the claude leaf's output ceiling off the CLI default (see LEAF_MAX_OUTPUT_TOKENS:
+        # thinking is billed against it, so the default truncates a hard leaf mid-think). Set
+        # here — not in `.claude/settings.json` — so it stays a property of the CONDUCTOR'S leaf
+        # contract and does not leak into the operator's own interactive sessions. bwrap passes
+        # the environment through (no --clearenv), so this reaches the leaf's `claude` process.
+        # codex reads a different config surface and is left alone.
+        if self.backend == "claude":
+            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(LEAF_MAX_OUTPUT_TOKENS)
         return env
 
     def read_case_ids(self, refs: NodeRefs) -> tuple[str, ...]:
@@ -2389,8 +2563,20 @@ clean:
             # node is clean: semantic_review.decision == "pass". A decision=="fail" (a
             # fabrication / consistency finding on otherwise-passing tests) breaks run_phase
             # before post_judge; classify_failure then routes it (via the diagnostician).
+            #
+            # The same freshness requirement as every other LLM substep, and load-bearing for the
+            # SAME reason as compile.verify's: a judge that writes nothing this window must not
+            # pass on an artifact from an earlier attempt. The run dir is NOT rotated between
+            # attempts of one phase (`_ensure_fresh_producer_id` runs once per phase), so without
+            # this a judge leaf that authored `decision: "pass"` and THEN died on a transient
+            # transport fault would be tombstoned, retried, and the retry — finding the dead
+            # attempt's file already in place and rewriting nothing — would certify the node on an
+            # artifact authored by a leaf that never completed, vouched to an arid that never
+            # wrote it. semantic_review.json is the judge's ONLY allowed output path, so gating on
+            # the whole set is exact.
             sem = _read_json(self.repo_root / refs.run_node_dir() / "semantic_review.json") or {}
-            status = "pass" if str(sem.get("decision") or "").strip().lower() == "pass" else "fail"
+            status = "pass" if (str(sem.get("decision") or "").strip().lower() == "pass"
+                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "validate" and substep == "post_judge":
             # Deterministic post-return gate: the conductor-authored post_judge_meta records
             # the `--stage pre_judge` verdict (orchestration-record + cross-pipeline DAG
@@ -3858,7 +4044,6 @@ clean:
         # Memoized per orchestration (no-op after the first); spawn_leaf also calls it as a
         # safety net for the record-launch-less diagnostician leaf.
         self._ensure_codex_feature_cache()
-        child_arid = self.new_agent_run_id()
         # Resolve the warm-resume decision BEFORE building the request so the slim-vs-full
         # prompt choice (build_launch_request) matches what record_launch persists and what
         # spawn_leaf sends below. None => cold launch (full prompt). Deterministic substeps
@@ -3879,91 +4064,164 @@ clean:
         exemplar = (self._resolve_exemplar(refs)
                     if (phase == "generate" and substep == "generate"
                         and not deterministic and not warm_resume) else None)
-        request = build_launch_request(
-            refs, step=phase, substep=substep,
-            orchestration_id=self.orchestration_id,
-            orchestration_agent_run_id=self.orchestration_agent_run_id,
-            child_agent_run_id=child_arid,
-            agent_model=self.agent_model, workflow_mode=self.workflow_mode,
-            case_ids=self.read_case_ids(refs) if phase == "validate" else (),
-            evidence_artifacts=self._read_evidence_artifacts(refs) if phase == "validate"
-            else ("state_snapshots",),
-            # build's allowed_output_paths binary path = the imposed canonical exe name.
-            exe_name=(self._resolve_exe_name(refs) if phase == "build" else None),
-            # leaf generate: src/Makefile is conductor-authored, so drop it from the leaf's
-            # allowed_output_paths (it must not author it).
-            makefile_host_authored=(phase == "generate" and self._conductor_authors_makefile(refs)),
-            # leaf generate: on an M3c node the runner is conductor-rendered, so the leaf authors
-            # <spec_id>_checks.f90 instead of <spec_id>_runner.f90 (build_launch_request swaps it).
-            runner_host_authored=(phase == "generate" and self._conductor_authors_runner(refs)),
-            repair=repair,
-            resolved_dependencies=resolved_dependencies,
-            exemplar=exemplar,
-            warm_resume=warm_resume,
-        )
-        rec = self.record_launch(child_arid, request)
-        # Capture the launch instant so a producer substep only passes on outputs
-        # (re)written during this child window, not stale files from a prior attempt.
-        launched_at = time.time()
-        if deterministic:
-            # Non-LLM step: run the body in-process and play the child-return ourselves
-            # (no `claude -p` leaf). record_launch above + record-child-return here +
-            # finalize_child below keep the executor a normal step/substep agent_run_id,
-            # so the integrity validators pass unchanged.
-            proc = self._run_deterministic_substep(refs, phase, substep, child_arid, request)
-            self._persist_leaf_output(child_arid, proc, prefix="deterministic")
-            token = self.read_parent_return_token(child_arid)
-            self.runtime([
-                "record-child-return", *self._oid_args(),
-                "--agent-run-id", child_arid, "--return-token", token,
-            ])
-        else:
-            # resume_session_id was resolved before build_launch_request (above) so the
-            # slim-vs-full prompt selection is consistent with what is actually sent here.
-            proc = self.spawn_leaf(
-                rec["launch_prompt_text"], self._child_env(child_arid),
-                session_id=child_arid, resume_session_id=resume_session_id,
-                child_arid=child_arid)
-            # Persist the leaf's verbatim stdout/stderr durably (every run, pass or
-            # fail) so the LLM's actual response — including an infra failure message
-            # such as a token-limit abort — is never lost. These conductor-side writes
-            # land in the child's bookkeeping dir (not its allowed_output_paths) and are
-            # not hook-guarded, so they don't trip the output-manifest guard.
-            self._persist_leaf_output(child_arid, proc)
-            token = self.read_parent_return_token(child_arid)
-            # G3 split: the `--stage pre_judge` gate that used to run here inline after the
-            # judge leaf is now the deterministic `post_judge` substep
-            # (Conductor._post_judge_inproc), so the judge leaf is a pure LLM semantic pass and
-            # run_substep no longer runs any gate for it.
-        status, output_refs = self.determine_substep_status(
-            refs, phase, substep, request["allowed_output_paths"], min_mtime=launched_at)
-        # A nonzero leaf exit (crash / transport failure) fails the substep even if
-        # the expected artifacts happen to exist (e.g. stale outputs from a prior
-        # attempt) — the process return code gates artifact-based success.
-        # EVERY non-pass status must carry a result_summary: a failed payload has no
-        # output_refs, so without one _validate_agent_summary_text rejects the
-        # auto-generated agent.summary.txt and finalize-child crashes. A nonzero exit
-        # uses the leaf's stderr tail; a returncode-0 content failure (verify/judge
-        # fail, missing deliverable) uses a generic tag — the detailed diagnostics
-        # live in the canonical artifacts (ir_meta/verdict.json) that classify_failure
-        # reads for routing.
-        result_summary: str | None = None
-        infra_error: tuple[str, str] | None = None
-        if proc.returncode != 0:
-            status = "fail"
-            result_summary = self._leaf_failure_summary(proc)
-            infra_error = _classify_leaf_infra_error(proc.stderr or "", proc.stdout or "")
-        elif status != "pass":
-            result_summary = f"substep_fail: {phase}" + (f".{substep}" if substep else "")
-        reply = f"status: {status}\noutput_refs: {len(output_refs)}\nleaf rc={proc.returncode}"
-        if result_summary:
-            reply += f"\nresult_summary: {result_summary}"
-        self.finalize_child(
-            child_arid, token, reply,
-            self._agent_run_json(refs, phase, substep, child_arid, status,
-                                 output_refs, result_summary))
-        return SubstepOutcome(child_arid, status, output_refs, proc.returncode,
-                              infra_error, launched_at)
+        # Bounded transient-transport retry (see _RETRYABLE_LEAF_INFRA_TAGS): a leaf whose
+        # connection died mid-response is re-launched in place rather than fail-closing the whole
+        # run for a human to `--resume` hours later. The loop is closed INSIDE run_substep on
+        # purpose — run_phase's `outcomes` list is positionally aligned with SUBSTEPS[phase]
+        # (_producer_arid / _judge_attempt_count index into it), so an extra outcome per retry
+        # would corrupt it. Everything attempt-invariant (codex cache, warm-resume target,
+        # exemplar) is resolved ABOVE the loop; only the launch itself repeats.
+        attempt = 0
+        while True:
+            child_arid = self.new_agent_run_id()
+            request = build_launch_request(
+                refs, step=phase, substep=substep,
+                orchestration_id=self.orchestration_id,
+                orchestration_agent_run_id=self.orchestration_agent_run_id,
+                child_agent_run_id=child_arid,
+                agent_model=self.agent_model, workflow_mode=self.workflow_mode,
+                case_ids=self.read_case_ids(refs) if phase == "validate" else (),
+                evidence_artifacts=self._read_evidence_artifacts(refs) if phase == "validate"
+                else ("state_snapshots",),
+                # build's allowed_output_paths binary path = the imposed canonical exe name.
+                exe_name=(self._resolve_exe_name(refs) if phase == "build" else None),
+                # leaf generate: src/Makefile is conductor-authored, so drop it from the leaf's
+                # allowed_output_paths (it must not author it).
+                makefile_host_authored=(
+                    phase == "generate" and self._conductor_authors_makefile(refs)),
+                # leaf generate: on an M3c node the runner is conductor-rendered, so the leaf
+                # authors <spec_id>_checks.f90 instead of <spec_id>_runner.f90
+                # (build_launch_request swaps it).
+                runner_host_authored=(
+                    phase == "generate" and self._conductor_authors_runner(refs)),
+                repair=repair,
+                resolved_dependencies=resolved_dependencies,
+                exemplar=exemplar,
+                warm_resume=warm_resume,
+            )
+            rec = self.record_launch(child_arid, request)
+            # Capture the launch instant so a producer substep only passes on outputs
+            # (re)written during this child window, not stale files from a prior attempt.
+            # Re-taken per attempt: a half-written artifact left by the leaf that died is older
+            # than the retry's window, so it cannot fake the retry's pass.
+            launched_at = time.time()
+            if deterministic:
+                # Non-LLM step: run the body in-process and play the child-return ourselves
+                # (no `claude -p` leaf). record_launch above + record-child-return here +
+                # finalize_child below keep the executor a normal step/substep agent_run_id,
+                # so the integrity validators pass unchanged.
+                proc = self._run_deterministic_substep(refs, phase, substep, child_arid, request)
+                self._persist_leaf_output(child_arid, proc, prefix="deterministic")
+                token = self.read_parent_return_token(child_arid)
+                self.runtime([
+                    "record-child-return", *self._oid_args(),
+                    "--agent-run-id", child_arid, "--return-token", token,
+                ])
+            else:
+                # resume_session_id was resolved before build_launch_request (above) so the
+                # slim-vs-full prompt selection is consistent with what is actually sent here.
+                # A retry keeps the SAME resume target: the producer session is idempotent to
+                # fork, and a cold retry would silently drop the slim turn's findings excerpt
+                # (build_launch_request only sends it when warm_resume is True).
+                proc = self.spawn_leaf(
+                    rec["launch_prompt_text"], self._child_env(child_arid),
+                    session_id=child_arid, resume_session_id=resume_session_id,
+                    child_arid=child_arid)
+                # Persist the leaf's verbatim stdout/stderr durably (every run, pass or
+                # fail) so the LLM's actual response — including an infra failure message
+                # such as a token-limit abort — is never lost. These conductor-side writes
+                # land in the child's bookkeeping dir (not its allowed_output_paths) and are
+                # not hook-guarded, so they don't trip the output-manifest guard. Each attempt
+                # has its own arid, so a retried substep keeps the dead attempt's log too.
+                self._persist_leaf_output(child_arid, proc)
+                token = self.read_parent_return_token(child_arid)
+                # G3 split: the `--stage pre_judge` gate that used to run here inline after the
+                # judge leaf is now the deterministic `post_judge` substep
+                # (Conductor._post_judge_inproc), so the judge leaf is a pure LLM semantic pass and
+                # run_substep no longer runs any gate for it.
+            status, output_refs = self.determine_substep_status(
+                refs, phase, substep, request["allowed_output_paths"], min_mtime=launched_at)
+            # A nonzero leaf exit (crash / transport failure) fails the substep even if
+            # the expected artifacts happen to exist (e.g. stale outputs from a prior
+            # attempt) — the process return code gates artifact-based success.
+            # EVERY non-pass status must carry a result_summary: a failed payload has no
+            # output_refs, so without one _validate_agent_summary_text rejects the
+            # auto-generated agent.summary.txt and finalize-child crashes. A nonzero exit
+            # uses the leaf's stderr tail; a returncode-0 content failure (verify/judge
+            # fail, missing deliverable) uses a generic tag — the detailed diagnostics
+            # live in the canonical artifacts (ir_meta/verdict.json) that classify_failure
+            # reads for routing.
+            result_summary: str | None = None
+            infra_error: tuple[str, str] | None = None
+            if proc.returncode != 0:
+                status = "fail"
+                result_summary = self._leaf_failure_summary(proc)
+                infra_error = _classify_leaf_infra_error(proc.stderr or "", proc.stdout or "")
+            elif status != "pass":
+                result_summary = f"substep_fail: {phase}" + (f".{substep}" if substep else "")
+            reply = f"status: {status}\noutput_refs: {len(output_refs)}\nleaf rc={proc.returncode}"
+            if result_summary:
+                reply += f"\nresult_summary: {result_summary}"
+            # Terminalize the attempt FIRST, and only then tombstone it. Both orderings have a
+            # cost and this one is the survivable one:
+            #   - `finalize_child` closes the child's write window: `record-agent-run` re-walks the
+            #     live workspace and diffs it against the baseline `record-launch` took, and
+            #     ANY path outside the child's write_roots is an unauthorized write. The tombstone
+            #     writes `<orch_root>/reopen/{superseded_runs.json,reopen_log.jsonl}`, which is NOT
+            #     runtime-ignored (unlike launches/ agents/ violations/), so tombstoning inside the
+            #     window would attribute the conductor's own two writes to the dying leaf: the
+            #     attempt is rejected as an unauthorized write, finalize-child exits nonzero, and
+            #     the retry this function exists to perform never launches at all. (The three
+            #     pre-existing tombstone call sites all sit outside any open child window, which is
+            #     why they never hit this.)
+            #   - tombstoning a leaf that ALSO made a genuine unauthorized write would hide it from
+            #     `_derive_unauthorized_write_resume_directive`, which skips superseded candidates
+            #     — leaving the operator in the `resume_reopen_no_valid_trigger` dead end.
+            # The residual: a host crash BETWEEN the two writes leaves a terminal, un-vouched,
+            # un-tombstoned arid, which a resume cannot repair on its own (it needs a manual
+            # `add-superseded-runs`). That window is the same one the three pre-existing tombstone
+            # sites carry, and it is two subprocess calls wide.
+            self.finalize_child(
+                child_arid, token, reply,
+                self._agent_run_json(refs, phase, substep, child_arid, status,
+                                     output_refs, result_summary))
+            retryable = (
+                not deterministic
+                and proc.returncode != 0
+                and infra_error is not None
+                and infra_error[0] in _RETRYABLE_LEAF_INFRA_TAGS
+                and attempt < MAX_LEAF_TRANSIENT_RETRIES)
+            if not retryable:
+                return SubstepOutcome(child_arid, status, output_refs, proc.returncode,
+                                      infra_error, launched_at, attempt + 1)
+            tag = infra_error[0]
+            max_attempts = MAX_LEAF_TRANSIENT_RETRIES + 1
+            # A dead attempt is never vouched by a step_result (only the surviving attempt's arid
+            # goes into substep_agent_run_ids), and an un-vouched TERMINAL arid is an orphan the
+            # completion check rejects at the end of an otherwise-passing run. The FINAL attempt of
+            # an exhausted budget is tombstoned instead by run_phase's transport branch — between
+            # the two, every arid this loop mints is covered. Idempotent (a set union), so a
+            # re-tombstone is harmless.
+            self._add_superseded_run_ids(
+                [child_arid],
+                reason=(f"leaf_transient_retry_orphan: {tag}; "
+                        f"attempt={attempt + 1}/{max_attempts}"))
+            delays = _LEAF_RETRY_BACKOFF_SECONDS.get(tag, _DEFAULT_LEAF_RETRY_BACKOFF)
+            delay = delays[min(attempt, len(delays) - 1)]
+            self.emit("leaf_transient_retry", node_key=refs.node_key, step=phase,
+                      substep=substep, tag=tag, attempt=attempt + 1,
+                      max_attempts=max_attempts, backoff_seconds=delay,
+                      dead_agent_run_id=child_arid, evidence=infra_error[1])
+            self._sleep_backoff(delay)
+            attempt += 1
+
+    def _sleep_backoff(self, seconds: float) -> None:
+        """Wait out a transient LLM-infrastructure failure before re-launching the leaf.
+
+        The conductor's ONE and ONLY sleep, isolated in a method so tests can replace it (they
+        assert the schedule without waiting it out) and so a future reader can see at a glance
+        that the loop does not otherwise block."""
+        time.sleep(seconds)
 
     def _persist_leaf_output(self, child_arid: str, proc: ProcResult,
                              prefix: str = "leaf") -> None:
@@ -4844,7 +5102,13 @@ clean:
             # fail_closed reason to a reason_code by prefix match, so the tag only ever appends.
             # The evidence is clipped so the whole reason survives set_status's reason_detail[:200].
             infra = transport.infra_error
-            suffix = f" (tag: {infra[0]}; {infra[1][:120]})" if infra else ""
+            suffix = f" (tag: {infra[0]}; {infra[1][:110]})" if infra else ""
+            # A retried-and-still-dead leaf reached here only after exhausting its transient
+            # budget, i.e. the outage outlasted every backoff. Say so: `attempts=3` tells the
+            # operator NOT to `--resume` immediately (the provider is still down), where a bare
+            # transport error would invite an instant retry that dies the same way.
+            if transport.attempts > 1:
+                suffix += f" [attempts={transport.attempts}]"
             orphan_arids = [oc.agent_run_id for oc in outcomes]
             if orphan_arids:
                 self._add_superseded_run_ids(
@@ -5519,6 +5783,10 @@ class SubstepOutcome:
     # ask "did THIS leaf author that artifact?" — an mtime older than this belongs to an
     # earlier substep, not to the one that just failed.
     launched_at: float = 0.0
+    # How many times run_substep launched this substep, counting the surviving/last attempt
+    # (1 = no retry). >1 means a transient LLM-infrastructure failure was retried in place; the
+    # dead attempts are tombstoned and not carried here.
+    attempts: int = 1
 
 
 @dataclass

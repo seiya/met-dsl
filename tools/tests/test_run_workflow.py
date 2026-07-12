@@ -2793,6 +2793,18 @@ class StdoutFormatTests(unittest.TestCase):
                        "agent_run_id": "ar_x", "orchestration_id": "o"})
         self.assertIn("fail", fail_line or "")
         self.assertIn("arid=ar_x", fail_line or "")
+        # A transient-transport retry: the run is NOT stuck and the operator should not kill it,
+        # so the wait is announced rather than left as a silent gap in the stream.
+        retry_line = f({"status": "info", "event": "leaf_transient_retry",
+                        "node_key": "n", "step": "compile", "substep": "verify",
+                        "tag": "llm_transport_flake", "attempt": 1, "max_attempts": 3,
+                        "backoff_seconds": 2.0, "dead_agent_run_id": "ar_dead",
+                        "orchestration_id": "o"})
+        self.assertEqual(
+            retry_line,
+            "    [warn   ] transient leaf failure (llm_transport_flake) in compile.verify "
+            "[attempt 1/3]: retrying in 2.0s",
+        )
         # Final ok / fail summaries.
         self.assertTrue(
             (f({"status": "ok", "orchestration_id": "orch_1",

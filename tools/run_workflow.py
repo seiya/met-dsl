@@ -1382,6 +1382,16 @@ def _format_event_human(payload: dict[str, Any]) -> str | None:
         target = payload.get("target", "?")
         return f"    [warn   ] resume session unavailable: {phase}.{substep} target={target}"
 
+    if status == "info" and event == "leaf_transient_retry":
+        phase = payload.get("step", "?")
+        substep = payload.get("substep") or "step"
+        tag = payload.get("tag", "?")
+        attempt = payload.get("attempt", "?")
+        total = payload.get("max_attempts", "?")
+        backoff = payload.get("backoff_seconds", "?")
+        return (f"    [warn   ] transient leaf failure ({tag}) in {phase}.{substep} "
+                f"[attempt {attempt}/{total}]: retrying in {backoff}s")
+
     if status == "info" and event == "diagnose_launch_failed":
         phase = payload.get("phase", "?")
         err = payload.get("error", "")
