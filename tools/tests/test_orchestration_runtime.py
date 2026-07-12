@@ -26350,7 +26350,16 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # violation text alone. The rule states when the gate ACTUALLY fires: it inspects only a
         # subroutine that declares >=1 intent(out) dummy (one with none is skipped outright), so
         # "intent(inout) is a Generate fail" would have been simply false.
-        "skills/workflow-generate-generate/SKILL.md": 32700,
+        # Bumped 32700->34900: the inert dependency call rule — a dependency operation whose
+        # results spec.ir.yaml gives no sink (per-operation judgment over steps[] inputs AND
+        # outputs, derived_field_rules, invariants, io_contract outputs, required_sources;
+        # uncertain => load-bearing) is called inert (actuals assigned before the call; no
+        # result reaches an io_contract output / diagnostics check / invariant). E2E #4: the
+        # profile leaf invented a "resolution binding check" probe path gating
+        # profile_selected_flag on dependency runtime behavior
+        # (orch_20260712T014005Z_e02a2d4d, generate.verify major). The inputs-only predicate
+        # was rejected in review: a terminal dependency result appears in steps[].outputs only.
+        "skills/workflow-generate-generate/SKILL.md": 34900,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
@@ -26372,7 +26381,15 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 24400->24900: the benign `associate (unused_x => x)` binding of an
         # intentionally-unused dummy is a sanctioned idiom, not an "additional operation" — the
         # verify leaf must not fail a source for carrying it (its absence is the defect).
-        "skills/workflow-generate-verify/SKILL.md": 24900,
+        # Bumped 24900->27300: the inert dependency call rule, all three directions — a call
+        # result gating an io_contract output / diagnostics check / invariant with no declared
+        # sink is a major fail; discarding a result the algorithm DOES declare a sink for
+        # (per-operation judgment over steps[] inputs AND outputs, derived_field_rules,
+        # invariants, io_contract outputs, required_sources) is a fail; the inert call itself
+        # is the sanctioned form of the dependency mandate and must not be flagged (oscillation
+        # guard, same shape as the associate-binding carve-out). E2E #4
+        # (orch_20260712T014005Z_e02a2d4d, generate.verify major).
+        "skills/workflow-generate-verify/SKILL.md": 27300,
         # Bumped 10000->10400: documented the verdict.json#per_test entry schema
         # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
         # called out as conductor-derived not judge-written) so the judge leaf no longer
