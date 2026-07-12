@@ -142,6 +142,9 @@ releases/
 - An operation shared across `spec` is managed independently as a `component`.
 
 ### Operations Rules
+- When a `spec` is newly created, and whenever any of its three input files (`controlled_spec.md` / `deps.yaml` / `tests.md`) is updated, run the `spec-input-check` skill (`skills/spec-input-check/SKILL.md`) against it before the workflow is started. The check is read-only and advisory: it reports findings and never modifies the `spec`.
+- The check is a pre-`Compile` step that sits **outside** the phase sequence. It is not a `phase`, `tools/workflow_conductor.py` does not launch it, and it forms no part of any `step agent` / `substep agent` contract. The `spec` author runs it.
+- Updating a `spec` also requires running the check against every `spec` that declares it as a dependency. A rename or a contract change is applied in lockstep across the dependent's `deps.yaml` and the prose of its `controlled_spec.md`, and a half-applied change is a contradiction that only the dependent's own check surfaces.
 - When adding a new `spec`, registration into `spec/registry/spec_catalog.yaml` is required.
 - The required items of `spec_catalog.yaml` are `spec_kind`, `domain`, `family`, `spec_id`, `spec_version`, `status`, `controlled_spec_path`, and `tests_path`.
 - When the reuse boundary of a `problem spec` is changed, update `releases/registry/component_catalog.yaml` at the same time.
@@ -152,6 +155,7 @@ releases/
 - The placement of a `spec` is canonically `spec/<spec_kind>/<domain>/<family>/<spec_id>/...`.
 
 ### Decision Criteria
+- A `spec` whose input check reports a `blocker` must not be handed to the workflow. A `blocker` is resolved by re-authoring the `spec`; no `phase` can repair it. A `spec` that is structurally complete, registered, and free of ambiguity can still declare a test that cannot reach its `expected_outcome` — a swept case parameter that no rule reads, or a judged metric that no diagnostics field carries — so a clean structural review is not a substitute for running the check.
 - `CI` must `pass` the format verification of `spec_kind` / `spec_id` / `component_id` / `operation_id`.
 - `CI` must `pass` the existence verification of each `spec`'s `tests.md` and the `L0`-test existence verification.
 - `CI` must `pass` the consistency verification between the `spec_ref` of `tests.md` and `controlled_spec.md`.
