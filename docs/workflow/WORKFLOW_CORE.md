@@ -91,7 +91,8 @@ This document defines the workflow's phase sequence, inter-phase input/output co
 - Apply the "Handling of the `LLM` (overall principles)" of `SPEC.md` to all phases that use the `LLM`.
 - An `LLM`-using phase produces each phase's `<stage>_meta.json` (`ir_meta.json` for `Compile`, `source_meta.json` for `Generate`, `validate_meta.json` for `Validate`) as a required output.
 - The common required keys of `<stage>_meta.json` are `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, and `context_isolated`.
-- When `context_isolated=false`, `constraint_reason` is required.
+- The value types are fixed: `attempt_count` is an integer, `verification_status` is a non-empty string, `last_fail_reason` is a **single plain string or `null`** (never an object or an array — fold multiple findings into one string), and `debug_mode` / `context_isolated` are booleans. For the leaf-authored `ir_meta.json` / `source_meta.json` this is gate-enforced: a type violation fails the phase. `validate_meta.json` is host-authored (`Validate` derived artifacts) and is not leaf-writable.
+- When `context_isolated=false`, `constraint_reason` is required (a non-empty string).
 - `ir_meta.json` requires only the common keys above.
 - `source_meta.json` requires the common keys above. Lint is no longer recorded in `source_meta.lint_command_ref` — it is the deterministic conductor-run `Generate.lint` substep, certified by `post_generate` against the host-authored `<pipeline_root>/lint_evidence/<source_id>.json`.
 - `validate_meta.json` requires the common keys above, and only when `verification_status=pass` requires the evidence of the LLM semantic check in `judge_command_ref`.

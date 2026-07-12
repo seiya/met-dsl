@@ -388,6 +388,14 @@ def classify_post_judge_violations(violations: list[str]) -> str:
 # spin forever; matches the operator-observed ceiling of ~3 reopens.
 MAX_ATTEMPTS_PER_PHASE = 3
 
+# The repair_reason that marks a verify re-run whose SOLE task is to re-author its own
+# stage meta (`_maybe_warm_resume_verify_meta`). build_launch_request keys on it to narrow
+# allowed_output_paths to the meta alone, so "re-author only the meta" is carried by the leaf's
+# TRUSTED deliverable list and the file-tool write guard (see the narrowing block there for what
+# does and does not enforce it) rather than by prose the leaf is told to distrust — the findings
+# text sits inside the slim prompt's untrusted-data fence.
+VERIFY_META_SCHEMA_REPAIR_REASON = "verify_meta_schema"
+
 # C2 backstop: after this many consecutive execute (no-verdict) failures on a node, a
 # Generate restart is deemed unable to fix the (IR-rooted) structural mismatch, so the
 # defect is reattributed to the IR and Compile is reopened instead of looping Generate.
@@ -1151,6 +1159,27 @@ def build_launch_request(
     if exemplar and step == "generate" and substep == "generate":
         req["exemplar"] = exemplar
     req.update(rep)
+    # A verify_meta_schema repair re-authors the phase's stage meta and NOTHING else, so its
+    # allowed_output_paths is narrowed to exactly that file. This is the structural statement of
+    # "re-author only the meta": the narrowed list is what the leaf's TRUSTED prompt shows as its
+    # deliverables, and it is what `allowed_file_tool_paths` (hence the output_manifest_write_guard
+    # hook, which rejects an Edit/Write/apply_patch to any unlisted path) holds the leaf to.
+    # What does NOT narrow with it: the bwrap `write_roots` and the terminal FS-diff are both keyed
+    # on (role, step), so the whole `source/` tree stays RW-bound and a source rewrite there would
+    # be write-root-contained (authorized). The file-tool guard is the enforcing layer, and its
+    # Bash-write detector is pattern-based, so this is one layer, not defence in depth — the same
+    # posture that already keeps compile.verify off the certified spec.ir.yaml.
+    # Load-bearing for generate.verify, whose normal allowed_output_paths also lists the producer
+    # sources (model/runner/checks .f90): those are certified by lint / syntax / static, which run
+    # BEFORE verify and are never re-run, so a source rewritten on a verify turn would reach Build
+    # uncertified. The constraint cannot live in the findings text instead — the slim renderer
+    # fences that as untrusted data the leaf is explicitly told not to obey.
+    if (substep == "verify" and rep.get("repair_reason") == VERIFY_META_SCHEMA_REPAIR_REASON
+            and step in ("compile", "generate")):
+        req["allowed_output_paths"] = [
+            f"{refs.ir_ref}/ir_meta.json" if step == "compile"
+            else f"{refs.source_dir()}/source_meta.json"
+        ]
     # Slim warm-resume repair turn: when the conductor has decided the producer session is
     # resumable (warm_resume) AND this is a reuse repair carrying findings, mark the request
     # so the runtime renders the findings-only slim prompt and empty the must-read (the
@@ -2205,6 +2234,77 @@ clean:
         except Exception:
             return None
 
+    def _stage_meta_contract_findings(self, refs: NodeRefs, phase: str) -> list[str]:
+        """Contract findings against the phase's verify meta (compile -> ir_meta.json,
+        generate -> source_meta.json): missing required keys + value-type violations, from the
+        one canonical definition (tools/meta_contracts) the runtime write gate and the
+        validator sweeps also use.
+
+        This is the WRITE-POINT detector for a defect class that is otherwise UNREPAIRABLE:
+        the runtime's `_validate_step_meta_payload` only runs for a PASS step_result, so a
+        FAILED verify leaf could persist a schema-violating meta (e.g. `last_fail_reason` as a
+        structured incident dict) unchecked — and since a Generate reopen rotates a fresh
+        source dir and deletes nothing, the violation is immutable and no repair loop
+        converges on it (E2E #4). Detecting it while the authoring leaf's session is still
+        resumable is what makes it fixable at all.
+
+        Stateless by construction: the meta is re-read and re-checked on demand, so no new
+        persisted artifact is introduced and the findings cannot go stale. A missing or
+        non-dict meta returns [] — that is an ordinary verify failure (or a leaf that wrote
+        nothing), handled by the normal severity/freshness gates, not this class.
+        """
+        from tools.meta_contracts import (
+            STAGE_META_FILENAME_BY_STEP,
+            missing_required_meta_keys,
+            stage_meta_type_violations,
+        )
+
+        if phase not in STAGE_META_FILENAME_BY_STEP:
+            return []
+        meta_filename = STAGE_META_FILENAME_BY_STEP[phase]
+        # Same meta-path synthesis as classify_failure / _read_repair_findings.
+        meta_dir = refs.ir_ref if phase == "compile" else refs.source_dir()
+        meta = _read_json(self.repo_root / meta_dir / meta_filename)
+        if not isinstance(meta, dict):
+            return []
+        findings = [
+            f"{meta_filename} missing required key {k!r}"
+            for k in missing_required_meta_keys(meta, step_token=phase)
+        ]
+        findings += [
+            f"{meta_filename} {clause}"
+            for clause in stage_meta_type_violations(meta, step_token=phase)
+        ]
+        return findings
+
+    def _stage_meta_path(self, refs: NodeRefs, phase: str) -> Path | None:
+        """Absolute path of the phase's verify meta, or None for a phase that has none."""
+        from tools.meta_contracts import STAGE_META_FILENAME_BY_STEP
+
+        if phase not in STAGE_META_FILENAME_BY_STEP:
+            return None
+        meta_dir = refs.ir_ref if phase == "compile" else refs.source_dir()
+        return self.repo_root / meta_dir / STAGE_META_FILENAME_BY_STEP[phase]
+
+    def _stage_meta_authored_since(self, refs: NodeRefs, phase: str, min_mtime: float) -> bool:
+        """True if the phase's verify meta was (re)written at/after `min_mtime` — i.e. by the
+        substep launched then. Same mtime test the freshness clause of determine_substep_status
+        uses, so "the leaf wrote it" means the same thing in both places."""
+        path = self._stage_meta_path(refs, phase)
+        if path is None:
+            return False
+        try:
+            return path.stat().st_mtime >= min_mtime
+        except OSError:
+            return False
+
+    def _verify_session_resumable(self, verify_arid: str) -> bool:
+        """True if the failed verify leaf's session can actually be warm-resumed. Mirrors the
+        preconditions `_resolve_reuse_resume` applies at launch (claude backend + a surviving
+        session transcript), consulted BEFORE the repair turn so the loop never spawns a cold
+        leaf that cannot see its findings."""
+        return self.backend == "claude" and self._claude_session_resumable(verify_arid)
+
     def determine_substep_status(self, refs: NodeRefs, phase: str, substep: str | None,
                                  allowed_output_paths: list[str],
                                  min_mtime: float = 0.0) -> tuple[str, list[str]]:
@@ -2248,9 +2348,13 @@ clean:
             # a no-op verify (exit 0, no rewrite) would pass on generate's stale status.
             # allowed_output_paths == [ir_meta.json], so _fresh_deliverables_written checks
             # exactly that file's mtime against this substep's launch time.
+            # ...and it must satisfy the stage-meta contract: a verify that certifies its own
+            # phase with a schema-violating meta would persist an unrepairable artifact (the
+            # write gate only checks PASS step_results, so nothing else catches it here).
             meta = _read_json(self.repo_root / refs.ir_ref / "ir_meta.json") or {}
             status = "pass" if (meta.get("verification_status") == "pass"
-                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
+                                and _fresh_deliverables_written(allowed_output_paths)
+                                and not self._stage_meta_contract_findings(refs, phase)) else "fail"
         elif phase == "generate" and substep == "verify":
             # Same freshness requirement as compile.verify: post-G1 generate.verify is a pure
             # semantic pass whose meta deliverable is source_meta.json, and it must RE-AUTHOR it
@@ -2260,10 +2364,14 @@ clean:
             # source_meta.json ONLY — generate.verify's allowed_output_paths also lists the
             # producer sources (model/runner.f90) it does NOT rewrite, so checking the whole set
             # would false-fail a verify that legitimately only re-authors source_meta.json.
+            # The stage-meta contract is enforced here too (see the compile.verify note above):
+            # a pass-status meta whose last_fail_reason is a dict / whose keys are missing
+            # cannot certify the phase.
             src_meta = f"{refs.source_dir()}/source_meta.json"
             meta = _read_json(self.repo_root / src_meta) or {}
             status = "pass" if (meta.get("verification_status") == "pass"
-                                and _fresh_deliverables_written([src_meta])) else "fail"
+                                and _fresh_deliverables_written([src_meta])
+                                and not self._stage_meta_contract_findings(refs, phase)) else "fail"
         elif phase == "validate" and substep == "pre_judge":
             # Deterministic pre-spawn DAG readiness: the conductor-authored pre_judge_meta
             # records whether every --with-deps closure node is built+validated in its own
@@ -3855,7 +3963,7 @@ clean:
             self._agent_run_json(refs, phase, substep, child_arid, status,
                                  output_refs, result_summary))
         return SubstepOutcome(child_arid, status, output_refs, proc.returncode,
-                              infra_error)
+                              infra_error, launched_at)
 
     def _persist_leaf_output(self, child_arid: str, proc: ProcResult,
                              prefix: str = "leaf") -> None:
@@ -4454,6 +4562,97 @@ clean:
                 break  # became unrecoverable/unknown -> fail_closed
         return outcomes
 
+    def _maybe_warm_resume_verify_meta(
+            self, refs: NodeRefs, phase: str, outcomes: list["SubstepOutcome"],
+            dep_facts: tuple[dict[str, str], ...]) -> list["SubstepOutcome"]:
+        """Recover a verify leaf that authored a CONTRACT-VIOLATING stage meta by warm-resuming
+        that same leaf to re-author it, instead of letting the violation persist.
+
+        The violating meta (canonically: a `last_fail_reason` written as a structured incident
+        dict rather than one plain string) is the unrepairable class from E2E #4 — a Generate
+        reopen rotates a FRESH source dir and deletes nothing, so the bad meta stays readable
+        forever and every later gate re-trips on it. The fix must therefore land while the
+        AUTHORING leaf is still resumable: re-run that same verify substep with the contract
+        findings as slim repair findings, and it rewrites its own meta with context intact.
+
+        Self-contained by design, exactly like `_maybe_warm_resume_post_judge` (see its
+        docstring): conduct/reopen_phase re-runs the whole phase from index 0, hands repair
+        only to index 0 (the producer), and rotates a fresh producer dir — all three are wrong
+        for a verify-authored meta defect. `verify` is the LAST substep of both compile and
+        generate, so a recovered pass needs no downstream re-run.
+
+        Bounded by MAX_ATTEMPTS_PER_PHASE. On budget exhaustion the outcome stays fail and
+        classify_failure's meta-schema guard terminalizes it as `{phase}_fail_meta_schema`
+        rather than routing a garbage meta through the severity table.
+
+        The repair carries ONLY the violation clauses as findings — no instructions. The slim
+        renderer wraps `repair_findings` in an UNTRUSTED-data fence that tells the leaf not to
+        obey anything inside it, so a constraint smuggled in there is both ignored and
+        self-contradictory. The constraint is imposed structurally instead: the repair narrows
+        `allowed_output_paths` to the meta alone (see build_launch_request), which the leaf sees
+        as its trusted deliverable list and the file-tool write guard holds it to.
+        """
+        # Guards touch no filesystem beyond the meta read, so a healthy phase returns fast.
+        if not outcomes or outcomes[-1].status == "pass":
+            return outcomes
+        if SUBSTEPS[phase][len(outcomes) - 1] != "verify":
+            return outcomes
+        failed = outcomes[-1]
+        # A leaf that died of an infra/transport error (usage limit, OOM) did not "author a bad
+        # meta" — it authored nothing. Repairing here would overwrite outcomes[-1] and erase the
+        # nonzero returncode that run_phase's transport branch fail_closes on, silently turning
+        # a dead leaf into a certified phase.
+        if failed.leaf_returncode != 0:
+            return outcomes
+        # Attribution: repair only a meta THIS verify leaf actually (re)wrote. A meta whose
+        # mtime predates this substep's launch was left by the PRODUCER, and the verify failed
+        # for some other reason — canonically the freshness clause ("an inspect-only verify that
+        # writes nothing cannot terminate pass"). Handing such a leaf a "just fix the meta" turn
+        # would let it satisfy the freshness gate without doing the verification it skipped.
+        # Not this loop's class: classify_failure escalates it as `{phase}_fail_meta_schema`.
+        if not self._stage_meta_authored_since(refs, phase, failed.launched_at):
+            return outcomes
+        findings = self._stage_meta_contract_findings(refs, phase)
+        if not findings:
+            return outcomes
+        for attempt in range(MAX_ATTEMPTS_PER_PHASE):
+            verify_arid = outcomes[-1].agent_run_id
+            # Warm resume is the whole mechanism: the leaf fixes its own meta with its context
+            # (and its semantic verdict) intact, from a findings-only slim turn. Without a
+            # resumable session the launch silently degrades to a COLD full prompt, which
+            # carries NO findings (the full template has no findings placeholder) — the leaf
+            # would re-verify blind and escalate anyway. Re-checked every iteration, not just on
+            # entry: each repair turn is a new session that may itself not be resumable.
+            if not self._verify_session_resumable(verify_arid):
+                self.emit("verify_meta_schema_no_warm_session", node_key=refs.node_key,
+                          phase=phase, attempt=attempt + 1,
+                          detail="; ".join(findings)[:200])
+                return outcomes
+            self.emit("verify_meta_schema_warm_resume", node_key=refs.node_key, phase=phase,
+                      attempt=attempt + 1, detail="; ".join(findings)[:200])
+            # Tombstone the superseded verify attempt so a later --resume can still reach pass
+            # (same contract as the post_judge warm-resume).
+            self._add_superseded_run_ids(
+                [verify_arid], reason=f"{phase}_verify_meta_schema_warm_resume_orphan")
+            repair = {
+                "issue_severity": "major",
+                "repair_strategy": "reuse",
+                "repair_target_agent_run_id": verify_arid,
+                "repair_reason": VERIFY_META_SCHEMA_REPAIR_REASON,
+                "repair_findings": "\n".join(findings),
+            }
+            oc = self.run_substep(refs, phase, "verify", repair=repair,
+                                  resolved_dependencies=dep_facts)
+            outcomes[-1] = oc
+            if oc.leaf_returncode != 0:
+                return outcomes  # transport error -> run_phase's fail_closed posture
+            findings = self._stage_meta_contract_findings(refs, phase)
+            if not findings:
+                # Schema repaired. A pass status now passes the phase; a legitimately recorded
+                # fail carries a READABLE last_fail_reason into the normal severity gate.
+                return outcomes
+        return outcomes
+
     def run_phase(self, refs: NodeRefs, phase: str,
                   repair: dict[str, str] | None = None) -> PhaseOutcome:
         """Run one phase as a single attempt and write one terminal step_result.
@@ -4580,6 +4779,12 @@ clean:
         # the deterministic post_judge gate, instead of terminalizing fail_closed.
         if phase == "validate":
             outcomes = self._maybe_warm_resume_post_judge(refs, outcomes, dep_facts)
+        # Warm-resume mini-loop: a verify leaf that authored a contract-violating stage meta
+        # (e.g. last_fail_reason as a dict) re-authors it in place. The violating meta is
+        # immutable once the phase moves on — a reopen rotates a fresh source dir and deletes
+        # nothing — so it must be repaired while its authoring leaf is still resumable.
+        if phase in ("compile", "generate"):
+            outcomes = self._maybe_warm_resume_verify_meta(refs, phase, outcomes, dep_facts)
         self._producer_arid[phase] = outcomes[0].agent_run_id
 
         if phase in SUBSTEP_AWARE_PHASES:
@@ -4957,6 +5162,15 @@ clean:
         # compile / generate: verify severity gate. A failed phase with no
         # recorded severity (e.g. the producing substep itself failed) is
         # unclassifiable -> escalate to the diagnostician rather than guessing.
+        #
+        # A meta that violates the stage-meta contract is read FIRST and never routed by
+        # severity: its fields are not trustworthy inputs to a decision table (the same posture
+        # as `{phase}_fail_unclassified`). Reaching here means the warm-resume mini-loop
+        # already spent its budget trying to get the leaf to re-author it, so this is the
+        # terminal edge of that class — and it also covers a malformed meta left by the
+        # PRODUCING substep, which the mini-loop (verify-scoped) does not touch.
+        if self._stage_meta_contract_findings(refs, phase):
+            return RouteDecision("escalate", reason=f"{phase}_fail_meta_schema")
         meta_path = (refs.ir_ref + "/ir_meta.json") if phase == "compile" else (refs.source_dir() + "/source_meta.json")
         meta = _read_json(self.repo_root / meta_path) or {}
         sev = meta.get("last_fail_severity") or meta.get("issue_severity")
@@ -5300,6 +5514,11 @@ class SubstepOutcome:
     # re-deriving it there from the already-truncated result_summary would silently lose the tag
     # whenever the marker sat past the truncation point.
     infra_error: tuple[str, str] | None = None
+    # Wall-clock instant this substep's leaf was launched (== the `min_mtime` its
+    # determine_substep_status freshness check used). Carried so a later attribution check can
+    # ask "did THIS leaf author that artifact?" — an mtime older than this belongs to an
+    # earlier substep, not to the one that just failed.
+    launched_at: float = 0.0
 
 
 @dataclass

@@ -83,6 +83,21 @@ def _evidence_artifacts_from_outputs(paths: list[str]) -> tuple[str, ...]:
     return tuple(arts) or ("state_snapshots",)
 
 
+def _conformant_stage_meta(status: str = "pass", **overrides: object) -> dict:
+    """A stage meta (ir_meta / source_meta) that satisfies the canonical contract
+    (tools/meta_contracts). Fixtures that mean to exercise some OTHER gate must start from a
+    contract-clean meta, or the stage-meta gate is what fails them."""
+    meta = {
+        "attempt_count": 1,
+        "verification_status": status,
+        "last_fail_reason": None,
+        "debug_mode": False,
+        "context_isolated": True,
+    }
+    meta.update(overrides)
+    return meta
+
+
 def _refs_from_request(req: dict) -> wc.NodeRefs:
     ir_id = req["ir_ref"].rsplit("/", 1)[1]
     pipeline_id = req["pipeline_ref"].rsplit("/", 1)[1]
@@ -6234,7 +6249,9 @@ class DeterministicStaticTest(unittest.TestCase):
             # Make the producer source OLD so it would fail a whole-set freshness check.
             os.utime(model, (1_000.0, 1_000.0))
             meta_path = src / "source_meta.json"
-            meta_path.write_text(json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            # Contract-conformant meta: this test isolates the FRESHNESS gate, and the
+            # stage-meta contract gate (a separate pass condition) must not be what fails it.
+            meta_path.write_text(json.dumps(_conformant_stage_meta()), encoding="utf-8")
             c = self._conductor(repo)
             allowed = [f"{refs.source_dir()}/src/{refs.spec_id}_model.f90",
                        f"{refs.source_dir()}/source_meta.json"]
@@ -6396,7 +6413,9 @@ class DeterministicCompileStaticTest(unittest.TestCase):
             self._seed(repo, refs)
             c = self._conductor(repo)
             meta_path = repo / refs.ir_ref / "ir_meta.json"
-            meta_path.write_text(json.dumps({"verification_status": "pass"}), encoding="utf-8")
+            # Contract-conformant meta: this test isolates the FRESHNESS gate, and the
+            # stage-meta contract gate (a separate pass condition) must not be what fails it.
+            meta_path.write_text(json.dumps(_conformant_stage_meta()), encoding="utf-8")
             paths = [refs.ir_ref + "/ir_meta.json"]
             mtime = meta_path.stat().st_mtime
             # Fresh: ir_meta was (re)authored at/after the substep launch -> pass.
@@ -7191,6 +7210,477 @@ class CodexFeatureCacheTest(unittest.TestCase):
                 c._ensure_codex_feature_cache()
             path = codex_feature_cache_path(repo_root=repo, orchestration_id="orch_cfc")
             self.assertFalse(path.is_file())
+
+
+_INCIDENT_DICT_REASON = {
+    "violated_convention": "inert_dependency_call",
+    "target_artifact": "src/model.f90",
+    "reason": "binding probe invented",
+}
+
+
+class VerifyMetaSchemaWarmResumeTests(unittest.TestCase):
+    """A verify leaf that authors a CONTRACT-VIOLATING stage meta (canonically:
+    last_fail_reason as a structured dict instead of one plain string) must be caught at the
+    write point and warm-resumed to re-author it. The runtime's write gate only checks PASS
+    step_results, and a Generate reopen rotates a fresh source dir without deleting anything,
+    so a violation that survives the phase is IMMUTABLE and unrepairable (E2E #4)."""
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_20260101_001", pipeline_id="x_20260101_001",
+            source_id="src_20260101_001", binary_id="bin_20260101_001",
+            run_id="run_20260101_001", source_binary_id="bin_20260101_001",
+        )
+
+    def _repair_requests(self, c: _FakeConductor) -> list[dict]:
+        """The launch requests that carried a repair (the mini-loop's re-run turns). A
+        non-repair launch still carries the literal `repair_reason: "none"` the templates use."""
+        return [
+            cap["--request-json"]
+            for sub, cap in c.calls
+            if sub == "record-launch"
+            and cap.get("--request-json", {}).get("repair_reason") not in (None, "none")
+        ]
+
+    def _meta_path(self, repo: Path, refs: wc.NodeRefs, phase: str) -> Path:
+        if phase == "compile":
+            return repo / refs.ir_ref / "ir_meta.json"
+        return repo / refs.source_dir() / "source_meta.json"
+
+    def _write_meta(self, repo: Path, refs: wc.NodeRefs, phase: str, meta: dict) -> Path:
+        path = self._meta_path(repo, refs, phase)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(meta), encoding="utf-8")
+        return path
+
+    def _conductor(self, repo: Path, refs: wc.NodeRefs, phase: str,
+                   metas_by_verify_attempt: list[dict]) -> _FakeConductor:
+        """A fake whose verify leaf authors `metas_by_verify_attempt[n-1]` on its n-th run (an
+        empty list models a leaf that writes NOTHING), and whose verify gate mirrors the real
+        one (status + freshness + stage-meta contract). Every other substep passes unless
+        `status_fn` says otherwise."""
+        meta_path = self._meta_path(repo, refs, phase)
+        state = {"verify_runs": 0}
+
+        class _C(_FakeConductor):
+            verify_leaf_returncode = 0
+
+            def _write_lineage(self, r):  # type: ignore[override]
+                return []
+
+            def _ensure_fresh_producer_id(self, r, p):  # type: ignore[override]
+                return None
+
+            # The real precondition (a claude session transcript on disk for the failed verify
+            # leaf) cannot hold for a fake arid; the loop's resumability guard is pinned
+            # separately by test_no_warm_session_skips_loop_and_escalates.
+            def _verify_session_resumable(self, verify_arid):  # type: ignore[override]
+                return True
+
+            def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+                if self._current_substep != "verify":
+                    return wc.ProcResult(0, "", "")
+                n = state["verify_runs"]
+                state["verify_runs"] += 1
+                if metas_by_verify_attempt:
+                    meta = metas_by_verify_attempt[
+                        min(n, len(metas_by_verify_attempt) - 1)]
+                    meta_path.parent.mkdir(parents=True, exist_ok=True)
+                    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+                return wc.ProcResult(self.verify_leaf_returncode, "", "")
+
+            def run_substep(self, r, p, substep, **kwargs):  # type: ignore[override]
+                self._current_substep = substep
+                return super().run_substep(r, p, substep, **kwargs)
+
+            def determine_substep_status(self, r, p, substep, allowed, min_mtime=0.0):  # type: ignore[override]
+                if self.status_fn is not None:
+                    self._sn = getattr(self, "_sn", 0) + 1
+                    return self.status_fn(p, substep, self._sn), ["out.json"]
+                if substep != "verify":
+                    return "pass", ["out.json"]
+                # Faithful mirror of the real verify gate: status + freshness + contract. The
+                # contract clause delegates to the REAL _stage_meta_contract_findings.
+                if not meta_path.exists():
+                    return "fail", ["out.json"]
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                ok = (meta.get("verification_status") == "pass"
+                      and meta_path.stat().st_mtime >= min_mtime
+                      and not self._stage_meta_contract_findings(r, p))
+                return ("pass" if ok else "fail"), ["out.json"]
+
+        c = _C(repo_root=repo, orchestration_id="orch_x",
+               orchestration_agent_run_id="ORCH", backend="claude", env={})
+        c.calls = []
+        c._current_substep = None
+        c.verify_runs = state
+        return c
+
+    # -- 3b: the choke point (real gate) ------------------------------------------------
+
+    def test_verify_with_type_invalid_meta_fails_even_when_status_pass(self) -> None:
+        # A verify cannot certify its phase with a schema-violating meta, even when it declares
+        # verification_status=pass — the violation would be persisted and become unrepairable.
+        for phase, meta_name, ref_attr in (("generate", "source_meta.json", "source_dir"),
+                                           ("compile", "ir_meta.json", "ir_ref")):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as td:
+                repo, refs = Path(td), self._refs()
+                path = self._write_meta(
+                    repo, refs, phase,
+                    _conformant_stage_meta("pass", last_fail_reason=_INCIDENT_DICT_REASON))
+                c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                                 orchestration_agent_run_id="ORCH", backend="claude", env={})
+                ref_dir = getattr(refs, ref_attr)
+                allowed = [f"{ref_dir() if callable(ref_dir) else ref_dir}/{meta_name}"]
+                mtime = path.stat().st_mtime
+                self.assertEqual(
+                    c.determine_substep_status(refs, phase, "verify", allowed,
+                                               min_mtime=mtime - 100)[0], "fail")
+                # Same meta with a plain-string reason and a pass status -> pass (the gate
+                # rejects the TYPE violation, not the presence of a reason).
+                path.write_text(json.dumps(_conformant_stage_meta("pass")), encoding="utf-8")
+                self.assertEqual(
+                    c.determine_substep_status(refs, phase, "verify", allowed,
+                                               min_mtime=path.stat().st_mtime - 100)[0], "pass")
+
+    def test_pass_status_meta_missing_key_fails_verify_instead_of_crashing(self) -> None:
+        # A pass-status meta with a MISSING required key used to reach write_step_result and
+        # raise ValueError there (crashing the conductor). It now fails the verify gate, which
+        # routes it into the warm-retry loop instead.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            meta = _conformant_stage_meta("pass")
+            meta.pop("debug_mode")
+            path = self._write_meta(repo, refs, "generate", meta)
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="ORCH", backend="claude", env={})
+            allowed = [f"{refs.source_dir()}/source_meta.json"]
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "verify", allowed,
+                                           min_mtime=path.stat().st_mtime - 100)[0], "fail")
+            self.assertEqual(
+                c._stage_meta_contract_findings(refs, "generate"),
+                ["source_meta.json missing required key 'debug_mode'"])
+
+    def test_contract_findings_empty_when_meta_absent(self) -> None:
+        # An absent meta is an ordinary verify failure (the leaf wrote nothing), NOT this
+        # class — the mini-loop must not fire and consume budget on it.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="ORCH", backend="claude", env={})
+            self.assertEqual(c._stage_meta_contract_findings(refs, "generate"), [])
+            self.assertEqual(c._stage_meta_contract_findings(refs, "build"), [])
+
+    # -- 3c: the warm-resume mini-loop -------------------------------------------------
+
+    def test_verify_meta_schema_warm_resumes_to_pass(self) -> None:
+        # The violating meta is re-authored by the SAME (warm-resumed) verify leaf, and the
+        # phase certifies pass. Assert the repair payload is the slim reuse shape and that the
+        # findings name the actual violation.
+        for phase in ("generate", "compile"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as td:
+                repo, refs = Path(td), self._refs()
+                bad = _conformant_stage_meta("fail", last_fail_reason=_INCIDENT_DICT_REASON)
+                good = _conformant_stage_meta("pass")
+                self._write_meta(repo, refs, phase, bad)
+                c = self._conductor(repo, refs, phase, [bad, good])
+                oc = c.run_phase(refs, phase)
+
+                self.assertEqual(oc.status, "pass")
+                self.assertEqual(oc.decision.action, "advance")
+                self.assertEqual(c.verify_runs["verify_runs"], 2)  # original + one repair
+                # The superseded verify attempt was tombstoned so a later --resume can pass.
+                sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+                self.assertEqual(len(sup), 1)
+                self.assertIn(f"{phase}_verify_meta_schema_warm_resume_orphan",
+                              sup[0]["--reason"])
+                # The repair is a reuse turn aimed at the VERIFY leaf itself (not the producer),
+                # so a resumable session inherits its context.
+                repairs = self._repair_requests(c)
+                self.assertEqual(len(repairs), 1)
+                self.assertEqual(repairs[0]["repair_reason"], "verify_meta_schema")
+                self.assertEqual(repairs[0]["repair_strategy"], "reuse")
+                self.assertEqual(repairs[0]["issue_severity"], "major")
+                # The repair targets the verify leaf's own arid (the last substep of the phase).
+                self.assertEqual(repairs[0]["repair_target_agent_run_id"],
+                                 f"child-{len(wc.SUBSTEPS[phase])}")
+                self.assertEqual(repairs[0]["substep"], "verify")
+
+    def test_verify_meta_schema_findings_name_the_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            bad = _conformant_stage_meta("fail", last_fail_reason=_INCIDENT_DICT_REASON)
+            self._write_meta(repo, refs, "generate", bad)
+            c = self._conductor(repo, refs, "generate", [bad, _conformant_stage_meta("pass")])
+            c.run_phase(refs, "generate")
+
+            repairs = self._repair_requests(c)
+            self.assertEqual(len(repairs), 1)
+            # The findings are PURE gate output — the slim renderer fences them as untrusted
+            # data the leaf is told not to obey, so an instruction smuggled in here would be
+            # both ignored and self-contradictory.
+            self.assertEqual(
+                repairs[0]["repair_findings"],
+                "source_meta.json last_fail_reason must be string or null")
+            # "Re-author only the meta" is imposed STRUCTURALLY instead: the repair turn's
+            # writable set is the meta alone, so the producer sources (which generate.verify's
+            # normal allowed_output_paths also lists) are not writable on this turn.
+            self.assertEqual(repairs[0]["allowed_output_paths"],
+                             [f"{refs.source_dir()}/source_meta.json"])
+
+    def test_verify_meta_schema_repair_then_normal_severity_routing(self) -> None:
+        # The repaired meta records a GENUINE fail (with a readable string reason). The
+        # mini-loop exits after one turn and the ordinary verify-severity gate routes it —
+        # repairing the schema must not swallow the real finding.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            bad = _conformant_stage_meta("fail", last_fail_reason=_INCIDENT_DICT_REASON)
+            repaired = _conformant_stage_meta(
+                "fail", last_fail_reason="model.f90: z_b associate directive missing",
+                last_fail_severity="minor")
+            self._write_meta(repo, refs, "generate", bad)
+            c = self._conductor(repo, refs, "generate", [bad, repaired])
+            oc = c.run_phase(refs, "generate")
+
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(c.verify_runs["verify_runs"], 2)  # exactly one repair turn
+            self.assertNotEqual(oc.decision.reason, "generate_fail_meta_schema")
+            self.assertEqual(oc.decision.action, "retry")  # verify_minor -> same-phase repair
+
+    def test_verify_meta_schema_budget_exhaustion_escalates(self) -> None:
+        # A leaf that keeps writing the violating meta exhausts MAX_ATTEMPTS_PER_PHASE and
+        # terminalizes as `{phase}_fail_meta_schema` — bounded, never an infinite loop, and
+        # never routed by the (untrustworthy) severity field.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            bad = _conformant_stage_meta(
+                "fail", last_fail_reason=_INCIDENT_DICT_REASON, last_fail_severity="minor")
+            self._write_meta(repo, refs, "generate", bad)
+            c = self._conductor(repo, refs, "generate", [bad])
+            oc = c.run_phase(refs, "generate")
+
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.decision.action, "escalate")
+            self.assertEqual(oc.decision.reason, "generate_fail_meta_schema")
+            # original + MAX_ATTEMPTS_PER_PHASE repair turns, then stop.
+            self.assertEqual(c.verify_runs["verify_runs"], 1 + wc.MAX_ATTEMPTS_PER_PHASE)
+
+    def test_mini_loop_does_not_fire_on_a_conformant_failing_verify(self) -> None:
+        # An ordinary semantic verify fail (conformant meta) must not spawn any repair turn
+        # here — that is the severity gate's job.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            meta = _conformant_stage_meta("fail", last_fail_reason="physics mismatch",
+                                          last_fail_severity="minor")
+            self._write_meta(repo, refs, "generate", meta)
+            c = self._conductor(repo, refs, "generate", [meta])
+            oc = c.run_phase(refs, "generate")
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(c.verify_runs["verify_runs"], 1)  # no repair turn
+            self.assertEqual([cap for s, cap in c.calls if s == "add-superseded-runs"], [])
+
+    # -- 3d / 3e: routing guard + findings recomputation --------------------------------
+
+    def test_classify_failure_ignores_severity_on_schema_violating_meta(self) -> None:
+        # severity=minor on a schema-violating meta must NOT route through the severity table:
+        # the meta's fields are not trustworthy inputs to a decision.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            self._write_meta(repo, refs, "generate", _conformant_stage_meta(
+                "fail", last_fail_reason=_INCIDENT_DICT_REASON, last_fail_severity="minor"))
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="ORCH", backend="claude", env={})
+            outcomes = [wc.SubstepOutcome(f"c{i}", "pass", [], 0) for i in range(4)]
+            outcomes.append(wc.SubstepOutcome("v", "fail", [], 0))
+            d = c.classify_failure(refs, "generate", outcomes)
+            self.assertEqual((d.action, d.reason), ("escalate", "generate_fail_meta_schema"))
+
+    def test_read_repair_findings_never_returns_a_dict_reason(self) -> None:
+        # The generic `verify_` route reads the meta's own last_fail_reason — which in this
+        # defect class is the field that may be a dict. It must degrade to None (full prompt),
+        # never hand a dict downstream.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            self._write_meta(repo, refs, "generate", _conformant_stage_meta(
+                "fail", last_fail_reason=_INCIDENT_DICT_REASON))
+            c = wc.Conductor(repo_root=repo, orchestration_id="o",
+                             orchestration_agent_run_id="ORCH", backend="claude", env={})
+            self.assertIsNone(c._read_repair_findings(refs, "verify_minor", "generate"))
+
+    # -- loop preconditions: only repair a meta THIS verify leaf authored -----------------
+
+    def test_transport_failed_verify_is_not_repaired(self) -> None:
+        # A leaf that died of an infra/transport error (usage limit, OOM) authored nothing. If
+        # the loop repaired it, `outcomes[-1] = oc` would erase the nonzero returncode that
+        # run_phase's transport branch fail_closes on — silently certifying a phase whose verify
+        # leaf never ran to completion.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            bad = _conformant_stage_meta("fail", last_fail_reason=_INCIDENT_DICT_REASON)
+            self._write_meta(repo, refs, "generate", bad)
+            c = self._conductor(repo, refs, "generate", [bad, _conformant_stage_meta("pass")])
+            # The verify leaf exits nonzero (transport), leaving the producer's dirty meta.
+            c.verify_leaf_returncode = 1
+            oc = c.run_phase(refs, "generate")
+
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.decision.action, "fail_closed")
+            self.assertIn("leaf_transport_error", oc.decision.reason)
+            self.assertEqual(c.verify_runs["verify_runs"], 1)  # the dead leaf only
+            self.assertEqual(self._repair_requests(c), [])  # no repair turn
+            # run_phase's own transport branch tombstones; the mini-loop's must not fire.
+            self.assertEqual(
+                [cap for s, cap in c.calls if s == "add-superseded-runs"
+                 and "meta_schema" in cap["--reason"]], [])
+
+    def test_producer_authored_dirty_meta_is_not_attributed_to_a_no_op_verify(self) -> None:
+        # The freshness clause exists to reject an inspect-only verify that writes NOTHING. If
+        # the loop fired on a meta the PRODUCER left dirty, it would hand that no-op verify a
+        # "just fix the meta" turn whose rewrite also satisfies the freshness gate — letting it
+        # certify `pass` without doing the verification it skipped. So the loop must only claim
+        # a meta whose mtime proves THIS verify leaf wrote it.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            bad = _conformant_stage_meta("pass", last_fail_reason=_INCIDENT_DICT_REASON)
+            meta_path = self._write_meta(repo, refs, "generate", bad)
+            os.utime(meta_path, (1_000.0, 1_000.0))  # authored long before the verify launch
+            c = self._conductor(repo, refs, "generate", [])  # verify leaf writes nothing
+            oc = c.run_phase(refs, "generate")
+
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(c.verify_runs["verify_runs"], 1)  # original verify, no repair turn
+            self.assertEqual(self._repair_requests(c), [])
+            # Routed as the meta-schema class (escalate), NOT silently passed.
+            self.assertEqual((oc.decision.action, oc.decision.reason),
+                             ("escalate", "generate_fail_meta_schema"))
+
+    def test_no_warm_session_skips_loop_and_escalates(self) -> None:
+        # Without a resumable session the launch degrades to a COLD full prompt, which carries
+        # no findings at all — the leaf would re-verify blind, 3x, then escalate anyway. Skip
+        # straight to the escalate instead of burning the budget.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            bad = _conformant_stage_meta("fail", last_fail_reason=_INCIDENT_DICT_REASON)
+            self._write_meta(repo, refs, "generate", bad)
+            c = self._conductor(repo, refs, "generate", [bad, _conformant_stage_meta("pass")])
+            c._verify_session_resumable = lambda arid: False  # type: ignore[assignment]
+            oc = c.run_phase(refs, "generate")
+
+            self.assertEqual(c.verify_runs["verify_runs"], 1)  # the original verify only
+            self.assertEqual(self._repair_requests(c), [])
+            self.assertEqual((oc.decision.action, oc.decision.reason),
+                             ("escalate", "generate_fail_meta_schema"))
+
+    def test_session_lost_mid_loop_stops_instead_of_degrading_to_cold(self) -> None:
+        # Resumability is re-checked EVERY iteration: each repair turn is a new session that may
+        # itself not be resumable. Without the re-check, iteration 2 would silently launch a COLD
+        # full prompt — which carries no findings at all — and re-verify blind.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            bad = _conformant_stage_meta("fail", last_fail_reason=_INCIDENT_DICT_REASON)
+            self._write_meta(repo, refs, "generate", bad)
+            c = self._conductor(repo, refs, "generate", [bad])  # leaf keeps writing the dict
+            # Only the ORIGINAL verify leaf's session survives; the repair turn's does not.
+            original_verify_arid = f"child-{len(wc.SUBSTEPS['generate'])}"
+            c._verify_session_resumable = (  # type: ignore[assignment]
+                lambda arid: arid == original_verify_arid)
+            oc = c.run_phase(refs, "generate")
+
+            self.assertEqual(len(self._repair_requests(c)), 1)  # one turn, then stop
+            self.assertEqual(c.verify_runs["verify_runs"], 2)
+            self.assertEqual((oc.decision.action, oc.decision.reason),
+                             ("escalate", "generate_fail_meta_schema"))
+
+    def test_producer_substep_failure_does_not_trigger_the_verify_loop(self) -> None:
+        # The loop is scoped to a failed VERIFY substep. Without that scoping a producer failure
+        # (index 0) with a dirty meta on disk would spawn 3 spurious verify turns AND overwrite
+        # outcomes[-1] — dropping the actually-failing producer from step_result.
+        # substep_agent_run_ids and pointing _producer_arid at a verify leaf.
+        with tempfile.TemporaryDirectory() as td:
+            repo, refs = Path(td), self._refs()
+            self._write_meta(repo, refs, "generate", _conformant_stage_meta(
+                "fail", last_fail_reason=_INCIDENT_DICT_REASON))
+            c = self._conductor(repo, refs, "generate", [])
+            c.status_fn = lambda phase, substep, n: (
+                "fail" if substep == "generate" else "pass")
+            oc = c.run_phase(refs, "generate")
+
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(c.verify_runs["verify_runs"], 0)  # verify never launched
+            self.assertEqual(self._repair_requests(c), [])
+            self.assertEqual([cap for s, cap in c.calls if s == "add-superseded-runs"], [])
+            # The failed producer is still the recorded outcome.
+            self.assertEqual(oc.substep_arids, ["child-1"])
+            self.assertEqual(c._producer_arid["generate"], "child-1")
+
+    def test_build_launch_request_slim_for_verify_meta_repair(self) -> None:
+        # The verify repair renders the findings-only SLIM prompt (warm resume), and that
+        # prompt satisfies the launch-integrity marker set for a slim request.
+        from tools.orchestration_runtime import (
+            _render_slim_repair_launch_prompt,
+            _required_launch_prompt_markers,
+        )
+        refs = self._refs()
+        repair = {
+            "issue_severity": "major", "repair_strategy": "reuse",
+            "repair_target_agent_run_id": "child-1", "repair_reason": "verify_meta_schema",
+            "repair_findings": "source_meta.json last_fail_reason must be string or null",
+        }
+        req = wc.build_launch_request(
+            refs, step="generate", substep="verify", orchestration_id="orch_x",
+            orchestration_agent_run_id="parent", child_agent_run_id="child-2",
+            agent_model="m", workflow_mode="dev", repair=repair, warm_resume=True)
+        self.assertTrue(req.get("warm_resume"))
+        self.assertEqual(req["skill_must_read_refs"], "")
+        # Narrowed to the meta: the producer sources a normal generate.verify may write are NOT
+        # writable on a meta-schema repair turn.
+        self.assertEqual(req["allowed_output_paths"],
+                         [f"{refs.source_dir()}/source_meta.json"])
+
+        prompt = _render_slim_repair_launch_prompt(req)
+        for marker in _required_launch_prompt_markers(req):
+            self.assertIn(marker, prompt)
+        # The resumed leaf is the VERIFY leaf; the prompt must not tell it it is the producer.
+        self.assertIn("generate.verify", prompt)
+        self.assertIn(repair["repair_findings"], prompt)
+        # The prompt's TRUSTED deliverable list names only the meta, so "re-write your
+        # deliverables" cannot be read as license to touch the sources.
+        self.assertNotIn("_model.f90", prompt)
+
+    def test_verify_session_resumable_predicate(self) -> None:
+        # The mini-loop tests stub this predicate (a fake arid can have no real session
+        # transcript), so its BODY needs its own coverage: warm resume requires the claude
+        # backend AND a surviving session for the failed verify leaf.
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+
+            def _conductor(backend: str) -> wc.Conductor:
+                return wc.Conductor(repo_root=repo, orchestration_id="o",
+                                    orchestration_agent_run_id="ORCH", backend=backend, env={})
+
+            claude = _conductor("claude")
+            claude._claude_session_resumable = lambda arid: arid == "live-arid"  # type: ignore[assignment]
+            self.assertTrue(claude._verify_session_resumable("live-arid"))
+            self.assertFalse(claude._verify_session_resumable("gc-ed-arid"))
+
+            # codex has no session-resume primitive at all -> never warm.
+            codex = _conductor("codex")
+            codex._claude_session_resumable = lambda arid: True  # type: ignore[assignment]
+            self.assertFalse(codex._verify_session_resumable("live-arid"))
+
+    def test_build_launch_request_does_not_narrow_a_normal_verify_launch(self) -> None:
+        # The narrowing is keyed on the meta-schema repair reason ONLY; an ordinary
+        # generate.verify launch keeps its full contract paths.
+        refs = self._refs()
+        req = wc.build_launch_request(
+            refs, step="generate", substep="verify", orchestration_id="orch_x",
+            orchestration_agent_run_id="parent", child_agent_run_id="child-2",
+            agent_model="m", workflow_mode="dev")
+        self.assertIn(f"{refs.source_dir()}/source_meta.json", req["allowed_output_paths"])
+        self.assertTrue([p for p in req["allowed_output_paths"] if p.endswith("_model.f90")])
 
 
 if __name__ == "__main__":  # pragma: no cover

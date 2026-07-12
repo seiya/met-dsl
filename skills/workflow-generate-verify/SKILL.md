@@ -66,12 +66,12 @@ Fix the verification responsibility of the Generate stage output, and reduce `Bu
 
 ## Operations Rules
 1. Based on the check result, update the `verification_status` of `source_meta.json` by writing it directly with the `Edit` / `Write` tool (managed JSON is direct-write eligible; no `guarded-apply-patch` and no `apply_patch_writes` gate evidence is required — under `bwrap` confinement the write is authorized by `write_roots` containment). Even when the inspection finds nothing to change, re-author `source_meta.json` (e.g. refresh an idempotent field such as `verify_attempts`) so the substep produces its declared output. An inspect-only verify that writes nothing cannot terminate `pass`.
-2. On `fail`, record the convention-violation content and the fix target in `last_fail_reason`. When originating from a `Validate` retry, record `code` in the `attribution_hint` of `source_meta.json` as required (routing consistency).
+2. On `fail`, record the convention-violation content and the fix target in `last_fail_reason`. `last_fail_reason` is a **single plain JSON string** (or `null`); an object or an array is a contract violation. Fold multiple findings into one string. When originating from a `Validate` retry, record `code` in the `attribution_hint` of `source_meta.json` as required (routing consistency).
 3. On `verification_status=fail`, request regenerate, and issue a new `source_id` with the same `ir_id`. The form of `source_id` is `src_<YYYYMMDD>_<seq3>` (e.g. `src_20260511_001`). canonical: `docs/workflow/phases/phase_02_generate.md`. The `<slug>_<YYYYMMDD>_<seq3>` form of `ir_id` must not be reused.
 4. Start `Build` only on `verification_status=pass`.
 5. When `workspace/` does not exist before workflow execution starts, create `workspace/` directly under the repository root.
 6. Do **not** run `validate_workspace_root.py` or `validate_pipeline_semantics --stage post_generate` yourself: both run in the conductor's deterministic `Generate.static` substep **before** verify. A `Generate.static` failure warm-resumes `Generate.generate` and verify never starts, so verify is reached only on a source that already passed them.
-7. When it `fail` in `dev` mode, record in `last_fail_reason` the basis needed to create `failure_analysis.json` (the violated convention, the target artifact, the failure reason).
+7. When it `fail` in `dev` mode, record in `last_fail_reason` the basis needed to create `failure_analysis.json` (the violated convention, the target artifact, the failure reason), as a single string — not a JSON object or dict.
 
 ## Decision Criteria
 - Make it `verification_status=pass` only when all check items are `pass`.

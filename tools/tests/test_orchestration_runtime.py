@@ -26131,7 +26131,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 17800->18300: R5 (M2) — the past-artifact-reference prohibition gains the
         # conductor-injected `Certified exemplar` exception (host-selected prior art, not a
         # spontaneous filesystem read).
-        "docs/AGENT_CONTRACT.md": 18300,
+        # Bumped 18300->18800: the <stage>_meta.json VALUE TYPES are now stated for the leaf
+        # (last_fail_reason a single plain string or null, never an object). The types existed
+        # only in gate code, so a verify leaf authoring a structured incident dict was writing
+        # an unrepairable artifact it had never been told was invalid. E2E #4
+        # (orch_20260712T014005Z_e02a2d4d, validate.execute post_execute_violation).
+        "docs/AGENT_CONTRACT.md": 18800,
         # Consolidated runner-output contract (was duplicated across phase_02/04 +
         # PERF §2/§6); M3d: a validate.judge-only leaf must-read (generate dropped it).
         # Bumped 7600->8100: §3 disambiguated the guard-case snapshot rule (declared
@@ -26295,7 +26300,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # structural shape is certified by Compile.static, and re-checking that here would both
         # contradict the "does NOT re-run --stage compile" rule above and risk false-rejecting a
         # gate-clean IR.
-        "skills/workflow-compile-verify/SKILL.md": 13900,
+        # Bumped 13900->14100: `last_fail_reason` is a single plain string, never a JSON
+        # object/dict — the compile-verify mirror of the generate-verify note (same E2E #4
+        # root cause). The prior ceiling left 21 bytes of headroom after the edit, which is
+        # not a budget, so it is raised to the new footprint.
+        "skills/workflow-compile-verify/SKILL.md": 14100,
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
         # generate.generate no longer force-reads) to avoid a lint/build round-trip.
@@ -26359,7 +26368,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # profile_selected_flag on dependency runtime behavior
         # (orch_20260712T014005Z_e02a2d4d, generate.verify major). The inputs-only predicate
         # was rejected in review: a terminal dependency result appears in steps[].outputs only.
-        "skills/workflow-generate-generate/SKILL.md": 34900,
+        # Bumped 34900->35200: this SKILL listed only 4 of the 5 required source_meta keys
+        # (`context_isolated` was missing, unlike its compile twin) and stated no value types.
+        # The stage-meta contract gate now terminalizes a missing key / a dict last_fail_reason
+        # as `generate_fail_meta_schema`, so the producer must be told the same contract its
+        # verify twin is told. E2E #4 (orch_20260712T014005Z_e02a2d4d).
+        "skills/workflow-generate-generate/SKILL.md": 35200,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare
@@ -26389,7 +26403,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # is the sanctioned form of the dependency mandate and must not be flagged (oscillation
         # guard, same shape as the associate-binding carve-out). E2E #4
         # (orch_20260712T014005Z_e02a2d4d, generate.verify major).
-        "skills/workflow-generate-verify/SKILL.md": 27300,
+        # Bumped 27300->27600: `last_fail_reason` is a single plain string, never a JSON
+        # object/dict — stated at both the write rule and the dev-mode failure-basis rule (the
+        # latter asks for a violated-convention / target-artifact / reason triple, which is what
+        # induced a structured dict). Same E2E #4 orchestration, post_execute_violation.
+        "skills/workflow-generate-verify/SKILL.md": 27600,
         # Bumped 10000->10400: documented the verdict.json#per_test entry schema
         # (field name `status`/`outcome` + the pass/fail/xfail/skipped enum, with `blocked`
         # called out as conductor-derived not judge-written) so the judge leaf no longer

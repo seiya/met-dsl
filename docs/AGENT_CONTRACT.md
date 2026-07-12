@@ -56,6 +56,7 @@ These are the workflow common norms a leaf must obey while authoring/verifying a
 Every LLM substep produces its phase's `<stage>_meta.json` (`ir_meta.json` for Compile, `source_meta.json` for Generate, `validate_meta.json` for Validate) as a required output.
 
 - Common required keys: `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, `context_isolated`. When `context_isolated=false`, `constraint_reason` is required.
+- Value types: `attempt_count` integer; `verification_status` non-empty string; `last_fail_reason` a **single plain string or `null`**, never an object or an array (fold multiple findings into one string); `debug_mode` and `context_isolated` boolean; `constraint_reason` (when required) a non-empty string. For the leaf-authored `ir_meta.json` / `source_meta.json` this is gate-enforced: a type violation fails the substep. (`validate_meta.json` is host-authored, not leaf-writable.)
 - `source_meta.json`: does not record lint or the syntax gate — `static lint` is the conductor-run `Generate.lint` substep and the compiler syntax gate is the conductor-run `Generate.syntax` substep, certified by `post_generate` against the host-authored `lint_evidence/<source_id>.json` / `syntax_evidence/<source_id>.json`.
 - `validate_meta.json`: additionally requires the LLM semantic-check evidence in `judge_command_ref` **only when** `verification_status=pass`.
 - With `debug_mode=false`, do not save failed-attempt artifacts. `verification_status` presumes `fail_closed`: unperformed/unjudgeable verification must never be recorded `pass`.

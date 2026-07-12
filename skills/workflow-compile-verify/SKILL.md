@@ -47,7 +47,7 @@ Detect structural-invariant violations of the Compile stage output, and judge th
 0. Immediately after starting work, Read the `allowed_file_tool_paths` and `allowed_output_paths` of `output_manifests/<agent_run_id>.json`, and confirm that the output destination of `ir_meta.json` matches `workspace/ir/<node_key_safe>/<ir_id>/ir_meta.json`. On a mismatch, immediately stop with fail.
 0.5. This substep does NOT write `spec.ir.yaml` — all 5 sections including `io_contract` are authored by `Compile.generate`, and the deterministic `Compile.static` gate already validated the IR structure before this leaf launched. `Read` `spec.ir.yaml` to check it, but the only artifact this leaf writes is `ir_meta.json`.
 1. Reflect the check result into `ir_meta.json`, and update `verification_status` to `pass` or `fail`, writing it directly with the `Edit` / `Write` tool (managed JSON is direct-write eligible; no `guarded-apply-patch` and no `apply_patch_writes` gate evidence is required — under `bwrap` confinement the write is authorized by `write_roots` containment). Even when the inspection finds nothing to change, re-author `ir_meta.json` (e.g. refresh an idempotent field such as `verify_attempts`) so the substep produces its declared output. An inspect-only verify that writes nothing cannot terminate `pass`.
-2. On `fail`, concretize `last_fail_reason`, and record the violated invariant ID (V1–V7), the section to fix, and the convention name.
+2. On `fail`, concretize `last_fail_reason`, and record the violated invariant ID (V1–V7), the section to fix, and the convention name. `last_fail_reason` is a **single plain JSON string** (or `null`); an object or an array is a contract violation. Fold multiple findings into one string.
 3. Proceed to `Generate` only the `ir_id` with `verification_status=pass`.
 4. Check the required keys (`attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, `context_isolated`) of `ir_meta.json`, and on omission it is a `fail`.
 5. When `context_isolated=false`, a non-empty string for `constraint_reason` is a required check.
@@ -55,7 +55,7 @@ Detect structural-invariant violations of the Compile stage output, and judge th
 7. When the storage root for workflow artifacts is not `workspace/`, do not start a downstream phase and it is a `Compile fail`.
 8. When `workspace/` does not exist before workflow execution starts, create `workspace/` directly under the repository root.
 9. This leaf runs NO validator gate (`validate_workspace_root` / `check_artifact_syntax` / `--stage compile` ran in the conductor's `Compile.static` substep before launch). It only assigns `ir_meta.json.verification_status` from the semantic checks above.
-10. When it `fail` in `dev` mode, record in `last_fail_reason` the basis needed to create `failure_analysis.json` (the violated convention, the target artifact, the failure reason).
+10. When it `fail` in `dev` mode, record in `last_fail_reason` the basis needed to create `failure_analysis.json` (the violated convention, the target artifact, the failure reason), as a single string — not a JSON object or dict.
 
 ## Decision Criteria
 - Assign `verification_status=pass` only when there is no violation of the structural invariants V1–V7.

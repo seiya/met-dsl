@@ -8966,6 +8966,246 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             _validate_source_meta_json_files(pipeline_dir, violations)
             self.assertEqual(violations, [])
 
+    # -- source_meta sweep lineage scoping (E2E #4) ---------------------------------
+
+    _INCIDENT_DICT_REASON = {
+        "violated_convention": "inert_dependency_call",
+        "target_artifact": "src/model.f90",
+        "reason": "binding probe invented",
+    }
+
+    def _plant_sibling_source_meta(self, pipeline_dir: Path, source_id: str, meta: dict) -> None:
+        gen_dir = pipeline_dir / "source" / source_id
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(gen_dir / "source_meta.json", meta)
+
+    def _minimal_tree_pipeline_dir(self, repo_root: Path) -> Path:
+        _seed_shape_expr_schema_into(repo_root)
+        _create_minimal_execution_tree(
+            repo_root,
+            dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+            model_text="module m\nimplicit none\nend module m\n",
+            runner_text="program r\nimplicit none\nend program r\n",
+            run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+        )
+        return (
+            repo_root
+            / "workspace"
+            / "pipelines"
+            / "problem__shallow_water2d__0.3.0"
+            / "shallow-water2d_20260415_001"
+        )
+
+    def test_superseded_source_dir_dict_last_fail_reason_does_not_fail_post_execute(self) -> None:
+        """E2E #4 reproduction: a SUPERSEDED source dir (left by an earlier failed Generate
+        attempt) whose source_meta.last_fail_reason is a structured dict must not fail the
+        run that declares a different, conformant source. The superseded dir is immutable
+        under the append-only contract and a Generate reopen only rotates a fresh dir, so
+        flagging it would make the failure permanently unrepairable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            pipeline_dir = self._minimal_tree_pipeline_dir(repo_root)
+            # The tree's trial_meta declares src_20260415_001; this is a stale sibling.
+            self._plant_sibling_source_meta(
+                pipeline_dir,
+                "src_20260415_000",
+                {
+                    "attempt_count": 2,
+                    "verification_status": "fail",
+                    "last_fail_reason": self._INCIDENT_DICT_REASON,
+                    "debug_mode": False,
+                    "context_isolated": True,
+                },
+            )
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertFalse(
+                [v for v in violations if "last_fail_reason" in v], violations
+            )
+
+    def test_declared_source_dir_dict_last_fail_reason_still_fails(self) -> None:
+        """The gate is scoped, not weakened: the same violation in the source the run
+        DECLARES is still reported."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            pipeline_dir = self._minimal_tree_pipeline_dir(repo_root)
+            meta_path = (
+                pipeline_dir / "source" / "src_20260415_001" / "source_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["last_fail_reason"] = self._INCIDENT_DICT_REASON
+            _write_json(meta_path, meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                [
+                    v
+                    for v in violations
+                    if "src_20260415_001" in v
+                    and "last_fail_reason must be string or null" in v
+                ],
+                violations,
+            )
+
+    def test_source_meta_sweep_unscoped_call_checks_all_dirs(self) -> None:
+        """The default (in_scope_source_ids=None) stays a pipeline-wide sweep: a caller that
+        cannot derive a declared-source scope must not silently get a weaker gate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_dir = Path(tmp) / "pipeline"
+            self._plant_sibling_source_meta(
+                pipeline_dir,
+                "src_stale_001",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "fail",
+                    "last_fail_reason": self._INCIDENT_DICT_REASON,
+                    "debug_mode": False,
+                    "context_isolated": True,
+                },
+            )
+            violations: list[str] = []
+            _validate_source_meta_json_files(pipeline_dir, violations)
+            self.assertEqual(
+                violations,
+                [
+                    f"{pipeline_dir / 'source' / 'src_stale_001' / 'source_meta.json'}"
+                    ":last_fail_reason must be string or null"
+                ],
+            )
+
+    def test_source_meta_scope_skips_only_undeclared_dirs(self) -> None:
+        """An explicit scope strictly checks the declared dirs and skips the rest — the
+        superseded dir is not even parsed (its JSON is invalid here, and that is fine)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_dir = Path(tmp) / "pipeline"
+            self._plant_sibling_source_meta(
+                pipeline_dir,
+                "src_declared_a",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "pass",
+                    "last_fail_reason": None,
+                    "debug_mode": False,
+                    "context_isolated": True,
+                },
+            )
+            self._plant_sibling_source_meta(
+                pipeline_dir,
+                "src_declared_b",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "fail",
+                    "last_fail_reason": self._INCIDENT_DICT_REASON,
+                    "debug_mode": False,
+                    "context_isolated": True,
+                },
+            )
+            superseded = pipeline_dir / "source" / "src_superseded"
+            superseded.mkdir(parents=True)
+            (superseded / "source_meta.json").write_text("{not json", encoding="utf-8")
+
+            violations: list[str] = []
+            _validate_source_meta_json_files(
+                pipeline_dir,
+                violations,
+                in_scope_source_ids={"src_declared_a", "src_declared_b"},
+            )
+            self.assertEqual(
+                violations,
+                [
+                    f"{pipeline_dir / 'source' / 'src_declared_b' / 'source_meta.json'}"
+                    ":last_fail_reason must be string or null"
+                ],
+            )
+
+    def test_source_meta_scope_unions_multiple_runs(self) -> None:
+        """A full (no --run-id) validate takes the UNION of every run's declared source, so a
+        second run's own source is strictly checked too; only a dir NO run references is
+        skipped. This is what keeps full-mode scoping equivalent to the structural source
+        check's existing semantics."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            pipeline_dir = self._minimal_tree_pipeline_dir(repo_root)
+            src_root = pipeline_dir / "source"
+            runs_root = pipeline_dir / "runs"
+            # Run 2 declares its own (copied) source dir; both are live lineage.
+            shutil.copytree(src_root / "src_20260415_001", src_root / "src_20260415_002")
+            shutil.copytree(runs_root / "run_test_001", runs_root / "run_test_002")
+            node_dir = (
+                runs_root / "run_test_002" / "problem__shallow_water2d__0.3.0"
+            )
+            trial_meta_path = node_dir / "trial_meta.json"
+            trial_meta = json.loads(trial_meta_path.read_text(encoding="utf-8"))
+            trial_meta["source_source_id"] = "src_20260415_002"
+            _write_json(trial_meta_path, trial_meta)
+            # The second run's declared source violates the contract...
+            meta_path = src_root / "src_20260415_002" / "source_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["last_fail_reason"] = self._INCIDENT_DICT_REASON
+            _write_json(meta_path, meta)
+            # ...while an unreferenced sibling violates it too.
+            self._plant_sibling_source_meta(
+                pipeline_dir,
+                "src_20260415_000",
+                {
+                    "attempt_count": 1,
+                    "verification_status": "fail",
+                    "last_fail_reason": self._INCIDENT_DICT_REASON,
+                    "debug_mode": False,
+                    "context_isolated": True,
+                },
+            )
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            reason_violations = [v for v in violations if "last_fail_reason" in v]
+            self.assertTrue(
+                [v for v in reason_violations if "src_20260415_002" in v], violations
+            )
+            self.assertFalse(
+                [v for v in reason_violations if "src_20260415_000" in v], violations
+            )
+
+    def test_declared_source_dir_without_source_meta_is_flagged(self) -> None:
+        """Scoping must not turn the sweep into a no-op: a DECLARED source dir has to carry its
+        meta (a required Generate output). Only undeclared/superseded attempt dirs, where a
+        missing meta says nothing, are silently skipped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_dir = Path(tmp) / "pipeline"
+            declared = pipeline_dir / "source" / "src_declared"
+            declared.mkdir(parents=True)
+            superseded = pipeline_dir / "source" / "src_superseded"
+            superseded.mkdir(parents=True)
+
+            violations: list[str] = []
+            _validate_source_meta_json_files(
+                pipeline_dir, violations, in_scope_source_ids={"src_declared"}
+            )
+            self.assertEqual(
+                violations, [f"{declared / 'source_meta.json'}: missing"]
+            )
+
+    def test_declared_source_meta_missing_constraint_reason_flagged(self) -> None:
+        """WI-2 contract unification: the source sweep now also enforces the conditional
+        constraint_reason requirement (previously only the ir_meta sweep and the runtime
+        write gate did), scoped to the declared lineage."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            pipeline_dir = self._minimal_tree_pipeline_dir(repo_root)
+            meta_path = (
+                pipeline_dir / "source" / "src_20260415_001" / "source_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["context_isolated"] = False
+            meta.pop("constraint_reason", None)
+            _write_json(meta_path, meta)
+            violations = validate(repo_root=repo_root, workspace_root="workspace")
+            self.assertTrue(
+                [
+                    v
+                    for v in violations
+                    if "src_20260415_001" in v
+                    and "constraint_reason when context_isolated=false" in v
+                ],
+                violations,
+            )
+
     def _lint_evidence_fixture(self, repo_root: Path, evidence: dict | None) -> Path:
         """Build <repo>/workspace/pipelines/p/pid/source/src_x/source_meta.json and
         (optionally) the conductor lint evidence at the pipeline root. Returns meta_path."""

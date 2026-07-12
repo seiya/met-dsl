@@ -58,7 +58,7 @@ Fix the generation responsibility of the Compile stage, and create a determinist
 3. The storage root for workflow artifacts allows only `workspace/`, and the workflow-root judgment targets only `workspace/`.
 4. When `workspace/` does not exist before workflow execution starts, create `workspace/` directly under the repository root.
 5. Before start and before completion, `python3 tools/validate_workspace_root.py` may be run. In an execution environment where `run-gate --gate validate_workspace_root` is available, prefer `run-gate`, and on `fail` it is a `Compile fail`.
-6. Record `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, and `context_isolated` in `ir_meta.json`.
+6. Record `attempt_count`, `verification_status`, `last_fail_reason`, `debug_mode`, and `context_isolated` in `ir_meta.json`. `last_fail_reason` is a **single plain JSON string** or `null` — never an object or an array.
 7. When `context_isolated=false`, record `ir_meta.json.constraint_reason` as required.
 8. With `debug_mode=false`, do not save failed-attempt artifacts.
 9. Before completion, `python3 tools/check_artifact_syntax.py --expect-top object` may be run on `spec.ir.yaml`. In an execution environment where the equivalent check via `run-gate` is available, prefer `run-gate`, and on `fail` it is a `Compile fail`.

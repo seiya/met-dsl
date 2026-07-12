@@ -20,6 +20,7 @@ try:
     from tools.meta_contracts import (
         STAGE_META_FILENAME_BY_STEP,
         required_meta_keys_for_step,
+        stage_meta_type_violations,
     )
 except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CLI execution
     _THIS_FILE = Path(__file__).resolve()
@@ -31,6 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
     from tools.meta_contracts import (
         STAGE_META_FILENAME_BY_STEP,
         required_meta_keys_for_step,
+        stage_meta_type_violations,
     )
 
 PLACEHOLDER_TEXT_PATTERNS = (
@@ -2996,15 +2998,41 @@ def _validate_pipeline_lineage_presence(
 def _validate_source_meta_json_files(
     pipeline_dir: Path,
     violations: list[str],
+    *,
+    in_scope_source_ids: set[str] | None = None,
 ) -> None:
+    """Check every in-scope ``source/<id>/source_meta.json`` against the stage-meta contract.
+
+    ``in_scope_source_ids`` scopes the sweep to the source directories the in-scope runs
+    actually DECLARE (``trial_meta.source_source_id``), mirroring ``_execution_in_scope_src_dir``
+    (see its docstring): a superseded attempt directory, left behind by an earlier Generate
+    under the append-only contract, must not fail an otherwise-conformant run. That is not a
+    cosmetic concern — a schema-violating meta in a superseded dir is UNREPAIRABLE: a Generate
+    reopen rotates a FRESH source dir and deletes nothing, so every subsequent attempt re-reads
+    the same immutable violation and the repair loop cannot converge (E2E #4).
+
+    A superseded dir is therefore skipped ENTIRELY — not even its JSON is parsed. Anything the
+    sweep could still flag there would reintroduce exactly the unrepairable class this scoping
+    removes; the dir is debug provenance, not a certified deliverable.
+
+    ``None`` (the default) keeps the historic pipeline-wide sweep: callers that cannot derive a
+    declared-source scope must not silently get a weaker gate.
+    """
     generate_root = pipeline_dir / "source"
     if not generate_root.exists() or not generate_root.is_dir():
         return
     for gen_dir in sorted(generate_root.iterdir()):
         if not gen_dir.is_dir():
             continue
+        if in_scope_source_ids is not None and gen_dir.name not in in_scope_source_ids:
+            continue
         meta_path = gen_dir / "source_meta.json"
         if not meta_path.exists():
+            # An in-scope (declared) source MUST carry its meta: it is a required output of the
+            # certified Generate. An undeclared/superseded dir is only ever an attempt artifact,
+            # so a missing meta there says nothing.
+            if in_scope_source_ids is not None:
+                violations.append(f"{meta_path}: missing")
             continue
         try:
             data = _read_json(meta_path)
@@ -3017,20 +3045,8 @@ def _validate_source_meta_json_files(
         for key in required_meta_keys_for_step("generate"):
             if key not in data:
                 violations.append(f"{meta_path}: missing required key {key!r}")
-        for key in required_meta_keys_for_step("generate"):
-            if key not in data:
-                continue
-            val = data.get(key)
-            if key == "attempt_count" and not isinstance(val, int):
-                violations.append(f"{meta_path}:attempt_count must be integer")
-            elif key == "verification_status" and (not isinstance(val, str) or not val.strip()):
-                violations.append(f"{meta_path}:verification_status must be non-empty string")
-            elif key == "last_fail_reason" and val is not None and not isinstance(val, str):
-                violations.append(f"{meta_path}:last_fail_reason must be string or null")
-            elif key == "debug_mode" and not isinstance(val, bool):
-                violations.append(f"{meta_path}:debug_mode must be boolean")
-            elif key == "context_isolated" and not isinstance(val, bool):
-                violations.append(f"{meta_path}:context_isolated must be boolean")
+        for clause in stage_meta_type_violations(data, step_token="generate"):
+            violations.append(f"{meta_path}:{clause}")
         # NOTE: lint is no longer recorded in source_meta.lint_command_ref (the leaf does
         # not run run_linter); the conductor-run lint is certified by post_generate (which now
         # runs in the deterministic generate.static substep, before verify) against the
@@ -3054,27 +3070,8 @@ def _validate_ir_meta_json(ir_dir: Path, violations: list[str]) -> None:
     for key in required_keys:
         if key not in data:
             violations.append(f"{meta_path}: missing required key {key!r}")
-    if "attempt_count" in data and not isinstance(data.get("attempt_count"), int):
-        violations.append(f"{meta_path}:attempt_count must be integer")
-    if "verification_status" in data and (
-        not isinstance(data.get("verification_status"), str)
-        or not str(data.get("verification_status")).strip()
-    ):
-        violations.append(f"{meta_path}:verification_status must be non-empty string")
-    if "last_fail_reason" in data and data.get("last_fail_reason") is not None and not isinstance(
-        data.get("last_fail_reason"), str
-    ):
-        violations.append(f"{meta_path}:last_fail_reason must be string or null")
-    if "debug_mode" in data and not isinstance(data.get("debug_mode"), bool):
-        violations.append(f"{meta_path}:debug_mode must be boolean")
-    if "context_isolated" in data and not isinstance(data.get("context_isolated"), bool):
-        violations.append(f"{meta_path}:context_isolated must be boolean")
-    if data.get("context_isolated") is False:
-        reason = data.get("constraint_reason")
-        if not isinstance(reason, str) or not reason.strip():
-            violations.append(
-                f"{meta_path}: requires non-empty constraint_reason when context_isolated=false"
-            )
+    for clause in stage_meta_type_violations(data, step_token="compile"):
+        violations.append(f"{meta_path}:{clause}")
 
 
 _MCP_AUDIT_LOG_BASENAME: str = "command_log.jsonl"
@@ -3702,6 +3699,53 @@ def _validate_execution_json_outputs(execution: NodeExecution, violations: list[
             violations.append(f"{perf_path}:parallelism.{key} must be >= 0")
 
 
+def _execution_raw_source_source_id(execution: NodeExecution) -> str | None:
+    """The ``source_source_id`` string declared by this execution's ``trial_meta.json``,
+    stripped; ``None`` when the file/key is absent, unreadable, or blank."""
+    trial_meta_path = execution.node_dir / "trial_meta.json"
+    if not trial_meta_path.exists():
+        return None
+    try:
+        data = _read_json(trial_meta_path)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    source_source_id = data.get("source_source_id")
+    if not isinstance(source_source_id, str) or not source_source_id.strip():
+        return None
+    return source_source_id.strip()
+
+
+def _plain_source_dir_name(source_source_id: str | None) -> str | None:
+    """``source_source_id`` if it is a single plain directory name, else ``None``.
+
+    The id is used directly as a path component, so anything else — a separator, an absolute
+    path, or a ``.``/``..`` traversal — is rejected: it would otherwise escape
+    ``<pipeline>/source/`` and scope a check to an unintended (or out-of-pipeline) directory.
+    """
+    if source_source_id is None:
+        return None
+    id_parts = Path(source_source_id).parts
+    if (
+        "/" in source_source_id
+        or "\\" in source_source_id
+        or len(id_parts) != 1
+        or id_parts[0] in (".", "..")
+    ):
+        return None
+    return source_source_id
+
+
+def _execution_declared_source_id(execution: NodeExecution) -> str | None:
+    """The source directory NAME this execution declares it was produced from, or ``None``
+    when absent/invalid. Pure: reports no violation (``_execution_in_scope_src_dir`` and
+    ``_validate_trial_meta`` already own that reporting, and a second report of one defect
+    would double-count it).
+    """
+    return _plain_source_dir_name(_execution_raw_source_source_id(execution))
+
+
 def _execution_in_scope_src_dir(
     execution: NodeExecution, violations: list[str]
 ) -> Path | None:
@@ -3720,31 +3764,16 @@ def _execution_in_scope_src_dir(
     silent pass) — callers then skip the structural source scan entirely rather
     than falling back to a pipeline-wide sweep.
     """
-    trial_meta_path = execution.node_dir / "trial_meta.json"
-    if not trial_meta_path.exists():
+    raw_source_id = _execution_raw_source_source_id(execution)
+    if raw_source_id is None:
         return None
-    try:
-        data = _read_json(trial_meta_path)
-    except (json.JSONDecodeError, OSError):
-        return None
-    source_source_id = data.get("source_source_id")
-    if not isinstance(source_source_id, str) or not source_source_id.strip():
-        return None
-    source_source_id = source_source_id.strip()
-    # The id is used directly as a path component, so reject anything that is not
-    # a single plain directory name: a separator, absolute path, or `.`/`..`
-    # traversal would otherwise escape `<pipeline>/source/` and run the structural
-    # source checks against an unintended (or out-of-pipeline) directory. Flag it
-    # rather than silently skipping so a forged/malformed trial_meta is caught.
-    id_parts = Path(source_source_id).parts
-    if (
-        "/" in source_source_id
-        or "\\" in source_source_id
-        or len(id_parts) != 1
-        or id_parts[0] in (".", "..")
-    ):
+    source_source_id = _plain_source_dir_name(raw_source_id)
+    if source_source_id is None:
+        # Malformed (separator / traversal). Flag it rather than silently skipping so a
+        # forged/malformed trial_meta is caught.
+        trial_meta_path = execution.node_dir / "trial_meta.json"
         violations.append(
-            f"{trial_meta_path}:source_source_id={source_source_id!r} must be a "
+            f"{trial_meta_path}:source_source_id={raw_source_id!r} must be a "
             "plain source directory name (no path separators or traversal)"
         )
         return None
@@ -10395,13 +10424,29 @@ def _validate_impl(
         violations=violations,
     )
 
+    # Scope the source_meta sweep to the source dirs the in-scope executions DECLARE, the
+    # same lineage scoping the structural source checks already use. With --run-id (the
+    # post_execute / pre_judge stages) `executions` is already the current run, so only the
+    # current source lineage is strictly checked and superseded attempt dirs are skipped;
+    # a full run takes the union over every run's declared source, so only a dir NO run
+    # references is skipped. A pipeline whose executions declare no valid source at all
+    # (itself a hard _validate_trial_meta violation) falls back to None = sweep everything,
+    # so the gate never silently weakens.
+    scope_by_pipeline: dict[Path, set[str]] = {}
+    for execution in executions:
+        declared = _execution_declared_source_id(execution)
+        if declared:
+            scope_by_pipeline.setdefault(execution.pipeline_dir, set()).add(declared)
+
     seen_pipeline_dirs: set[Path] = set()
     for execution in executions:
         pd = execution.pipeline_dir
         if pd in seen_pipeline_dirs:
             continue
         seen_pipeline_dirs.add(pd)
-        _validate_source_meta_json_files(pd, violations)
+        _validate_source_meta_json_files(
+            pd, violations, in_scope_source_ids=(scope_by_pipeline.get(pd) or None)
+        )
 
     if require_orchestration:
         _validate_orchestration_hierarchy(

@@ -70,6 +70,7 @@ try:
     from tools.meta_contracts import (
         STAGE_META_FILENAME_BY_STEP,
         missing_required_meta_keys,
+        stage_meta_type_violations,
     )
 except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CLI execution
     _THIS_FILE = Path(__file__).resolve()
@@ -87,6 +88,7 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
     from tools.meta_contracts import (
         STAGE_META_FILENAME_BY_STEP,
         missing_required_meta_keys,
+        stage_meta_type_violations,
     )
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
@@ -9845,10 +9847,10 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
     # Paragraph 1 (no blank lines — `build_launch_prompt_text` keys on the first blank
     # line): sentinel + identity + ids + rotated paths + findings header.
     lines = [
-        f"{SLIM_REPAIR_PROMPT_SENTINEL}: your prior producer-leaf session (the `{vals['step']}."
-        f"{vals['substep']}` producer — `generate.generate` or `compile.generate`) is resumed "
-        "and its context is intact. Fix ONLY the findings below, then re-write your deliverables. "
-        "Do NOT re-read the must-read docs or re-derive the design — you already have them.",
+        f"{SLIM_REPAIR_PROMPT_SENTINEL}: your prior `{vals['step']}.{vals['substep']}` leaf "
+        "session is resumed and its context is intact. Fix ONLY the findings below, then "
+        "re-write your deliverables. Do NOT re-read the must-read docs or re-derive the design "
+        "— you already have them.",
         f"Target node_key: {vals['node_key']}",
         f"Target step: {vals['step']}",
         f"Target substep: {vals['substep']}",
@@ -9859,12 +9861,13 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
         f"repair_reason: {vals['repair_reason']}",
         f"repair_target_agent_run_id: {vals['repair_target_agent_run_id']}",
         f"source_id: {str(p.get('source_id', ''))}",
-        "NOTE: your agent_run_id and the rotated per-attempt id (source_id for generate, ir_id "
-        "for compile) are NEW for this repair attempt — every per-agent "
-        "path your resumed context remembers is STALE. Use the NEW paths below: write your "
-        "deliverables to the new allowed_output_paths; reference (READ — do NOT write) the "
-        "new output_manifest_path as the canonical source of your allowed paths, it is "
-        "host-authored; and read your capability_token fresh from the new capability_doc_path "
+        "NOTE: the ids and paths in THIS prompt are authoritative for this repair attempt — "
+        "use them, not any your resumed context remembers. Your agent_run_id is always new, "
+        "and the per-attempt id (source_id for generate, ir_id for compile) may have been "
+        "rotated, so treat every per-agent path you remember as STALE. Write your deliverables "
+        "to the allowed_output_paths below; reference (READ — do NOT write) the "
+        "output_manifest_path below as the canonical source of your allowed paths, it is "
+        "host-authored; and read your capability_token fresh from the capability_doc_path below "
         "(do NOT reuse the token from your prior session — a stale token fails run-gate with "
         "a capability mismatch).",
         f"allowed_tmp_root: {vals['allowed_tmp_root']}",
@@ -12759,25 +12762,13 @@ def _validate_step_meta_payload(meta_data: dict[str, Any], *, step_token: str, m
             f"{meta_filename} missing required keys: {missing_keys} "
             f"(phase={step_token} substep=verify ref={meta_ref})"
         )
-    context_isolated = meta_data.get("context_isolated")
-    if not isinstance(context_isolated, bool):
-        raise ValueError(f"{meta_filename} context_isolated must be boolean: {meta_ref}")
-    if not isinstance(meta_data.get("debug_mode"), bool):
-        raise ValueError(f"{meta_filename} debug_mode must be boolean: {meta_ref}")
-    if not isinstance(meta_data.get("attempt_count"), int):
-        raise ValueError(f"{meta_filename} attempt_count must be integer: {meta_ref}")
-    verification_status = meta_data.get("verification_status")
-    if not isinstance(verification_status, str) or not verification_status.strip():
-        raise ValueError(f"{meta_filename} verification_status must be non-empty string: {meta_ref}")
-    last_fail_reason = meta_data.get("last_fail_reason")
-    if last_fail_reason is not None and not isinstance(last_fail_reason, str):
-        raise ValueError(f"{meta_filename} last_fail_reason must be string or null: {meta_ref}")
-    if context_isolated is False:
-        constraint_reason = meta_data.get("constraint_reason")
-        if not isinstance(constraint_reason, str) or not constraint_reason.strip():
-            raise ValueError(
-                f"{meta_filename} requires non-empty constraint_reason when context_isolated=false: {meta_ref}"
-            )
+    # Value types come from the one canonical definition (tools/meta_contracts), shared with
+    # both validator sweeps, so this write gate and the read gates cannot drift apart. The
+    # first violation in canonical key order is raised; the clause text is byte-identical to
+    # the sweeps' so a finding reads the same wherever it surfaces.
+    violations = stage_meta_type_violations(meta_data, step_token=step_token)
+    if violations:
+        raise ValueError(f"{meta_filename} {violations[0]}: {meta_ref}")
 
 
 def _effective_pass_substep_run_ids(
