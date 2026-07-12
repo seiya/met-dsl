@@ -118,9 +118,9 @@ releases/
 ```
 
 3. Make the definitions of `domain` and `family` match the "`spec` classification vocabulary" in `GLOSSARY.md`.
-4. `spec_id` must be unique within the repository, and requires the form `^[a-z][a-z0-9_]{2,63}$`.
+4. `spec_id` must be unique within the repository, and requires the form `^[a-z][a-z0-9_]{2,63}$` and a length of **at most 55 characters**. The 55-character bound keeps the identifiers derived from it (`<spec_id>_model` / `<spec_id>_runner` / `<spec_id>_checks`) within the `f2008` 63-character identifier limit. It is checked at **spec-input**, before any phase runs, for the target `spec` and for every member of a `--with-deps` dependency closure alike; an over-length `spec_id` is an error there and is resolved only by a rename (re-authoring the `IR` or the source cannot resolve it). The bound reflects the identifier limit of the only current backend (`fortran`); when a backend with a different limit is added, the bound moves to a language-aware point and does not enter the name grammar above.
 5. `tests.md` allows placing only 1 file per `spec`.
-6. `component_id` requires the form `^[a-z][a-z0-9_]{2,63}$`, and the recommended form is `<domain>_<family>_<operator>_<dim>d_<scheme>`.
+6. `component_id` requires the form `^[a-z][a-z0-9_]{2,63}$`, and the recommended form is `<domain>_<family>_<operator>_<dim>d_<scheme>`. A `component spec`'s `component_id` is its `spec_id`, so the 55-character bound of requirement 4 applies to it as well.
 7. `operation_id` requires the form `<component_id>__<action>`.
 8. The published names of the generated code require compatibility management, and a change that breaks `major` compatibility is separated into a different name.
 9. Every `spec` declares its dependencies in `deps.yaml`, and direct path references (relative `import`) are forbidden.

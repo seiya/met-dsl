@@ -127,25 +127,35 @@ Place **0. Meta information** at the top. The subsequent sections are fixed per 
 - Required statement: state the reference path of the corresponding `tests.md` and the `test_profile_version`.
 
 ### Required sections of an `infrastructure spec` (R1 harness)
+An `infrastructure spec` takes the `component spec` section shape **minus section 9 (AD preparation information)** — a harness carries no physics, so it has nothing to differentiate. The **section numbers are load-bearing**: the deterministic `Compile` gate reads the published surface out of `## 5.` and its `### 5.1` subsection by number (`docs/workflow/phases/phase_01_compile.md`), so a harness that renumbers its sections fails to certify.
+
 1. **Responsibility and scope**
 - Required statement: state the runner plumbing this harness provides (argv/`--cases` parsing, the case-loop driver, JSON/snapshot/perf/`metrics_basis` emission) and the `(language, hardware)` target it serves; state explicitly that it carries no physics.
 
-2. **Published harness API contract**
-- Required statement: state the `<spec_id>__*` operations a physics-node runner calls (e.g. case-set parse, per-case snapshot/JSON writers, rank-N array emitters, perf/diagnostics/metrics_basis writers), with each operation's argument roles.
+2. **input/output contract**
+- Required statement: state the runner argv it parses, and the `diagnostics.json` / `perf.json` / `raw/*` (snapshot / `metrics_basis.json`) shapes it emits, with the numeric/boolean descriptor rules (per `docs/workflow/RUNNER_OUTPUT_CONTRACT.md`). The `metrics_basis.json` index is keyed by (`test_id`, `case_id`) — one flat entry per case each test targets — so state which record component carries the `case_id`.
 
-3. **Runner output contract produced**
-- Required statement: state the `diagnostics.json` / `perf.json` / `raw/*` (snapshot / `metrics_basis.json`) shapes the harness emits, and the numeric/boolean descriptor rules (per `docs/workflow/RUNNER_OUTPUT_CONTRACT.md`). The `metrics_basis.json` index is keyed by (`test_id`, `case_id`) — one flat entry per case each test targets — so state which record component carries the `case_id`.
+3. **Operation definition**
+- Required statement: state, per published `<spec_id>__*` operation, its argument roles and behavior (case-set parse, per-case snapshot/JSON writers, rank-N array emitters, perf/diagnostics/`metrics_basis` writers), and the published derived types the operations exchange.
 
 4. **Failure conditions and constraints**
 - Required statement: state the guard behaviors (e.g. missing `--cases` aborts) and the invariants the harness enforces.
 
-5. **Prohibitions**
+5. **Public API and compatibility**
+- Required statement: state the published `operation_id` list **exhaustively** ("the published `operation_id`s are exactly: ...") and the published derived types, each as a backtick span carrying the `<spec_id>__` prefix; plus the `major` / `minor` update rules and the backward-compatibility policy. The list must include every helper operation a consuming runner calls, including one no test exercises: `Compile` pins the `IR`'s `public_api` to this list by set equality.
+- The subsection `### 5.1` below is required. The section numbers are load-bearing — the `Compile` gate reads the published surface out of `## 5.` and `### 5.1` by number — so a harness that renumbers its sections fails to certify.
+
+  **5.1 Canonical interface block**
+  - Required statement: the exact published surface as **one** fenced code block — a machine-readable interface giving every published type and operation signature (argument names, order, types, ranks, `intent`s, `result` names, and each derived type's component layout), plus the module-level `parameter` declarations the signatures reference.
+  - `Compile` transcribes this block verbatim into the `IR`'s `public_api.signatures`, which is the only carrier of the signatures to `Generate` (`Generate.generate` does not read `controlled_spec.md`; see `docs/workflow/phases/phase_02_generate.md` §2-1). The gates pin §5 ≡ §5.1 ≡ `IR` `public_api` at `Compile`, and pin the generated model source against those signatures at `Generate.static`. A missing `### 5.1`, a missing fence, more than one fence inside §5.1, or a §5 ↔ §5.1 symbol-set mismatch is a `Compile fail`.
+
+6. **Prohibitions**
 - Required statement: state what the harness must NOT do (embed physics, write `verdict.json` / `aggregate_verdict.json` / `summary.json` / `trial_meta.json`, hard-code case-specific values).
 
-6. **Traceability**
+7. **Traceability**
 - Required statement: state the correspondence rule for the keys and values fixed into `spec.ir.yaml`.
 
-7. **tests reference**
+8. **tests reference**
 - Required statement: state the reference path of the corresponding `tests.md` and the `test_profile_version`.
 
 ## Usage criteria for structured blocks

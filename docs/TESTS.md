@@ -8,6 +8,7 @@ The evaluation result of `tests.md` is mapped to the relevant `node`'s `self_ver
 - `spec/problem/<domain>/<family>/<spec_id>/tests.md`
 - `spec/component/<domain>/<family>/<spec_id>/tests.md`
 - `spec/profile/<domain>/<family>/<spec_id>/tests.md`
+- `spec/infrastructure/<domain>/<family>/<spec_id>/tests.md`
 
 ## Requirements
 1. The canonical source format is `Markdown`.
