@@ -30,7 +30,7 @@ This `problem spec` references the following `component`.
 - `dynamics_advection_diffusion_boundary_1d_periodic_copy`
 - `dynamics_advection_diffusion_time_update_1d_euler1`
 
-The adopted `profile` is `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1`.
+The adopted `profile` is `dynamics_advdiff_profile_1d_upwind_center2_euler1`.
 
 ## 5. Integration algorithm
 The update step is fixed to the following order.
@@ -65,7 +65,7 @@ Forbid non-periodic boundary. Forbid the addition of `limiter` / `clip` / `filte
 The reference basis is LeVeque (2002).
 
 ## 9. tests reference
-The corresponding `tests.md` is `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/tests.md`, with `test_profile_version` of `0.1.1`.
+The corresponding `tests.md` is `spec/problem/dynamics/advection_diffusion/advdiff1d_linear/tests.md`, with `test_profile_version` of `0.2.0`.
 
 ## 10. AD preparation information
 `ad_readiness.enabled` is `true`. The state update is expressed in the form $u_{next}=F(u_{now}, params)$, and `ceil` and the periodic-index wrap are made explicit as non-differentiable operations.

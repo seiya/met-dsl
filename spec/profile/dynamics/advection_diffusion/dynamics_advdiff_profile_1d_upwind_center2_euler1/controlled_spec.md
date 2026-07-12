@@ -1,7 +1,7 @@
 # Controlled Spec: 1D advection-diffusion default profile (profile spec)
 
 ## 0. Meta information
-- `spec_id`: `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1`
+- `spec_id`: `dynamics_advdiff_profile_1d_upwind_center2_euler1`
 - `spec_version`: `0.1.0`
 - `status`: `controlled_draft`
 - `spec_kind`: `profile`
@@ -28,7 +28,7 @@ The discretization constraints are the following.
 When the compatibility condition of a target `component` is not satisfied, it is an error, and automatic switching to an alternative `profile` is forbidden.
 
 ## 5. Traceability
-`case.resolved.yaml` requires recording `profile_id=dynamics_advection_diffusion_profile_1d_upwind_center2_euler1` and the resolved `component_id@version`.
+`case.resolved.yaml` requires recording `profile_id=dynamics_advdiff_profile_1d_upwind_center2_euler1` and the resolved `component_id@version`.
 
 ## 6. tests reference
-The corresponding `tests.md` is `spec/profile/dynamics/advection_diffusion/dynamics_advection_diffusion_profile_1d_upwind_center2_euler1/tests.md`, with `test_profile_version` of `0.1.0`.
+The corresponding `tests.md` is `spec/profile/dynamics/advection_diffusion/dynamics_advdiff_profile_1d_upwind_center2_euler1/tests.md`, with `test_profile_version` of `0.1.0`.

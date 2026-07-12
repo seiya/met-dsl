@@ -57,14 +57,14 @@ specs:
     official_releases: []
 
   - spec_kind: profile
-    spec_id: dynamics_advection_diffusion_profile_1d_upwind_center2_euler1
+    spec_id: dynamics_advdiff_profile_1d_upwind_center2_euler1
     spec_version: 0.1.0
     status: controlled_draft
     domain: dynamics
     family: advection_diffusion
-    controlled_spec_path: spec/profile/dynamics/advection_diffusion/dynamics_advection_diffusion_profile_1d_upwind_center2_euler1/controlled_spec.md
-    tests_path: spec/profile/dynamics/advection_diffusion/dynamics_advection_diffusion_profile_1d_upwind_center2_euler1/tests.md
-    deps_path: spec/profile/dynamics/advection_diffusion/dynamics_advection_diffusion_profile_1d_upwind_center2_euler1/deps.yaml
+    controlled_spec_path: spec/profile/dynamics/advection_diffusion/dynamics_advdiff_profile_1d_upwind_center2_euler1/controlled_spec.md
+    tests_path: spec/profile/dynamics/advection_diffusion/dynamics_advdiff_profile_1d_upwind_center2_euler1/tests.md
+    deps_path: spec/profile/dynamics/advection_diffusion/dynamics_advdiff_profile_1d_upwind_center2_euler1/deps.yaml
     official_releases: []
 
   - spec_kind: component

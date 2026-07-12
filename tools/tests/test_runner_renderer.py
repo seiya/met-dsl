@@ -1037,7 +1037,7 @@ class SpecIdLengthGateTest(unittest.TestCase):
             spec_id_length_violation("dynamics_advection_diffusion_boundary_1d_periodic_copy"))
 
     def test_violation_above_limit(self) -> None:
-        # The known 61-char catalog offender.
+        # The 61-char id the catalog carried until it was renamed to fit the bound.
         offender = "dynamics_advection_diffusion_profile_1d_upwind_center2_euler1"
         msg = spec_id_length_violation(offender)
         self.assertIsNotNone(msg)

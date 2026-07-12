@@ -1390,9 +1390,11 @@ adds the mass-opt-in prerequisite gate. Five parts:
    node-IDENTITY render precondition the compile.static hoist deliberately excludes (a re-author cannot
    shorten a spec_id); the renderer's `_check_identifier_lengths` keeps the same bound as a
    defense-in-depth backstop. Deliberately spec-input (pre-IR) ⇒ language/phase-agnostic; the 55 bound
-   reflects the f2008 limit of the only current backend (fortran). The known 61-char catalog offender
-   `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1` is thus blocked from harness adoption
-   until renamed (it is excluded from the mass-add below).
+   reflects the f2008 limit of the only current backend (fortran). At the time this gate landed the
+   catalog held one 61-char offender, `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1`,
+   which the gate blocked from harness adoption (it was excluded from the mass-add below); it has since
+   been renamed to `dynamics_advdiff_profile_1d_upwind_center2_euler1` (49 chars), and no catalog
+   `spec_id` now exceeds the bound.
 2. **Deleted the two LLM-fabrication heuristics** (`_validate_problem_runner_diagnostics_dependency`,
    `_validate_problem_runner_nonphysical_casepath_input`) + their now-dead private helpers +
    `skip_llm_heuristics` threading + 4 tests. They were unreliable `problem/`-scoped guesses with a

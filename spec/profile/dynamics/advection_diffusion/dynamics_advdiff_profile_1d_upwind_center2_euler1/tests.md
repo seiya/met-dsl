@@ -1,13 +1,13 @@
 # Tests: 1D advection-diffusion default profile
 
 ## 0. Meta information
-- `test_profile_id`: `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1_validation`
+- `test_profile_id`: `dynamics_advdiff_profile_1d_upwind_center2_euler1_validation`
 - `test_profile_version`: `0.1.0`
 - `status`: `draft`
 - `spec_ref.spec_kind`: `profile`
-- `spec_ref.spec_id`: `dynamics_advection_diffusion_profile_1d_upwind_center2_euler1`
+- `spec_ref.spec_id`: `dynamics_advdiff_profile_1d_upwind_center2_euler1`
 - `spec_ref.spec_version`: `0.1.0`
-- `spec_ref.controlled_spec_path`: `spec/profile/dynamics/advection_diffusion/dynamics_advection_diffusion_profile_1d_upwind_center2_euler1/controlled_spec.md`
+- `spec_ref.controlled_spec_path`: `spec/profile/dynamics/advection_diffusion/dynamics_advdiff_profile_1d_upwind_center2_euler1/controlled_spec.md`
 
 ## 1. Test purpose
 This suite verifies the default-profile selection rule and the compatibility guard for the `advection_diffusion` problem.
@@ -39,7 +39,7 @@ This suite targets only the judgment of the `profile`-selection logic. The execu
   - `level`: `L0`
   - `expected_outcome`: `pass`
   - `target_case`: `profile_select_default`
-  - `judgment`: `profile_id=dynamics_advection_diffusion_profile_1d_upwind_center2_euler1` is selected, and `checks.profile_selected=true` is satisfied.
+  - `judgment`: `profile_id=dynamics_advdiff_profile_1d_upwind_center2_euler1` is selected, and `checks.profile_selected=true` is satisfied.
 
 - `test_id`: `l0_guard_incompatible_component_version_xfail`
   - `level`: `L0`
