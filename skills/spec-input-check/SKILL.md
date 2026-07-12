@@ -1,6 +1,6 @@
 ---
 name: spec-input-check
-description: Use this before starting the workflow to check whether a spec's input set (`controlled_spec.md` / `deps.yaml` / `tests.md`) is sufficient and self-consistent to run `Spec -> Compile -> Generate -> Build -> Validate`. It detects missing required items, cross-file contradictions, ambiguous statements, and unresolvable dependencies, and reports them as proposals. It never modifies the spec.
+description: Use this before starting the workflow to check whether a spec's input set (`controlled_spec.md` / `deps.yaml` / `tests.md`) is sufficient and self-consistent to run `Spec -> Compile -> Generate -> Build -> Validate`. It detects missing required items, cross-file contradictions, ambiguous statements, unresolvable dependencies, and declared tests that cannot reach their `expected_outcome` as written, and reports them as proposals. It never modifies the spec.
 ---
 
 # Spec Input Check
@@ -29,7 +29,10 @@ This skill does not restate the spec format. The judgment rules are owned by:
 - `docs/TESTS.md` — required meta, required sections, and coverage rules of `tests.md` per `spec_kind`.
 - `docs/SPEC.md` — `spec` hierarchy, naming rules (including the `spec_id` length bound), `deps.yaml` declaration rules, and registry consistency.
 - `docs/GLOSSARY.md` — the allowed `domain` / `family` classification vocabulary, and the `deps.yaml` declaration vocabulary (`component_id` / `profile_id` / `infrastructure_id`).
-- `docs/workflow/phases/phase_01_compile.md` — the node-**identity** preconditions `Compile` cannot repair by re-authoring, so they must be caught here: `spec_id` ≤ 55 characters, and **exactly one** `infrastructure` direct dependency. Also the `infrastructure` §5 / §5.1 public-API pin.
+- `docs/workflow/phases/phase_01_compile.md` — the node-**identity** preconditions `Compile` cannot repair by re-authoring, so they must be caught here: `spec_id` ≤ 55 characters, and **exactly one** `infrastructure` direct dependency. Also the `infrastructure` §5 / §5.1 public-API pin, and the rule that the runner emits every numeric judgment **already reduced to a field, so predicates do no arithmetic**.
+- `docs/workflow/RUNNER_OUTPUT_CONTRACT.md` — the `diagnostics.json` / `perf.json` / `raw/` shapes the runner emits, and the `raw/metrics_basis.json` per-(`test_id`, `case_id`) index.
+- `docs/workflow/CHECKS_MODULE_CONTRACT.md` — what a metric is (one dotted address carries one scalar), and the rule that a **cross-case reduction** (a convergence order, a symmetry residual) is emitted as a **per-case** metric of the case where it first becomes computable, the earlier cases omitting it.
+- `tools/verdict_evaluator.py` — the predicate DSL that decides each per-test verdict. This canonical source is **code, not prose**: it fixes how a predicate `ref` resolves (only the `checks` / `verdict` heads are nested paths; every other `ref` is a whole-string key of the case's flat `metrics` map) and which per-case container shapes are accepted.
 
 When a check below and a canonical source disagree, the canonical source wins; report the divergence rather than guessing.
 
@@ -110,13 +113,31 @@ The **section numbers are load-bearing for an `infrastructure` spec** — the `C
 4. Flag a judgment threshold referenced in `tests.md` that is not numerically defined. → `blocker`.
 5. Flag any place that offers multiple options without a stated selection rule (priority or fixed value). → `warning`.
 
+### H. Executability of the declared tests
+Group G asks whether a statement is ambiguous. This group asks a different question: **whether the tests `tests.md` declares can execute and decide at all when sections 2–5 are executed exactly as written.** A defect here is a `blocker`, not a `warning`: it does not risk a downstream `fail`, it *guarantees* one, and no leaf can repair it by re-authoring — the input itself makes the declared outcome unreachable. A `tests.md` that is structurally complete and free of ambiguity can still carry such a defect and fail every attempt, so this group runs even when groups A–G are clean.
+
+1. **No dangling case dimension.** Every parameter the case-expansion rules sweep or fix (§4) is consumed by a rule in the input-defaulting rules (§2), the execution-control rules (§3), or the diagnostics contract (§5). A swept parameter that **no rule reads** is a `blocker`: the cases it distinguishes are numerically identical, so every test that depends on the distinction is decided on the wrong data. Conversely, a rule referencing a parameter that §4 never fixes is a `blocker` (the leaf must invent its value).
+   - The failure is silent in every other check group: the parameter is present, spelled correctly, carries a numeric value, is encoded in the `case_id`, and is named in a judgment — it is simply never *applied*. Trace each parameter from §4 to its point of use, and report the ones with no point of use.
+2. **Every test can reach its `expected_outcome`.** For each `test_id`, confirm a path exists from the case-expansion rules to the declared outcome.
+   - For an `xfail`, some case parameter must **make `xfail_condition` true**. An `xfail` whose condition no case-expansion parameter forces is a `blocker` — the test can never satisfy `xfail_rule`, so `suite.pass_rule` can never hold.
+   - For a `pass`, the judged metric must be computable for every target case (see H.3), and a threshold must not be contradicted by the case's own parameters.
+3. **Every judged metric resolves to a declared diagnostics field.** A predicate does no arithmetic (`phase_01_compile.md`; `verdict_evaluator._resolve_predicate_ref`), so **every metric name a judgment references must be carried by a field the diagnostics contract declares**. A judged metric that exists only as a formula — one the runner would have to reduce under an address the spec never declares — is a `blocker`; the predicate resolves to a structural absence and the test fails on shape, not on physics.
+   - A **derived** metric (a drift ratio, a convergence order, a symmetry residual) is not exempt: it is emitted under its **own** field address, already reduced to a scalar. State that address in the diagnostics contract.
+   - A **cross-case reduction** is a per-case field of the case where it first becomes computable (`CHECKS_MODULE_CONTRACT.md`); state which case carries it, and over which cases it accumulates. An accumulator whose scope is unstated can be poisoned by an unrelated case that happens to share the sweep key.
+   - A metric emitted **only for some cases** (a pair residual, an analytic error valid only under one profile) states its `N/A` rule and **which case slice carries the value**. Absence is a `blocker`, because the evaluator must otherwise guess the slice.
+   - An **array-valued** field cannot be a metric (one address carries one scalar). Report a declared field that is a time series or a vector.
+   - **Precedence over Operations Rule 8.** When the certified sibling carries the identical construct and certified with it, the pipeline demonstrably tolerates the construct — `Compile` resolves the address from the prose. Report it as a `warning` that names the inference the author can remove, not as a `blocker`. Reserve `blocker` for a construct with no certified precedent, or one the numbers prove unresolvable. H.1 and H.2 admit no such precedence: a dangling case dimension and an unreachable outcome are proved from the input set alone.
+
 ## Operations Rules
-1. Read-only operation. Use the `Read` tool, `grep`, and YAML/Markdown parsing for inspection only. Do not call `Edit` / `Write` on any spec file, registry, or workspace artifact. Do not run `tools/run_workflow.py` or any workflow phase.
+1. Read-only operation. Use the `Read` tool, `grep`, YAML/Markdown parsing, and local computation for inspection only. Do not call `Edit` / `Write` on any spec file, registry, or workspace artifact. Do not run `tools/run_workflow.py` or any workflow phase.
 2. Resolve the target spec directory first (see Input). If resolution is ambiguous or fails, report only that and stop.
-3. Run the checks A–G in order. Continue through all groups even after the first finding, so the author gets a complete list in one pass.
+3. Run the checks A–H in order. Continue through all groups even after the first finding, so the author gets a complete list in one pass.
 4. This check is heuristic for the Markdown-prose parts (sections D, E, G): a section or rule expressed in unusual wording may be miscounted. State assumptions, and prefer reporting a `warning` "could not confirm X" over silently passing or silently failing.
 5. Do not invent or assume default values for a missing item. A missing required item is reported as a deficiency, never completed.
 6. The output is advisory. Do not claim the spec "passed the workflow" or "is ready to merge"; state only that the input check found / did not find the listed problems.
+7. **Evaluate group H numerically whenever the input set fixes the constants it needs.** When the `spec` set fixes the physical constants, the discretization, and the thresholds, do not reason about reachability in prose — compute it. Derive each case's parameters through the §3 procedure exactly as written, evaluate each judgment against its threshold, and report the resulting value. A dangling case dimension is proved by two cases that differ in the sweep and agree in every judged metric; an unreachable `xfail` is proved by its condition evaluating false. A group-H finding backed by a number is a `blocker`; the same suspicion unbacked is a `warning` stating what could not be computed.
+8. **Diff against the certified sibling.** When a `spec` of the same `spec_kind` and comparable structure has already been certified (its artifacts exist under `workspace/ir/`), read its input set and compare construct by construct. It is the canonical evidence of what the pipeline accepts: a construct that deviates from it warrants a finding, and a construct identical to it is evidence that the construct is tolerated, so do not report the certified idiom as a defect. Where the target must deviate (a different normalizer, a different case topology), state the reason the sibling's form does not transfer.
+9. **Verify a claim about runtime behavior against the code that implements it, never against prose alone.** Before reporting a `blocker` that rests on how a phase, a gate, or the predicate evaluator behaves, read that implementation (`tools/verdict_evaluator.py`, `tools/runner_renderer.py`, `tools/validate_pipeline_semantics.py`). Prose documents state requirements, not the full set of accepted shapes; a `blocker` inferred from a document's silence is a false positive waiting to happen. If the implementation cannot be located, downgrade to a `warning` that names the unverified assumption.
 
 ## Output format
 Produce a single report with:
@@ -124,10 +145,11 @@ Produce a single report with:
 2. A `blocker` list, then a `warning` list, then an `info` list. Each finding states: the file and location (section / line / key), what is missing or contradictory, the canonical-source rule it relates to, and a concrete proposed fix for the author to apply.
 3. A closing note that this is a proposal only and no file was modified.
 
-When no findings exist, state that the input set passed all A–G checks and is structurally sufficient to start the workflow, while noting that physical validity is still decided at `Validate`.
+When no findings exist, state that the input set passed all A–H checks and is structurally sufficient to start the workflow, while noting that physical validity is still decided at `Validate`. State which group-H checks were evaluated numerically and which could not be, so the author knows how far the "no findings" result was actually proved.
 
 ## Decision Criteria
 - A `blocker` count of zero means the input set is structurally sufficient and self-consistent to start `Compile`; it does not assert physical correctness.
 - Any `blocker` means the workflow should not be started until the author resolves it.
+- A group-H `blocker` is a proof, not a risk estimate: it states the value a judgment takes and the outcome that value forecloses. A structurally complete, fully unambiguous input set can still carry one, so a clean A–G result is not a substitute for running group H.
 - Every finding cites the file location and the canonical-source rule, so the author can verify the basis independently.
 - No spec, registry, or workspace file was written or modified during the check.
