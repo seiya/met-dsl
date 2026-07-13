@@ -31,7 +31,7 @@ artifact; it only reads logs and transcripts.
   token generation, not tooling/sandbox/IO).
 
 ## The multiple-counting traps (why naive sums are wrong)
-The bundled script handles all six structurally; do not hand-sum these:
+The bundled script handles all seven structurally; do not hand-sum these:
 
 1. **One API response = several transcript lines.** A single model response is written
    as separate jsonl lines for its `thinking`, `text`, and `tool_use` blocks. They all
@@ -65,16 +65,33 @@ The bundled script handles all six structurally; do not hand-sum these:
    GLOBALLY across the run in launch order; the first leaf to emit an id owns it, and a
    later leaf reports only its NEW turns. Wall-clock is *not* affected (the leaves are
    separate processes, run sequentially) — only tokens.
-6. **A dead leaf's elapsed contains the human fix window.** When a child dies (transport
-   error, crash), its `record_agent_run_terminal` is stamped when the conductor next
-   runs — i.e. at the operator's `--resume`, possibly hours later. The
-   `child_launched → terminal` span is then mostly *waiting for a human*, not leaf
-   activity (observed: a leaf reporting **6.9 h** elapsed whose transcript spans **129 s**
-   and whose status is `fail`). → when elapsed exceeds the transcript wall by more than
-   `STALE_GAP_S` (10 min), the script uses the transcript wall as the effective elapsed
-   and reports the excess separately as a stale gap. A run's headline wall-clock
-   (`orchestration_meta.started_at → finished_at`) is likewise NOT leaf time if the run
-   was ever resumed.
+6. **A leaf's elapsed is WALL clock, and wall clock contains time in which nothing ran.**
+   Two different causes produce the same signature (`child_launched → terminal` far
+   exceeding the transcript), so the script excludes the excess either way and then
+   **classifies** it — it must not assert one cause when it was the other:
+   - **`dead_leaf`** — the child died (transport error, crash) and its
+     `record_agent_run_terminal` was stamped when the conductor next ran, i.e. at the
+     operator's `--resume`, hours later. The span is mostly *waiting for a human*
+     (observed: a leaf reporting **6.9 h** whose transcript spans **129 s**, status `fail`).
+   - **`host_suspend`** — the host slept mid-leaf (on WSL2 the VM is paused when Windows
+     sleeps). The leaf resumes and **completes normally**; only the wall clock jumped
+     (observed: **4.3 h** on a leaf that *passed*, E2E #5).
+
+   → when elapsed exceeds the transcript wall by more than `STALE_GAP_S` (10 min), the
+   script uses the transcript wall as the effective elapsed and reports the excess as
+   `EXCLUDED dead wall` with its cause. A leaf whose status is not `pass` died; a leaf
+   that **passed cannot have died**, and trap 7 then confirms its process was frozen.
+   Anything else is reported `unattributed` rather than guessed.
+7. **`time.monotonic()` does not tick while the host is suspended** (Linux
+   `CLOCK_MONOTONIC`), so the conductor's `substep_complete.elapsed_seconds` in
+   `run_logs/` is **suspend-immune**, while every timestamp in `phase_state_log.jsonl`
+   and `orchestration_meta.json` is wall clock and is **not**. Their divergence across one
+   continuously-running process is a *direct measurement* of host suspend, and is what
+   separates trap 6's two causes (measured on E2E #5: monotonic **216 s** vs wall
+   **15,719 s** on the same leaf). → **Corollary: a run's headline wall clock
+   (`orchestration_meta.started_at → finished_at`) is NOT its cost** — it also ticks
+   through suspend and through any `--resume` wait. Quote the leaf totals, never the
+   headline. The report prints the headline only to label it as such.
 
 ## Log / transcript sources
 
@@ -116,7 +133,7 @@ If transcripts live elsewhere, pass `--project-dir <dir>`.
    — that is compute, not overhead.
 3. Find the leaf with the largest **elapsed** and check its **gen% / tool%**. tool% in
    the low single digits is expected; a high tool% is the anomaly worth reporting. Note
-   any leaf flagged `[stale gap dropped]` or `[warm resume]` — its raw numbers are not
+   any leaf flagged `[dead wall dropped]` or `[warm resume]` — its raw numbers are not
    comparable to the others'.
 4. In the inside-leaf section, identify the **dominant turn(s)**. A `generate.generate`
    leaf is typically dominated by one large "write the whole source" turn; `verify` /

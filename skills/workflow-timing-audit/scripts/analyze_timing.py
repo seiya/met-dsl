@@ -8,7 +8,8 @@ Breaks a completed (or interrupted) orchestration run down into:
     output tokens, generation throughput, and the dominant turns,
   - node- and run-level rollups,
   - an ANOMALIES section: turns truncated by `max_tokens` (thinking that
-    produced nothing), leaf API/transport errors, stale terminal records, and
+    produced nothing), leaf API/transport errors, dead wall clock (a dead leaf's
+    resume-stamped terminal vs. a host suspend), and
     warm-resume replays.
 
 Multiple-counting is handled structurally (see MULTIPLE-COUNTING below), so the
@@ -45,23 +46,42 @@ MULTIPLE-COUNTING (why naive sums are wrong, and how this script avoids it):
      GLOBALLY across the run in launch order: the first leaf to emit an id owns
      it, and a later leaf that replays it reports only its NEW responses. The
      replayed span is reported separately, never summed into the totals.
-  5) A leaf whose child DIED (transport error, crash) has its
-     `record_agent_run_terminal` stamped when the conductor next runs — i.e. at
-     the operator's `--resume`, HOURS later. Its `child_launched ->
-     record_agent_run_terminal` elapsed therefore contains the human fix window,
-     not leaf activity (observed: 6.9h elapsed for a leaf with 129s of
-     transcript). -> When a leaf's elapsed exceeds its transcript wall by more
-     than STALE_GAP_S, the transcript wall is used as the effective elapsed and
-     the excess is reported separately as a stale gap. It is never added to the
-     LLM/deterministic split.
+  5) A leaf's `child_launched -> record_agent_run_terminal` span is WALL-CLOCK,
+     and wall clock can contain time in which nothing ran. Two distinct causes
+     produce the same signature (elapsed >> transcript wall), and the report must
+     not assert one when it was the other:
+       a) DEAD LEAF. The child died (transport error, crash) and its terminal
+          event was stamped when the conductor next ran — i.e. at the operator's
+          `--resume`, HOURS later. The gap is the human fix window (observed:
+          6.9h elapsed for a leaf with 129s of transcript).
+       b) HOST SUSPEND. The whole run was frozen mid-leaf (laptop sleep; on WSL2
+          the VM is paused when Windows sleeps). The leaf resumes and COMPLETES
+          NORMALLY; only the wall clock jumped (observed: 4.3h on a leaf that
+          passed).
+     -> The excess over the transcript wall is excluded from the elapsed either
+     way (never added to the LLM/deterministic split), and its cause is then
+     CLASSIFIED, not assumed: a leaf whose terminal status is not `pass` died (a);
+     a leaf that passed cannot have died, and the conductor's own MONOTONIC
+     elapsed (see below) confirms its process was frozen (b). Anything else is
+     reported as unattributed rather than guessed.
+
+  6) `time.monotonic()` DOES NOT ADVANCE WHILE THE HOST IS SUSPENDED (Linux
+     CLOCK_MONOTONIC), so the conductor's `substep_complete.elapsed_seconds` in
+     `run_logs/` is suspend-immune, whereas every timestamp in
+     `phase_state_log.jsonl` / `orchestration_meta.json` is wall clock and is not.
+     Their divergence over one continuously-running process is therefore a direct
+     measurement of host suspend, and is what distinguishes 5(b) from 5(a).
+     COROLLARY: `orchestration_meta.json`'s `finished_at - started_at` is NOT the
+     run's cost. Quote the monotonic total.
 """
+import glob
 import json
 import os
 import sys
 from datetime import datetime
 
 # A leaf's elapsed may legitimately exceed its transcript wall by process
-# startup/teardown (seconds). Beyond this, the excess is a stale terminal record
+# startup/teardown (seconds). Beyond this, the excess is dead time
 # (see MULTIPLE-COUNTING 5), not leaf activity.
 STALE_GAP_S = 600.0
 
@@ -121,6 +141,54 @@ def load_leaf_durations(orch_path):
                  "t0": t0, "t1": t1}
             )
     return rows
+
+
+def load_monotonic_elapsed(orch_path):
+    """run_id -> the conductor's own monotonic elapsed for that substep.
+
+    `substep_complete.elapsed_seconds` is measured with `time.monotonic()`, which
+    does not tick while the host is suspended (MULTIPLE-COUNTING 6). It is thus
+    the only suspend-immune timing in the run, and the ground truth against which
+    a wall-clock gap is classified. Every conductor process that touched this
+    orchestration writes its own run_log; a later pass (a `--resume`) re-runs the
+    substep and legitimately overwrites the entry, so last-write wins.
+    """
+    mono = {}
+    for path in sorted(glob.glob(os.path.join(orch_path, "run_logs", "*.jsonl"))):
+        for line in open(path):
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            if d.get("event") != "substep_complete":
+                continue
+            rid, el = d.get("agent_run_id"), d.get("elapsed_seconds")
+            if rid and el is not None:
+                mono[rid] = float(el)
+    return mono
+
+
+def classify_gap(status, wall_s, mono_s):
+    """Why did this leaf's wall span exceed its transcript wall? (see MULTIPLE-COUNTING 5)
+
+    Classified from evidence, never assumed: a leaf that PASSED cannot have died,
+    so a resume-stamped terminal is ruled out; and if the conductor's monotonic
+    clock advanced far less than the wall clock, its process was frozen.
+    """
+    if status and status != "pass":
+        return "dead_leaf"
+    if mono_s is not None and wall_s - mono_s > STALE_GAP_S:
+        return "host_suspend"
+    return "unattributed"
+
+
+GAP_CAUSE_NOTE = {
+    "dead_leaf": "dead leaf's terminal record stamped when the conductor next ran "
+                 "(the operator's --resume); the gap is the human fix window",
+    "host_suspend": "host suspended mid-leaf (the leaf then passed); wall clock jumped "
+                    "while the conductor's monotonic clock stood still",
+    "unattributed": "cause not established from the logs",
+}
 
 
 def load_labels(orch_path):
@@ -362,6 +430,7 @@ def main():
 
     durations = load_leaf_durations(orch_path)
     labels = load_labels(orch_path)
+    mono = load_monotonic_elapsed(orch_path)
 
     # Read every transcript first, then summarize in LAUNCH order: the global
     # message-id dedupe (MULTIPLE-COUNTING 4) must attribute a replayed response
@@ -385,17 +454,21 @@ def main():
         name = f"{row['step']}.{sub}" if sub else row["step"]
         tr = summaries[rid]
         elapsed = row["dur_s"]
-        # Stale terminal record (MULTIPLE-COUNTING 5): the leaf died and its
-        # terminal event was stamped at the operator's --resume. Use the
-        # transcript wall as the effective elapsed and report the excess.
+        mono_s = mono.get(rid)
+        # Dead wall time (MULTIPLE-COUNTING 5): the leaf's wall span exceeds the
+        # work its transcript shows. Exclude the excess regardless of cause, then
+        # classify the cause from evidence (dead leaf vs host suspend).
         stale_gap = 0.0
+        gap_cause = None
         if tr is not None and elapsed - tr["wall_s"] > STALE_GAP_S:
             stale_gap = elapsed - tr["wall_s"]
             elapsed = tr["wall_s"]
+            gap_cause = classify_gap(lab["status"], row["dur_s"], mono_s)
         leaves.append({
             "run_id": rid, "step": row["step"], "name": name,
             "role": lab["role"], "status": lab["status"],
             "elapsed_s": elapsed, "raw_elapsed_s": row["dur_s"], "stale_gap_s": stale_gap,
+            "gap_cause": gap_cause, "monotonic_s": mono_s,
             "is_llm": tr is not None,
             "transcript": tr,
         })
@@ -403,11 +476,18 @@ def main():
     meta_path = os.path.join(orch_path, "orchestration_meta.json")
     meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
 
+    # Run wall clock is NOT the run's cost: it contains any host suspend
+    # (MULTIPLE-COUNTING 6). Reported only to be contrasted with the leaf totals.
+    run_wall_s = None
+    if meta.get("started_at") and meta.get("finished_at"):
+        run_wall_s = (ts(meta["finished_at"]) - ts(meta["started_at"])).total_seconds()
+
     result = {
         "orchestration_id": orch_id,
         "spec_ref": meta.get("spec_ref"),
         "status": meta.get("status"),
         "project_dir": project_dir,
+        "run_wall_s": run_wall_s,
         "leaves": leaves,
     }
     if as_json:
@@ -424,7 +504,6 @@ def render(r):
     out_total = sum(l["transcript"]["out_tokens"] for l in llm)
     think_total = sum(l["transcript"]["thinking_tokens"] for l in llm)
     vis_total = sum(l["transcript"]["visible_tokens"] for l in llm)
-    stale_total = sum(l["stale_gap_s"] for l in r["leaves"])
     replay_tok = sum(l["transcript"]["replayed_tokens"] for l in llm)
     replay_leaves = [l for l in llm if l["transcript"]["replayed_responses"]]
 
@@ -432,6 +511,10 @@ def render(r):
     print(f"spec: {r.get('spec_ref')}")
     print(f"transcripts: {r['project_dir']}")
     print()
+    wall = r.get("run_wall_s")
+    if wall:
+        print(f"run wall clock: {wall/60:.1f} min  (meta finished_at - started_at -- NOT the cost: "
+              f"wall clock also ticks while the host is suspended)")
     print(f"leaf elapsed total: {total:.0f}s = {total/60:.1f} min")
     print(f"  LLM leaves:           {llm_total:6.0f}s ({pct(llm_total,total)})")
     print(f"  deterministic (cond): {total-llm_total:6.0f}s ({pct(total-llm_total,total)})  "
@@ -440,9 +523,11 @@ def render(r):
           f"+ visible {vis_total} ({pct(vis_total,out_total)})")
     print("    NOTE output_tokens includes extended thinking (billed as output, not in "
           "the files); visible = text + serialized tool inputs (the emitted source).")
-    if stale_total:
-        print(f"  EXCLUDED stale gap:   {stale_total:6.0f}s = {stale_total/3600:.1f}h  "
-              f"(dead leaf's terminal record stamped at --resume; not leaf activity)")
+    for cause in ("dead_leaf", "host_suspend", "unattributed"):
+        gap = sum(l["stale_gap_s"] for l in r["leaves"] if l["gap_cause"] == cause)
+        if gap:
+            print(f"  EXCLUDED dead wall:   {gap:6.0f}s = {gap/3600:.1f}h  "
+                  f"({GAP_CAUSE_NOTE[cause]}; not leaf activity)")
     if replay_tok:
         print(f"  EXCLUDED replay:      {replay_tok} tok across {len(replay_leaves)} warm-resumed "
               f"leaf(s) (producer's turns, already counted once)")
@@ -456,7 +541,8 @@ def render(r):
             t = l["transcript"]
             flags = ""
             if l["stale_gap_s"]:
-                flags += f"  [+{l['stale_gap_s']/3600:.1f}h stale gap dropped]"
+                flags += (f"  [+{l['stale_gap_s']/3600:.1f}h dead wall dropped: "
+                          f"{l['gap_cause']}]")
             if t["replayed_responses"]:
                 flags += (f"  [warm resume: {t['replayed_responses']} replayed turns dropped; "
                           f"latencies unreliable]")
