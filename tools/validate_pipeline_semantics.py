@@ -4195,10 +4195,12 @@ def _validate_generate_outputs_for_generation(
     # and non-physical case_path input — were removed in M3d: they were unreliable
     # `problem/`-scoped guesses with a known false-positive history, and once the physics
     # nodes host-render there is little leaf-authored physics-runner surface left for them to
-    # police. NOTE they are NOT a full no-op: a legacy no-harness `problem/` node — currently
-    # only `advdiff1d_linear` — still authors its own runner, so removing them accepts that its
-    # fabrication is caught by the LLM verify/judge + these deterministic backstops, not by the
-    # two deleted heuristics.)
+    # police. NOTE they are NOT a full no-op: the legacy leaf-authored-runner path stays live —
+    # the `infrastructure` harness self-test, any non-`(fortran, make)` node, and any node
+    # without an infra dep (the catalog currently holds no such physics node, since the
+    # advection_diffusion family opted into the harness, but nothing pins that). Removing the
+    # heuristics accepts that fabrication in those runners is caught by the LLM verify/judge +
+    # these deterministic backstops, not by the two deleted heuristics.)
     runner_files = sorted(src_dir.glob("*_runner.f90"))
     _validate_runner_source_files(
         execution, runner_files, violations,
@@ -9439,9 +9441,9 @@ def _validate_harness_render_preconditions(
     ``<spec_id>_runner``/``_checks``/``_model`` names (spec_id + 7) stay inside the f2008 63-char
     limit. A node declaring >1 infrastructure dep is not M3c (``_conductor_authors_runner``
     requires exactly one), so its runner is never host-rendered. The renderer keeps both as
-    defense-in-depth backstops. The catalog's one remaining over-length spec_id (an
-    ``advection_diffusion`` profile node) is therefore blocked at spec-input and must be renamed
-    before that node runs again.
+    defense-in-depth backstops. The catalog's former over-length offender (a 61-char
+    ``advection_diffusion`` profile node) has since been renamed, and no catalog ``spec_id``
+    now exceeds the bound — the gate stands as a guard on future additions.
 
     No-op only when the node is not M3c (legacy leaf-authored runner)."""
     derived_path = ir_dir / "spec.ir.yaml"

@@ -1402,6 +1402,11 @@ adds the mass-opt-in prerequisite gate. Five parts:
    json-serialization / snapshot-filename) stay for every runner. Not a full no-op: the one remaining
    legacy no-harness `problem/` node (`advdiff1d_linear`) now relies on LLM verify/judge + backstops
    for fabrication, not these heuristics.
+   **2026-07-13 update:** that last sentence is now historical — `advdiff1d_linear` took the harness dep
+   in the opt-in below, so the catalog holds ZERO legacy no-harness physics nodes and every `problem/`
+   runner is host-rendered. The legacy path itself stays live (the `infrastructure` harness self-test,
+   any non-`(fortran, make)` node, and any future node without an infra dep), so the removal of the two
+   heuristics still means those runners are policed by LLM verify/judge + the deterministic backstops.
 3. **Node-aware runner-output-contract narrowing.** `leaf_contract_doc_refs(step, *, is_m3c_physics)`
    drops `RUNNER_OUTPUT_CONTRACT.md` from an M3c PHYSICS generate leaf (authors model+checks, runner
    host-rendered) but KEEPS it for `Validate.judge` and for a NON-M3c runner-authoring generate leaf
@@ -1421,6 +1426,16 @@ adds the mass-opt-in prerequisite gate. Five parts:
    exact set billed E2E #4 re-certifies. The advection_diffusion family is deferred: its closure
    (`advdiff1d_linear`) pulls in the 61-char offender, which the new spec-input gate would reject, so
    that family opts in only after the offender is renamed.
+   **2026-07-13 update — advection_diffusion opted in.** The rename landed (`c42eee5`:
+   `dynamics_advdiff_profile_1d_upwind_center2_euler1`, 49 chars; the closure's longest `spec_id` is now
+   the 54-char boundary component), and billed E2E #5 re-certified the whole renamed closure on the
+   legacy path (all 5 nodes pass, `52c29dd`). Both preconditions being met, the same
+   `infrastructure: harness_fortran_cpu` dep — at `>=0.3.0 <1.0.0`, matching the harness's current
+   `spec_version` and the shallow_water constraint — was added to all 5 closure `deps.yaml` files
+   (`advdiff1d_linear`, its profile, and its 3 components). M3c membership is derived purely from
+   deps.yaml (`_conductor_authors_runner` / `_ir_is_m3c_physics`; no hard-coded node list), so the
+   deps.yaml edit IS the opt-in: no spec / catalog / code change accompanies it. Re-certification of the
+   family on the M3c path is billed E2E #6.
 
 Unit suite green (2134). Two independent adversarial reviews (general + Codex) converged — no confirmed
 correctness bug. The general pass drove rationale/caveat fixes (accurate `advdiff1d_linear` coverage
