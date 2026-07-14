@@ -320,7 +320,7 @@ dependency-build/migration bug — and the dependency-build path (D1/D2) was not
 
 **Fix — IMPLEMENTED (validator-side, deterministic).** `_validate_raw_evidence` now scopes each
 snapshot's required state variables to its case's test: it builds `_case_id_to_test_id` (from
-`case.test_case_set`, via `_algorithm_contract_for_execution`) and intersects the per-test
+`case.test_case_set`, via `_ir_document_for_execution`) and intersects the per-test
 `_contract_test_evidence_requirements` with the declared schema variables. A snapshot tagged with a
 `case_id` (in-file field, else filename stem) is only required to carry that case's test's
 `required_raw_variables`. Falls back to the prior strict union when no per-test contract / case mapping
@@ -2060,8 +2060,9 @@ failure under LLM output variance; resolve ground truth structurally / host-auth
 
 ## Problem state-array usage — a dormant gate, and the accessor bug class behind it (OPEN, filed 2026-07-12)
 
-`_validate_problem_state_array_usage` (`tools/validate_pipeline_semantics.py`) has never fired. It resolves its
-contract with `_algorithm_contract_for_execution`, which returns the WHOLE `spec.ir.yaml` document, and then hands
+`_validate_problem_state_array_usage` (`tools/validate_pipeline_semantics.py`) has never fired. It resolved its
+contract with `_algorithm_contract_for_execution` (renamed to `_ir_document_for_execution` by the accessor entry below),
+which returns the WHOLE `spec.ir.yaml` document, and then handed
 that to `_algorithm_state_contract`, which looks for the 4 contract keys (`state_variables` /
 `required_update_paths` / `diagnostics_from_state` / `fallback_policy`) at the TOP level — while every real IR
 nests them under `algorithm:`. The `isinstance(kernel_contract, dict)` guard is therefore always false and the body
@@ -2088,4 +2089,135 @@ Follow-up work, after the billed E2E:
    the whole document where the `algorithm` section is expected, and adopt the testing rule that a gate must be
    exercised against a fixture with the REAL IR shape. Every one of these three bugs was green under a suite whose
    fixtures used a shape the pipeline never produces — a passing test proved only that the gate could fire, never
-   that it does.
+   that it does. **DONE 2026-07-14** — see "IR document/section accessor confusion" below; the audit it forced found
+   two more dead gates. Items 1 and 2 remain open. `_validate_problem_state_array_usage` itself is DELETED: it ran no
+   check, and a body that only a misrouted lookup kept unreachable is an invitation to "repair" the early return and
+   silently enable a gate with a known false-positive class. Deleting it does not preempt item 2 — a revived check
+   needs a structurally-anchored gate written from scratch either way, and the design for it is recorded above.
+
+## IR document/section accessor confusion — three dead gates, two of them fail-open (IMPLEMENTED 2026-07-14)
+
+Follow-up 3 of the entry above. The defect class: a helper reads `spec.ir.yaml` and looks its keys up against a shape
+no real IR has — usually because the caller hands it the whole document where a *section* is expected. The document
+and a section are both plain dicts, so the mistake is invisible at the call site: the lookup misses, the helper
+returns `None`, and the body below it never runs. The suite stays green because the fixtures carry the same unreal
+shape.
+
+**The audit.** Every IR reader in `tools/` was checked against the shape derived mechanically from the 116 certified
+`spec.ir.yaml` files under `workspace*/ir/`. Beyond the known dormant gate, two more were dead, and both were
+fail-open:
+
+- `_tests_path_from_contract` resolved tests.md from a `source:` key — the legacy `derived_contract.json` layout,
+  carried by 0 of the 116 IRs (the ref lives at `meta.source_refs.tests`, 116/116). It always returned `None`, which
+  disabled:
+  - `_validate_test_evidence_requirements` (compile / post_generate / post_execute / pre_judge) — the pin that
+    `io_contract.test_evidence_requirements` holds the `tests.md` `test_id` set, neither more nor less. An IR that
+    omitted one test's evidence requirement certified clean. `_validate_metrics_basis_per_test` and the compile
+    test-id pin also document their own fallbacks as safe *because this gate exists*.
+  - `_validate_tests_verdict_summary_consistency` (pre_judge) — the `tests.md` ↔ `verdict.json#per_test` ↔
+    `summary.json` counts pin.
+- `_validate_problem_state_array_usage` — the dormant gate of the entry above.
+
+**The fix.** Access is centralized on `_ir_document_for_execution` (the whole document; formerly named
+`_algorithm_contract_for_execution`, which is what invited the confusion), `_ir_section`, and
+`_tests_path_from_ir_document` (the single tests.md resolver). `_require_ir_section` RAISES when the document is
+passed where a section is expected, so the class fails loudly instead of returning `None`. The `"source"` entries in
+both io_contract flatteners are deleted.
+
+The raise is a programmer tripwire, and **no leaf-authored shape may reach it**: the conductor treats a non-zero exit
+of `--stage compile` as a `compile_static_violation` and hands the leaf the last 50 lines as its repair findings, so a
+traceback would arrive as an unrepairable finding and burn the retry budget. `_validate_algorithm_contract_file`
+therefore reports every IR shape as a violation before the raise is reachable: an absent or non-mapping `algorithm:`,
+and — because the guard discriminates document from section by key — an `algorithm:` section that itself carries a
+document-level key. Both are pinned by tests; review found the second one by construction, since the certified corpus
+describes only IRs that already passed.
+
+**A revived gate is measured before it is enabled.** Enabling `_validate_tests_verdict_summary_consistency` without
+stage conditioning fail-closes every node on every run: the conductor clears any stale `verdict.json` at the top of
+execute and authors the deterministic verdict only after the post_execute gate returns clean (`_execute_inproc`), so
+an absent verdict is the normal state there. The gate takes `require_verdict`, derived from the STAGE — false at
+`post_execute`, true everywhere else. It is deliberately NOT `require_orchestration`: that flag governs the
+orchestration artifacts and `--allow-missing-orchestration` waives exactly those, so coupling the two let that flag
+silently switch the verdict/summary pin off — a fail-open the flag never promised (found by Codex review). Evidence on the live corpus (`workspace/`): compile /
+post_execute / pre_judge verdicts are identical to the pre-change ones on all 16 certified nodes, while a certified IR
+mutated to drop one test's evidence requirement passes before the change and fails after it. (Archived IRs under
+`workspace_*` are never re-validated; several predate a later `tests.md` addition and would now fail the set-equality
+pin, which is the intended behavior — R6-lite freshness re-certifies such a node.)
+
+**The ref itself is now checked.** `meta.source_refs.tests` is LLM-authored, and all three tests.md pins return
+silently when it does not resolve, so a mistyped or rename-orphaned ref would reopen the same fail-open hole one level
+up (2 of the 116 archived IRs already carry a ref orphaned by the `c42eee5` rename). `_validate_ir_source_refs_tests`
+fails Compile on a ref that is absent or does not resolve to a readable file, mirroring the infrastructure
+`meta.source_refs.controlled_spec` check. It does not yet pin the ref to *this node's* spec directory (a ref naming any
+readable tests.md satisfies it) — the same latitude the `controlled_spec` check has; strengthening both against
+`meta.spec_kind`/`spec_id` is open follow-up work.
+
+Because the ref is LLM-authored, every probe of it goes through `_is_readable_file`: `Path.is_file()` swallows only
+ENOENT/ENOTDIR/EBADF/ELOOP, so a ref naming an over-long path (ENAMETOOLONG) or one under an unsearchable directory
+(EACCES) raises out of the probe itself — and the conductor would hand that traceback to the leaf as its repair
+findings. The same total probe now guards the `controlled_spec` ref, which carried the identical hole, and the READS
+behind both refs absorb an `OSError` (a path that stats but does not open) rather than raising into the gate.
+
+The invariant these serve — **an artifact defect reaches the leaf as a finding it can repair, never as a traceback** —
+also closed four pre-existing escapes on leaf-authored content, each found by review rather than by a run:
+`_read_yaml` decoded `spec.ir.yaml` strictly (a non-UTF-8 IR raised `UnicodeDecodeError` past every caller — they guard
+`yaml.YAMLError` only) and raised `RecursionError` on a pathologically nested document; `_read_json` had the same
+decode hole (`UnicodeDecodeError` is a `ValueError`, not a `json.JSONDecodeError`, so it escaped even the callers that
+report `invalid json`) on every runner-written evidence file; `_ir_document_for_execution` read the IR unguarded; and
+the `command_log.jsonl` readers decoded strictly on a path that is in the generate leaf's `allowed_output_paths`.
+
+Each of these TRANSLATES the escaping error into the one its callers already handle. None of them decodes leniently:
+`errors="ignore"` DELETES the offending bytes, so an IR whose invalid byte sits in a comment would sanitize into a
+clean document and certify — trading a crash for a fail-open. (That trade was made and then reverted; Codex review
+caught it. The `command_log.jsonl` readers are the one place lenient decoding is correct: they scan for a record by
+`command_id`, every reader treats a record it cannot find as a violation, and no gate's passing condition is the
+ABSENCE of a record.)
+
+**The invariant is not yet total, and the residue is filed rather than claimed closed.** A leaf-authored artifact
+REPLACED BY A DIRECTORY still raises `IsADirectoryError` out of the reads that take it (model / runner / Makefile /
+`command_log.jsonl` / `metrics_basis.json` / `diagnostics.json` / `semantic_review.json` / `spec.ir.yaml`) — a shape no
+leaf produces today, and one that predates this change. Closing it properly means routing every artifact read through
+one guarded helper, which is the same centralization this entry applied to the IR accessors. Also open: the new
+`meta.source_refs.tests` gate runs at `compile` only, so on an `--resume` across this commit (Compile already done
+under the pre-change validator) an unresolvable ref leaves both revived pins dark at `post_execute` / `pre_judge` with
+nothing reporting the ref — see the landing note.
+
+Author-facing parity: the `test_evidence_requirements` set equality the revived gate enforces was stated only in the
+`Compile.verify` SKILL and the RUNBOOK; it is now in `phase_01_compile.md` V3 and the `Compile.generate` SKILL, both of
+which the compile.generate leaf force-reads — together with the ref requirement.
+
+**The testing rule, enforced.** The shared IR fixture factory authors the real document shape (`schema_version` /
+`meta.source_refs` / `case` present; the state contract as direct children of `algorithm`, not nested under a
+`state_contract:` block no IR authors; `direct_deps` entries as objects, not bare strings), and `IrFixtureShapeTests`
+pins it, the `require_verdict` wiring, the two repairs above, and — the pin the revival exists for — that the
+`test_evidence_requirements` set equality actually fires (a missing, extra, or duplicated `test_id`, an absent or
+unresolvable `meta.source_refs.tests`, and a tests.md that parses to zero test ids each fail the suite when the
+corresponding check is removed). Three fixtures that faked reachability are gone: the
+tests.md-dependent gate tests used a phantom `io_contract.source`; `ConductorDerivedSummaryConsistencyTest`
+monkeypatched the very resolver that was broken; and `DiagnosticsContractOutputTest` monkeypatched
+`_io_contract_for_execution`, leaving its `diagnostics_contract` hoist — the only route to that gate on 109 of the 116
+IRs — pinned by nothing. Each is now driven through the production accessor, and each mutation of the code it covers
+fails the suite.
+
+**Landing note — do not `--resume` across this commit; start a new run.** The revived `test_evidence_requirements` pin
+runs at `compile`, `post_generate`, `post_execute` and `pre_judge` (not `post_build`, which validates only the
+Makefile). Outside Compile the violation names `spec.ir.yaml`, which is outside the leaf's write root in those phases,
+so it is unrepairable where it fires. A fresh run never reaches that — Compile applies the same predicate to the same
+IR first — but an orchestration whose Compile ran under the pre-change validator can, on `--resume`, and the
+consequences are not self-healing:
+
+- `post_generate` fires first (Generate precedes Validate) and routes `("generate", "reuse")`. The C2 backstop counts
+  only no-verdict *execute* failures, so nothing reattributes a static Generate finding to Compile: the node exhausts
+  `MAX_ATTEMPTS_PER_PHASE` in Generate and terminalizes.
+- `post_execute` routes `("generate", "reuse")` as well; there the C2 backstop does eventually reopen Compile, after
+  burning two execute attempts.
+- `pre_judge`: `classify_post_judge_violations` returns `unknown` for an unrecognized basename, which the conductor
+  dispositions as `escalate` in prod (the diagnostician can reopen Compile) and as `fail_closed` in dev.
+
+Not changed, deliberately: the `algorithm.state_contract` / `algorithm.update_semantics` resolution branches stay.
+`phase_01_compile.md` §"Placement of the multi-dimensional contract" documents them as shadow detectors for an IR that
+authors the contract in the wrong place, so they are intentional rather than dead. Filed, not fixed: the
+`isinstance(d, str)` tolerance for `direct_deps` in `orchestration_runtime` (no producer emits it, and no fixture
+relies on it any more), and the line-scanning `_impl_resolved_build_system` / `_impl_resolved_language`, which are
+nesting-blind by construction (see L4) and therefore cannot pin the `impl_defaults.toolchain` nesting their fixtures
+now use.

@@ -237,15 +237,20 @@ def _spawn_response_payload(session_id: str) -> dict[str, object]:
 
 
 def _plant_spec_ir_yaml_make(repo_root: Path, ir_ref: str = _FIX_IR_REF) -> None:
-    """Plant spec.ir.yaml with toolchain.build_system: make.
+    """Plant spec.ir.yaml with impl_defaults.toolchain.build_system: make.
 
     Required for tests that exercise cross-phase canonical placement: record_launch
     reads this file to gate cross-phase auto-inject on Make toolchain.
+
+    The toolchain is nested under `impl_defaults:` because that is where every certified IR
+    carries it. A top-level `toolchain:` (what this fixture used to plant) is a shape the
+    pipeline never produces, and it passed only because `_impl_resolved_build_system` scans
+    lines and ignores nesting — any structured reader of the same field sees nothing there.
     """
     p = repo_root / ir_ref / "spec.ir.yaml"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(
-        "toolchain:\n  language: fortran\n  build_system: make\n",
+        "impl_defaults:\n  toolchain:\n    language: fortran\n    build_system: make\n",
         encoding="utf-8",
     )
 

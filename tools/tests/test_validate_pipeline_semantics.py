@@ -32,11 +32,22 @@ from tools.validate_pipeline_semantics import (
     _validate_infrastructure_public_api,
     _parse_public_api_from_controlled_spec,
     _dependency_expected_node_keys,
+    _algorithm_state_contract,
+    _require_ir_section,
+    _tests_path_from_ir_document,
     validate,
     validate_compile_stage,
     validate_post_build_stage,
     validate_post_generate_stage,
 )
+
+
+# The mock spec the shared fixture's IR points at through `meta.source_refs` (the real IR's only
+# route to controlled_spec.md / tests.md / deps.yaml). A test that wants the tests.md-dependent
+# gates to run writes its tests.md at MOCK_TESTS_REF; one that does not simply leaves the file
+# absent, and those gates no-op exactly as they do for an IR whose tests.md is missing.
+MOCK_SPEC_DIR = "spec/problem/mock_domain/mock_family/mock_spec"
+MOCK_TESTS_REF = f"{MOCK_SPEC_DIR}/tests.md"
 
 
 def _seed_shape_expr_schema_into(repo_root: Path) -> None:
@@ -250,10 +261,18 @@ def _create_minimal_execution_tree(
         f"workspace/pipelines/{node_safe}/{pipeline_id}/source/src_20260415_001/src/command_log.jsonl"
     )
     if dependency_resolved is None:
+        # Real shape: `direct_deps` entries are objects (node_key / kind / operations) in every
+        # certified IR — never bare strings.
         dependency_resolved = {
             "node_key": "problem/shallow_water2d@0.3.0",
-            "direct_deps": [f"component/{dep_spec_id}@0.1.0"],
-            "transitive_deps": [f"component/{dep_spec_id}@0.1.0"],
+            "direct_deps": [
+                {
+                    "node_key": f"component/{dep_spec_id}@0.1.0",
+                    "kind": "component",
+                    "operations": [f"{dep_spec_id}__compute_flux"],
+                }
+            ],
+            "transitive_deps": [],
             "topo_level": 1,
         }
     _write_json(
@@ -295,16 +314,16 @@ def _create_minimal_execution_tree(
             "derived_field_rules": [],
             "invariants": [],
             "splitting_policy": {"kind": "none"},
-            "state_contract": {
-                "state_variables": [
-                    {"name": "h", "shape_expr": "[2,2]"},
-                    {"name": "hu", "shape_expr": "[2,2]"},
-                    {"name": "hv", "shape_expr": "[2,2]"},
-                ],
-                "required_update_paths": ["h", "hu", "hv"],
-                "diagnostics_from_state": True,
-                "fallback_policy": "fail_closed",
-            },
+            # Real shape: the state contract's four fields are direct children of `algorithm:`.
+            # No certified IR nests them under a `state_contract:` block.
+            "state_variables": [
+                {"name": "h", "shape_expr": "[2,2]"},
+                {"name": "hu", "shape_expr": "[2,2]"},
+                {"name": "hv", "shape_expr": "[2,2]"},
+            ],
+            "required_update_paths": ["h", "hu", "hv"],
+            "diagnostics_from_state": True,
+            "fallback_policy": "fail_closed",
         }
     if io_contract is None:
         # New IR: spec.ir.yaml.io_contract holds inputs / outputs /
@@ -372,10 +391,28 @@ def _create_minimal_execution_tree(
             "backend_overrides": [],
         }
 
-    # Merge all 5 sections into a single spec.ir.yaml. The new IR design puts
-    # algorithm / io_contract / impl_defaults / dependency under their own
-    # top-level keys; case is optional here.
+    # A real spec.ir.yaml always carries schema_version / meta / case as well as the four
+    # sections below. Fixtures that omitted them silently disabled every gate that reaches the
+    # IR through them — notably `meta.source_refs.tests`, which is how tests.md is located
+    # (see _tests_path_from_ir_document). Keep this document real-shaped; the shape is pinned by
+    # `IrFixtureShapeTests`.
     spec_ir_doc: dict[str, object] = {
+        "schema_version": "1.0",
+        "meta": {
+            "node_key": "problem/shallow_water2d@0.3.0",
+            "spec_kind": "problem",
+            "spec_id": "shallow_water2d",
+            "spec_version": "0.3.0",
+            "ir_id": pipeline_id,
+            "source_refs": {
+                "controlled_spec": f"{MOCK_SPEC_DIR}/controlled_spec.md",
+                "tests": MOCK_TESTS_REF,
+                "deps": f"{MOCK_SPEC_DIR}/deps.yaml",
+            },
+        },
+        # Every certified IR carries at least one case; an empty test_case_set is a shape the
+        # pipeline never produces.
+        "case": {"test_case_set": [{"case_id": "c1", "inputs": {}}]},
         "algorithm": algorithm_contract,
         "io_contract": io_contract,
         "impl_defaults": impl_resolved,
@@ -960,7 +997,6 @@ end program shallow_water2d_runner
         runner_text=runner_text,
         run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
         io_contract={
-            "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
             "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
             "outputs": [
                 {
@@ -5546,9 +5582,6 @@ end program shallow_water2d_runner
                 runner_text=runner_text,
                 run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 io_contract={
-                    "source": {
-                        "tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"
-                    },
                     "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
@@ -5629,15 +5662,7 @@ implicit none
 write(*,*) 'ok'
 end program shallow_water2d_runner
 """
-            tests_md = (
-                repo_root
-                / "spec"
-                / "problem"
-                / "dynamics"
-                / "shallow_water"
-                / "shallow_water2d"
-                / "tests.md"
-            )
+            tests_md = repo_root / MOCK_TESTS_REF
             tests_md.parent.mkdir(parents=True, exist_ok=True)
             tests_md.write_text(
                 "## 7. Test definitions\n"
@@ -5652,9 +5677,6 @@ end program shallow_water2d_runner
                 runner_text=runner_text,
                 run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 io_contract={
-                    "source": {
-                        "tests": "spec/problem/dynamics/shallow_water/shallow_water2d/tests.md"
-                    },
                     "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {"name": "metric_mass", "shape_expr": "scalar", "evidence_ref": "raw/metrics_basis.json"},
@@ -5771,8 +5793,7 @@ end program shallow_water2d_runner
                 runner_text=runner_text,
                 run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 io_contract={
-                    "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
-                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
+                            "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -5851,8 +5872,7 @@ end program shallow_water2d_runner
                 runner_text=runner_text,
                 run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 io_contract={
-                    "source": {"tests": "spec/problem/mock_domain/mock_family/mock_spec/tests.md"},
-                    "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
+                            "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
                                 "name": "metric",
@@ -6816,13 +6836,7 @@ end program shallow_water2d_runner
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             _seed_shape_expr_schema_into(repo_root)
-            tests_path = (
-                repo_root
-                / "spec"
-                / "problem"
-                / "shallow_water2d"
-                / "tests.md"
-            )
+            tests_path = repo_root / MOCK_TESTS_REF
             tests_path.parent.mkdir(parents=True, exist_ok=True)
             tests_path.write_text("### 1-1. `l0_case_pass`\n", encoding="utf-8")
             model_text = """module shallow_water2d_model
@@ -6847,7 +6861,6 @@ end program shallow_water2d_runner
                 runner_text=runner_text,
                 run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
                 io_contract={
-                    "source": {"tests": "spec/problem/shallow_water2d/tests.md"},
                     "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
                         "outputs": [
                             {
@@ -7629,8 +7642,22 @@ end program shallow_water2d_runner
                 "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001")
             self.assertTrue(any("not safe tokens" in x and "raw/state_snapshots" in x for x in v), v)
 
-    def _compile_with_io_contract(self, repo_root: Path, io_contract: dict):
+    def _plant_tests_md(self, repo_root: Path, test_ids: tuple[str, ...] = ("t1",)) -> None:
+        """A compile-stage fixture needs the tests.md its `meta.source_refs.tests` names: the ref is
+        gated (`_validate_ir_source_refs_tests`) and the test-id pins read the file through it."""
+        tests_md = repo_root / MOCK_TESTS_REF
+        tests_md.parent.mkdir(parents=True, exist_ok=True)
+        tests_md.write_text(
+            "".join(f"### 1-{i}. `{t}`\n" for i, t in enumerate(test_ids, start=1)),
+            encoding="utf-8",
+        )
+
+    def _compile_with_io_contract(
+        self, repo_root: Path, io_contract: dict, *, plant_tests_md: bool = True
+    ):
         _seed_shape_expr_schema_into(repo_root)
+        if plant_tests_md:
+            self._plant_tests_md(repo_root)
         _create_minimal_execution_tree(
             repo_root,
             dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -7680,6 +7707,11 @@ end program shallow_water2d_runner
                 "checks": [{"id": "g"}],
                 "verdict": {"required": True, "fields": ["overall", "failed_checks"]},
                 "metrics": ["metrics.mass_drift_rel"]},
+            # The canonical test-id set of this fixture is tests.md (planted by the compile helpers
+            # at MOCK_TESTS_REF), so the evidence requirements must cover it exactly — a real IR
+            # always carries both.
+            "test_evidence_requirements": [
+                {"test_id": "t1", "required_raw_variables": ["h", "time"]}],
             "test_predicates": predicates,
         }
 
@@ -7688,6 +7720,7 @@ end program shallow_water2d_runner
         carries `state_contract`, so the node_key-conditioned gate is exercised through the
         real wiring (`_plan_dependency_node_key` -> `_validate_algorithm_contract_file`)."""
         _seed_shape_expr_schema_into(repo_root)
+        self._plant_tests_md(repo_root)
         preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
                   "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}]
         _create_minimal_execution_tree(
@@ -7904,18 +7937,20 @@ end program shallow_water2d_runner
             self.assertTrue(any("diagnostics_contract.checks" in x for x in v), v)
 
     def test_compile_predicate_gate_uses_test_evidence_requirements_fallback(self) -> None:
-        # F2: with no resolvable tests.md (the fixture has no meta.source_refs.tests + no spec
-        # file), the gate falls back to the same-IR test_evidence_requirements id set — so a
-        # predicate id that is NOT in test_evidence_requirements is still caught.
+        # F2: when tests.md does NOT resolve, the predicate gate falls back to the same-IR
+        # test_evidence_requirements id set, so a predicate id absent from it is still caught.
+        # The fixture must therefore withhold tests.md — planting it (the default now) resolves the
+        # ref and routes the gate through its tests.md branch instead, leaving this fallback
+        # unexercised. An unresolvable ref is itself a violation (_validate_ir_source_refs_tests),
+        # which is why this asserts the specific fallback finding rather than the whole list.
         with tempfile.TemporaryDirectory() as tmp:
             io = self._io_contract_with_predicates(
                 [{"test_id": "not_in_ter", "expected_outcome": "pass", "target_cases": ["c1"],
                   "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}])
             io["test_evidence_requirements"] = [
                 {"test_id": "t1", "required_raw_variables": ["h"]}]
-            v = self._compile_with_io_contract(Path(tmp), io)
-            self.assertTrue(any("unknown test_id not in tests.md" in x for x in v)
-                            or any("missing tests" in x for x in v), v)
+            v = self._compile_with_io_contract(Path(tmp), io, plant_tests_md=False)
+            self.assertTrue(any("unknown test_id not in tests.md" in x for x in v), v)
 
     def test_parse_test_ids_handles_heading_and_bullet_forms(self) -> None:
         from tools.validate_pipeline_semantics import _parse_test_ids_from_tests_md
@@ -11902,17 +11937,41 @@ class DiagnosticsContractOutputTest(unittest.TestCase):
     }
 
     def _run(self, diagnostics: dict, contract: dict | None = CONTRACT) -> list[str]:
-        node_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, node_dir, ignore_errors=True)
+        """Reach the contract through the production accessor, not a monkeypatch.
+
+        `_io_contract_for_execution` hoists `io_contract.diagnostics_contract` to the top level of
+        the dict this gate reads; every real IR nests it, and none carries it at document level.
+        Substituting a pre-flattened dict here left that hoist — one entry in a key tuple — as the
+        only route to the gate on 109 of 116 certified IRs, with nothing pinning it.
+        """
+        repo_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo_root, ignore_errors=True)
+        pipeline_dir = repo_root / "workspace" / "pipelines" / "n" / "p_001"
+        node_dir = pipeline_dir / "runs" / "run_001" / "n"
+        node_dir.mkdir(parents=True, exist_ok=True)
         (node_dir / "diagnostics.json").write_text(json.dumps(diagnostics))
-        execution = NodeExecution(
-            node_key="n", node_dir=node_dir, exec_dir=node_dir, pipeline_dir=node_dir
+
+        ir_ref = "workspace/ir/component__n__0.1.0/n_001"
+        _write_json(
+            pipeline_dir / "lineage.json",
+            {"node_key": "component/n@0.1.0", "ir_ref": ir_ref, "dependency_ref": ir_ref},
         )
-        original = vps._io_contract_for_execution
-        vps._io_contract_for_execution = lambda repo_root, ex: contract
-        self.addCleanup(setattr, vps, "_io_contract_for_execution", original)
+        io_contract: dict[str, object] = {
+            "inputs": [{"name": "case_resolved", "source": "spec.ir.yaml"}],
+            "outputs": [],
+        }
+        if contract is not None:
+            io_contract.update(contract)  # nested, exactly as a real IR authors it
+        _write_json(repo_root / ir_ref / "spec.ir.yaml", {"io_contract": io_contract})
+
+        execution = NodeExecution(
+            node_key="component/n@0.1.0",
+            node_dir=node_dir,
+            exec_dir=node_dir,
+            pipeline_dir=pipeline_dir,
+        )
         violations: list[str] = []
-        _validate_diagnostics_contract_output(Path("."), execution, violations)
+        _validate_diagnostics_contract_output(repo_root, execution, violations)
         return violations
 
     def test_broken_per_case_array_is_flagged(self) -> None:
@@ -12024,11 +12083,22 @@ class ConductorDerivedSummaryConsistencyTest(unittest.TestCase):
             exec_dir=node_dir, pipeline_dir=tmp)
 
     def _seed(self, tmp: Path, ex: vps.NodeExecution, counts: dict) -> None:
-        tests_md = tmp / "tests.md"
+        # Reach tests.md the way the gate reaches it in production — lineage.json -> the IR's
+        # `meta.source_refs.tests`. Monkeypatching `_tests_path_for_execution` here is what let
+        # this gate stay green while it was, in fact, unreachable on every real artifact: the
+        # resolver read a `source:` key no IR has, so the gate returned before its first check.
+        tests_md = tmp / MOCK_TESTS_REF
+        tests_md.parent.mkdir(parents=True, exist_ok=True)
         tests_md.write_text("### 1-1. `t1`\n### 1-2. `t2`\n", encoding="utf-8")
-        self._orig = vps._tests_path_for_execution
-        vps._tests_path_for_execution = lambda repo, execution: tests_md
-        self.addCleanup(setattr, vps, "_tests_path_for_execution", self._orig)
+        ir_ref = "workspace/ir/component__spec_x__0.1.0/spec-x_20260415_001"
+        _write_json(
+            ex.pipeline_dir / "lineage.json",
+            {"node_key": ex.node_key, "ir_ref": ir_ref, "dependency_ref": ir_ref},
+        )
+        _write_json(
+            tmp / ir_ref / "spec.ir.yaml",
+            {"meta": {"node_key": ex.node_key, "source_refs": {"tests": MOCK_TESTS_REF}}},
+        )
         (ex.node_dir / "verdict.json").write_text(json.dumps({
             "per_test": [{"test_id": "t1", "status": "pass"},
                          {"test_id": "t2", "status": "xfail"}],
@@ -12042,7 +12112,8 @@ class ConductorDerivedSummaryConsistencyTest(unittest.TestCase):
             ex = self._execution(tmp)
             self._seed(tmp, ex, {"pass": 1, "fail": 0, "xfail": 1, "skipped": 0})
             violations: list[str] = []
-            vps._validate_tests_verdict_summary_consistency(tmp, ex, violations)
+            vps._validate_tests_verdict_summary_consistency(
+                tmp, ex, violations, require_verdict=True)
             self.assertEqual(violations, [])
 
     def test_mutated_summary_counts_flagged(self) -> None:
@@ -12052,9 +12123,74 @@ class ConductorDerivedSummaryConsistencyTest(unittest.TestCase):
             # pass count does not match the verdict.per_test aggregate (1).
             self._seed(tmp, ex, {"pass": 2, "fail": 0, "xfail": 1, "skipped": 0})
             violations: list[str] = []
-            vps._validate_tests_verdict_summary_consistency(tmp, ex, violations)
+            vps._validate_tests_verdict_summary_consistency(
+                tmp, ex, violations, require_verdict=True)
             self.assertTrue(any("counts.pass must equal" in v for v in violations),
                             violations)
+
+    def test_absent_summary_is_flagged(self) -> None:
+        """The only place the validator requires summary.json to exist — load-bearing only since the
+        gate was revived, so it was pinned by nothing."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ex = self._execution(tmp)
+            self._seed(tmp, ex, {"pass": 1, "fail": 0, "xfail": 1, "skipped": 0})
+            (ex.node_dir / "summary.json").unlink()
+            violations: list[str] = []
+            vps._validate_tests_verdict_summary_consistency(
+                tmp, ex, violations, require_verdict=True)
+        self.assertTrue([v for v in violations if "summary.json: missing" in v], violations)
+
+    def test_duplicated_per_test_entry_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ex = self._execution(tmp)
+            self._seed(tmp, ex, {"pass": 1, "fail": 0, "xfail": 1, "skipped": 0})
+            (ex.node_dir / "verdict.json").write_text(json.dumps({
+                "per_test": [{"test_id": "t1", "status": "pass"},
+                             {"test_id": "t1", "status": "pass"},
+                             {"test_id": "t2", "status": "xfail"}],
+            }), encoding="utf-8")
+            violations: list[str] = []
+            vps._validate_tests_verdict_summary_consistency(
+                tmp, ex, violations, require_verdict=True)
+        self.assertTrue(
+            [v for v in violations if "per_test has duplicated test_id" in v], violations
+        )
+
+    def test_tests_md_without_a_test_id_heading_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ex = self._execution(tmp)
+            self._seed(tmp, ex, {"pass": 1, "fail": 0, "xfail": 1, "skipped": 0})
+            (tmp / MOCK_TESTS_REF).write_text("## 4. Tests\nprose only\n", encoding="utf-8")
+            violations: list[str] = []
+            vps._validate_tests_verdict_summary_consistency(
+                tmp, ex, violations, require_verdict=True)
+        self.assertTrue(
+            [v for v in violations if "test_id heading not found" in v], violations
+        )
+
+    def test_absent_verdict_is_not_flagged_at_execute_but_is_at_pre_judge(self) -> None:
+        """The conductor authors verdict.json AFTER the post_execute gate runs (and clears any
+        stale one at the top of execute), so demanding it there would fail-close every node on
+        every run. At pre_judge the verdict exists and its absence is a real defect."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ex = self._execution(tmp)
+            self._seed(tmp, ex, {"pass": 1, "fail": 0, "xfail": 1, "skipped": 0})
+            (ex.node_dir / "verdict.json").unlink()
+
+            at_execute: list[str] = []
+            vps._validate_tests_verdict_summary_consistency(
+                tmp, ex, at_execute, require_verdict=False)
+            self.assertEqual(at_execute, [])
+
+            at_pre_judge: list[str] = []
+            vps._validate_tests_verdict_summary_consistency(
+                tmp, ex, at_pre_judge, require_verdict=True)
+            self.assertTrue(any("verdict.json: missing" in v for v in at_pre_judge),
+                            at_pre_judge)
 
 
 class CompileDependencyConsistencyTests(unittest.TestCase):
@@ -13416,6 +13552,580 @@ class HarnessRenderPreconditionsTests(unittest.TestCase):
         ir["io_contract"]["raw_requirements"]["required_evidence"][0]["schema"][
             "time_variable"] = "time"
         self.assertEqual(self._run(ir), [])
+
+
+# The shape every certified spec.ir.yaml actually has, measured over the 116 IRs under
+# `workspace*/ir/` on 2026-07-14. `workspace/` is untracked, so the corpus cannot be read at test
+# time — this constant IS the pin, and it must be re-measured if the IR contract changes.
+_REAL_IR_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "meta",
+        "case",
+        "algorithm",
+        "impl_defaults",
+        "io_contract",
+        "dependency",
+    }  # + `public_api`, on infrastructure nodes only
+)
+_REAL_IR_STATE_CONTRACT_FIELDS = frozenset(
+    {"state_variables", "required_update_paths", "diagnostics_from_state", "fallback_policy"}
+)
+
+_UNSET = object()
+
+_FIXTURE_IR_REL = (
+    "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001/spec.ir.yaml"
+)
+
+
+class IrFixtureShapeTests(unittest.TestCase):
+    """The testing rule: a gate must be exercised against a fixture with the REAL IR shape.
+
+    Three gates were silently dead under a green suite because their fixtures used a shape the
+    pipeline never produces — a passing test proved only that the gate COULD fire, never that it
+    DOES on a real artifact (`_plan_dependency_node_key`; `_validate_problem_state_array_usage`;
+    and the tests.md resolution behind `_validate_test_evidence_requirements` /
+    `_validate_tests_verdict_summary_consistency`, which read a `source:` key no IR has). These
+    tests pin the shared factory's document against the real shape so the class cannot recur.
+    """
+
+    def _fixture_ir(self, repo_root: Path) -> dict:
+        _seed_shape_expr_schema_into(repo_root)
+        _create_minimal_execution_tree(
+            repo_root,
+            dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+            model_text="module m\nimplicit none\nend module m\n",
+            runner_text="program r\nimplicit none\nend program r\n",
+            run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+        )
+        return json.loads((repo_root / _FIXTURE_IR_REL).read_text(encoding="utf-8"))
+
+    def test_shared_fixture_carries_every_document_level_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = self._fixture_ir(Path(tmp))
+        self.assertEqual(
+            set(doc),
+            set(_REAL_IR_TOP_LEVEL_KEYS),
+            "the shared fixture's spec.ir.yaml must carry exactly the sections a real IR carries; "
+            "a fixture missing `meta` silently disables every gate that reaches the IR through it",
+        )
+        self.assertTrue(
+            doc["case"]["test_case_set"],
+            "every certified IR declares at least one case; an empty case set is a shape the "
+            "pipeline never produces, and the case->test mapping reads it",
+        )
+
+    def test_shared_fixture_places_the_state_contract_where_real_irs_place_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            algorithm = self._fixture_ir(Path(tmp))["algorithm"]
+        self.assertNotIn(
+            "state_contract",
+            algorithm,
+            "no certified IR nests the contract under `algorithm.state_contract` — the fixture must "
+            "author the canonical flat placement, or the gates run against the shadow branch only",
+        )
+        self.assertTrue(_REAL_IR_STATE_CONTRACT_FIELDS <= set(algorithm))
+
+    def test_shared_fixture_resolves_tests_md_the_way_a_real_ir_does(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            doc = self._fixture_ir(repo_root)
+            tests_path = _tests_path_from_ir_document(repo_root, doc)
+        self.assertEqual(
+            tests_path,
+            repo_root / MOCK_TESTS_REF,
+            "tests.md is reachable only through `meta.source_refs.tests`; a fixture that does not "
+            "carry it leaves the tests.md-dependent gates unexercised",
+        )
+
+    def test_shared_fixture_direct_deps_entries_are_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            direct_deps = self._fixture_ir(Path(tmp))["dependency"]["direct_deps"]
+        self.assertTrue(direct_deps)
+        for entry in direct_deps:
+            self.assertIsInstance(
+                entry,
+                dict,
+                "every `direct_deps` entry of every certified IR is an object (node_key / kind / "
+                "operations); a bare string exercises a compat branch no producer emits",
+            )
+            self.assertIn("node_key", entry)
+
+    def _compile_with_tests_md(
+        self,
+        repo_root: Path,
+        *,
+        test_ids: tuple[str, ...] = ("t1",),
+        evidence: object = _UNSET,
+        drop_tests_ref: bool = False,
+        tests_md_body: str | None = None,
+    ) -> list[str]:
+        """Drive the compile stage over the shared fixture with a real tests.md in place.
+
+        This is the state the revived gates actually run in: `meta.source_refs.tests` resolves, so
+        `tests.md` is the canonical test-id set and `io_contract.test_evidence_requirements` is
+        pinned against it.
+        """
+        self._fixture_ir(repo_root)
+        tests_md = repo_root / MOCK_TESTS_REF
+        tests_md.parent.mkdir(parents=True, exist_ok=True)
+        tests_md.write_text(
+            tests_md_body
+            if tests_md_body is not None
+            else "".join(f"### 1-{i}. `{t}`\n" for i, t in enumerate(test_ids, start=1)),
+            encoding="utf-8",
+        )
+
+        ir_path = repo_root / _FIXTURE_IR_REL
+        doc = json.loads(ir_path.read_text(encoding="utf-8"))
+        if evidence is not _UNSET:
+            doc["io_contract"]["test_evidence_requirements"] = evidence
+        if drop_tests_ref:
+            doc["meta"]["source_refs"].pop("tests", None)
+        ir_path.write_text(json.dumps(doc), encoding="utf-8")
+        return validate_compile_stage(
+            repo_root, "workspace", str(Path(_FIXTURE_IR_REL).parent)
+        )
+
+    def test_evidence_requirements_must_cover_every_tests_md_test(self) -> None:
+        """The pin the revival exists for: an IR that omits one test's evidence requirement used to
+        certify clean, because tests.md was never resolved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._compile_with_tests_md(
+                Path(tmp),
+                test_ids=("t1", "t2"),
+                evidence=[{"test_id": "t1", "required_raw_variables": ["h"]}],
+            )
+        self.assertTrue(
+            [v for v in violations if "missing tests from tests.md" in v and "t2" in v], violations
+        )
+
+    def test_evidence_requirements_reject_a_test_id_absent_from_tests_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._compile_with_tests_md(
+                Path(tmp),
+                test_ids=("t1",),
+                evidence=[
+                    {"test_id": "t1", "required_raw_variables": ["h"]},
+                    {"test_id": "t_ghost", "required_raw_variables": ["h"]},
+                ],
+            )
+        self.assertTrue(
+            [v for v in violations if "unknown test_id" in v and "t_ghost" in v], violations
+        )
+
+    def test_evidence_requirements_reject_a_duplicated_test_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._compile_with_tests_md(
+                Path(tmp),
+                test_ids=("t1",),
+                evidence=[
+                    {"test_id": "t1", "required_raw_variables": ["h"]},
+                    {"test_id": "t1", "required_raw_variables": ["hu"]},
+                ],
+            )
+        self.assertTrue([v for v in violations if "duplicated test_id" in v], violations)
+
+    def test_evidence_requirements_are_clean_when_the_set_matches(self) -> None:
+        """The negative twin: the pin does not simply reject everything."""
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._compile_with_tests_md(
+                Path(tmp),
+                test_ids=("t1",),
+                evidence=[{"test_id": "t1", "required_raw_variables": ["h"]}],
+            )
+        self.assertFalse(
+            [v for v in violations if "test_evidence_requirements" in v], violations
+        )
+
+    def test_absent_tests_ref_fails_compile(self) -> None:
+        """The other branch of the ref gate: the key missing entirely, not merely unresolvable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._compile_with_tests_md(Path(tmp), drop_tests_ref=True)
+        self.assertTrue(
+            [v for v in violations if "meta.source_refs.tests missing" in v], violations
+        )
+
+    def test_tests_ref_naming_a_directory_is_a_violation_not_a_traceback(self) -> None:
+        """`meta.source_refs.tests` is LLM-authored: a ref naming the spec directory instead of
+        tests.md passes an existence check, and reading it would raise `IsADirectoryError` out of
+        the gate — a traceback where the compile leaf expects its repair findings."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)
+            spec_dir = repo_root / MOCK_SPEC_DIR
+            spec_dir.mkdir(parents=True, exist_ok=True)
+            ir_path = repo_root / _FIXTURE_IR_REL
+            doc = json.loads(ir_path.read_text(encoding="utf-8"))
+            doc["meta"]["source_refs"]["tests"] = MOCK_SPEC_DIR  # the directory, not tests.md
+            ir_path.write_text(json.dumps(doc), encoding="utf-8")
+            violations = validate_compile_stage(
+                repo_root, "workspace", str(Path(_FIXTURE_IR_REL).parent)
+            )
+        self.assertTrue(
+            [v for v in violations if "meta.source_refs.tests" in v and "unresolvable" in v],
+            violations,
+        )
+
+    def test_tests_md_that_parses_to_zero_test_ids_fails_compile(self) -> None:
+        """A resolvable tests.md whose test-id form is unrecognized would silently degrade every
+        test-id pin to the same-IR fallback, so it is a violation rather than a no-op."""
+        with tempfile.TemporaryDirectory() as tmp:
+            violations = self._compile_with_tests_md(
+                Path(tmp), tests_md_body="## 4. Tests\nno test ids here\n"
+            )
+        self.assertTrue([v for v in violations if "parsed 0 test_ids" in v], violations)
+
+    def _validate_stage_via_cli(self, repo_root: Path, argv: list[str]) -> list[str]:
+        """Drive `main()` so the STAGE -> flag wiring is what is under test, not a hand-passed flag."""
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            vps.main(["--repo-root", str(repo_root), "--workspace-root", "workspace", *argv])
+        return [line for line in buf.getvalue().splitlines() if line.startswith("- ")]
+
+    def test_only_post_execute_waives_the_verdict(self) -> None:
+        """Pin the STAGE wiring, not just the parameter.
+
+        `post_execute` is the one stage where verdict.json is legitimately absent (the conductor
+        authors it only after that gate returns clean). Every other stage must demand it: hardcode
+        `require_verdict=True` and every node fails `verdict.json: missing` on every run; hardcode
+        it False and the pre_judge pin is fail-open again — the defect being repaired.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)  # no verdict.json anywhere in the tree
+            tests_md = repo_root / MOCK_TESTS_REF
+            tests_md.parent.mkdir(parents=True, exist_ok=True)
+            tests_md.write_text("### 1-1. `t1`\n", encoding="utf-8")
+
+            at_execute = self._validate_stage_via_cli(repo_root, ["--stage", "post_execute"])
+            at_full = self._validate_stage_via_cli(
+                repo_root,
+                ["--stage", "full", "--legacy-mode", "--allow-missing-llm-review"],
+            )
+            # `--allow-missing-orchestration` waives the ORCHESTRATION artifacts. Coupling the
+            # verdict to it (require_verdict = not allow_missing_orchestration) silently switched
+            # the verdict/summary pin off, which is a fail-open the flag never promised.
+            at_full_no_orch = self._validate_stage_via_cli(
+                repo_root,
+                [
+                    "--stage", "full", "--legacy-mode",
+                    "--allow-missing-llm-review", "--allow-missing-orchestration",
+                ],
+            )
+        self.assertFalse(
+            [v for v in at_execute if "verdict.json: missing" in v],
+            "post_execute must not demand a verdict the conductor has not authored yet",
+        )
+        self.assertTrue(
+            [v for v in at_full if "verdict.json: missing" in v],
+            "every other stage must demand the verdict",
+        )
+        self.assertTrue(
+            [v for v in at_full_no_orch if "verdict.json: missing" in v],
+            "--allow-missing-orchestration must not waive the verdict pin",
+        )
+
+    def test_unresolvable_tests_ref_fails_compile(self) -> None:
+        """The three tests.md pins all no-op silently when the ref does not resolve, so the ref
+        itself is gated at compile — otherwise a mistyped (or rename-orphaned) ref re-opens the
+        fail-open hole this change closed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)  # factory points meta.source_refs.tests at MOCK_TESTS_REF
+            ir_ref = str(Path(_FIXTURE_IR_REL).parent)
+
+            without_tests_md = validate_compile_stage(repo_root, "workspace", ir_ref)
+            self.assertTrue(
+                [v for v in without_tests_md if "meta.source_refs.tests" in v and "unresolvable" in v],
+                without_tests_md,
+            )
+
+            (repo_root / MOCK_TESTS_REF).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / MOCK_TESTS_REF).write_text("### 1-1. `t1`\n", encoding="utf-8")
+            with_tests_md = validate_compile_stage(repo_root, "workspace", ir_ref)
+        self.assertFalse(
+            [v for v in with_tests_md if "meta.source_refs.tests" in v],
+            with_tests_md,
+        )
+
+    def test_missing_algorithm_section_is_a_violation_not_a_traceback(self) -> None:
+        """The section guard must not turn an IR defect into a validator crash: an IR whose
+        `algorithm:` is absent (or is not a mapping) is exactly what the gate exists to catch, and
+        the compile leaf repairs from the violation text — a `ValueError` would hand it a traceback
+        about the validator's own internals and no findings at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)
+            ir_path = repo_root / _FIXTURE_IR_REL
+            doc = json.loads(ir_path.read_text(encoding="utf-8"))
+            doc["algorithm"] = None
+            ir_path.write_text(json.dumps(doc), encoding="utf-8")
+            violations = validate_compile_stage(
+                repo_root, "workspace", str(Path(_FIXTURE_IR_REL).parent)
+            )
+        self.assertTrue(
+            [v for v in violations if "algorithm section missing or not a mapping" in v],
+            violations,
+        )
+
+    def test_document_level_key_inside_the_algorithm_section_does_not_raise(self) -> None:
+        """The section guard discriminates document-from-section by key, so a section carrying a
+        document-level key would otherwise reach `_require_ir_section`'s raise — and the conductor
+        would hand the compile leaf a traceback as its repair findings. The key is ignored for the
+        read (no canonical document forbids it), and the IR validates as it otherwise would.
+        """
+        for stray in ("schema_version", "algorithm"):
+            with self.subTest(stray=stray), tempfile.TemporaryDirectory() as tmp:
+                repo_root = Path(tmp)
+                self._fixture_ir(repo_root)
+                (repo_root / MOCK_TESTS_REF).parent.mkdir(parents=True, exist_ok=True)
+                (repo_root / MOCK_TESTS_REF).write_text("### 1-1. `t1`\n", encoding="utf-8")
+                ir_path = repo_root / _FIXTURE_IR_REL
+                doc = json.loads(ir_path.read_text(encoding="utf-8"))
+                doc["algorithm"][stray] = "1.0"
+                doc["io_contract"]["test_evidence_requirements"] = [
+                    {"test_id": "t1", "required_raw_variables": ["h"]}
+                ]
+                ir_path.write_text(json.dumps(doc), encoding="utf-8")
+                violations = validate_compile_stage(  # must not raise
+                    repo_root, "workspace", str(Path(_FIXTURE_IR_REL).parent)
+                )
+                self.assertFalse(
+                    [v for v in violations if "algorithm" in v and "must be" in v], violations
+                )
+
+    def test_over_long_tests_ref_is_a_violation_not_a_traceback(self) -> None:
+        """`Path.is_file()` is not total — an over-long path (ENAMETOOLONG) raises out of the probe
+        itself, so probing an LLM-authored ref with it would crash the validator before the leaf
+        gets its finding."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)
+            # The parent must EXIST, or the probe short-circuits on ENOENT and never reaches the
+            # over-long component — which is what ENAMETOOLONG needs to surface.
+            (repo_root / MOCK_SPEC_DIR).mkdir(parents=True, exist_ok=True)
+            ir_path = repo_root / _FIXTURE_IR_REL
+            doc = json.loads(ir_path.read_text(encoding="utf-8"))
+            doc["meta"]["source_refs"]["tests"] = f"{MOCK_SPEC_DIR}/{'a' * 300}.md"
+            ir_path.write_text(json.dumps(doc), encoding="utf-8")
+            violations = validate_compile_stage(  # must not raise
+                repo_root, "workspace", str(Path(_FIXTURE_IR_REL).parent)
+            )
+        self.assertTrue(
+            [v for v in violations if "meta.source_refs.tests" in v and "unresolvable" in v],
+            violations,
+        )
+
+    def test_non_utf8_ir_is_a_violation_not_a_traceback(self) -> None:
+        """A leaf-authored artifact need not be valid UTF-8. `_read_yaml` decoded strictly, so a
+        `UnicodeDecodeError` escaped every caller (they guard `yaml.YAMLError` only) and reached the
+        leaf as a traceback instead of a finding."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)
+            (repo_root / _FIXTURE_IR_REL).write_bytes(b"\xff\xfeschema_version: '1.0'\n")
+            violations = validate_compile_stage(  # must not raise
+                repo_root, "workspace", str(Path(_FIXTURE_IR_REL).parent)
+            )
+        self.assertTrue(violations)
+
+    def test_non_utf8_ir_is_not_silently_sanitized(self) -> None:
+        """The trap in the fix above: decoding leniently (`errors="ignore"`) DELETES the offending
+        bytes, so an IR whose invalid byte sits in a comment sanitizes into a clean document and
+        CERTIFIES. An artifact that is not valid UTF-8 must fail, not be silently rewritten."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)
+            (repo_root / MOCK_TESTS_REF).parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / MOCK_TESTS_REF).write_text("### 1-1. `t1`\n", encoding="utf-8")
+            ir_path = repo_root / _FIXTURE_IR_REL
+            doc = json.loads(ir_path.read_text(encoding="utf-8"))
+            doc["io_contract"]["test_evidence_requirements"] = [
+                {"test_id": "t1", "required_raw_variables": ["h"]}
+            ]
+            clean = yaml.safe_dump(doc, sort_keys=False).encode("utf-8")
+            self.assertFalse(
+                [v for v in self._compile(repo_root, ir_path, clean) if "invalid json" in v],
+                "the fixture must certify while it is valid UTF-8",
+            )
+            # the SAME document, plus one invalid byte inside a YAML comment
+            dirty = b"# note: \xff invalid byte in a comment\n" + clean
+            violations = self._compile(repo_root, ir_path, dirty)
+        self.assertTrue([v for v in violations if "invalid json" in v], violations)
+
+    def _compile(self, repo_root: Path, ir_path: Path, body: bytes) -> list[str]:
+        ir_path.write_bytes(body)
+        return validate_compile_stage(
+            repo_root, "workspace", str(Path(_FIXTURE_IR_REL).parent)
+        )
+
+    def test_non_utf8_json_evidence_is_a_violation_not_a_traceback(self) -> None:
+        """`UnicodeDecodeError` is a `ValueError`, not a `json.JSONDecodeError`, so a non-UTF-8
+        artifact escaped every caller — all of which guard `JSONDecodeError` and report
+        `invalid json` as the finding the leaf repairs. The runner that writes these files is
+        leaf-authored Fortran, so this is a shape the workflow can actually produce."""
+        from tools.validate_pipeline_semantics import _read_json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "metrics_basis.json"
+            bad.write_bytes(b"\xff{}")
+            with self.assertRaises(json.JSONDecodeError):  # not UnicodeDecodeError
+                _read_json(bad)
+
+    def test_deeply_nested_ir_is_a_violation_not_a_traceback(self) -> None:
+        """A pathologically nested document raises `RecursionError`, which `yaml.YAMLError` does not
+        cover, so it escaped the gates that guard the IR read."""
+        from tools.validate_pipeline_semantics import _read_yaml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bomb = Path(tmp) / "spec.ir.yaml"
+            bomb.write_text("a: " + "[" * 50000, encoding="utf-8")
+            with self.assertRaises(yaml.YAMLError):  # not RecursionError
+                _read_yaml(bomb)
+
+    def test_malformed_ir_does_not_raise_out_of_the_document_reader(self) -> None:
+        """`_ir_document_for_execution` feeds the post_execute case/test mappings. It read the IR
+        unguarded, so a malformed `spec.ir.yaml` raised `yaml.ParserError` out of the gate loop —
+        while the contract-file gate reports the same IR as invalid at the same stage."""
+        from tools.validate_pipeline_semantics import _ir_document_for_execution
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)
+            (repo_root / _FIXTURE_IR_REL).write_text("a: [unterminated\n", encoding="utf-8")
+            pipeline_dir = (
+                repo_root / "workspace/pipelines/problem__shallow_water2d__0.3.0"
+                / "shallow-water2d_20260415_001"
+            )
+            execution = vps.NodeExecution(
+                node_key="problem/shallow_water2d@0.3.0",
+                node_dir=pipeline_dir,
+                exec_dir=pipeline_dir,
+                pipeline_dir=pipeline_dir,
+            )
+            self.assertIsNone(_ir_document_for_execution(repo_root, execution))  # must not raise
+
+    def test_non_utf8_command_log_does_not_raise(self) -> None:
+        """`command_log.jsonl` is in the generate/verify leaf's `allowed_output_paths`, so a stray
+        byte in it is leaf-authored content: the readers must degrade to "record not found" (itself
+        a violation) rather than raise."""
+        from tools.validate_pipeline_semantics import _find_command_log_record
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            log_ref = "workspace/pipelines/n/p/source/s/src/command_log.jsonl"
+            log = repo_root / log_ref
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_bytes(
+                b'{"command_id": "cmd_ok", "tool": "run_linter"}\n\xff\xfe{"command_id": "x"}\n'
+            )
+            found = _find_command_log_record(repo_root, "cmd_ok", log_ref)  # must not raise
+            self.assertIsNotNone(found)
+            self.assertIsNone(_find_command_log_record(repo_root, "cmd_absent", log_ref))
+
+            # `_validate_trial_meta` scans the same log through its own reader.
+            node_dir = repo_root / "node"
+            node_dir.mkdir()
+            _write_json(
+                node_dir / "trial_meta.json",
+                {
+                    "source_command_ref": [
+                        {"command_id": "cmd_ok", "command_log_ref": log_ref},
+                    ]
+                },
+            )
+            execution = vps.NodeExecution(
+                node_key="component/n@0.1.0",
+                node_dir=node_dir,
+                exec_dir=node_dir,
+                pipeline_dir=node_dir,
+            )
+            violations: list[str] = []
+            vps._validate_trial_meta(repo_root, execution, violations)  # must not raise
+        self.assertFalse(
+            [v for v in violations if "command_id" in v and "not found" in v], violations
+        )
+
+    def test_over_long_controlled_spec_ref_is_a_violation_not_a_traceback(self) -> None:
+        """`meta.source_refs.controlled_spec` is LLM-authored like the tests ref, and the two
+        infrastructure gates probe it. Without the total probe an over-long ref raises ENAMETOOLONG
+        out of the gate."""
+        from tools.validate_pipeline_semantics import (
+            _validate_infrastructure_generated_signatures,
+            _validate_infrastructure_public_api,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._fixture_ir(repo_root)
+            (repo_root / MOCK_SPEC_DIR).mkdir(parents=True, exist_ok=True)
+            ir_dir = repo_root / Path(_FIXTURE_IR_REL).parent
+            doc = json.loads((ir_dir / "spec.ir.yaml").read_text(encoding="utf-8"))
+            doc["meta"]["spec_kind"] = "infrastructure"
+            doc["meta"]["spec_id"] = "harness_x"
+            doc["meta"]["source_refs"]["controlled_spec"] = (
+                f"{MOCK_SPEC_DIR}/{'a' * 300}.md"
+            )
+            (ir_dir / "spec.ir.yaml").write_text(json.dumps(doc), encoding="utf-8")
+
+            for gate in (
+                _validate_infrastructure_public_api,
+                _validate_infrastructure_generated_signatures,
+            ):
+                violations: list[str] = []
+                try:
+                    gate(repo_root, ir_dir, violations)  # must not raise
+                except TypeError:
+                    # signature gate takes the source dir; drive it through the compile stage below
+                    continue
+            compile_violations = validate_compile_stage(
+                repo_root, "workspace", str(Path(_FIXTURE_IR_REL).parent)
+            )
+        self.assertTrue(
+            [v for v in compile_violations if "controlled_spec" in v], compile_violations
+        )
+
+    def test_unreadable_controlled_spec_degrades_to_an_empty_parse(self) -> None:
+        """The controlled_spec ref is LLM-authored too: its probe is total, but the READ can still
+        fail (a file that stats but does not open). Both §5 parsers absorb it — the callers already
+        report an empty parse as a fail-closed violation."""
+        from tools.validate_pipeline_semantics import (
+            _parse_canonical_interface_from_controlled_spec,
+            _parse_public_api_from_controlled_spec,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            unreadable = Path(tmp)  # a directory: stats fine, does not open
+            self.assertEqual(
+                _parse_public_api_from_controlled_spec(unreadable, "spec_x"), (set(), set())
+            )
+            _, _, err = _parse_canonical_interface_from_controlled_spec(unreadable)
+            self.assertIsNotNone(err)
+
+    def test_unreadable_tests_md_degrades_to_no_test_ids(self) -> None:
+        """A file readable at probe time but not at read time is what the probe cannot cover, so the
+        parser absorbs it rather than raising into the gate."""
+        from tools.validate_pipeline_semantics import _parse_test_ids_from_tests_md
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(_parse_test_ids_from_tests_md(Path(tmp)), [])
+
+    def test_ir_document_cannot_be_passed_where_a_section_is_expected(self) -> None:
+        """The class-kill: handing the whole document to a section-level reader now raises."""
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = self._fixture_ir(Path(tmp))
+        with self.assertRaises(ValueError):
+            _algorithm_state_contract(doc)
+        with self.assertRaises(ValueError):
+            _require_ir_section(doc, "io_contract")
+        # The section itself passes through untouched.
+        self.assertIs(_require_ir_section(doc["algorithm"], "algorithm"), doc["algorithm"])
+        self.assertIsNotNone(_algorithm_state_contract(doc["algorithm"]))
 
 
 if __name__ == "__main__":

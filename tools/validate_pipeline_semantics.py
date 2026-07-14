@@ -847,85 +847,6 @@ def _is_multidim_problem_node(execution: NodeExecution) -> bool:
     return _is_multidim_problem_node_key(execution.node_key)
 
 
-def _validate_problem_state_array_usage(
-    repo_root: Path,
-    execution: NodeExecution,
-    model_file: Path,
-    lowered: str,
-    violations: list[str],
-) -> None:
-    """DORMANT — this gate never fires, deliberately left so pending a redesign.
-
-    `_algorithm_contract_for_execution` returns the WHOLE IR document, but `_algorithm_state_contract`
-    looks for the contract keys at the top level, while every real IR nests them under `algorithm:`.
-    So `kernel_contract` is always None and the body below is unreachable. (The same class of bug as
-    the one `_plan_dependency_node_key` carried: a lookup against a shape no real IR has.)
-
-    It is NOT revived by simply unwrapping the section, because the `>= 3 intent(out)` predicate below
-    cannot tell the true positive (a fabricated metric-only kernel) from the false positive (a
-    legitimately decomposed helper such as a flux-divergence routine) — both present the same
-    signature, so no threshold fixes it. Reviving it needs a structural anchor on the node's published
-    entry point instead of a shape heuristic, plus an overlap analysis against the two live gates that
-    already cover part of this ground (`_validate_problem_model_dependency_dataflow` and
-    `_validate_problem_metric_only_scalar_kernel`). Canonical: the "problem state-array usage" entry of
-    `docs/design/deterministic_followups.md`. Do not "fix" the early return in isolation: that silently
-    turns on a gate with a known false-positive class.
-    """
-    if not _is_multidim_problem_node(execution):
-        return
-
-    contract = _algorithm_contract_for_execution(repo_root, execution)
-    if not isinstance(contract, dict):
-        return
-    kernel_contract = _algorithm_state_contract(contract)
-    if not isinstance(kernel_contract, dict):
-        return  # DORMANT: always taken on a real IR — see the docstring.
-
-    raw_state_variables = kernel_contract.get("state_variables")
-    if not isinstance(raw_state_variables, list):
-        return
-
-    state_names: list[str] = []
-    for item in raw_state_variables:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        if isinstance(name, str) and name.strip():
-            state_names.append(name.strip().lower())
-
-    if not state_names:
-        return
-
-    subroutine_pattern = re.compile(
-        r"subroutine\s+([a-z_][a-z0-9_]*)\s*\((.*?)\)(.*?)end\s+subroutine",
-        re.DOTALL,
-    )
-    intent_out_pattern = re.compile(r"intent\s*\(\s*out\s*\)\s*::\s*([^\n!]+)")
-    candidate_found = False
-    for match in subroutine_pattern.finditer(lowered):
-        sub_name = match.group(1)
-        body = match.group(3)
-        out_vars: set[str] = set()
-        for out_match in intent_out_pattern.finditer(body):
-            out_vars.update(_split_fortran_names(out_match.group(1)))
-        if len(out_vars) < 3:
-            continue
-        candidate_found = True
-
-        missing_array_refs: list[str] = []
-        for name in sorted(set(state_names)):
-            array_ref = re.search(rf"\b{re.escape(name)}\s*\(", body)
-            if array_ref is None:
-                missing_array_refs.append(name)
-        if missing_array_refs:
-            violations.append(
-                f"{model_file}: subroutine {sub_name} must reference state arrays declared in algorithm state_contract ({missing_array_refs})"
-            )
-
-    if not candidate_found:
-        return
-
-
 def _validate_problem_metric_only_scalar_kernel(
     execution: NodeExecution,
     model_file: Path,
@@ -2735,7 +2656,16 @@ class SourceFingerprint:
 
 
 def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # A UnicodeDecodeError is a ValueError, NOT a json.JSONDecodeError, so it escapes even the
+        # callers that guard the decode error and report `invalid json` — the finding the leaf
+        # repairs. Re-raise as the error they already handle. (Callers reading CONDUCTOR-authored
+        # JSON — trial_meta.json, lineage.json — guard nothing; those files are host-authored, so no
+        # leaf can put a bad byte in them.)
+        raise json.JSONDecodeError(f"not valid UTF-8 ({exc})", "", 0) from exc
+    return json.loads(text)
 
 
 def _canonical_json(obj: Any) -> str:
@@ -3217,7 +3147,7 @@ def _validate_trial_meta(repo_root: Path, execution: NodeExecution, violations: 
             violations.append(f"{trial_meta_path}:command log missing ({log_ref})")
             continue
         found_record: dict[str, Any] | None = None
-        for line in log_path.read_text(encoding="utf-8").splitlines():
+        for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -3843,13 +3773,6 @@ def _validate_generate_outputs(
             lowered=lowered,
             violations=violations,
         )
-        _validate_problem_state_array_usage(
-            repo_root=repo_root,
-            execution=execution,
-            model_file=model_file,
-            lowered=lowered,
-            violations=violations,
-        )
 
     _validate_fortran_makefile_src_dir(src_dir, violations)
     _build_system, _language = _impl_toolchain_from_pipeline_dir(
@@ -4171,13 +4094,6 @@ def _validate_generate_outputs_for_generation(
             lowered=lowered,
             violations=violations,
         )
-        _validate_problem_state_array_usage(
-            repo_root=repo_root,
-            execution=execution,
-            model_file=model_file,
-            lowered=lowered,
-            violations=violations,
-        )
 
     _validate_fortran_makefile_src_dir(src_dir, violations)
     _build_system, _language = _impl_toolchain_from_pipeline_dir(
@@ -4428,7 +4344,6 @@ def _io_contract_for_execution(
             # required raw variables through it (`_case_id_to_test_ids`).
             "test_predicates",
             "diagnostics_contract",
-            "source",
         ):
             if key in section:
                 flattened[key] = section[key]
@@ -4437,12 +4352,50 @@ def _io_contract_for_execution(
 
 
 def _read_yaml(path: Path) -> Any:
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    # Decode STRICTLY, and translate the two errors that would otherwise escape into the one the
+    # callers already handle (`yaml.YAMLError` -> "invalid json" / a contract violation):
+    #   - UnicodeDecodeError is not a YAMLError, so it reached the leaf as a traceback in place of
+    #     its repair findings. Decoding leniently instead (errors="ignore") would be worse: it
+    #     DELETES the offending bytes, so an IR whose invalid byte sits in a comment sanitizes into
+    #     a clean document and CERTIFIES. An artifact that is not valid UTF-8 must fail, not be
+    #     silently rewritten.
+    #   - RecursionError (a pathologically nested document) is not a YAMLError either.
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise yaml.YAMLError(f"{path}: not valid UTF-8 ({exc})") from exc
+    try:
+        return yaml.safe_load(text)
+    except RecursionError as exc:
+        raise yaml.YAMLError(f"{path}: structure too deeply nested to parse") from exc
 
 
-def _algorithm_contract_for_execution(
+# A section of the IR document (`algorithm:`, `io_contract:`, ...) and the document itself are both
+# plain dicts, so handing the whole document to a helper that looks its keys up at section level is
+# invisible at the call site: the lookup misses, the helper returns None, and everything below it is
+# dead. Three gates were silently dormant for exactly this reason (`_plan_dependency_node_key`,
+# `_validate_problem_state_array_usage`, and the tests.md path resolution that fed
+# `_validate_test_evidence_requirements` / `_validate_tests_verdict_summary_consistency`). The guard
+# below discriminates the two shapes on keys that occur at document level only: `schema_version`, and
+# the section's own name (no section of any of the 116 certified IRs contains either).
+_IR_DOCUMENT_ONLY_KEYS = ("schema_version",)
+
+
+def _require_ir_section(contract: dict[str, Any], section: str) -> dict[str, Any]:
+    """Raise if the whole IR document is passed where the named section is expected."""
+    markers = [key for key in (section, *_IR_DOCUMENT_ONLY_KEYS) if key in contract]
+    if markers:
+        raise ValueError(
+            f"IR document passed where the `{section}` section was expected "
+            f"(document-level keys present: {markers}); unwrap it with _ir_section() first"
+        )
+    return contract
+
+
+def _ir_document_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> dict[str, Any] | None:
+    """The whole `spec.ir.yaml` document. Use _ir_section() to reach a section."""
     ir_dir = _ir_dir_for_execution(repo_root, execution)
     if ir_dir is None:
         return None
@@ -4451,13 +4404,59 @@ def _algorithm_contract_for_execution(
     if not contract_path.exists():
         return None
 
-    data = _read_yaml(contract_path)
+    try:
+        data = _read_yaml(contract_path)
+    except (yaml.YAMLError, OSError):
+        return None  # the contract-file gate reports a malformed IR at the same stage
     return data if isinstance(data, dict) else None
 
 
-def _algorithm_contract_path_for_execution(
+def _ir_section(document: dict[str, Any], section: str) -> dict[str, Any] | None:
+    """The named top-level section of an IR document, or None when it is absent."""
+    value = document.get(section)
+    return value if isinstance(value, dict) else None
+
+
+def _is_readable_file(path: Path) -> bool:
+    """Total existence probe for an LLM-AUTHORED path.
+
+    `Path.is_file()` is not total: it swallows only ENOENT / ENOTDIR / EBADF / ELOOP, so a ref that
+    names an over-long path (ENAMETOOLONG) or one under an unsearchable directory (EACCES) RAISES
+    out of the probe itself. Every ref in `meta.source_refs` is authored by the compile leaf, and
+    the conductor turns a non-zero exit of this validator into the leaf's repair findings — so an
+    escaping OSError would reach it as a traceback naming no IR field. Any such path is simply "not
+    a readable file", which the callers already report as an unresolvable ref.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _tests_path_from_ir_document(repo_root: Path, document: dict[str, Any]) -> Path | None:
+    """Resolve tests.md from `meta.source_refs.tests` — the only place a real IR carries it."""
+    meta = _ir_section(document, "meta")
+    if meta is None:
+        return None
+    source_refs = meta.get("source_refs")
+    if not isinstance(source_refs, dict):
+        return None
+
+    tests_ref = source_refs.get("tests")
+    if not isinstance(tests_ref, str) or not tests_ref.strip():
+        return None
+
+    tests_path = Path(tests_ref.strip())
+    if not tests_path.is_absolute():
+        tests_path = repo_root / tests_path
+    return tests_path
+
+
+def _ir_document_path_for_execution(
     repo_root: Path, execution: NodeExecution
 ) -> Path | None:
+    """Path of the whole `spec.ir.yaml`. There is no section-scoped path: a name that promises one
+    is what invited the document/section confusion this module now guards against."""
     ir_dir = _ir_dir_for_execution(repo_root, execution)
     if ir_dir is None:
         return None
@@ -4553,6 +4552,9 @@ def _make_targets(makefile_path: Path) -> set[str]:
 
 
 def _algorithm_state_contract(contract: dict[str, Any]) -> dict[str, Any] | None:
+    """The state contract, read from the `algorithm:` SECTION (never the whole document)."""
+    _require_ir_section(contract, "algorithm")
+
     state_contract = contract.get("state_contract")
     if isinstance(state_contract, dict):
         return state_contract
@@ -4591,40 +4593,24 @@ def _algorithm_state_contract(contract: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
-def _io_contract_path_for_execution(
-    repo_root: Path, execution: NodeExecution
-) -> Path | None:
-    ir_dir = _ir_dir_for_execution(repo_root, execution)
-    if ir_dir is None:
-        return None
-    return ir_dir / "spec.ir.yaml"
-
-
-def _tests_path_from_contract(repo_root: Path, contract: dict[str, Any]) -> Path | None:
-    source = contract.get("source")
-    if not isinstance(source, dict):
-        return None
-    tests_ref = source.get("tests")
-    if not isinstance(tests_ref, str) or not tests_ref.strip():
-        return None
-
-    tests_path = Path(tests_ref.strip())
-    if not tests_path.is_absolute():
-        tests_path = repo_root / tests_path
-    return tests_path
-
-
 def _tests_path_for_execution(repo_root: Path, execution: NodeExecution) -> Path | None:
-    contract = _io_contract_for_execution(repo_root, execution)
-    if not isinstance(contract, dict):
+    document = _ir_document_for_execution(repo_root, execution)
+    if not isinstance(document, dict):
         return None
-    return _tests_path_from_contract(repo_root, contract)
+    return _tests_path_from_ir_document(repo_root, document)
 
 
 def _parse_test_ids_from_tests_md(tests_path: Path) -> list[str]:
     test_ids: list[str] = []
     seen: set[str] = set()
-    for raw_line in tests_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    try:
+        text = tests_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        # The callers probe with `_is_readable_file` first, so this covers what a probe cannot: a
+        # file readable at stat time but not at read time (EACCES on the file itself, a vanished
+        # file). An empty id list is what the callers already treat as "no canonical set".
+        return []
+    for raw_line in text.splitlines():
         line = raw_line.strip()
         match = TEST_ID_HEADING_PATTERN.match(line) or TEST_ID_BULLET_PATTERN.match(line)
         if not match:
@@ -4696,7 +4682,12 @@ def _parse_public_api_from_controlled_spec(
     is not swept in. A published type introduced WITHOUT "derived type" / ``type(...)`` degrades
     to op-classified — a fail-closed set mismatch (a visible Compile fail), never a silent
     accept."""
-    text = controlled_spec_path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        text = controlled_spec_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        # Readable at stat time, not at read time. The caller reports an empty §5 parse as a
+        # fail-closed violation, which is the finding the leaf needs; a raise here would not be.
+        return (set(), set())
     section = _extract_controlled_spec_section(text, "5")
     if section is None:
         return (set(), set())
@@ -4947,7 +4938,10 @@ def _section51_fence_body(controlled_spec_path: Path) -> tuple[str | None, str |
     """Return ``(fence_body, error)`` for the §5.1 canonical interface fence (the sole fenced block
     inside the ``### 5.1`` subsection). Fail-closed on a missing subsection, a missing fence, or
     multiple fences within §5.1."""
-    text = controlled_spec_path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        text = controlled_spec_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return (None, f"{controlled_spec_path}: controlled_spec unreadable")
     section = _extract_controlled_spec_section(text, "5")
     if section is None:
         return (None, "controlled_spec has no §5 section")
@@ -5033,7 +5027,7 @@ def _case_id_to_test_id(
     io_contract.test_evidence_requirements (e.g. an input-guard rejection case
     that produces no output state), not the global union of declared variables.
     """
-    data = _algorithm_contract_for_execution(repo_root, execution)
+    data = _ir_document_for_execution(repo_root, execution)
     if not isinstance(data, dict):
         return {}
     case_section = data.get("case")
@@ -5135,7 +5129,7 @@ def _case_ids_for_execution(repo_root: Path, execution: NodeExecution) -> set[st
     matches a declared case (it satisfies the deliverable gate). Unlike
     ``_case_id_to_test_id`` this includes cases whose ``test_id`` is null.
     """
-    data = _algorithm_contract_for_execution(repo_root, execution)
+    data = _ir_document_for_execution(repo_root, execution)
     if not isinstance(data, dict):
         return set()
     case_section = data.get("case")
@@ -5741,7 +5735,9 @@ def _find_command_log_record(
     if not log_path.exists():
         return None
 
-    for raw_line in log_path.read_text(encoding="utf-8").splitlines():
+    # Leaf-writable artifact (it is in the generate/verify `allowed_output_paths`): decode
+    # leniently so a stray byte is a missing/!matching command record — a finding — not a traceback.
+    for raw_line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw_line.strip()
         if not line:
             continue
@@ -6085,6 +6081,10 @@ def _validate_io_contract_file(
         violations.append(f"{contract_path}: must be json object")
         return
 
+    # tests.md is referenced from `meta.source_refs.tests`, which the io_contract flattening below
+    # does not carry — resolve it from the document while we still hold it.
+    tests_path = _tests_path_from_ir_document(repo_root, contract)
+
     # New IR: spec.ir.yaml has the io_contract section nested under
     # `io_contract:` and contains inputs / outputs / raw_requirements /
     # test_evidence_requirements / semantic_dependency as siblings.  The
@@ -6111,7 +6111,6 @@ def _validate_io_contract_file(
             "semantic_dependency",
             "test_evidence_requirements",
             "diagnostics_contract",
-            "source",
         ):
             if key in io_section:
                 new_contract[key] = io_section[key]
@@ -6413,7 +6412,7 @@ def _validate_io_contract_file(
         )
 
     _validate_test_evidence_requirements(
-        repo_root=repo_root,
+        tests_path=tests_path,
         contract_path=contract_path,
         contract=contract,
         snapshot_reference_variables=snapshot_reference_variables,
@@ -6627,7 +6626,7 @@ def _validate_diagnostics_contract_output(
 def _validate_io_contract_schema(
     repo_root: Path, execution: NodeExecution, violations: list[str]
 ) -> None:
-    contract_path = _io_contract_path_for_execution(repo_root, execution)
+    contract_path = _ir_document_path_for_execution(repo_root, execution)
     if contract_path is None:
         violations.append(
             f"{execution.pipeline_dir / 'lineage.json'}: ir_ref missing; cannot resolve spec.ir.yaml"
@@ -6744,8 +6743,24 @@ def _validate_algorithm_contract_file(
     # Unified IR: spec.ir.yaml has `algorithm:` key at the top.  Read the
     # algorithm section if present; otherwise fall back to a flat document
     # (still legal for tests that write the algorithm block at the root).
-    if isinstance(contract.get("algorithm"), dict):
-        contract = contract["algorithm"]
+    # No leaf-authored shape may reach `_require_ir_section`'s raise below: the conductor turns a
+    # non-zero exit of this gate into a `compile_static_violation` and hands the leaf the last 50
+    # lines as its repair findings, so a traceback would arrive as an unrepairable finding. Every
+    # shape an IR can take is reported as a violation here instead.
+    section = contract.get("algorithm")
+    if isinstance(section, dict):
+        # `_require_ir_section` tells a section from the document by key, so a section that happens
+        # to carry a document-level key would trip its raise. Drop those keys for this read instead
+        # of rejecting the IR: unknown keys are tolerated everywhere else in the IR, and a gate must
+        # not enforce a rule (`algorithm:` may not carry `schema_version`) that no canonical
+        # document states to the compile author.
+        markers = {"algorithm", *_IR_DOCUMENT_ONLY_KEYS} & set(section)
+        contract = (
+            {k: v for k, v in section.items() if k not in markers} if markers else section
+        )
+    elif "algorithm" in contract or "schema_version" in contract:
+        violations.append(f"{contract_path}:algorithm section missing or not a mapping")
+        return
 
     algorithm_id = contract.get("algorithm_id")
     if not isinstance(algorithm_id, str) or not algorithm_id.strip():
@@ -7023,7 +7038,7 @@ def _validate_algorithm_contract_file(
 def _validate_algorithm_contract_schema(
     repo_root: Path, execution: NodeExecution, violations: list[str]
 ) -> None:
-    contract_path = _algorithm_contract_path_for_execution(repo_root, execution)
+    contract_path = _ir_document_path_for_execution(repo_root, execution)
     if contract_path is None:
         violations.append(
             f"{execution.pipeline_dir / 'lineage.json'}: ir_ref missing; cannot resolve spec.ir.yaml"
@@ -7041,15 +7056,17 @@ def _validate_algorithm_contract_schema(
 
 
 def _validate_test_evidence_requirements(
-    repo_root: Path,
+    tests_path: Path | None,
     contract_path: Path,
     contract: dict[str, Any],
     snapshot_reference_variables: set[str],
     snapshot_required: bool,
     violations: list[str],
 ) -> None:
-    tests_path = _tests_path_from_contract(repo_root, contract)
-    if tests_path is None or not tests_path.exists():
+    # The ref is LLM-authored: it may name a directory, an over-long path, or an unreadable one.
+    # `_validate_ir_source_refs_tests` reports such a ref as the violation it is; this gate must not
+    # read (or probe) it in a way that raises before the leaf gets that finding.
+    if tests_path is None or not _is_readable_file(tests_path):
         return
 
     test_ids = _parse_test_ids_from_tests_md(tests_path)
@@ -7978,10 +7995,29 @@ def _validate_quality_check_commands(
 
 
 def _validate_tests_verdict_summary_consistency(
-    repo_root: Path, execution: NodeExecution, violations: list[str]
+    repo_root: Path,
+    execution: NodeExecution,
+    violations: list[str],
+    *,
+    require_verdict: bool,
 ) -> None:
+    """tests.md test ids == verdict.json#per_test, and summary.json counts == that verdict.
+
+    `require_verdict` is the stage's `require_orchestration`: at `post_execute` the conductor has
+    NOT authored verdict.json yet (it clears any stale one at the top of execute and writes the
+    deterministic verdict only after this gate returns clean — `workflow_conductor._execute_inproc`),
+    so a missing verdict is the normal state there and must not be flagged. At `pre_judge` / `full`
+    the verdict is authored and its absence is a real defect. (`pre_judge` is `--run-id`-scoped, so
+    it sees only the run under judgment. `full` is the unscoped operator/audit stage: it walks every
+    run dir, so a superseded run that failed structurally at execute — and correctly holds no verdict
+    — is reported there too. Those runs already fail `full` on their missing `semantic_review.json`;
+    no conductor path invokes `full`.)
+    """
     tests_path = _tests_path_for_execution(repo_root, execution)
-    if tests_path is None or not tests_path.exists():
+    # The ref is LLM-authored: it may name a directory, an over-long path, or an unreadable one.
+    # `_validate_ir_source_refs_tests` reports such a ref as the violation it is; this gate must not
+    # read (or probe) it in a way that raises before the leaf gets that finding.
+    if tests_path is None or not _is_readable_file(tests_path):
         return
 
     test_ids = _parse_test_ids_from_tests_md(tests_path)
@@ -7992,7 +8028,8 @@ def _validate_tests_verdict_summary_consistency(
     verdict_path = execution.node_dir / "verdict.json"
     summary_path = execution.node_dir / "summary.json"
     if not verdict_path.exists():
-        violations.append(f"{verdict_path}: missing")
+        if require_verdict:
+            violations.append(f"{verdict_path}: missing")
         return
     if not summary_path.exists():
         violations.append(f"{summary_path}: missing")
@@ -9298,6 +9335,7 @@ def _validate_compile_stage_impl(
 
     for optional in ("spec.ir.yaml", "spec.ir.yaml", "spec.ir.yaml"):
         _try_load_optional_plan_yaml(ir_dir, optional, violations)
+    _validate_ir_source_refs_tests(repo_root, ir_dir, violations)
     _validate_ir_meta_json(ir_dir, violations)
     _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
     _validate_test_predicates(repo_root, ir_dir, violations)
@@ -9539,7 +9577,7 @@ def _validate_infrastructure_public_api(
     cs_path = Path(cs_ref.strip())
     if not cs_path.is_absolute():
         cs_path = repo_root / cs_path
-    if not cs_path.is_file():
+    if not _is_readable_file(cs_path):
         violations.append(
             f"{derived_path}:controlled_spec ({cs_ref}) unresolvable "
             "(cannot pin infrastructure public_api to §5)")
@@ -9849,7 +9887,7 @@ def _validate_infrastructure_generated_signatures(
     cs_path = Path(cs_ref.strip())
     if not cs_path.is_absolute():
         cs_path = repo_root / cs_path
-    if not cs_path.is_file():
+    if not _is_readable_file(cs_path):
         _fail_closed_if_infra(f"controlled_spec ({cs_ref}) unresolvable")
         return
 
@@ -9946,10 +9984,11 @@ def _validate_test_predicates(
     fail-closed hardening — a ``meta.source_refs.tests`` that resolves to a file yielding ZERO
     test_ids is itself a violation (never a silent fallback). Only when the ref is
     absent/unresolvable does it fall back to the same-IR ``io_contract.test_evidence_requirements``
-    id set as a best-effort same-IR reference (note: the separate ``test_evidence_requirements``
-    gate resolves tests.md via ``io_contract.source.tests``, absent in current IRs, so it does NOT
-    independently pin TER to tests.md — the fallback is best-effort, and on real IRs the primary
-    ``meta.source_refs.tests`` path always resolves so it never fires). A degenerate IR carrying
+    id set (note: the separate ``test_evidence_requirements`` gate resolves tests.md through the
+    same ``meta.source_refs.tests`` ref and pins TER == tests.md, so on any IR that reaches this
+    fallback the ref is already a violation — ``_validate_ir_source_refs_tests`` fails Compile on an
+    absent or unresolvable ref — and the fallback is a defence-in-depth path, not a silent one that
+    the TER gate is trusted to backstop). A degenerate IR carrying
     NEITHER (which fails the io_contract gate anyway) degrades to the predicate ids (a no-op).
 
     A violation routes (via ``classify_compile_static_failure``) back to ``compile.generate``
@@ -10006,25 +10045,19 @@ def _validate_test_predicates(
     # real IR); fall back to the same-IR test_evidence_requirements set (which the io_contract
     # gate requires to cover tests.md); only a degenerate IR carrying neither degrades to the
     # predicate ids (a no-op — but that IR fails the io_contract gate on its own).
-    meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
-    source_refs = meta.get("source_refs") if isinstance(meta.get("source_refs"), dict) else {}
-    tests_ref = source_refs.get("tests")
+    tests_path = _tests_path_from_ir_document(repo_root, ir)
     test_ids: list[str] | None = None
-    if isinstance(tests_ref, str) and tests_ref.strip():
-        tests_path = Path(tests_ref.strip())
-        if not tests_path.is_absolute():
-            tests_path = repo_root / tests_path
-        if tests_path.is_file():
-            test_ids = _parse_test_ids_from_tests_md(tests_path)
-            # Fail-closed: a RESOLVABLE tests.md that parses to ZERO test_ids means the file's
-            # test-id form isn't recognized (a parser/format drift). Silently degrading to the
-            # same-leaf test_evidence_requirements would let a common-mode drop of a tests.md test
-            # (from both TER and the predicates) certify undetected. Flag it so the equality pin
-            # is never a silent no-op when tests.md is present.
-            if not test_ids:
-                violations.append(
-                    f"{derived_path}:tests.md ({tests_ref}) resolved but parsed 0 test_ids "
-                    "(unrecognized test-id form — cannot pin test_predicates set == tests.md)")
+    if tests_path is not None and _is_readable_file(tests_path):
+        test_ids = _parse_test_ids_from_tests_md(tests_path)
+        # Fail-closed: a RESOLVABLE tests.md that parses to ZERO test_ids means the file's
+        # test-id form isn't recognized (a parser/format drift). Silently degrading to the
+        # same-leaf test_evidence_requirements would let a common-mode drop of a tests.md test
+        # (from both TER and the predicates) certify undetected. Flag it so the equality pin
+        # is never a silent no-op when tests.md is present.
+        if not test_ids:
+            violations.append(
+                f"{derived_path}:tests.md ({tests_path}) resolved but parsed 0 test_ids "
+                "(unrecognized test-id form — cannot pin test_predicates set == tests.md)")
     # `not test_ids` (not `is None`): fall through to the same-IR fallback (TER, then predicate
     # ids) for the rest of the schema check so it does not ALSO spuriously report every predicate
     # as an unknown test_id; the resolved-but-empty case above already fails the gate.
@@ -10053,6 +10086,46 @@ def _validate_test_predicates(
         metric_addrs=metric_addrs,
     ):
         violations.append(f"{derived_path}:{msg}")
+
+
+def _validate_ir_source_refs_tests(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """`meta.source_refs.tests` must resolve to an existing tests.md.
+
+    Three pins reach tests.md through this ref and every one of them returns SILENTLY when it does
+    not resolve: `_validate_test_evidence_requirements`, `_validate_tests_verdict_summary_consistency`,
+    and the tests.md branch of `_validate_test_predicates`. An IR that mistypes the ref — or that
+    keeps a ref to a spec directory a later rename moved — therefore certifies clean with all three
+    dark. The ref is LLM-authored, so it is pinned here rather than assumed, mirroring the
+    infrastructure `meta.source_refs.controlled_spec` check.
+    """
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.is_file():
+        return  # absence is already reported by the caller
+    try:
+        document = _read_yaml(derived_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return  # malformed IR is already reported by the contract-file gates
+    if not isinstance(document, dict):
+        return
+
+    meta = _ir_section(document, "meta") or {}
+    source_refs = meta.get("source_refs")
+    tests_ref = source_refs.get("tests") if isinstance(source_refs, dict) else None
+    if not isinstance(tests_ref, str) or not tests_ref.strip():
+        violations.append(
+            f"{derived_path}:meta.source_refs.tests missing "
+            "(the only route to tests.md; without it the test-evidence and verdict pins are silent)"
+        )
+        return
+
+    tests_path = _tests_path_from_ir_document(repo_root, document)
+    if tests_path is None or not _is_readable_file(tests_path):
+        violations.append(
+            f"{derived_path}:meta.source_refs.tests ({tests_ref.strip()}) unresolvable "
+            "(no such file; the test-evidence and verdict pins would be silent)"
+        )
 
 
 def _validate_compile_dependency_consistency(
@@ -10358,6 +10431,7 @@ def validate(
     run_ids: set[str] | None = None,
     in_flight_agent_run_ids: set[str] | None = None,
     current_orchestration_id: str | None = None,
+    require_verdict: bool = True,
 ) -> list[str]:
     with _pinned_repo_root_for_schema(repo_root):
         return _validate_impl(
@@ -10369,6 +10443,7 @@ def validate(
             run_ids,
             in_flight_agent_run_ids,
             current_orchestration_id,
+            require_verdict,
         )
 
 
@@ -10381,6 +10456,7 @@ def _validate_impl(
     run_ids: set[str] | None = None,
     in_flight_agent_run_ids: set[str] | None = None,
     current_orchestration_id: str | None = None,
+    require_verdict: bool = True,
 ) -> list[str]:
     violations: list[str] = []
     normalized_workspace_root = _normalize_workspace_root_token(workspace_root)
@@ -10495,7 +10571,9 @@ def _validate_impl(
             )
         _validate_run_program_inputs(repo_root, execution, violations)
         _validate_quality_check_commands(repo_root, execution, violations)
-        _validate_tests_verdict_summary_consistency(repo_root, execution, violations)
+        _validate_tests_verdict_summary_consistency(
+            repo_root, execution, violations, require_verdict=require_verdict
+        )
         _validate_llm_semantic_review(
             repo_root,
             execution,
@@ -10859,6 +10937,9 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
                     require_llm_review=False,
                     require_orchestration=False,
                     run_ids=run_ids,
+                    # The ONLY stage where verdict.json is legitimately absent: the conductor
+                    # authors it after this gate returns clean (`_execute_inproc`).
+                    require_verdict=False,
                 )
             elif args.stage == "pre_judge":
                 violations = validate(
@@ -10886,6 +10967,10 @@ def _main_dispatch(args: argparse.Namespace, repo_root: Path) -> int:
                     pipeline_roots=pipeline_roots,
                     require_llm_review=not args.allow_missing_llm_review,
                     require_orchestration=not args.allow_missing_orchestration,
+                    # NOT `not args.allow_missing_orchestration`: that flag waives the
+                    # ORCHESTRATION artifacts, and coupling the verdict to it would let
+                    # `--allow-missing-orchestration` silently switch off the verdict/summary pin.
+                    require_verdict=True,
                 )
     except RuntimeError as exc:
         print(f"pipeline semantic validation: FAIL\n- schema_load_failed: {exc}")
