@@ -2058,7 +2058,7 @@ on `(kind, id, version)` and picks the latest by parsed canonical `(date, seq)`.
 address fix): host deterministic code silently depending on a leaf-authored non-required field surfaces as a
 failure under LLM output variance; resolve ground truth structurally / host-authored.
 
-## Problem state-array usage — a dormant gate, and the accessor bug class behind it (OPEN, filed 2026-07-12)
+## Problem state-array usage — a dormant gate, and the accessor bug class behind it (CLOSED 2026-07-14 — no new gate, filed 2026-07-12)
 
 `_validate_problem_state_array_usage` (`tools/validate_pipeline_semantics.py`) has never fired. It resolved its
 contract with `_algorithm_contract_for_execution` (renamed to `_ir_document_for_execution` by the accessor entry below),
@@ -2081,19 +2081,87 @@ The current commit therefore changes NO behavior: it only records the dormancy i
 Follow-up work, after the billed E2E:
 1. **Re-anchor the check structurally, not heuristically.** Identify the update path by the node's PUBLISHED entry
    point (`<spec_id>__apply` / the entry realizing `io_contract.outputs`) rather than by counting `intent(out)`
-   dummies. The role must be identified by contract, not guessed from a signature.
+   dummies. The role must be identified by contract, not guessed from a signature. **SUPERSEDED by Z0 2026-07-14** —
+   the structural anchor this item asks for is a declared field of Z0's `CodegenBundle` (`entrypoints`,
+   `state_bindings`; `zero_base_architecture.md` Z0). Recovering the same anchor by parsing generated Fortran and
+   inferring each procedure's role is code Z0 deletes. No parse-based anchor is to be written before Z0 lands.
 2. **Analyze the overlap with the two gates that already live here** — `_validate_problem_model_dependency_dataflow`
    (the dependency-result → `intent(out)` chain) and `_validate_problem_metric_only_scalar_kernel` (the metric-only
    kernel). If the revived check adds nothing they do not already cover, DELETE it rather than repair it.
+   **DONE 2026-07-14 — see the closure note below. The gate is not rebuilt, and the stated reason is NOT that the two
+   live gates already cover it (they do not).**
 3. **Class-kill the accessor bug (this is the third instance).** Centralize contract access so a caller cannot pass
    the whole document where the `algorithm` section is expected, and adopt the testing rule that a gate must be
    exercised against a fixture with the REAL IR shape. Every one of these three bugs was green under a suite whose
    fixtures used a shape the pipeline never produces — a passing test proved only that the gate could fire, never
    that it does. **DONE 2026-07-14** — see "IR document/section accessor confusion" below; the audit it forced found
-   two more dead gates. Items 1 and 2 remain open. `_validate_problem_state_array_usage` itself is DELETED: it ran no
+   two more dead gates. `_validate_problem_state_array_usage` itself is DELETED: it ran no
    check, and a body that only a misrouted lookup kept unreachable is an invitation to "repair" the early return and
    silently enable a gate with a known false-positive class. Deleting it does not preempt item 2 — a revived check
    needs a structurally-anchored gate written from scratch either way, and the design for it is recorded above.
+
+**Closure (2026-07-14): the deleted gate is not rebuilt, in any form, before Z0 / Z6.** Item 2's overlap analysis and
+the decision it feeds are recorded here.
+
+**The overlap is partial, not total.** `_validate_problem_model_dependency_dataflow` applies only to a `problem` node
+with a non-empty dependency set, and inspects only whether a dependency's result reaches an `intent(out)` result — a
+kernel that calls no dependency is outside it, and on a dependency-free node it is a no-op.
+`_validate_problem_metric_only_scalar_kernel` applies to a 2d/3d `problem` node and fires on the conjunction "≥ 5
+`intent(out)` dummies AND no array input AND no loop"; it does not require a reference to the state arrays, so a
+single decoy array declaration or one unrelated loop clears it. The uncovered shape is therefore real: a kernel that
+carries a decoy array and a loop and computes its metrics by non-literal arithmetic that never reads the state. Of the
+three gates, only the deleted one demanded an actual state-array reference. A claim that the two live gates already
+subsume it would be false.
+
+**The uncovered shape nonetheless fails the conditions for a deterministic gate.** (a) The threat is hypothetical: the
+gate's introducing commits (`362c0a1`, `26aff60`) are generic hardening, not incident-driven; no `fabrication`-class
+hit exists in the orchestration / failure records; and the gate was dead from birth, so the shape it names has never
+been observed. (b) The predicate cannot be evaluated without false positives. Recovering the deleted predicate
+verbatim (2d/3d `problem`; candidate = a `subroutine` with ≥ 3 `intent(out)` dummies; requirement = every
+`algorithm.state_variables[].name` appears in the body as an array reference) and replaying it over every CERTIFIED
+2d/3d `problem` model source in the corpus — each resolved through `_certified_model_source`, i.e. the exact source
+Build compiled — fails-closed an honest, certified model on 2 of the 3 sources, on a different procedure each time:
+`hydrostatic_reconstruct` in the 0.4.0 source (8 `intent(out)` interface states; it reads the halo-extended copies
+`h_ext` / `hu_ext` / `hv_ext`, so no `h(` / `hu(` / `hv(` reference occurs) and `build_topography` in the 0.3.0 source
+of `workspace_20260712` (bathymetry plus its two gradients and a status flag; touching no state is what makes it
+correct). The third source — an earlier 0.3.0 derivation — is clean. What decides whether the gate fires is therefore
+not a defect but how the generator happened to decompose an honest model, which is the false-positive class predicted
+above, now measured. The 0.4.0 case exposes a second, deeper defect in the predicate: a real model hands its helpers
+RENAMED VIEWS of the state (halo-extended copies, interface reconstructions, flux arrays), so a name-anchored "the
+state array is referenced" test systematically rejects correct decomposition. No threshold separates the classes:
+`finalize_diagnostics` (17 `intent(out)`) passes the predicate while the honest helpers above fail it.
+(c) A rebuilt gate is powerless adversarially: a kernel willing to declare a decoy array to
+clear the metric-only gate clears a state-reference gate with one decoy reference (`h(1, 1)`); a static text test
+displaces the fabrication by one step and does not prevent it. (d) The class has an owner elsewhere:
+`zero_base_architecture.md` A4 states that a defective kernel paired with checks that report it as passing clears
+stages 4-6, and that this gap is closed on the VERIFICATION side, not the enforcement side. Z6 owns it, and its
+acceptance criteria already require an adversarial fixture — "a checks module that reports pass against a defective
+kernel" must fail certification. Decoy state storage is a named accepted residual of A4, not a gap a source-text gate
+is expected to close.
+
+**The check's intent is distributed across four layers; there is no unowned position for a new gate.** (1)
+Deterministic: `_validate_problem_metric_only_scalar_kernel` plus the literal-output checks catch the mechanically
+decidable shape (all-literal outputs, no array input, no loop) with no false positives — replayed over the same 3
+certified sources it scores zero firings, where the deleted predicate fail-closes 2 of them. Keeping the deterministic
+layer at the weaker, decidable shape is what buys that difference. (2) LLM: `skills/workflow-generate-verify/SKILL.md`
+carries the deleted gate's rule in its full strength ("a `subroutine` that outputs multiple `intent(out)` metrics with
+no `state_variables` array reference is a `metric-only scalar kernel` and a `fail`") as a judged check at
+`Generate.verify`. A rule whose true
+positives are separable from its false positives only by judgment belongs in the LLM check, which is the established
+placement in this repository. (3) Execution: the `tests.md` predicates compare the final-time snapshot against
+analytic solutions (relative L2 error, convergence order, initial-to-final conservation), so frozen state is caught
+deterministically at `Validate.execute` — PROVIDED the checks module is honest. (4) Architecture: Z6, unimplemented.
+
+Two blind spots are recorded explicitly. The R2 predicates read only diagnostics computed by generated
+code, so a kernel and checks fabricated together pass them — the known co-generation gap that Z6 exists to close
+(`zero_base_architecture.md` A4). And a well-balanced case (`l2_lake_at_rest_invariance` and its kind) asserts that
+the state does NOT move, which is the structural blind spot of ANY check demanding evidence that the state moves; the
+accuracy tests of the same suite, not a state-motion gate, are what cover those nodes.
+
+**"The execution layer catches it" is not, by itself, the basis for this closure, and must not be cited as such.** It
+is false for the co-generation case above. The basis is the conjunction (a)-(d): a hypothetical threat, a predicate
+measured to be false-positive on certified sources, no adversarial strength if built, and a canonical owner. Ownership
+of the adversarial class is Z6; the structural anchor item 1 wanted is delivered as a declared field by Z0.
 
 ## IR document/section accessor confusion — three dead gates, two of them fail-open (IMPLEMENTED 2026-07-14)
 
