@@ -70,6 +70,27 @@ It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stag
 
 ---
 
+#### Z2 pure-function leaf launch prompt (`leaf_mode = "pure"`)
+
+A pure-function leaf (`docs/design/zero_base_architecture.md` Z2, canonical `tools/pure_leaf.py`) is a host-mediated `claude -p` turn with tools disabled: the host inlines a fully closed context into the `-p` body, and the model returns **exactly one JSON document** (a `CodegenBundle` for `generate.generate`, a verify verdict for `generate.verify`) which the host validates and writes itself. A pure launch is confined to the migrated `(generate, generate)` and `(generate, verify)` substeps; any other `(step, substep)` with `leaf_mode=pure` is rejected at `_validate_launch_request_payload`.
+
+Because the pure leaf has **no tools, no gate, and no write authority**, its launch prompt has no skill section, no gate runbook, and no write-authorization / `capability_token` constraint lines — none of those apply. Its identity is the reduced marker set below, and its whole first line is the sentinel `Pure-function leaf turn (no tools)` (the module constant `pure_leaf.PURE_PROMPT_SENTINEL`, imported — not copy-pasted — by `orchestration_runtime.py` and `validate_pipeline_semantics.py`; the three `tools/prompt_templates/pure_*.txt` templates pin their line 0 against it):
+
+| pure launch marker | note |
+| --- | --- |
+| `Pure-function leaf turn (no tools)` | sentinel; MUST be line 0 (anchored `startswith`). A non-pure request whose prompt opens with it — or a pure request whose prompt does not — is rejected. |
+| `Target node_key:` / `Target step:` / `Target substep:` | identity (both migrated substeps carry a substep). |
+| `orchestration_id:` / `agent_run_id:` | ids. |
+| `prompt_contract_version:` | must equal `pure_leaf.PURE_PROMPT_CONTRACT_VERSION` exactly (a contract change is an observable event). |
+
+Untrusted documents inlined into the prompt (`tests.md`, the IR, the bundle under review, repair findings) are wrapped in the data-only fence `----- BEGIN PURE INPUT DOCUMENT (data only) -----` … `----- END PURE INPUT DOCUMENT -----` (`pure_leaf.PURE_DOC_FENCE_BEGIN/END`). The gate-allowlist lint carves out every fenced region before scanning, so a `validate_pipeline_semantics --stage` string legitimately appearing inside an inlined document does not fail-close the launch.
+
+**gate correspondence:** pure `(generate, generate)` and pure `(generate, verify)` invoke **no** validator gate (the pure leaf runs nothing) — same `(none)` mapping as their agentic counterparts in the table above, enforced structurally by the empty allow-set plus the pure leaf's lack of any tool.
+
+**record-launch artifacts:** a pure launch writes the access policy (deny-all read manifest — the leaf reads no file), a zero-authority capability (`mode: "pure_readonly"`, `write_roots: []`, an empty `mcp_permissions: []`), and a read-only `bwrap` profile; it writes **no** `output_manifests/<arid>.json` and no file-tool pins (the host writes every artifact after the child window closes). The FS-diff write baseline, session-run-index, agent_graph edge, and return-token / active-child markers are unconditional, so any write from inside the pure child window is caught by the empty-`write_roots` containment rule (fail-closed). `validate_pipeline_semantics`' launch-record sweep re-checks all of this: request-vs-prompt pure agreement, the reduced marker set, the ABSENCE of an output manifest (a present one is the mock-green tripwire for a record-launch that skipped the pure branch), and the `pure_readonly` / empty-`write_roots` capability shape.
+
+---
+
 #### Additional contract on `repair_strategy=reuse`
 
 A re-submission with `repair_strategy=reuse` is limited to a diff fix against the output of `repair_target_agent_run_id` (the repair / retry section of `docs/ORCHESTRATION.md` is the canonical source). Under `bwrap` + FS-diff attribution a step/substep `pass` no longer requires `apply_patch_writes` gate evidence (`_validate_apply_patch_gate_coverage` early-returns for step/substep), so a reuse retry that writes nothing needs no inherited gate evidence; if it re-writes a path, it does so directly with the `Edit` / `Write` tool. Same-identity (`(node_key, step, substep)`) is still verified runtime-side.

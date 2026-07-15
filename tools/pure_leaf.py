@@ -59,6 +59,46 @@ PURE_SYSTEM_PROMPT = (
 # recorded, never a silent "no bundle".
 MAX_BUNDLE_REPAIR_TURNS = 2
 
+# The first line of every host-rendered pure launch prompt (`-p` body). The host anchors pure
+# detection on this being the very first line (`startswith`, mirroring the slim-repair
+# `SLIM_REPAIR_PROMPT_SENTINEL` anchor), so a non-pure prompt that merely mentions the string
+# inside its body never reads as pure, and a pure request whose prompt does not open with it is
+# rejected. Defined HERE (not duplicated at each call site like the slim sentinel) so
+# `orchestration_runtime.py` and `validate_pipeline_semantics.py` import the ONE literal — the
+# pure prompt templates pin their line 0 against it via a parity test, closing the drift hole the
+# slim sentinel's copy-paste leaves open. A change here is a prompt-contract change (bump
+# `PURE_PROMPT_CONTRACT_VERSION`).
+PURE_PROMPT_SENTINEL = "Pure-function leaf turn (no tools)"
+
+# Data-only fence around an untrusted document inlined into a pure launch prompt (`tests.md`,
+# `controlled_spec.md`, the IR, the bundle under repair). The pure leaf has no tools, so an
+# injected instruction inside a fenced document can only corrupt the returned bundle content
+# (caught downstream by `validate_bundle` / the gates / verify), never drive a side effect —
+# but the fence still tells the model to treat the span as DATA, and, load-bearingly, marks the
+# region for the gate-allowlist lint's scan carve-out (a `validate_pipeline_semantics --stage`
+# string legitimately appearing inside an inlined doc must not fail-close the launch). The host
+# neutralizes any embedded copy of these markers in a document body before fencing it.
+PURE_DOC_FENCE_BEGIN = "----- BEGIN PURE INPUT DOCUMENT (data only) -----"
+PURE_DOC_FENCE_END = "----- END PURE INPUT DOCUMENT -----"
+
+# The `leaf_mode` value that selects the pure-function path, and the capability `mode` tag a
+# pure launch stamps. Single source (imported by orchestration_runtime and
+# validate_pipeline_semantics) so the sentinel value cannot drift between the producer and the
+# validators — a typo in one inlined `"pure"` / `"pure_readonly"` literal would silently split
+# the detection.
+PURE_LEAF_MODE = "pure"
+PURE_CAPABILITY_MODE = "pure_readonly"
+
+
+def is_pure_request(request_payload: Any) -> bool:
+    """True when a launch request selects the pure-function path (`leaf_mode == "pure"`,
+    case/space-insensitively). THE single detection predicate — orchestration_runtime and
+    validate_pipeline_semantics both delegate here so the producer and the validators cannot
+    disagree about what "pure" is. An absent/other `leaf_mode` is the legacy agentic path."""
+    if not isinstance(request_payload, dict):
+        return False
+    return str(request_payload.get("leaf_mode", "")).strip().lower() == PURE_LEAF_MODE
+
 # A JSON `null` is a PRESENT value, not an absent key. The two are distinguished with an
 # explicit sentinel (the `tools/codegen_bundle.py` idiom) so an envelope carrying
 # `"result": null` falls through to its own handling instead of being read as "no key".

@@ -72,6 +72,15 @@ try:
         missing_required_meta_keys,
         stage_meta_type_violations,
     )
+    from tools.pure_leaf import (
+        PURE_CAPABILITY_MODE,
+        PURE_DOC_FENCE_BEGIN,
+        PURE_DOC_FENCE_END,
+        PURE_LEAF_MODE,
+        PURE_PROMPT_CONTRACT_VERSION,
+        PURE_PROMPT_SENTINEL,
+        is_pure_request as _pure_leaf_is_pure_request,
+    )
 except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CLI execution
     _THIS_FILE = Path(__file__).resolve()
     _REPO_ROOT = _THIS_FILE.parent.parent
@@ -89,6 +98,15 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
         STAGE_META_FILENAME_BY_STEP,
         missing_required_meta_keys,
         stage_meta_type_violations,
+    )
+    from tools.pure_leaf import (
+        PURE_CAPABILITY_MODE,
+        PURE_DOC_FENCE_BEGIN,
+        PURE_DOC_FENCE_END,
+        PURE_LEAF_MODE,
+        PURE_PROMPT_CONTRACT_VERSION,
+        PURE_PROMPT_SENTINEL,
+        is_pure_request as _pure_leaf_is_pure_request,
     )
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
@@ -3028,7 +3046,10 @@ def _write_orphan_launch_tombstones(
     A dangling launch (host died mid-Agent-call) leaves orphan launch artifacts
     (`launches/<arid>.{prompt,request,response,reply}`, `capabilities/<arid>.json`,
     `output_manifests/<arid>.json`) with NO terminal `agent_runs.jsonl` row and NO
-    `child_returns/<arid>.txt` ack. Resume keeps those artifacts for forensics but,
+    `child_returns/<arid>.txt` ack. (A Z2 pure-function leaf's residual set has NO
+    `output_manifests/<arid>.json` — a pure launch never writes one — but the tombstone key is
+    derived solely from `launches/<arid>.request.json`, so a pure orphan is tombstoned the same
+    way.) Resume keeps those artifacts for forensics but,
     without a marker, a later manual inspection / audit tool cannot distinguish them
     from a genuine protocol violation (a launched child that vanished). The tombstone
     records that the runtime intentionally pruned the orphan during recovery. It lives
@@ -3950,6 +3971,12 @@ def build_capability_document(
     if isinstance(ss, str) and ss.strip():
         substep_val = ss.strip().lower()
 
+    # A pure-function leaf holds NO write authority (no tools, host writes after the child
+    # window closes) and invokes no gate/MCP: its capability is a truthful zero-authority
+    # record — `write_roots: []`, no mcp_permissions — tagged `mode: PURE_CAPABILITY_MODE` so the
+    # verification systems (and the record-launch read-only-profile branch) can recognize it.
+    pure = _is_pure_launch_request(request_payload)
+
     token = secrets.token_hex(32)
     body: dict[str, Any] = {
         "agent_run_id": agent_run_id.strip(),
@@ -3958,7 +3985,7 @@ def build_capability_document(
         "agent_role": role,
         "node_key": node_key,
         "step": step,
-        "write_roots": _write_roots_for_launch(
+        "write_roots": [] if pure else _write_roots_for_launch(
             role=role,
             step=step,
             orchestration_id=orchestration_id,
@@ -3966,15 +3993,19 @@ def build_capability_document(
             pipeline_ref=pipeline_ref,
             node_key=node_key,
         ),
-        "mcp_permissions": _mcp_permissions_for_launch(role, step),
+        "mcp_permissions": [] if pure else _mcp_permissions_for_launch(role, step),
         "expires_at": _default_capability_expires_at_iso(),
     }
+    if pure:
+        body["mode"] = PURE_CAPABILITY_MODE
     if substep_val is not None:
         body["substep"] = substep_val
     # step/substep agents must have at least one write root; an empty list means
     # the request_payload was missing or incomplete and would later cause a
-    # fail_closed violation. Fail early here instead.
-    if role in {"step", "substep"} and not body.get("write_roots"):
+    # fail_closed violation. Fail early here instead. EXCEPTION: a pure leaf's empty
+    # write_roots is intentional and load-bearing (fail-closed against ANY child-window write),
+    # so the empty-write_roots guard is relaxed for pure only; the default stays fail-closed.
+    if role in {"step", "substep"} and not pure and not body.get("write_roots"):
         raise ValueError(
             f"capability_invalid_empty_write_roots: agent_role={role!r} requires at least "
             "one write_root. Check that ir_ref and pipeline_ref in request_payload are "
@@ -6748,6 +6779,28 @@ def build_access_policy_payload(
     if not isinstance(pipeline_ref, str) or not pipeline_ref.strip():
         raise ValueError("access policy requires pipeline_ref")
 
+    if _is_pure_launch_request(request_payload):
+        # A pure leaf receives its whole context inlined in the `-p` body and reads NO file. The
+        # policy is an ALLOWLIST: an EMPTY `allowed_read_roots` is what denies every read (a path
+        # not under any allowed root is rejected) — that empty allow-set is the enforcing
+        # mechanism. `denied_read_roots: ["."]` is an explicit audit statement of intent, not the
+        # enforcer (the read matcher's containment check does not treat "." as a repo-wide
+        # prefix). `--safe-mode` means no PreToolUse hook runs anyway, so the manifest is audit
+        # truth and the read-only bwrap profile is the real defense-in-depth. No gate services
+        # either — the pure leaf invokes no validator gate.
+        pure_body = {
+            "agent_run_id": agent_run_id.strip(),
+            "node_key": node_key.strip(),
+            "step": step.strip().lower(),
+            "allowed_read_roots": [],
+            "denied_read_roots": ["."],
+            "allowed_gate_services": [],
+        }
+        substep_pure = request_payload.get("substep")
+        if isinstance(substep_pure, str) and substep_pure.strip():
+            pure_body["substep"] = substep_pure.strip().lower()
+        return pure_body
+
     allowed_read_roots = [
         "docs/",
         "spec/",
@@ -8684,6 +8737,17 @@ def _validate_actual_write_paths(
             unauthorized.append(path)
             continue
         if actor_role in {"step", "substep"}:
+            if not write_roots:
+                # EMPTY write_roots (a Z2 pure-function leaf's zero-authority capability):
+                # containment cannot authorize a write when there is NO authorized root, so
+                # EVERY non-exempt child-window change is unauthorized. Without this guard the
+                # empty-write_roots case falls through to the containment `continue` below and
+                # fail-OPENs — the exact property the pure design relies on (a pure leaf writes
+                # nothing in its window; the host writes after it closes). For a NON-pure
+                # step/substep, build_capability_document rejects empty write_roots at launch,
+                # so this branch is reached only for a pure leaf.
+                unauthorized.append(path)
+                continue
             # Phase-2 FS-diff attribution: bwrap is mandatory (a host that cannot
             # sandbox the leaf fails closed at launch), so a leaf can only write
             # inside its declared write_roots. A change that landed under a
@@ -9233,6 +9297,12 @@ _PROMPT_TEMPLATE_FILES = {
     "step agent": "step_agent.txt",
     "substep agent": "substep_agent.txt",
     "common boilerplate": "common_boilerplate.txt",
+    # Z2 pure-function leaf prompts (host-mediated `claude -p`, no tools). One per
+    # migrated (step, substep); the repair template is substep-agnostic. Their line 0 is
+    # PURE_PROMPT_SENTINEL (parity-tested against the module constant).
+    "pure generate.generate": "pure_generate_generate.txt",
+    "pure generate.verify": "pure_generate_verify.txt",
+    "pure bundle repair": "pure_bundle_repair.txt",
 }
 
 
@@ -9810,9 +9880,15 @@ def _is_slim_repair_request(request_payload: dict[str, Any]) -> bool:
     conductor has decided the producer session is actually resumable (else it falls back to
     a cold full prompt). The `repair_strategy` check is defensive: `warm_resume` is only ever
     set on the reuse path, but restating it keeps this predicate independently correct.
-    Deterministic in-process steps never take this path. Canonical:
-    docs/design/deterministic_followups.md (warm-resume reuse repair / slim turn)."""
+    Deterministic in-process steps never take this path. A PURE request is excluded up front:
+    a pure warm-resume repair satisfies the (warm_resume + reuse + findings) shape but has its
+    own renderer/marker set, so returning False here makes pure and slim mutually exclusive
+    predicates — the dispatch order that checks pure first is then merely defensive, not
+    load-bearing. Canonical: docs/design/deterministic_followups.md (warm-resume reuse repair /
+    slim turn)."""
     if request_payload.get("deterministic"):
+        return False
+    if _is_pure_launch_request(request_payload):
         return False
     if not request_payload.get("warm_resume"):
         return False
@@ -9886,6 +9962,151 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# --------------------------------------------------------------------------------------
+# Z2 pure-function leaf (host-mediated `claude -p`, tools disabled). A pure leaf receives a
+# fully closed context in its `-p` body and returns ONE JSON document; the host validates and
+# writes it. Its launch prompt has no skill section, no gate runbook, no write-authorization
+# constraints — the leaf has no write authority to constrain — so it needs its own renderer,
+# marker set, and record-launch branch, all keyed off `leaf_mode == "pure"`.
+# --------------------------------------------------------------------------------------
+
+# Migrated (step, substep) pairs a pure leaf may serve, and the required `pure_context` keys the
+# host inlines for each. A pure request outside this map is rejected at validation
+# (`_validate_launch_request_payload`); a missing context key on a cold launch is rejected too.
+PURE_CONTEXT_REQUIRED_KEYS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("generate", "generate"): ("harness_capabilities", "target_profile", "ir_document",
+                               "tests_document"),
+    ("generate", "verify"): ("controlled_spec_document", "tests_document", "ir_document",
+                             "bundle_document"),
+}
+
+
+def _is_pure_launch_request(request_payload: dict[str, Any]) -> bool:
+    """True when this launch is a Z2 pure-function leaf turn (`leaf_mode == "pure"`).
+
+    An ABSENT `leaf_mode` is the legacy agentic path (every existing caller); this predicate is
+    the single gate that steers a request into the pure renderer / marker set / record-launch
+    branch. `_is_slim_repair_request` now returns False for a pure request, so pure and slim are
+    mutually exclusive predicates (dispatch order is defensive, not load-bearing); deterministic
+    and pure are likewise mutually exclusive (enforced at validation). Delegates to
+    `pure_leaf.is_pure_request` — the single detection source shared with the validator."""
+    return _pure_leaf_is_pure_request(request_payload)
+
+
+def _sanitize_pure_doc_body(text: str) -> str:
+    """Neutralize any embedded pure-doc fence marker in an inlined document body so an
+    untrusted document (tests.md, the IR, the bundle under review) cannot FORGE or prematurely
+    close the data fence. Mirrors `_sanitize_exemplar_body`: an early close would (a) render the
+    document tail as live prompt text (injection surface) and (b) truncate the gate-allowlist
+    scan carve-out so a `validate_pipeline_semantics --stage` string in the leaked tail
+    fail-closes the launch. Breaking the exact marker token leaves the body human-legible."""
+    return (text.replace(PURE_DOC_FENCE_BEGIN, PURE_DOC_FENCE_BEGIN.replace("BEGIN", "BEGIN-"))
+                .replace(PURE_DOC_FENCE_END, PURE_DOC_FENCE_END.replace("END", "END-")))
+
+
+def _fence_pure_doc(text: str) -> str:
+    """Wrap an inlined pure-context document in the data-only fence (sanitized body). The
+    fenced region is what the gate-allowlist scan carve-out (`_gate_allowlist_scan_text`)
+    removes before linting, so an untrusted document that legitimately mentions a gate command
+    is never mistaken for a leaf instruction."""
+    return "\n".join([PURE_DOC_FENCE_BEGIN, _sanitize_pure_doc_body(text).rstrip("\n"),
+                      PURE_DOC_FENCE_END])
+
+
+_PURE_PLACEHOLDER_RE = re.compile(r"<(\w+)>")
+
+
+def _substitute_pure_placeholders(template: str, subs: dict[str, str]) -> str:
+    """Replace each `<key>` placeholder in `template` EXACTLY ONCE, in a single pass over the
+    template, using `subs`.
+
+    A single-pass `re.sub` — NOT a `for key: rendered.replace(...)` loop — because the
+    substituted values include untrusted inlined document bodies (the IR, tests.md, the bundle
+    under verify review) that can legitimately contain a literal `<step>` / `<ir_document>`
+    token. A replace-loop re-scans already-inserted text and would corrupt such a token (splice
+    an id into the data, or leave an unprocessed `<key>` behind depending on key order); the
+    single pass leaves inserted content untouched. An unknown `<key>` (not in `subs`) is left
+    verbatim, so a template typo surfaces rather than silently vanishing."""
+    return _PURE_PLACEHOLDER_RE.sub(
+        lambda m: subs.get(m.group(1), m.group(0)), template)
+
+
+def _pure_launch_template_name(request_payload: dict[str, Any]) -> str:
+    step = str(request_payload.get("step", "")).strip().lower()
+    substep = str(request_payload.get("substep", "")).strip().lower()
+    return f"pure {step}.{substep}"
+
+
+def _render_pure_launch_prompt(request_payload: dict[str, Any]) -> str:
+    """Render a cold pure-function launch prompt from its `pure_{step}_{substep}.txt` template.
+
+    Byte-stable order (static persona/output-contract prefix first, variable ids last): the
+    template holds the static body and `<key>` tokens; this fills them from `pure_context`
+    (each inlined document fenced as data), the reused dependency-facts / exemplar renderers,
+    and the identity block. No `_template_placeholder_values` (no gate runbook / task card /
+    capability paths — a pure leaf runs no gate and writes nothing)."""
+    templates = _load_launch_prompt_templates()
+    template = templates[_pure_launch_template_name(request_payload)]
+    pure_context = request_payload.get("pure_context")
+    subs: dict[str, str] = {}
+    if isinstance(pure_context, dict):
+        for key, value in pure_context.items():
+            subs[str(key)] = _fence_pure_doc(str(value))
+    # dependency_facts stays UNFENCED (host-resolved orientation), so it remains in the
+    # gate-allowlist scan text; sanitize any stray PURE fence marker in it so it cannot pair
+    # with a later legitimate fence END and drop that region from the scan (fail-open of the
+    # recurrence lint). The exemplar is stripped wholesale by the scan carve-out, so it needs no
+    # separate PURE-marker sanitizing here.
+    subs["dependency_facts"] = _sanitize_pure_doc_body(_build_dependency_facts(request_payload))
+    subs["exemplar"] = _build_exemplar(request_payload)
+    subs["node_key"] = str(request_payload.get("node_key", ""))
+    subs["step"] = str(request_payload.get("step", ""))
+    subs["substep"] = str(request_payload.get("substep", ""))
+    subs["orchestration_id"] = str(request_payload.get("orchestration_id", ""))
+    subs["agent_run_id"] = str(request_payload.get("agent_run_id", ""))
+    subs["prompt_contract_version"] = str(request_payload.get("prompt_contract_version", ""))
+    return _substitute_pure_placeholders(template, subs)
+
+
+def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:
+    """Render a bounded pure schema-repair turn (`pure_bundle_repair.txt`).
+
+    The findings excerpt is wrapped in the same data-only fence as an inlined document so the
+    single scan carve-out covers it. On a WARM repair the resumed session already holds the
+    output-contract schema, the prior document under repair, and the full context, so
+    `<pure_context>` is empty. On the COLD fallback (`_claude_session_resumable` returned false —
+    no `warm_resume`) the input context documents (`pure_context`) are re-inlined, but the
+    output-contract SCHEMA and the model's PRIOR document are NOT (the schema lives in the
+    generate/verify launch templates, and a cold session has no prior turn to reference).
+    Threading those into a cold repair is deferred to M-C, which wires the producer repair loop
+    and owns how a failed bundle is carried forward — until then the cold fallback is a
+    context-complete but schema-thin turn, adequate for the inert wiring but NOT the final
+    cold-repair contract."""
+    templates = _load_launch_prompt_templates()
+    template = templates["pure bundle repair"]
+    findings = str(request_payload.get("repair_findings", "")).strip()
+    subs: dict[str, str] = {
+        "node_key": str(request_payload.get("node_key", "")),
+        "step": str(request_payload.get("step", "")),
+        "substep": str(request_payload.get("substep", "")),
+        "orchestration_id": str(request_payload.get("orchestration_id", "")),
+        "agent_run_id": str(request_payload.get("agent_run_id", "")),
+        "prompt_contract_version": str(request_payload.get("prompt_contract_version", "")),
+        "findings": _fence_pure_doc(findings),
+    }
+    if not request_payload.get("warm_resume"):
+        pure_context = request_payload.get("pure_context")
+        context_blocks: list[str] = []
+        if isinstance(pure_context, dict):
+            for key in sorted(pure_context, key=str):
+                context_blocks.append(f"**{key}:**")
+                context_blocks.append(_fence_pure_doc(str(pure_context[key])))
+        subs["pure_context"] = "\n".join(context_blocks)
+    else:
+        subs["pure_context"] = ""
+    return _substitute_pure_placeholders(template, subs)
+
+
 def _render_launch_prompt_template(request_payload: dict[str, Any]) -> str:
     """Render the launch prompt template.
 
@@ -9897,6 +10118,13 @@ def _render_launch_prompt_template(request_payload: dict[str, Any]) -> str:
     """
     if request_payload.get("deterministic"):
         return _render_deterministic_launch_prompt(request_payload)
+    # Pure BEFORE slim: a pure warm-resume repair also satisfies `_is_slim_repair_request`
+    # (warm_resume + reuse + findings), so checking pure first keeps the slim renderer from
+    # swallowing it. Order is load-bearing.
+    if _is_pure_launch_request(request_payload):
+        if str(request_payload.get("repair_findings", "")).strip():
+            return _render_pure_repair_prompt(request_payload)
+        return _render_pure_launch_prompt(request_payload)
     if _is_slim_repair_request(request_payload):
         return _render_slim_repair_launch_prompt(request_payload)
     templates = _load_launch_prompt_templates()
@@ -10088,7 +10316,12 @@ def prepare_launch_request_payload(request_payload: dict[str, Any]) -> dict[str,
     # stripped and skill_must_read_refs empty (mirror build_launch_request) so the
     # persisted request stays self-consistent and references no deleted SKILL.
     deterministic = bool(payload.get("deterministic"))
-    if not deterministic:
+    # A pure-function leaf reads no SKILL (its whole context is host-inlined) and has no
+    # skill section in its prompt: force the three skill fields empty, exactly like the
+    # deterministic path, so the persisted request is self-consistent and the pure marker /
+    # validation checks (which require empty skill fields) hold.
+    pure = _is_pure_launch_request(payload)
+    if not deterministic and not pure:
         if not isinstance(payload.get("skill_name"), str) or not payload.get("skill_name", "").strip():
             skill_name = _skill_name_for_request(payload)
             if skill_name is not None:
@@ -10097,16 +10330,20 @@ def prepare_launch_request_payload(request_payload: dict[str, Any]) -> dict[str,
             skill_name = payload.get("skill_name")
             if isinstance(skill_name, str) and skill_name.strip():
                 payload["skill_ref"] = f"skills/{skill_name.strip()}/SKILL.md"
+    if pure:
+        payload["skill_name"] = ""
+        payload["skill_ref"] = ""
     payload.setdefault("issue_severity", "none")
     payload.setdefault("workflow_mode", os.environ.get("METDSL_WORKFLOW_EXEC_MODE", "dev"))
     payload.setdefault("repair_strategy", "none")
     payload.setdefault("repair_target_agent_run_id", "none")
     payload.setdefault("repair_reason", "none")
-    # Slim warm-resume repair turns carry no must-read (the resumed leaf already read them
-    # in its prior session); keep this empty in BOTH assembly paths or the launch-integrity
-    # validator rejects the persisted prompt (build_launch_request empties it too).
+    # Slim warm-resume repair turns and pure leaves carry no must-read (the resumed leaf
+    # already read them / the pure leaf reads none); keep this empty in BOTH assembly paths or
+    # the launch-integrity validator rejects the persisted prompt (build_launch_request empties
+    # it too).
     payload["skill_must_read_refs"] = (
-        "" if (deterministic or _is_slim_repair_request(payload))
+        "" if (deterministic or pure or _is_slim_repair_request(payload))
         else ",".join(build_skill_must_read_refs(payload)))
     explicit_prompt_present = any(
         _coerce_nested_launch_text(payload, path) is not None
@@ -10126,7 +10363,13 @@ def prepare_launch_request_payload(request_payload: dict[str, Any]) -> dict[str,
             ("launch_prompt",),
         )
     )
-    if not explicit_prompt_present:
+    # A pure launch is HOST-MEDIATED: the host fully controls the closed context, so the prompt
+    # is ALWAYS the canonical render of THIS request — never a caller-supplied body. Force-render
+    # (overwriting any explicit prompt field) so a supplied `launch_prompt_full` cannot inject a
+    # mismatched identity/context that the marker-only validation would otherwise accept (the
+    # child would act on one context while its output is attributed to another request). For the
+    # legacy path, keep the existing behavior (render only when no explicit prompt is supplied).
+    if pure or not explicit_prompt_present:
         payload["launch_prompt_full"] = render_launch_prompt_text(payload)
     return payload
 
@@ -10202,6 +10445,16 @@ def _required_launch_prompt_markers(request_payload: dict[str, Any]) -> list[str
     step = request_payload.get("step")
     if not isinstance(step, str) or not step.strip():
         return []
+    if _is_pure_launch_request(request_payload):
+        # Pure-function leaf turn (launch OR repair): sentinel + identity + contract version.
+        # No skill / must-read / `Required requirements:` markers — the pure prompt has no
+        # skill section and no leaf-authorable gate/write instructions.
+        return [
+            PURE_PROMPT_SENTINEL,
+            "Target node_key:", "Target step:", "Target substep:",
+            "orchestration_id:", "agent_run_id:",
+            "prompt_contract_version:",
+        ]
     if request_payload.get("deterministic"):
         # In-process Build / Validate.execute: minimal prompt, no skill section.
         det = [
@@ -10273,11 +10526,14 @@ def _required_launch_prompt_constraint_lines(request_payload: dict[str, Any]) ->
     step = request_payload.get("step")
     if not isinstance(step, str) or not step.strip():
         return []
-    if request_payload.get("deterministic") or _is_slim_repair_request(request_payload):
+    if (request_payload.get("deterministic")
+            or _is_pure_launch_request(request_payload)
+            or _is_slim_repair_request(request_payload)):
         # No leaf runs the deterministic prompt; the slim repair turn's leaf is resumed and
         # already holds the security-constraint instructions (apply-patch gate,
-        # capability_token handling, direct Edit/Write) from its prior session — so the slim
-        # turn need not (and does not) restate them.
+        # capability_token handling, direct Edit/Write) from its prior session; a pure leaf has
+        # NO write authority at all (no tools, no capability write_roots) so there is nothing to
+        # constrain — all three skip the shell-write / capability-token constraint lines.
         return []
     required_fragments = (
         "`run-gate --gate apply_patch_writes` and `apply-patch-gate`",
@@ -10585,6 +10841,18 @@ def _gate_allowlist_scan_text(request_payload: dict[str, Any], prompt_text: str)
     must NOT fail-close the launch under the empty `(generate,generate)` allow-set. The
     conductor-authored prefix carries no gate runbook, so scanning it preserves the
     recurrence-prevention intent (no prompt INSTRUCTS the leaf to run a forbidden gate)."""
+    if _is_pure_launch_request(request_payload):
+        # A pure prompt inlines untrusted documents (tests.md / IR / bundle / repair findings)
+        # inside the data-only PURE_DOC_FENCE, AND a pure generate.generate prompt injects a
+        # certified sibling `<exemplar>` inside the `--- BEGIN/END EXEMPLAR ---` fence (its own
+        # marker, not PURE_DOC). A `validate_pipeline_semantics --stage` string appearing INSIDE
+        # either fenced region (a comment, a quoted diagnostic) is DATA, not a leaf instruction,
+        # and must not fail-close the launch under the empty pure allow-set — drop BOTH fence
+        # families before scanning (exemplar strip mirrors the agentic path's R5 carve-out; a
+        # stray PURE marker inside the exemplar is removed with the whole exemplar region). The
+        # static persona text carries no gate command, so scanning the remainder preserves the
+        # recurrence-prevention intent.
+        return _strip_exemplar_regions(_strip_pure_doc_regions(prompt_text))
     if _is_slim_repair_request(request_payload):
         return prompt_text.split(SLIM_REPAIR_FINDINGS_HEADER, 1)[0]
     # R5: a conductor-injected `Certified exemplar` block is verbatim certified source fenced as
@@ -10599,6 +10867,24 @@ _EXEMPLAR_REGION_RE = re.compile(
     re.escape(_EXEMPLAR_BEGIN_PREFIX) + r".*?" + re.escape(_EXEMPLAR_END_PREFIX) + r"[^\n]*",
     re.DOTALL,
 )
+
+
+_PURE_DOC_REGION_RE = re.compile(
+    re.escape(PURE_DOC_FENCE_BEGIN) + r".*?" + re.escape(PURE_DOC_FENCE_END),
+    re.DOTALL,
+)
+
+
+def _strip_pure_doc_regions(text: str) -> str:
+    """Remove every balanced PURE_DOC_FENCE region (inclusive) so the gate-allowlist lint does
+    not scan inlined pure-context documents / repair findings. Non-greedy (BEGIN → first
+    following END): an unbalanced BEGIN matches nothing and is left in place, so the region
+    carve-out can only ever REMOVE genuinely-fenced data, never hide real leaf instructions.
+    `_fence_pure_doc` always emits balanced fences and sanitizes any embedded marker in the
+    body, so in practice every region is stripped."""
+    if PURE_DOC_FENCE_BEGIN not in text:
+        return text
+    return _PURE_DOC_REGION_RE.sub("", text)
 
 
 def _strip_exemplar_regions(text: str) -> str:
@@ -10616,6 +10902,42 @@ def _strip_exemplar_regions(text: str) -> str:
 
 
 def _validate_launch_prompt_text(request_payload: dict[str, Any], prompt_text: str) -> None:
+    # Pure detection is the AND of "request declares pure" and "prompt opens with the pure
+    # sentinel" (line 0). Guard the reverse-injection here (mirroring the slim double-check in
+    # the pipeline-semantics sweep): a NON-pure request whose prompt was swapped for a
+    # pure-looking body would otherwise dodge the full skill / must-read / requirements markers.
+    prompt_opens_pure = prompt_text.lstrip().startswith(PURE_PROMPT_SENTINEL)
+    if prompt_opens_pure and not _is_pure_launch_request(request_payload):
+        raise ValueError(
+            "launch prompt opens with the pure-function sentinel but the launch request does "
+            "not declare leaf_mode=pure; a non-pure request must not carry a pure-shaped prompt"
+        )
+    if _is_pure_launch_request(request_payload) and not prompt_opens_pure:
+        raise ValueError(
+            "pure launch request prompt must open with the pure-function sentinel "
+            f"({PURE_PROMPT_SENTINEL!r})"
+        )
+    if _is_pure_launch_request(request_payload):
+        # Defense-in-depth: bind the pure prompt's identity VALUES to the request, not just the
+        # marker NAMES. `prepare_launch_request_payload` force-renders the canonical pure prompt,
+        # so at the record-launch chokepoint this holds by construction; but a caller that reaches
+        # this validator with a hand-supplied prompt must not be able to keep the `Target
+        # node_key:` marker while swapping its VALUE (which would attribute the child's output to
+        # the wrong request). Require each rendered identity line, with its value, verbatim.
+        expected_identity_lines = (
+            f"Target node_key: {request_payload.get('node_key', '')}",
+            f"Target step: {request_payload.get('step', '')}",
+            f"Target substep: {request_payload.get('substep', '')}",
+            f"orchestration_id: {request_payload.get('orchestration_id', '')}",
+            f"agent_run_id: {request_payload.get('agent_run_id', '')}",
+            f"prompt_contract_version: {request_payload.get('prompt_contract_version', '')}",
+        )
+        missing_identity = [line for line in expected_identity_lines if line not in prompt_text]
+        if missing_identity:
+            raise ValueError(
+                "pure launch prompt identity does not match the request (missing/mismatched: "
+                + "; ".join(missing_identity) + ")"
+            )
     required_markers = _required_launch_prompt_markers(request_payload)
     scan_text = _gate_allowlist_scan_text(request_payload, prompt_text)
     if not required_markers:
@@ -12214,6 +12536,81 @@ def _validate_pass_output_refs_against_launch(
         )
 
 
+def _validate_pure_launch_request_payload(request_payload: dict[str, Any]) -> None:
+    """Validate the pure-leaf-specific shape of a launch request (`leaf_mode == "pure"`).
+
+    Enforced (fail-closed): the only accepted `leaf_mode` value is `"pure"`; pure is confined to
+    the migrated (generate, generate) / (generate, verify) substeps; it is mutually exclusive
+    with `deterministic`; `prompt_contract_version` matches the transport's contract EXACTLY;
+    `allowed_output_paths` is empty (the leaf has no write authority — the host writes after the
+    child window closes); the three skill fields are empty (no SKILL is read); and the required
+    `pure_context` keys are present on a cold launch. A warm-resume repair (`warm_resume` +
+    `repair_findings`) may omit `pure_context` — the resumed session already holds it — but a
+    cold repair fallback still requires it."""
+    leaf_mode = str(request_payload.get("leaf_mode", "")).strip().lower()
+    if leaf_mode != PURE_LEAF_MODE:
+        raise ValueError(
+            f"launch request leaf_mode must be {PURE_LEAF_MODE!r} when present; got "
+            f"{request_payload.get('leaf_mode')!r}"
+        )
+    if request_payload.get("deterministic"):
+        raise ValueError(
+            "launch request must not set both leaf_mode=pure and deterministic=True"
+        )
+    step = str(request_payload.get("step", "")).strip().lower()
+    substep = str(request_payload.get("substep", "")).strip().lower()
+    key = (step, substep)
+    if key not in PURE_CONTEXT_REQUIRED_KEYS:
+        raise ValueError(
+            "leaf_mode=pure is only valid for (generate, generate) and (generate, verify); "
+            f"got (step={step!r}, substep={substep!r})"
+        )
+    version = request_payload.get("prompt_contract_version")
+    if version != PURE_PROMPT_CONTRACT_VERSION:
+        raise ValueError(
+            "pure launch request prompt_contract_version must be exactly "
+            f"{PURE_PROMPT_CONTRACT_VERSION!r}; got {version!r}"
+        )
+    aop = request_payload.get("allowed_output_paths")
+    if aop not in (None, []):
+        raise ValueError(
+            "pure launch request allowed_output_paths must be empty — a pure leaf writes "
+            f"nothing (the host writes after the child window closes); got {aop!r}"
+        )
+    for field in ("skill_name", "skill_ref", "skill_must_read_refs"):
+        value = request_payload.get(field)
+        if isinstance(value, str) and value.strip():
+            raise ValueError(
+                f"pure launch request must leave {field} empty (no SKILL is read); got {value!r}"
+            )
+    # `pure_context` may be omitted ONLY on a genuine warm-resume REUSE repair — the resumed
+    # producer session already holds the schema, the prior document, and the input context, so
+    # re-inlining them is redundant. A `restart` (or any non-reuse) repair has no such session,
+    # and the cold fallback renderer needs the context re-inlined, so it is NOT exempt: require
+    # `repair_strategy == "reuse"` alongside warm_resume + findings, or the context stays
+    # mandatory. Mirrors `_is_slim_repair_request`'s (warm + reuse + findings) shape.
+    warm = bool(request_payload.get("warm_resume"))
+    reuse = str(request_payload.get("repair_strategy", "")).strip() == "reuse"
+    findings = str(request_payload.get("repair_findings", "")).strip()
+    context_required = not (warm and reuse and findings)
+    if context_required:
+        ctx = request_payload.get("pure_context")
+        if not isinstance(ctx, dict):
+            raise ValueError(
+                "pure launch request must include a pure_context object (except on a "
+                "warm-resume repair, where the resumed session already holds it)"
+            )
+        missing = [
+            k for k in PURE_CONTEXT_REQUIRED_KEYS[key]
+            if not (isinstance(ctx.get(k), str) and ctx.get(k).strip())
+        ]
+        if missing:
+            raise ValueError(
+                f"pure launch request pure_context missing required key(s) for {key}: "
+                f"{', '.join(missing)}"
+            )
+
+
 def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
     node_key = request_payload.get("node_key")
     step = request_payload.get("step")
@@ -12325,6 +12722,19 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
                 f"(repair_strategy={repair_strategy!r})"
             )
 
+    # Pure-function leaf (`leaf_mode` present): validate its dedicated shape and, for the pure
+    # verify substep, short-circuit before the verify skill-requirement block below (a pure
+    # verify carries empty skill fields by contract, so those checks would false-reject it —
+    # this branch is the one that currently rejects pure verify). The gate is KEY PRESENCE, not
+    # `is not None`: the invariant is "any present `leaf_mode` other than 'pure' is invalid", so
+    # an explicit `leaf_mode: null` (or "", or "agentic") must reach the validator and be
+    # REJECTED — not silently fall through to the agentic path with write authority. Only an
+    # ABSENT key is the legacy path. `_validate_pure_launch_request_payload` then requires the
+    # value be exactly "pure".
+    is_pure = "leaf_mode" in request_payload
+    if is_pure:
+        _validate_pure_launch_request_payload(request_payload)
+
     is_verify_substep = (
         isinstance(step, str)
         and step.strip().lower() in {"compile", "generate"}
@@ -12359,6 +12769,10 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
             raise ValueError("generate verify launch request must include non-empty source_id")
 
     if not is_verify_substep:
+        return
+    if is_pure:
+        # Pure verify: skill fields are empty by contract (validated above); the agentic-verify
+        # skill / must-read requirements below do not apply.
         return
 
     skill_name = request_payload.get("skill_name")
@@ -12505,6 +12919,12 @@ def _validate_terminal_run_payload(
 
     output_refs = payload.get("output_refs")
     if role_token in {"step", "substep"}:
+        # M-C PRECONDITION (Z2 pure leaf): a pure launch writes NO output manifest and the host
+        # writes the leaf's artifacts AFTER the child window, so a passing pure terminal row
+        # needs a carve-out here — otherwise the non-empty-output_refs requirement and
+        # `_validate_paths_against_allowed_output_manifest` (which raises on the absent manifest)
+        # fail-close it. Not added in M-B because no pure leaf terminalizes yet (inert) and the
+        # exact pure output_refs contract is defined in M-C; wire it when the producer flips.
         if not isinstance(output_refs, list) or not output_refs:
             raise ValueError("pass status for step/substep requires non-empty output_refs")
         for idx, item in enumerate(output_refs):
@@ -14759,6 +15179,15 @@ def record_launch(
         cap_rel = f"workspace/orchestrations/{orchestration_id}/capabilities/{child_agent_run_id}.json"
         out_refs["capability_ref"] = cap_rel
         out_refs["capability_token"] = cap_doc.get("capability_token", "")
+        # A pure-function leaf (Z2) holds no write authority: the access policy (denied-all),
+        # read manifest, and capability (`write_roots: []`, `mode: pure_readonly`) written above
+        # are the truthful zero-authority record. Below, the write-authorization surface —
+        # output paths, file-tool pins, write-contract preflight, and the output manifest — is
+        # skipped, and the sandbox is the read-only profile. The FS-diff baseline,
+        # session-run-index, agent_graph, parent_return_token, and active-child markers stay
+        # unconditional (a child-window write is then caught by the empty-write_roots containment
+        # rule against that baseline — fail-closed, no new branch).
+        is_pure = _is_pure_launch_request(request_payload)
         write_roots_obj = cap_doc.get("write_roots")
         write_roots = [str(item) for item in write_roots_obj] if isinstance(write_roots_obj, list) else []
         # Resolve toolchain.build_system from spec.ir.yaml.impl_defaults so the
@@ -14796,19 +15225,26 @@ def record_launch(
             request_payload["_resolved_makefile_host_authored"] = (
                 (_bs_for_mk or "make") == "make"
                 and (_lang_resolved or "fortran") == "fortran")
-        allowed_output_paths = _allowed_output_paths_for_launch(
-            request_payload=request_payload,
-            write_roots=write_roots,
-        )
-        allowed_file_tool_paths = _allowed_file_tool_paths_for_launch(
-            request_payload=request_payload,
-            allowed_output_paths=allowed_output_paths,
-        )
-        _validate_child_write_contract_preflight(
-            request_payload=request_payload,
-            capability_doc=cap_doc,
-            allowed_output_paths=allowed_output_paths,
-        )
+        if is_pure:
+            # No output paths, no file-tool pins, no write-contract preflight — a pure leaf
+            # authors nothing in its window. Empty lists flow through the (inert for generate)
+            # lineage / cross-phase blocks below and suppress the output-manifest write.
+            allowed_output_paths = []
+            allowed_file_tool_paths = []
+        else:
+            allowed_output_paths = _allowed_output_paths_for_launch(
+                request_payload=request_payload,
+                write_roots=write_roots,
+            )
+            allowed_file_tool_paths = _allowed_file_tool_paths_for_launch(
+                request_payload=request_payload,
+                allowed_output_paths=allowed_output_paths,
+            )
+            _validate_child_write_contract_preflight(
+                request_payload=request_payload,
+                capability_doc=cap_doc,
+                allowed_output_paths=allowed_output_paths,
+            )
         (repo_root / "workspace" / "tmp" / child_agent_run_id).mkdir(parents=True, exist_ok=True)
         # Execute step lineage bind (mandatory for ALL execute launches, not
         # only when cross-phase quality_check log is authorized): every
@@ -14964,25 +15400,40 @@ def record_launch(
                 # cross-phase loop here only handles existence + pass-state
                 # of the generation referenced from the cross-phase audit
                 # log path (build step's Make-only path).
-        manifest_ref = _write_allowed_output_manifest(
-            repo_root,
-            orchestration_id=orchestration_id,
-            agent_run_id=child_agent_run_id,
-            allowed_output_paths=allowed_output_paths,
-            allowed_file_tool_paths=allowed_file_tool_paths,
-            allowed_tmp_root=f"workspace/tmp/{child_agent_run_id}",
-            mcp_owned_audit_logs=canonical_audit_logs,
-        )
-        out_refs["allowed_output_manifest_ref"] = manifest_ref
-        try:
-            _resp_backend = response_payload.get("backend")
-            profile = build_bwrap_profile(
-                repo_root=repo_root,
+        if not is_pure:
+            # A pure launch writes NO output manifest — its absence is what the
+            # pipeline-semantics sweep keys on to catch a record-launch skip (mock-green guard).
+            manifest_ref = _write_allowed_output_manifest(
+                repo_root,
                 orchestration_id=orchestration_id,
                 agent_run_id=child_agent_run_id,
-                backend_command=backend_command,
-                backend_type=_resp_backend if isinstance(_resp_backend, str) else "",
+                allowed_output_paths=allowed_output_paths,
+                allowed_file_tool_paths=allowed_file_tool_paths,
+                allowed_tmp_root=f"workspace/tmp/{child_agent_run_id}",
+                mcp_owned_audit_logs=canonical_audit_logs,
             )
+            out_refs["allowed_output_manifest_ref"] = manifest_ref
+        try:
+            _resp_backend = response_payload.get("backend")
+            if is_pure:
+                # Read-only sandbox: repo bound ro, NO write_roots, no file pins. The pure leaf
+                # has no tools anyway (`--safe-mode`); this is defense-in-depth so even a
+                # tool-bearing regression could not write an artifact from the child window.
+                profile = build_readonly_bwrap_profile(
+                    repo_root=repo_root,
+                    orchestration_id=orchestration_id,
+                    agent_run_id=child_agent_run_id,
+                    backend_command=backend_command,
+                    backend_type=_resp_backend if isinstance(_resp_backend, str) else "",
+                )
+            else:
+                profile = build_bwrap_profile(
+                    repo_root=repo_root,
+                    orchestration_id=orchestration_id,
+                    agent_run_id=child_agent_run_id,
+                    backend_command=backend_command,
+                    backend_type=_resp_backend if isinstance(_resp_backend, str) else "",
+                )
             command_argv = [backend_command]
             rendered = render_bwrap_command(profile=profile, command_argv=command_argv)
             profile["rendered_command"] = rendered

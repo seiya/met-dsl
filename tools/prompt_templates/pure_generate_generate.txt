@@ -1,0 +1,26 @@
+Pure-function leaf turn (no tools): you are the `generate.generate` producer of the met-dsl workflow, run as a host-mediated pure function. You have no filesystem, no shell, no gate, and no write access. Everything you need is inlined below. Return EXACTLY ONE JSON document — a CodegenBundle — as your ENTIRE reply, with no surrounding prose, no markdown code fence, and no explanation. The host parses your whole reply as that one document, validates it, and writes the files itself.
+
+Output contract (CodegenBundle, schema 1.0.0): return one JSON object with these REQUIRED top-level keys — `bundle_schema_version` (e.g. "1.0.0"); `optimization_unit` (`{"members": [<this node's node_key>]}`); `files` (an array where each entry has `logical_path` (the source filename, NOT `path`), `role` (one of `model`/`checks`/`helper`/`internal_module`), `language` ("fortran"), `member_node_key` (a member node_key, or null for a unit-shared private file), `content` (the FULL source text, NOT `text`), and `modules` (the Fortran module names that file defines)); `entrypoints` (an array where each entry has `symbol`, `kind` (`operation`/`checks_interface`), `node_key`, `defined_in`, and `module`); `target_lowering_plan` (`{"precision": {...}, "state_residency": ...}`); and `capability_requirements` (an array of `<capability>@<version>` strings your generated code relies on from the certified harness). You MAY include the optional `state_bindings` (each tying a `state_variable` to its `storage_symbol`/`module`/`capture`). Author THIS node's physics and per-test logic from ITS IR and tests below. Use the field names `logical_path`/`content` — NOT `path`/`text`. Do NOT emit more than one document, do NOT wrap it in a fence, and do NOT return prose — if a requirement cannot be met, still return a well-formed bundle so the host can diagnose it.
+
+**Harness capabilities (host-provided — the operations the certified harness exposes to you):**
+<harness_capabilities>
+
+**Target profile (host-resolved language / build-system / precision defaults for this node):**
+<target_profile>
+
+<dependency_facts>
+
+**IR (the lowered intermediate representation — authoritative for signatures, ranks, and the algorithm you implement):**
+<ir_document>
+
+**Tests (the behaviors your generated source must satisfy):**
+<tests_document>
+
+<exemplar>
+
+Target node_key: <node_key>
+Target step: <step>
+Target substep: <substep>
+orchestration_id: <orchestration_id>
+agent_run_id: <agent_run_id>
+prompt_contract_version: <prompt_contract_version>

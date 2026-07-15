@@ -22,6 +22,16 @@ try:
         required_meta_keys_for_step,
         stage_meta_type_violations,
     )
+    # PURE_PROMPT_SENTINEL is IMPORTED (not copy-pasted like SLIM_REPAIR_PROMPT_SENTINEL): the
+    # Z2 pure sentinel has a single source in tools/pure_leaf so orchestration_runtime, the
+    # prompt templates, and this validator cannot drift (a parity test still pins template
+    # line 0 against it). pure_leaf is stdlib-only, so importing it here introduces no cycle.
+    from tools.pure_leaf import (
+        PURE_CAPABILITY_MODE,
+        PURE_PROMPT_CONTRACT_VERSION,
+        PURE_PROMPT_SENTINEL,
+        is_pure_request as _pure_leaf_is_pure_request,
+    )
 except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CLI execution
     _THIS_FILE = Path(__file__).resolve()
     _REPO_ROOT = _THIS_FILE.parent.parent
@@ -33,6 +43,12 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
         STAGE_META_FILENAME_BY_STEP,
         required_meta_keys_for_step,
         stage_meta_type_violations,
+    )
+    from tools.pure_leaf import (
+        PURE_CAPABILITY_MODE,
+        PURE_PROMPT_CONTRACT_VERSION,
+        PURE_PROMPT_SENTINEL,
+        is_pure_request as _pure_leaf_is_pure_request,
     )
 
 PLACEHOLDER_TEXT_PATTERNS = (
@@ -473,8 +489,14 @@ def _launch_request_is_slim_repair(request_payload: dict) -> bool:
     SLIM_REPAIR_PROMPT_SENTINEL duplication — a cross-module parity test guards against drift).
     Gating the reduced marker set on this — not on prompt text alone — prevents a non-slim
     launch record whose prompt was replaced with a slim-looking body from escaping the full
-    skill / must-read / requirements markers (an inconsistent record would otherwise pass)."""
+    skill / must-read / requirements markers (an inconsistent record would otherwise pass).
+
+    A pure request is excluded up front (mirrors orchestration_runtime._is_slim_repair_request):
+    a pure warm-resume repair satisfies the slim shape but has its own pure marker set, so pure
+    and slim classify mutually exclusively here too."""
     if request_payload.get("deterministic"):
+        return False
+    if _pure_leaf_is_pure_request(request_payload):
         return False
     if not request_payload.get("warm_resume"):
         return False
@@ -483,11 +505,45 @@ def _launch_request_is_slim_repair(request_payload: dict) -> bool:
     return bool(str(request_payload.get("repair_findings", "")).strip())
 
 
+def _is_pure_launch_prompt_text(launch_text: str) -> bool:
+    """True when a recorded launch_prompt body is shaped like a Z2 pure-function leaf turn.
+
+    Anchored on the sentinel's POSITION (first line), mirroring _is_slim_launch_prompt_text: the
+    pure renderer (orchestration_runtime._render_pure_launch_prompt / _render_pure_repair_prompt)
+    always emits PURE_PROMPT_SENTINEL as line 0. A NECESSARY but not SUFFICIENT signal — the
+    authoritative signal is the structured request (_launch_request_is_pure); a record is treated
+    as pure only when both agree, and a disagreement is itself a violation."""
+    return launch_text.lstrip().startswith(PURE_PROMPT_SENTINEL)
+
+
+def _launch_request_is_pure(request_payload: dict) -> bool:
+    """True when the structured launch REQUEST is a Z2 pure-function leaf (`leaf_mode == "pure"`).
+
+    Delegates to `pure_leaf.is_pure_request` — the SAME single detection source
+    orchestration_runtime._is_pure_launch_request uses, so the producer and this validator cannot
+    disagree about what "pure" is. Gating on this (not prompt text alone) prevents a non-pure
+    record whose prompt was swapped for a pure-looking body from escaping the full markers, and
+    vice versa."""
+    return _pure_leaf_is_pure_request(request_payload)
+
+
 def _required_launch_prompt_markers_for_role(
     role: str,
     deterministic: bool = False,
     slim: bool = False,
+    pure: bool = False,
 ) -> list[str]:
+    if pure:
+        # Z2 pure-function leaf (launch OR repair): sentinel + identity + contract version. No
+        # skill / must-read / requirements markers — the pure prompt has no skill section and
+        # no leaf-authorable gate/write instructions. Mirror
+        # orchestration_runtime._required_launch_prompt_markers (pure branch).
+        return [
+            PURE_PROMPT_SENTINEL,
+            "Target node_key:", "Target step:", "Target substep:",
+            "orchestration_id:", "agent_run_id:",
+            "prompt_contract_version:",
+        ]
     if slim:
         # Warm-resume slim repair turn: the conductor renders a reduced body (built
         # directly, not from the template) because the resumed producer leaf already holds
@@ -8720,33 +8776,49 @@ def _validate_orchestration_hierarchy(
                                     f"{runs_path}:line {idx + 1} {key} target must be non-empty ({ref_token})"
                                 )
                             if key == "launch_prompt_ref":
-                                # Downgrade to the reduced slim marker set ONLY when the
-                                # structured launch REQUEST confirms a warm-resume slim repair
-                                # (_launch_request_is_slim_repair) AND the recorded prompt is
-                                # actually slim-shaped (sentinel anchored at line 0). Relying on
-                                # prompt text alone would let a non-slim record whose prompt was
-                                # replaced with a slim-looking body escape the full markers.
+                                # Downgrade to the reduced slim / pure marker set ONLY when the
+                                # structured launch REQUEST confirms it (_launch_request_is_slim_repair
+                                # / _launch_request_is_pure) AND the recorded prompt is actually
+                                # slim- / pure-shaped (sentinel anchored at line 0). Relying on
+                                # prompt text alone would let a record whose prompt was replaced
+                                # with a slim/pure-looking body escape the full markers.
                                 request_confirms_slim = False
+                                request_confirms_pure = False
+                                req_payload_for_launch = None
                                 req_ref = launch_refs.get("launch_request_ref")
                                 if isinstance(req_ref, str):
                                     req_path = workspace_path.parent / req_ref
                                     if req_path.is_file():
                                         try:
-                                            req_payload = _read_json(req_path)
+                                            req_payload_for_launch = _read_json(req_path)
                                         except json.JSONDecodeError:
-                                            req_payload = None
-                                        if isinstance(req_payload, dict):
+                                            req_payload_for_launch = None
+                                        if isinstance(req_payload_for_launch, dict):
                                             request_confirms_slim = _launch_request_is_slim_repair(
-                                                req_payload)
-                                # Anchored slim detection takes precedence over the substring-based
-                                # deterministic check when a slim prompt's untrusted findings excerpt
-                                # happens to embed the deterministic sentinel.
+                                                req_payload_for_launch)
+                                            request_confirms_pure = _launch_request_is_pure(
+                                                req_payload_for_launch)
+                                # Anchored slim/pure detection takes precedence over the substring
+                                # deterministic check when an untrusted findings excerpt happens to
+                                # embed the deterministic sentinel.
+                                prompt_is_pure = _is_pure_launch_prompt_text(launch_text)
+                                # Request and prompt must AGREE on pure: a pure request with a
+                                # non-pure prompt (or a pure prompt from a non-pure request) is an
+                                # inconsistent record that must not silently pass.
+                                if request_confirms_pure != prompt_is_pure:
+                                    violations.append(
+                                        f"{runs_path}:line {idx + 1} {key} pure-launch mismatch: "
+                                        f"request leaf_mode=pure is {request_confirms_pure} but "
+                                        f"prompt-is-pure is {prompt_is_pure}"
+                                    )
+                                is_pure = request_confirms_pure and prompt_is_pure
                                 is_slim = (
                                     request_confirms_slim
                                     and _is_slim_launch_prompt_text(launch_text))
                                 is_deterministic = DETERMINISTIC_PROMPT_SENTINEL in launch_text
                                 required_markers = _required_launch_prompt_markers_for_role(
-                                    role_l, deterministic=is_deterministic, slim=is_slim)
+                                    role_l, deterministic=is_deterministic, slim=is_slim,
+                                    pure=is_pure)
                                 missing_markers = [
                                     marker
                                     for marker in required_markers
@@ -8756,6 +8828,136 @@ def _validate_orchestration_hierarchy(
                                     violations.append(
                                         f"{runs_path}:line {idx + 1} {key} missing launch-prompt template markers ({', '.join(missing_markers)})"
                                     )
+                                if is_pure:
+                                    # Independent audit of the persisted pure record (tamper /
+                                    # drift detection), so it re-checks the value invariants the
+                                    # runtime enforces at launch — the marker sweep above only
+                                    # proves the marker NAME is present.
+                                    # (1) prompt_contract_version must equal the transport's
+                                    # contract, in BOTH the structured request and the rendered
+                                    # prompt line; an obsolete/forged version passing the audit
+                                    # would let a stale-contract producer look compliant.
+                                    req_version = (
+                                        req_payload_for_launch.get("prompt_contract_version")
+                                        if isinstance(req_payload_for_launch, dict) else None
+                                    )
+                                    if req_version != PURE_PROMPT_CONTRACT_VERSION:
+                                        violations.append(
+                                            f"{runs_path}:line {idx + 1} pure launch request "
+                                            f"prompt_contract_version must be "
+                                            f"{PURE_PROMPT_CONTRACT_VERSION!r} (got {req_version!r})"
+                                        )
+                                    expected_version_line = (
+                                        f"prompt_contract_version: {PURE_PROMPT_CONTRACT_VERSION}"
+                                    )
+                                    if expected_version_line not in launch_text:
+                                        violations.append(
+                                            f"{runs_path}:line {idx + 1} pure launch prompt must "
+                                            f"carry {expected_version_line!r}"
+                                        )
+                                    # (2) A pure launch writes no output manifest — its ABSENCE is
+                                    # the mock-green tripwire (a record-launch that skipped the pure
+                                    # write-authorization branch would leave one). And the
+                                    # capability must be the truthful zero-authority record
+                                    # (mode=pure_readonly, write_roots==[], mcp_permissions==[]).
+                                    om_path = (
+                                        orchestration_dir / "output_manifests" / f"{run_id}.json"
+                                    )
+                                    if om_path.exists():
+                                        violations.append(
+                                            f"{runs_path}:line {idx + 1} pure launch must NOT have "
+                                            f"an output manifest ({om_path.name} exists)"
+                                        )
+                                    cap_path = (
+                                        orchestration_dir / "capabilities" / f"{run_id}.json"
+                                    )
+                                    cap_doc = None
+                                    if cap_path.is_file():
+                                        try:
+                                            cap_doc = _read_json(cap_path)
+                                        except json.JSONDecodeError:
+                                            cap_doc = None
+                                    if not isinstance(cap_doc, dict):
+                                        violations.append(
+                                            f"{runs_path}:line {idx + 1} pure launch capability "
+                                            f"missing/unreadable ({cap_path.name})"
+                                        )
+                                    else:
+                                        if str(cap_doc.get("mode", "")).strip() != PURE_CAPABILITY_MODE:
+                                            violations.append(
+                                                f"{runs_path}:line {idx + 1} pure launch capability "
+                                                f"mode must be {PURE_CAPABILITY_MODE!r} (got {cap_doc.get('mode')!r})"
+                                            )
+                                        if cap_doc.get("write_roots") != []:
+                                            violations.append(
+                                                f"{runs_path}:line {idx + 1} pure launch capability "
+                                                f"write_roots must be [] (got {cap_doc.get('write_roots')!r})"
+                                            )
+                                        # A pure leaf invokes no gate/MCP, so its capability must
+                                        # carry an EXPLICIT empty mcp_permissions list (part of the
+                                        # zero-authority record the producer always emits). No
+                                        # `get` default: absence (a truncated/hand-crafted record)
+                                        # and a non-list value must be flagged too — only a present
+                                        # `[]` is compliant. Mirrors the write_roots check above.
+                                        if cap_doc.get("mcp_permissions") != []:
+                                            violations.append(
+                                                f"{runs_path}:line {idx + 1} pure launch capability "
+                                                f"mcp_permissions must be [] (got {cap_doc.get('mcp_permissions')!r})"
+                                            )
+                                    # (3) The read manifest must be DENY-ALL (empty
+                                    # allowed_read_roots — the enforcing allowlist for a leaf that
+                                    # reads no file) and the sandbox must be the READ-ONLY profile
+                                    # (readonly + write_roots==[]). Auditing these here catches a
+                                    # pure launch mistakenly provisioned through the generic
+                                    # (writable/read-granting) record-launch path even though the
+                                    # capability/output-manifest signals looked pure.
+                                    rman_path = (
+                                        orchestration_dir / "read_manifests" / f"{run_id}.json"
+                                    )
+                                    rman_doc = None
+                                    if rman_path.is_file():
+                                        try:
+                                            rman_doc = _read_json(rman_path)
+                                        except json.JSONDecodeError:
+                                            rman_doc = None
+                                    if not isinstance(rman_doc, dict):
+                                        violations.append(
+                                            f"{runs_path}:line {idx + 1} pure launch read manifest "
+                                            f"missing/unreadable ({rman_path.name})"
+                                        )
+                                    elif rman_doc.get("allowed_read_roots") != []:
+                                        violations.append(
+                                            f"{runs_path}:line {idx + 1} pure launch read manifest "
+                                            f"allowed_read_roots must be [] (deny-all; got "
+                                            f"{rman_doc.get('allowed_read_roots')!r})"
+                                        )
+                                    sbx_path = (
+                                        orchestration_dir / "sandbox_profiles" / f"{run_id}.json"
+                                    )
+                                    sbx_doc = None
+                                    if sbx_path.is_file():
+                                        try:
+                                            sbx_doc = _read_json(sbx_path)
+                                        except json.JSONDecodeError:
+                                            sbx_doc = None
+                                    if not isinstance(sbx_doc, dict):
+                                        violations.append(
+                                            f"{runs_path}:line {idx + 1} pure launch sandbox profile "
+                                            f"missing/unreadable ({sbx_path.name})"
+                                        )
+                                    else:
+                                        if sbx_doc.get("readonly") is not True:
+                                            violations.append(
+                                                f"{runs_path}:line {idx + 1} pure launch sandbox "
+                                                f"profile must be readonly (got readonly="
+                                                f"{sbx_doc.get('readonly')!r})"
+                                            )
+                                        if sbx_doc.get("write_roots") != []:
+                                            violations.append(
+                                                f"{runs_path}:line {idx + 1} pure launch sandbox "
+                                                f"profile write_roots must be [] (got "
+                                                f"{sbx_doc.get('write_roots')!r})"
+                                            )
 
                     for key in ("agent_result_ref", "agent_summary_ref"):
                         agent_ref = item.get(key)

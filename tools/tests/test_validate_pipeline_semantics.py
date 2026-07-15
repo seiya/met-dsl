@@ -14128,5 +14128,254 @@ class IrFixtureShapeTests(unittest.TestCase):
         self.assertIsNotNone(_algorithm_state_contract(doc["algorithm"]))
 
 
+class PureLaunchRecordSweepTest(unittest.TestCase):
+    """M-B: the launch-record sweep's Z2 pure-leaf checks — request/prompt agreement, the
+    reduced pure marker set, the ABSENCE of an output manifest, and the pure_readonly / empty
+    write_roots capability shape. Built by converting the minimal orchestration tree's
+    generate.generate substep into a pure record, then mutating each invariant."""
+
+    _ORCH = "orch_test_001"
+    _ARID = "substep_run_generate_generate_001"
+    _NODE = "problem/shallow_water2d@0.3.0"
+
+    def _build_tree(self, repo_root: Path) -> None:
+        _seed_shape_expr_schema_into(repo_root)
+        model_text = (
+            "module shallow_water2d_model\n"
+            "use dynamics_shallow_water_flux_2d_rusanov_p0_model\n"
+            "implicit none\ncontains\nsubroutine solve(flag)\n"
+            "  logical, intent(out) :: flag\n"
+            "  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(flag)\n"
+            "end subroutine solve\nend module shallow_water2d_model\n"
+        )
+        runner_text = ("program shallow_water2d_runner\nimplicit none\n"
+                       "write(*,*) 'ok'\nend program shallow_water2d_runner\n")
+        _create_minimal_execution_tree(
+            repo_root,
+            dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+            model_text=model_text,
+            runner_text=runner_text,
+            run_command=["./simulate", "workspace/spec.ir.yaml", "workspace/outdir"],
+        )
+        _create_minimal_orchestration_tree(repo_root)
+
+    def _orch_root(self, repo_root: Path) -> Path:
+        return repo_root / "workspace" / "orchestrations" / self._ORCH
+
+    def _make_pure(self, repo_root: Path, *, capability_mode: str = "pure_readonly",
+                   pure_prompt: bool = True) -> None:
+        """Convert the generate.generate substep launch record into a pure record."""
+        from tools.orchestration_runtime import (
+            prepare_launch_request_payload, render_launch_prompt_text)
+        from tools.pure_leaf import PURE_PROMPT_CONTRACT_VERSION
+        orch_root = self._orch_root(repo_root)
+        req_path = orch_root / "launches" / f"{self._ARID}.request.json"
+        req = json.loads(req_path.read_text(encoding="utf-8"))
+        req["leaf_mode"] = "pure"
+        # A real pure launch request carries the contract version; the audit re-checks its value.
+        req["prompt_contract_version"] = PURE_PROMPT_CONTRACT_VERSION
+        req_path.write_text(json.dumps(req, ensure_ascii=False), encoding="utf-8")
+        if pure_prompt:
+            pure_render_req = prepare_launch_request_payload({
+                "leaf_mode": "pure", "agent_model": "opus", "agent_role": "substep",
+                "node_key": self._NODE, "step": "generate", "substep": "generate",
+                "orchestration_id": self._ORCH, "agent_run_id": self._ARID,
+                "parent_agent_run_id": "orch_run_001",
+                "ir_ref": "workspace/ir/problem__shallow_water2d__0.3.0/x_001",
+                "pipeline_ref": "workspace/pipelines/problem__shallow_water2d__0.3.0/x_001",
+                "dependency_ref": "workspace/ir/problem__shallow_water2d__0.3.0/x_001/spec.ir.yaml",
+                "source_id": "src_20260415_001",
+                "prompt_contract_version": PURE_PROMPT_CONTRACT_VERSION,
+                "allowed_output_paths": [],
+                "pure_context": {"harness_capabilities": "{}", "target_profile": "t",
+                                 "ir_document": "i", "tests_document": "t"},
+            })
+            prompt = render_launch_prompt_text(pure_render_req)
+            (orch_root / "launches" / f"{self._ARID}.prompt.txt").write_text(
+                prompt, encoding="utf-8")
+        # A pure launch's zero-authority capability.
+        cap_dir = orch_root / "capabilities"
+        cap_dir.mkdir(parents=True, exist_ok=True)
+        (cap_dir / f"{self._ARID}.json").write_text(
+            json.dumps({"agent_run_id": self._ARID, "mode": capability_mode,
+                        "write_roots": [], "mcp_permissions": [],
+                        "step": "generate", "substep": "generate"}),
+            encoding="utf-8")
+        # Deny-all read manifest + read-only sandbox profile a real pure launch persists.
+        rman_dir = orch_root / "read_manifests"
+        rman_dir.mkdir(parents=True, exist_ok=True)
+        (rman_dir / f"{self._ARID}.json").write_text(
+            json.dumps({"agent_run_id": self._ARID, "allowed_read_roots": [],
+                        "denied_read_roots": ["./"]}),
+            encoding="utf-8")
+        sbx_dir = orch_root / "sandbox_profiles"
+        sbx_dir.mkdir(parents=True, exist_ok=True)
+        (sbx_dir / f"{self._ARID}.json").write_text(
+            json.dumps({"agent_run_id": self._ARID, "readonly": True, "write_roots": [],
+                        "read_roots": []}),
+            encoding="utf-8")
+
+    def _pure_violations(self, repo_root: Path) -> list[str]:
+        violations = validate(repo_root=repo_root, workspace_root="workspace",
+                              require_orchestration=True)
+        return [v for v in violations
+                if "pure launch" in v or "pure-launch mismatch" in v]
+
+    def test_consistent_pure_record_has_no_pure_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            self.assertEqual(self._pure_violations(repo_root), [])
+
+    def test_pure_record_with_output_manifest_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            om_dir = self._orch_root(repo_root) / "output_manifests"
+            om_dir.mkdir(parents=True, exist_ok=True)
+            (om_dir / f"{self._ARID}.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(
+                any("must NOT have an output manifest" in v
+                    for v in self._pure_violations(repo_root)))
+
+    def test_pure_record_wrong_capability_mode_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root, capability_mode="readwrite")
+            self.assertTrue(
+                any("capability mode must be 'pure_readonly'" in v
+                    for v in self._pure_violations(repo_root)))
+
+    def test_pure_request_with_nonpure_prompt_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            # Request declares pure but the prompt stays the original (non-pure) full body.
+            self._make_pure(repo_root, pure_prompt=False)
+            self.assertTrue(
+                any("pure-launch mismatch" in v
+                    for v in self._pure_violations(repo_root)))
+
+    def test_pure_record_nonempty_capability_write_roots_flagged(self) -> None:
+        # Positive test for the sweep's `write_roots must be []` clause (otherwise it could be
+        # deleted and stay green — _make_pure always writes []).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            cap_path = self._orch_root(repo_root) / "capabilities" / f"{self._ARID}.json"
+            cap = json.loads(cap_path.read_text(encoding="utf-8"))
+            cap["write_roots"] = ["workspace/pipelines/x/source/s/src/"]
+            cap_path.write_text(json.dumps(cap), encoding="utf-8")
+            self.assertTrue(
+                any("write_roots must be []" in v
+                    for v in self._pure_violations(repo_root)))
+
+    def test_pure_record_nonempty_capability_mcp_permissions_flagged(self) -> None:
+        # Positive test for the sweep's `mcp_permissions must be []` tripwire — a pure leaf
+        # invokes no gate/MCP, so a populated list is a zero-authority-record violation.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            cap_path = self._orch_root(repo_root) / "capabilities" / f"{self._ARID}.json"
+            cap = json.loads(cap_path.read_text(encoding="utf-8"))
+            cap["mcp_permissions"] = ["build-runtime"]
+            cap_path.write_text(json.dumps(cap), encoding="utf-8")
+            self.assertTrue(
+                any("mcp_permissions must be []" in v
+                    for v in self._pure_violations(repo_root)))
+
+    def test_pure_record_obsolete_contract_version_flagged(self) -> None:
+        # The audit re-checks the prompt_contract_version VALUE (request + prompt), not just the
+        # marker name — an obsolete/forged version in a persisted record must be caught.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            root = self._orch_root(repo_root)
+            req_path = root / "launches" / f"{self._ARID}.request.json"
+            req = json.loads(req_path.read_text(encoding="utf-8"))
+            req["prompt_contract_version"] = "pure-OBSOLETE"
+            req_path.write_text(json.dumps(req), encoding="utf-8")
+            prompt_path = root / "launches" / f"{self._ARID}.prompt.txt"
+            prompt_path.write_text(
+                prompt_path.read_text(encoding="utf-8").replace(
+                    "prompt_contract_version: pure-1",
+                    "prompt_contract_version: pure-OBSOLETE"),
+                encoding="utf-8")
+            self.assertTrue(
+                any("prompt_contract_version" in v for v in self._pure_violations(repo_root)))
+
+    def test_pure_record_omitted_mcp_permissions_flagged(self) -> None:
+        # An absent mcp_permissions (truncated/hand-crafted capability) must be flagged, not
+        # defaulted to [] — the producer always emits an explicit empty list.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            cap_path = self._orch_root(repo_root) / "capabilities" / f"{self._ARID}.json"
+            cap = json.loads(cap_path.read_text(encoding="utf-8"))
+            cap.pop("mcp_permissions", None)
+            cap_path.write_text(json.dumps(cap), encoding="utf-8")
+            self.assertTrue(
+                any("mcp_permissions must be []" in v
+                    for v in self._pure_violations(repo_root)))
+
+    def test_pure_record_non_denyall_read_manifest_flagged(self) -> None:
+        # A pure launch mistakenly provisioned with a non-empty read manifest must be caught.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            rman_path = self._orch_root(repo_root) / "read_manifests" / f"{self._ARID}.json"
+            rman = json.loads(rman_path.read_text(encoding="utf-8"))
+            rman["allowed_read_roots"] = ["workspace/ir/"]
+            rman_path.write_text(json.dumps(rman), encoding="utf-8")
+            self.assertTrue(
+                any("read manifest allowed_read_roots must be []" in v
+                    for v in self._pure_violations(repo_root)))
+
+    def test_pure_record_writable_sandbox_profile_flagged(self) -> None:
+        # A pure launch provisioned through the generic (writable/non-readonly) sandbox path
+        # must be caught.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            sbx_path = self._orch_root(repo_root) / "sandbox_profiles" / f"{self._ARID}.json"
+            sbx = json.loads(sbx_path.read_text(encoding="utf-8"))
+            sbx["readonly"] = False
+            sbx["write_roots"] = ["workspace/pipelines/x/source/s/src/"]
+            sbx_path.write_text(json.dumps(sbx), encoding="utf-8")
+            violations = self._pure_violations(repo_root)
+            self.assertTrue(any("sandbox profile must be readonly" in v for v in violations))
+            self.assertTrue(any("sandbox profile write_roots must be []" in v for v in violations))
+
+    def test_pure_record_missing_marker_flagged(self) -> None:
+        # Positive test for the sweep's pure marker set: strip a required NON-sentinel marker
+        # (keep the sentinel so the record still classifies as pure) and confirm the generic
+        # marker violation fires for the pure record.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._build_tree(repo_root)
+            self._make_pure(repo_root)
+            prompt_path = self._orch_root(repo_root) / "launches" / f"{self._ARID}.prompt.txt"
+            lines = prompt_path.read_text(encoding="utf-8").splitlines()
+            kept = [ln for ln in lines if not ln.startswith("prompt_contract_version:")]
+            prompt_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            violations = validate(repo_root=repo_root, workspace_root="workspace",
+                                  require_orchestration=True)
+            # The stripped marker is the pure-only `prompt_contract_version:`, so the violation
+            # naming it is unambiguously from the pure record.
+            self.assertTrue(
+                any("missing launch-prompt template markers" in v
+                    and "prompt_contract_version:" in v
+                    for v in violations))
+
+
 if __name__ == "__main__":
     unittest.main()

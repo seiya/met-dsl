@@ -392,6 +392,20 @@ class VerdictVocabParityTest(unittest.TestCase):
                     f"severity {sev!r} must route to a repair, not advance")
 
 
+class PurePromptConstantsTest(unittest.TestCase):
+    """M-B: the pure prompt sentinel + doc fence are the single source imported by
+    orchestration_runtime and validate_pipeline_semantics; pin their presence and shape so a
+    rename is a deliberate, test-visible event."""
+
+    def test_sentinel_present_and_nonempty(self):
+        self.assertTrue(isinstance(pl.PURE_PROMPT_SENTINEL, str) and pl.PURE_PROMPT_SENTINEL.strip())
+
+    def test_doc_fence_markers_distinct_and_nonempty(self):
+        self.assertTrue(pl.PURE_DOC_FENCE_BEGIN.strip())
+        self.assertTrue(pl.PURE_DOC_FENCE_END.strip())
+        self.assertNotEqual(pl.PURE_DOC_FENCE_BEGIN, pl.PURE_DOC_FENCE_END)
+
+
 class LeafCommandPureBranchTest(unittest.TestCase):
     def _conductor(self, backend: str) -> wc.Conductor:
         return wc.Conductor(
