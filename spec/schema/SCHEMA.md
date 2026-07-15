@@ -1,17 +1,23 @@
 # spec/schema/
 
 ## Purpose
-`spec/schema/` is the canonical-source location that holds the field-notation rules of workflow artifacts (`algorithm.resolved.yaml`, `derived_contract.json`, etc.) as **declarative JSON Schema**. Validators such as `tools/validate_pipeline_semantics.py` read the regex / enum / type information from here and use it for judgment.
+`spec/schema/` is the canonical-source location that holds the field-notation rules of workflow artifacts (`algorithm.resolved.yaml`, `derived_contract.json`, etc.) as **declarative JSON Schema**.
+
+A schema here is consumed in one of two ways, and each schema states which in its `x-canonical-validator` target:
+- **Runtime driving source.** The validator loads the schema and reads the regex / enum / type information from it at judgment time (`tools/validate_pipeline_semantics.py` and `ir/shape_expr.schema.json`). The grammar is changed by editing the schema alone.
+- **Declarative copy.** The validator module holds the same facts as constants and enforces them without file I/O, so a missing or unreadable schema cannot fail-open a running gate (`tools/codegen_bundle.py` and `generate/codegen_bundle.schema.json`). The unit suite enforces that the two copies agree, so the grammar is changed by editing both.
 
 ## Scope
 - the per-field notation rules of workflow artifacts (e.g. `shape_expr`)
 - enumerated values, regex patterns, format constraints
+- the whole-document shape of an artifact **that no phase produces yet** (e.g. `generate/codegen_bundle.schema.json`, whose producer arrives with `Z2`). For such an artifact the schema is the declarative copy of the field grammar; the rules a draft-07 pattern cannot carry (closed vocabularies, cross-field invariants) live in the canonical validator module named by `x-canonical-validator`, and the prose contract in the document named by `x-canonical-doc`. State in `x-forbidden-examples-note` which forbidden examples the schema rejects on its own and which the validator rejects.
 
-The structural rules of the whole artifact continue to use `docs/workflow/phases/phase_*.md` as the canonical source, and the schema in this directory bears the declarative expression of a part of them.
+The structural rules of an artifact that a phase already produces continue to use `docs/workflow/phases/phase_*.md` as the canonical source, and the schema in this directory bears the declarative expression of a part of them.
 
 ## Placement rules
-- 1 schema = 1 file in the form `spec/schema/<phase>/<field>.schema.json` (e.g. `spec/schema/ir/shape_expr.schema.json`).
+- 1 schema = 1 file in the form `spec/schema/<phase>/<field>.schema.json` (e.g. `spec/schema/ir/shape_expr.schema.json`). A whole-document schema uses the document name in place of the field name (e.g. `spec/schema/generate/codegen_bundle.schema.json`).
 - Use JSON Schema draft-07. It has no dependency on the `jsonschema` library, and the validator interprets `pattern` with the standard `re` module.
+- Anchor a whole-string `pattern` with `^` … `(?![\s\S])`, not `^` … `$`. Under Python `re` (used by the canonical validator via `fullmatch` and by the `jsonschema` library via `re.search`), `$` also matches just before a trailing newline, so `^…$` would let a schema-only consumer accept a value such as `"1.0.0\n"` that the canonical validator rejects; and `\A` / `\Z` fix Python but are invalid in ECMA-262 (Ajv), where `\A` degrades to a literal `A`. The negative lookahead `(?![\s\S])` means "true end of string" and is valid and identical in both engines.
 - State "when and where the rule is applied" in the `description` field.
 - Note the validator-side entry point in `x-canonical-validator` (extension).
 - Note the corresponding document in `x-canonical-doc` (extension).
@@ -40,3 +46,5 @@ In other words, the schema can declare the grammar of shape_expr that the valida
 
 ## Current schema
 - `ir/shape_expr.schema.json` — the notation rules for `temporaries[].shape_expr` etc. Limited to the 3 forms `scalar` / `[d1,...]` / `(d1,...)`.
+- `generate/codegen_bundle.schema.json` — the whole-document grammar of a `CodegenBundle` (`files[]`, `entrypoints[]`, `target lowering plan`, `capability_requirements`, `state_bindings[]`). Every object is closed; the file-role and `logical_path` rules deny the bundle any build or shell authority. Canonical validator: `tools/codegen_bundle.py:validate_bundle`. Canonical document: `docs/workflow/CODEGEN_BUNDLE_CONTRACT.md`. No phase produces a bundle yet — the producer arrives with `Z2`.
+- `generate/harness_capabilities.schema.json` — the shape of a harness capability manifest (the `harness capability ABI` a `CodegenBundle` negotiates against). Canonical validator: `tools/codegen_bundle.py:harness_capability_manifest_violations`. The manifests themselves are tool-side data in `tools/codegen_bundle.py` until the harness spec is next re-specified on content grounds (`Z6`).

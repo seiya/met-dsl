@@ -2085,6 +2085,9 @@ Follow-up work, after the billed E2E:
    the structural anchor this item asks for is a declared field of Z0's `CodegenBundle` (`entrypoints`,
    `state_bindings`; `zero_base_architecture.md` Z0). Recovering the same anchor by parsing generated Fortran and
    inferring each procedure's role is code Z0 deletes. No parse-based anchor is to be written before Z0 lands.
+   **Z0 landed 2026-07-14** (see "Z0 — CodegenBundle and the optimization-boundary contract" below): the fields exist
+   (`docs/workflow/CODEGEN_BUNDLE_CONTRACT.md`), but no producer emits them until Z2, so a check anchored on them is
+   written when the producer lands — not before, and never by parsing Fortran.
 2. **Analyze the overlap with the two gates that already live here** — `_validate_problem_model_dependency_dataflow`
    (the dependency-result → `intent(out)` chain) and `_validate_problem_metric_only_scalar_kernel` (the metric-only
    kernel). If the revived check adds nothing they do not already cover, DELETE it rather than repair it.
@@ -2289,3 +2292,142 @@ authors the contract in the wrong place, so they are intentional rather than dea
 relies on it any more), and the line-scanning `_impl_resolved_build_system` / `_impl_resolved_language`, which are
 nesting-blind by construction (see L4) and therefore cannot pin the `impl_defaults.toolchain` nesting their fixtures
 now use.
+
+## Z0 — CodegenBundle and the optimization-boundary contract (LANDED 2026-07-14)
+
+`zero_base_architecture.md` Z0. The contract Z2 (host-mediated `generate.generate`) generates against is now pinned,
+ahead of any change to the Generate executor. What landed:
+
+- `docs/workflow/CODEGEN_BUNDLE_CONTRACT.md` — the canonical prose contract (bundle definition, the closed file-role
+  vocabulary, the `logical_path` rules, the target-lowering-plan envelope, optimization-unit membership, the harness
+  capability ABI, and the build-authority prohibition).
+- `spec/schema/generate/codegen_bundle.schema.json` + `spec/schema/generate/harness_capabilities.schema.json` — the
+  declarative grammar (draft-07, `jsonschema`-free, `x-canonical-validator` / `x-canonical-doc` /
+  `x-forbidden-examples`). These are the first WHOLE-DOCUMENT schemas in `spec/schema/`; `SCHEMA.md` states the
+  scope rule that admits them (an artifact whose producing phase document does not exist yet).
+- `tools/codegen_bundle.py` — the canonical validator module (`meta_contracts.py` idiom: stdlib only, pure functions,
+  prefix-free violation clauses), plus the capability negotiation and `derive_build_graph`.
+- `tools/tests/test_codegen_bundle.py` — 196 tests covering the six items the Z0 acceptance bullet enumerates
+  (`zero_base_architecture.md`, Decision Criteria: multi-file source, a private helper procedure, target capability
+  negotiation, deterministic build-graph derivation, forbidden arbitrary commands, a multi-node optimization-unit
+  manifest),
+  each per-field clause (an out-of-vocabulary enum value would otherwise ALSO bypass the coupling invariant keyed on
+  it), the `null`-as-a-present-value class, object-name collisions, and the schema's own examples driven through the
+  validator.
+
+**Deliberately absent: a CLI and a `--stage` gate.** No phase produces a bundle, so a gate over it would be dead code
+and its fixtures would pin a shape nothing emits — the exact failure mode the accessor-confusion entry above records.
+`validate_bundle` becomes the post-generate gate in Z2, at the same commit as the producer.
+
+**Nothing in the running workflow changed.** `workflow_conductor.py`, `runner_renderer.py`,
+`validate_pipeline_semantics.py`, `docs/workflow/phases/`, `skills/`, and `spec/infrastructure/` are untouched, so no
+billed E2E is required for this item (the billed A/B criterion attaches to the implementation-bearing Z1/Z2). The one
+mechanical tie to the live code is a **parity test**: for a current-shape (M3c) bundle the derived build graph's object
+order must equal the object order of the Makefile `_write_makefile` renders today. Z2 replaces that method's body with
+a synthesis over the graph; until it does, the parity test is what pins the derived graph to the Makefile the conductor
+actually renders.
+
+**The structural anchor promised to the dormant state-array gate is delivered.** "Problem state-array usage" (above,
+item 1) asked for the update path to be identified by contract rather than guessed from a signature. It is now a
+declared field: `entrypoints[]` (`kind: operation`, `defined_in` a `model`-role file) and `state_bindings[]`
+(`state_variable` → `storage_symbol` → `capture`). The prohibition recorded there stands — no parse-based anchor is to
+be written — and a structurally-anchored check now has a field to anchor to, once a producer emits one (Z2) and the
+evidence-trust work (Z6) defines what it must assert.
+
+**Contract decisions worth carrying into Z2.** (1) The capability manifest is tool-side data, not a section of the
+harness `controlled_spec.md`: putting it in the spec would edit a certified artifact and force recertification for no
+change in generated behavior; it moves into the spec at Z6, when that spec is re-specified on content grounds anyway.
+(2) Capability matching is exact `name@version` — version ordering never implies compatibility, and compatibility is
+declared by adding a token to a manifest. (3) `files[].content` is inline only; a detached-content variant is a minor
+bump if Z2 needs one. (4) The no-arbitrary-command guarantee is structural (closed schema + role/path rules + a graph
+type with no command slot) and NOT a scan of `files[].content`: a Fortran source legitimately holds shell-looking
+string literals, so a content scan is a false-positive source that adds no guarantee.
+
+**Post-review hardening (Codex review + 6 adversarial sub-agent rounds).** Three defects were corrected after the
+contract was first drafted. (a) `derive_build_graph` ordered same-role files by `logical_path` lexically, which can put
+a module consumer before its provider and fail the build; files now carry an optional `compile_after` (validated:
+resolvable, no self-reference, acyclic, and — added in a follow-on review round — non-reversing of
+`ROLE_BUILD_PRECEDENCE`, so a `model` cannot depend on its `checks`) and the graph topologically sorts by it, role
+precedence remaining the deterministic tie-break. (b) The graph echoed `impl_defaults.toolchain` verbatim, and that IR object is not closed, so
+a stray `command`/`flags` key rode into the graph and defeated its "no command/flag slot" guarantee; the echo is now
+projected onto the declarative allowlist `TOOLCHAIN_ECHO_KEYS`. (c) The `state_registration@N` reverse coupling was
+"at least one binding" rather than per token, so a `@1` binding licensed an unused `@2` requirement; it is now
+per-token. (d) A later round found that a multi-node optimization unit which absorbs one of the target's dependencies
+left that dependency in the staged `dependency_closure` as well as in the bundle, colliding on `<spec_id>_model.o` (or
+linking two implementations); `derive_build_graph` now excludes unit members (keyed on `spec_id`) from the staged
+closure, since a member's implementation is generated inside the bundle. (e) A further round closed three more: an
+entrypoint / `state_bindings` identifier longer than the f2008 63-character limit was accepted (the identifier grammar
+now caps length, so the contract rejects it before the compiler gate); the "accept any same-major minor" version policy
+read as forward-compatible while closed objects reject any new field, so the doc now states the policy is backward-only
+(a later validator reads an earlier doc; an unknown field from a later minor is always rejected, because the closure is a
+security property never relaxed); and `derive_build_graph` echoed `impl_defaults.toolchain.compiler` / `linker`
+verbatim, so a shell-syntax executable selector rode into the graph — these are now value-validated as bare tool
+names/paths and an unsafe value is dropped. (f) A final round closed two more: a
+`checks_getter` `state_binding` was accepted with no `checks`-role file for its member (the getter has no structural
+anchor), now required; and the member exclusion from (d) filtered the staged closure by bare `spec_id`, which silently
+dropped a *distinct* dependency that merely shared a `spec_id` with a member (`component/foo@2.0.0` vs a
+`component/foo@1.0.0` member) — `derive_build_graph` now takes the closure as `node_key`s and excludes members by exact
+identity, so such a distinct dependency stays and its genuine `<spec_id>_model.o` basename collision surfaces loudly.
+(g) A last round closed two contract inconsistencies: the declarative schema's `bundle_schema_version` pattern accepted
+any major while `validate_bundle` rejects a non-1 major (the schema pattern now pins `^1\.` so a schema-only consumer
+agrees), and two `state_bindings` for the same `(node_key, state_variable)` were accepted (the pair is a member's
+primary-state identity and is now required unique). (h) A final round closed two more: the capability-negotiation
+helper read a `Mapping` as a token collection (a dict's keys became tokens, so `provided={"sync_single_case@1": false}`
+falsely satisfied it) and read an empty collection as "nothing required" — both now fail closed; and every schema
+grammar pattern anchored with `^`/`$`, which under Python `re` (`jsonschema` uses `re.search`) also matches before a
+trailing newline, so a schema-only consumer accepted `"1.0.0\n"` — the patterns now anchor with `\A`/`\Z` (matching the
+canonical `fullmatch` validator). (i) A final round closed three more, two of them P1. Entrypoints did not name the
+Fortran module that publishes each `symbol`, so `Z2` could not render `use <module>, only: <symbol>` without parsing
+the source; a required `module` field was added. The executable-selector filter (h→toolchain) accepted any
+shell-metachar-free string, so a bare `sh`, an absolute `/tmp/payload`, or a traversal `a/../b` — all runnable — passed;
+`compiler`/`linker` are now restricted to a recognized compiler-driver allowlist (`COMPILER_SELECTOR_FAMILIES`, bare
+name with no path). And the `\A`/`\Z` anchors from (h) are invalid in ECMA-262 (Ajv treats `\A` as a literal `A`, so a
+valid version failed); the patterns now use `^` … `(?![\s\S])`, valid and identical in Python `re` and ECMA-262.
+(j) A follow-on round applied the same "declare the module" fix to `state_bindings`: a `checks_getter` binding named a
+`storage_symbol` getter but not the module that exports it, so with several checks files or arbitrary module names `Z2`
+could not render `use <module>, only: <storage_symbol>` mechanically; a required `module` field was added (the entrypoint
+`module` fix, one level over). (k) A last round closed two grammar mismatches: the `node_key` pattern was narrower than
+the repository's canonical `_parse_node_key_strict` (it rejected a dot-separated spec_id and a prerelease/short version
+the workflow accepts) — now aligned; and the compiler-selector allowlist accepted an arbitrary hyphen prefix
+(`payload-gfortran`), so the cross-compiler prefix is now constrained to a target triple that begins with a known CPU
+architecture (`COMPILER_TARGET_TRIPLE_ARCHES`). (l) A final round closed the attribution bypass the `module` fields
+opened: `module` was a free identifier tied to no file, so an entrypoint could name its own member's file in
+`defined_in` while `module`/`symbol` pointed at another member's export, and a `checks_getter` binding for member A
+could name member B's checks module. Files now declare `modules` (the Fortran modules they define, unique across the
+bundle); an entrypoint's `module` must be one its `defined_in` file declares, and a binding's `module` must be defined
+by a `checks`-role file owned by the binding's own `node_key`. A follow-on round found the same ownership check was
+applied only to the `checks_getter` capture, so a `harness_registration` binding could still name a nonexistent or
+cross-member module; the module-ownership check now runs for BOTH captures. (m) A last round added the module-name
+analogue of the object-name cross-origin collision check to `derive_build_graph`: a bundle file could declare a
+`modules` name equal to a staged dependency's derived `<spec_id>_model` module at a distinct object name (so no object
+collision), and two definitions of one Fortran module overwrite the dependency's `.mod`; assembly now fails closed on
+that clash. (n) A final round tightened two more: the coverage invariant required *at least one* `operation` entrypoint
+per member, so two operations (with no selector in the contract) left the host unable to pick the member's published
+update path — now *exactly one*; and the "nothing a bundle can say reaches a shell" wording overclaimed (a generated
+`execute_command_line` reaches a shell at runtime), so the doc now scopes the command prohibition to host ASSEMBLY, with
+the compiled program's runtime behavior contained by the separate execution sandbox (`bwrap`), not by this contract.
+(o) A follow-on round rejected two distinct `harness_registration` states sharing one `(module, storage_symbol)`
+(registering one storage for two semantic states silently corrupts evidence) — a `checks_getter` rank getter (`get_r1`)
+is deliberately exempt, since it dispatches on `state_variable`; and fixed the shared schema loader's
+FileNotFoundError message, which named `codegen_bundle.schema.json` even when the harness schema was the missing file. (p) A final round rejected a
+multi-node unit that STRADDLES a staged dependency (an absorbed member deeper in the deepest-first closure than a
+staged dependency, so the staged dependency would `use` a bundle-provided module compiled after it — an unbuildable
+`bundle → staged → bundle` shape); and re-keyed the schema loader cache on CONTENT hash rather than mtime, so an
+mtime-preserving replacement (metadata-preserving deploy, coarse-resolution filesystem) is observed. (q) The straddle
+check from (p) used POSITION in the flat closure as a proxy for ancestry, which false-rejects a valid unit whose
+absorbed member and a staged dependency are independent branches ordered `(member, staged)`. It is now edge-based: an
+optional `dependency_edges` input (from the dependency-graph sidecar) proves the staged dependency actually depends on
+an absorbed member before failing closed; without edges the check is skipped, so independent branches and the
+single-node closure are never false-rejected. (r) A last round fixed three node-kind/interface gaps: the exactly-one
+`operation` rule (from (n)) could not represent an `infrastructure` node (the harness publishes many operations) or a
+multi-operation `component`, so cardinality is now by kind — `problem` exactly one, `component`/`infrastructure` at
+least one; entrypoint `symbol` uniqueness was global, which false-rejected each member's checks module exporting the
+same fixed ABI name (`case_run`), now scoped to `(module, symbol)`; and `derive_build_graph` silently emitted
+`staged:_model.f90` for a bare-spec_id closure entry, now rejected (the closure must be node_keys). (s) A follow-on round extended the kind-aware operation cardinality to
+`profile`: a profile publishes no operation (it is consumed through its selection result, not a call —
+`phase_02_generate.md`), so a profile member publishes exactly zero operations (a follow-on round tightened this from "zero or more" — an
+operation entrypoint on a profile is an invented callable interface the Generate contract forbids, so it is rejected). (t) A final round keyed the
+compiler-selector allowlist by LANGUAGE: the flat allowlist accepted C/C++-only drivers (`gcc`, `g++`, `clang`, `icc`,
+`nvc`) as `toolchain.compiler`, and since the backend pins `FC` to that value, a fortran bundle carrying `compiler: gcc`
+would deterministically fail on `.f90`; the compiler/linker is now validated against the bundle's own languages
+(`COMPILER_SELECTOR_FAMILIES_BY_LANGUAGE`; v1 fortran-only).

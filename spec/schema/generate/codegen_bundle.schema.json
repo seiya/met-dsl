@@ -1,0 +1,255 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "spec/schema/generate/codegen_bundle.schema.json",
+  "title": "CodegenBundle document",
+  "description": "Canonical field grammar of a CodegenBundle: the typed output of target-specific code generation for one optimization unit (files[], entrypoints[], target_lowering_plan, capability_requirements, state_bindings[]). The enforcement point is tools/codegen_bundle.py:validate_bundle, which holds the same facts as module constants (the unit suite pins the two copies together) and therefore cannot fail-open when this file is missing or unreadable; it additionally holds the rules no draft-07 pattern can carry (closed vocabularies, cross-field invariants). No workflow phase produces a bundle yet: the producer arrives with Z2 (docs/design/zero_base_architecture.md); this schema pins the contract beforehand. Every object is closed (additionalProperties: false) except the declared A5 extension point — the value objects of target_lowering_plan (precision, data_layout, parallelization, decomposition, communication, accelerator_mapping), whose interiors a target backend defines. That closure, together with the file-role and logical_path rules and a build graph with no command slot, is what structurally denies the bundle any build or shell authority; the extension point does not weaken it, because no consumer executes a lowering-plan value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "bundle_schema_version",
+    "optimization_unit",
+    "files",
+    "entrypoints",
+    "target_lowering_plan",
+    "capability_requirements"
+  ],
+  "properties": {
+    "bundle_schema_version": {
+      "description": "Semantic version of this contract. The pattern pins the supported MAJOR (1), so a schema-only consumer rejects an incompatible major here rather than admitting it to fail later at validate_bundle; the canonical validator additionally reports a malformed version and an unsupported major as distinct clauses.",
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+(?![\\s\\S])",
+      "x-current-version": "1.0.0"
+    },
+    "optimization_unit": {
+      "description": "The semantic nodes generated as this one bundle. The ordered member list IS the unit identity; no derived unit_id exists.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["members"],
+      "properties": {
+        "members": {
+          "description": "Ordered node_key list, length >= 1, duplicate-free. A single-member unit is the default.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/definitions/node_key"}
+        }
+      }
+    },
+    "files": {
+      "description": "The complete generated source-file set. Non-empty. Multiple compilation units, private helper procedures, and internal modules are permitted.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_path", "role", "language", "member_node_key", "content", "modules"],
+        "properties": {
+          "logical_path": {
+            "description": "Path relative to the assembled source root: normalized, POSIX-separated, confined (no leading '/', no '.'/'..' segment), unique within the bundle after case folding, with a language-allowed extension and no reserved build filename. The full rule set is tools/codegen_bundle.py:logical_path_violations; this pattern bears the per-segment grammar only.",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*(?![\\s\\S])",
+            "x-segment-pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*(?![\\s\\S])"
+          },
+          "role": {
+            "description": "The file's build and visibility role. There is no runner/glue role (contract-boundary glue is host-rendered and can never be bundle content) and no build/script role (the backbone of the no-arbitrary-command rule). Only helper and internal_module may be private (they cannot define an entrypoint) and only they may be shared across unit members (member_node_key: null).",
+            "type": "string",
+            "enum": ["model", "checks", "helper", "internal_module"],
+            "x-entrypoint-bearing-roles": ["model", "checks"],
+            "x-unit-shareable-roles": ["helper", "internal_module"]
+          },
+          "language": {
+            "description": "Source language. v1 is fortran only; a new language is added by extending this enum and LANGUAGE_EXTENSION_ALLOWLIST together.",
+            "type": "string",
+            "enum": ["fortran"],
+            "x-extension-allowlist": {"fortran": [".f90"]}
+          },
+          "member_node_key": {
+            "description": "The unit member this file belongs to, or null for a file shared by the whole unit. null is admissible only for role helper / internal_module; a model or checks file belongs to exactly one member.",
+            "oneOf": [{"$ref": "#/definitions/node_key"}, {"type": "null"}]
+          },
+          "content": {
+            "description": "The complete source text, inline. A detached-content variant is not part of v1.",
+            "type": "string",
+            "minLength": 1
+          },
+          "modules": {
+            "description": "The Fortran modules this file defines. Non-empty, and a module name is unique across the whole bundle (one .mod per module). The host resolves an entrypoint's / state_binding's `module` to the file (and thus member) that owns it via this list, and renders `use <module>, only: <symbol>` without parsing the source; tools/codegen_bundle.py:bundle_invariant_violations ties module attribution to file/member ownership.",
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}(?![\\s\\S])"}
+          },
+          "compile_after": {
+            "description": "Optional. logical_paths of other bundle files that must compile before this one (e.g. this file `use`s a module another defines). It refines the role-precedence order that ROLE_BUILD_PRECEDENCE gives by default, so two files of the same role can be ordered. tools/codegen_bundle.py:bundle_invariant_violations checks that each entry resolves to another files[] entry, does not name the file itself, does not reverse ROLE_BUILD_PRECEDENCE (an edge may order within a role or agree with precedence, never a dependency of a later role), and forms no cycle; derive_build_graph topologically sorts by it. The host never infers these edges from the source — the bundle declares them.",
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "entrypoints": {
+      "description": "The externally visible symbols of the unit. Non-empty. Together with state_bindings these are the structural anchors that replace signature-shape heuristics for identifying a node's published update path.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symbol", "kind", "node_key", "defined_in", "module"],
+        "properties": {
+          "symbol": {
+            "description": "The published identifier (Fortran identifier grammar).",
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}(?![\\s\\S])"
+          },
+          "module": {
+            "description": "The Fortran module that publishes `symbol`, so the host renders `use <module>, only: <symbol>` mechanically. A file may define several modules or name them freely; the host never parses the source to discover which, so the bundle declares it. Fortran identifier grammar (<= 63 chars).",
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}(?![\\s\\S])"
+          },
+          "kind": {
+            "description": "operation = the member's published semantic operation (defined in a model-role file). checks_interface = the member's checks module surface (defined in a checks-role file).",
+            "type": "string",
+            "enum": ["operation", "checks_interface"],
+            "x-role-for-kind": {"operation": "model", "checks_interface": "checks"}
+          },
+          "node_key": {"$ref": "#/definitions/node_key"},
+          "defined_in": {
+            "description": "The logical_path of the files[] entry that defines this symbol. A helper / internal_module file can never appear here — that is the definition of 'private' in this contract.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "target_lowering_plan": {
+      "description": "How the semantic IR is realized as execution algorithms for the target profile. A CLOSED key envelope with OPEN values: the key set is fixed here, and the interior of each object is left unconstrained in v1 (an A5 extension point a target backend fills in). state_residency other than 'host' requires the matching RESIDENCY capability in capability_requirements (x-required-capability-name), in addition to the one execution-model capability every bundle declares (checked by tools/codegen_bundle.py:bundle_invariant_violations).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["precision", "state_residency"],
+      "properties": {
+        "precision": {"type": "object"},
+        "state_residency": {
+          "type": "string",
+          "enum": ["host", "device", "distributed"],
+          "x-required-capability-name": {
+            "device": "async_device_resident",
+            "distributed": "distributed_state"
+          }
+        },
+        "data_layout": {"type": "object"},
+        "parallelization": {"type": "object"},
+        "decomposition": {"type": "object"},
+        "communication": {"type": "object"},
+        "accelerator_mapping": {"type": "object"},
+        "fusion": {
+          "description": "Fusion groups over unit members. Each group's members must be a subset of optimization_unit.members.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["members"],
+            "properties": {
+              "members": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"$ref": "#/definitions/node_key"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "capability_requirements": {
+      "description": "The harness capability ABI tokens this bundle requires. Duplicate-free, non-empty, and holding exactly one execution-model capability (sync_single_case / async_device_resident / batched_cases). A token whose name is outside CAPABILITY_VOCABULARY is a violation (fail-closed: an unrecognized capability is never assumed available). Matching against a harness manifest is by exact name@version; version ordering never implies compatibility.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/definitions/capability_token"}
+    },
+    "state_bindings": {
+      "description": "How each member's primary state is reached. May be empty in v1. capture=checks_getter is the current M3c mechanism and takes capability: null; capture=harness_registration requires a state_registration@N token, which must also appear in capability_requirements (the Z6 shape — additive, no schema change). Agreement with the IR's algorithm.state_variables is checked at assembly time (Z2), where the IR is in scope.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_key", "state_variable", "storage_symbol", "module", "capture", "capability"],
+        "properties": {
+          "node_key": {"$ref": "#/definitions/node_key"},
+          "state_variable": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}(?![\\s\\S])"
+          },
+          "storage_symbol": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}(?![\\s\\S])"
+          },
+          "module": {
+            "description": "The Fortran module that publishes storage_symbol, so the host renders `use <module>, only: <storage_symbol>` mechanically. A member may have several checks files with freely chosen module names; the host never parses the source to find the exporter. Fortran identifier grammar (<= 63 chars).",
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}(?![\\s\\S])"
+          },
+          "capture": {
+            "type": "string",
+            "enum": ["checks_getter", "harness_registration"],
+            "x-capability-name-for-capture": {"harness_registration": "state_registration"}
+          },
+          "capability": {
+            "oneOf": [{"$ref": "#/definitions/capability_token"}, {"type": "null"}]
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "node_key": {
+      "description": "<spec_kind>/<spec_id>@<spec_version> (docs/GLOSSARY.md). The grammar matches the repository's canonical parser tools/orchestration_runtime.py:_parse_node_key_strict: a dot-separated lowercase spec_id and a [0-9][0-9A-Za-z._-]* version (a prerelease or short version, not only three numeric components).",
+      "type": "string",
+      "pattern": "^(problem|component|profile|infrastructure)/[a-z0-9][a-z0-9_]*(?:\\.[a-z0-9][a-z0-9_]*)*@[0-9][0-9A-Za-z._-]*(?![\\s\\S])"
+    },
+    "capability_token": {
+      "description": "<capability_name>@<abi_version>. The name must be a member of CAPABILITY_VOCABULARY (tools/codegen_bundle.py); the version is an exact integer, never a range.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*@[0-9]+(?![\\s\\S])"
+    }
+  },
+  "examples": [
+    {
+      "bundle_schema_version": "1.0.0",
+      "optimization_unit": {"members": ["problem/adv1d@0.1.0"]},
+      "files": [
+        {"logical_path": "adv1d_model.f90", "role": "model", "language": "fortran",
+         "member_node_key": "problem/adv1d@0.1.0", "content": "module adv1d_model\nend module adv1d_model\n",
+         "modules": ["adv1d_model"]},
+        {"logical_path": "adv1d_checks.f90", "role": "checks", "language": "fortran",
+         "member_node_key": "problem/adv1d@0.1.0", "content": "module adv1d_checks\nend module adv1d_checks\n",
+         "modules": ["adv1d_checks"]}
+      ],
+      "entrypoints": [
+        {"symbol": "adv1d__apply", "kind": "operation", "node_key": "problem/adv1d@0.1.0",
+         "defined_in": "adv1d_model.f90", "module": "adv1d_model"}
+      ],
+      "target_lowering_plan": {"precision": {"real_kind": "real64"}, "state_residency": "host"},
+      "capability_requirements": ["sync_single_case@1"],
+      "state_bindings": []
+    }
+  ],
+  "x-forbidden-examples": [
+    {"note": "path escapes the assembled source root", "logical_path": "../escape.f90"},
+    {"note": "absolute path", "logical_path": "/abs.f90"},
+    {"note": "unnormalized path", "logical_path": "a/../b.f90"},
+    {"note": "empty path segment", "logical_path": "a//b.f90"},
+    {"note": "non-POSIX separator", "logical_path": "dir\\win.f90"},
+    {"note": "unnormalized current-directory prefix", "logical_path": "./x.f90"},
+    {"note": "reserved build filename", "logical_path": "Makefile"},
+    {"note": "build script extension", "logical_path": "build.sh"},
+    {"note": "case-folded duplicate of a.f90", "logical_path": "A.f90"},
+    {"note": "no build/script role exists", "role": "script"},
+    {"note": "the bundle carries no commands; the object is closed", "build_commands": ["gfortran -c x.f90"]},
+    {"note": "the bundle carries no compiler flags; the target backend derives them", "compile_flags": "-O3"},
+    {"note": "an entrypoint may not be defined in a private (helper / internal_module) file", "kind": "operation", "defined_in": "adv1d_limiter.f90"},
+    {"note": "a capability name outside CAPABILITY_VOCABULARY", "capability_requirements": ["gpu_magic@1"]}
+  ],
+  "x-forbidden-examples-note": "This schema rejects on its own: the closed-key entries (an unknown top-level or per-object key), the unknown role, and — through the whole-path logical_path pattern — every traversal, separator, and normalization example ('../escape.f90', '/abs.f90', 'a/../b.f90', 'a//b.f90', 'dir\\win.f90', './x.f90'). The canonical validator tools/codegen_bundle.py:validate_bundle rejects the rest, because no draft-07 pattern can carry them: the reserved build filenames ('Makefile'), the build/script extensions ('build.sh'), the per-language extension allowlist, the case-folded duplicate path ('A.f90' beside 'a.f90'), the closed capability vocabulary ('gpu_magic@1' matches the token pattern), and every cross-field invariant (entrypoint privacy and attribution, member coverage, the residency-capability coupling, object-name uniqueness). A consumer that applies this schema with a generic JSON Schema library obtains the field grammar only and must still call the canonical validator.",
+  "x-canonical-validator": "tools/codegen_bundle.py:validate_bundle",
+  "x-canonical-doc": "docs/workflow/CODEGEN_BUNDLE_CONTRACT.md"
+}

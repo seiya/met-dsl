@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "spec/schema/generate/harness_capabilities.schema.json",
+  "title": "harness capability manifest document",
+  "description": "Canonical form of a harness capability manifest: the capability set one harness node provides to a CodegenBundle, under a versioned ABI. tools/codegen_bundle.py holds the manifests as tool-side data (HARNESS_CAPABILITY_MANIFESTS), renders them in this document form (harness_capability_manifest_document), and validates them against this shape (harness_capability_manifest_violations); the harness controlled_spec.md is NOT edited to carry them, because that would recertify a certified artifact for no change in generated behavior. When the harness spec is next re-specified on content grounds (Z6, docs/design/zero_base_architecture.md), the manifest moves into a spec-side capabilities section of exactly this shape. Negotiation matches an exact name@version token: version ordering never implies compatibility, and an undeclared harness provides nothing (fail-closed).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["harness_capability_abi_version", "manifests"],
+  "properties": {
+    "harness_capability_abi_version": {
+      "description": "The ABI generation this manifest document is written against. Pinned, not a floor: this contract is generation HARNESS_CAPABILITY_ABI_VERSION = 1, and a later-generation manifest is rejected rather than read under generation-1 semantics (forward compatibility is never assumed — the same rule the exact name@version token match applies to a single capability).",
+      "type": "integer",
+      "const": 1,
+      "minimum": 1
+    },
+    "manifests": {
+      "description": "One entry per harness node_key. A harness_capability_abi_version-compatible consumer treats an absent node_key as providing nothing.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_key", "provides"],
+        "properties": {
+          "node_key": {
+            "description": "The harness node this manifest describes. Only an infrastructure node provides capabilities.",
+            "type": "string",
+            "pattern": "^infrastructure/[a-z0-9][a-z0-9_]*(?:\\.[a-z0-9][a-z0-9_]*)*@[0-9][0-9A-Za-z._-]*(?![\\s\\S])"
+          },
+          "provides": {
+            "description": "The capability tokens this harness provides, duplicate-free. sync_single_case@1 is defined as exactly the canonical interface block of harness_fortran_cpu@0.3.0 section 5.1 (13 operations, 5 published types, dp = real64, case_id_len = 64); tools/runner_renderer.py:assert_harness_pin remains its mechanical enforcer.",
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"$ref": "#/definitions/capability_token"}
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "capability_token": {
+      "description": "<capability_name>@<abi_version>. The name must be a member of the closed vocabulary below; the version is an exact integer, never a range.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*@[0-9]+(?![\\s\\S])",
+      "x-capability-vocabulary": [
+        "sync_single_case",
+        "async_device_resident",
+        "distributed_state",
+        "batched_cases",
+        "full_state_capture",
+        "trusted_reductions",
+        "state_registration"
+      ],
+      "x-execution-model-capabilities": [
+        "sync_single_case",
+        "async_device_resident",
+        "batched_cases"
+      ]
+    }
+  },
+  "examples": [
+    {
+      "harness_capability_abi_version": 1,
+      "manifests": [
+        {"node_key": "infrastructure/harness_fortran_cpu@0.3.0",
+         "provides": ["sync_single_case@1"]}
+      ]
+    }
+  ],
+  "x-forbidden-examples": [
+    {"note": "a capability name outside the closed vocabulary", "provides": ["gpu_magic@1"]},
+    {"note": "a version range; only an exact integer version is a token", "provides": ["sync_single_case@>=1"]},
+    {"note": "a bare name with no ABI version", "provides": ["sync_single_case"]},
+    {"note": "only an infrastructure node provides capabilities", "node_key": "component/adv_flux@0.1.0"}
+  ],
+  "x-forbidden-examples-note": "This schema rejects on its own: a version range and a bare name (the token pattern), and a non-infrastructure node_key (the node_key pattern). A well-formed token whose NAME is outside x-capability-vocabulary (gpu_magic@1) matches the token pattern and is rejected by the canonical validator, tools/codegen_bundle.py:harness_capability_manifest_violations, which holds the vocabulary as a closed set.",
+  "x-canonical-validator": "tools/codegen_bundle.py:harness_capability_manifest_violations",
+  "x-canonical-doc": "docs/workflow/CODEGEN_BUNDLE_CONTRACT.md"
+}
