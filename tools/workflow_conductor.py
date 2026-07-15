@@ -1554,6 +1554,7 @@ class Conductor:
         *,
         session_id: str | None = None,
         resume_session_id: str | None = None,
+        pure: bool = False,
     ) -> list[str]:
         """Headless command to run one substep body as an isolated leaf agent.
         Honors a custom llm_command (wrapper + flags) so the conductor launches the
@@ -1565,7 +1566,19 @@ class Conductor:
         leaf's session for context inheritance on a minor-fix `repair_strategy=reuse`,
         forked into the new session so the prior transcript is not mutated. Guards key
         on the active_child marker (= the new arid), not the session, so the resumed
-        repair is still evaluated against its own manifest."""
+        repair is still evaluated against its own manifest.
+
+        `pure=True` (Z2) launches a HOST-MEDIATED PURE FUNCTION rather than an agentic
+        session: `tools/pure_leaf.pure_leaf_flags()` disables every tool, MCP server, and
+        slash command and selects the JSON result envelope, so the model returns exactly one
+        typed document and holds no write path. Claude-only by construction — a codex pure
+        leaf fails closed here (there is no migrated codex producer; the operator decision is
+        claude-only for Z2), well before spawn, so the ValueError names the misconfiguration
+        instead of a downstream parse failure."""
+        if pure and self.backend != "claude":
+            raise ValueError(
+                f"pure leaf mode is claude-only; backend {self.backend!r} has no pure "
+                "producer (Z2 fail-closed)")
         base = shlex.split(self.llm_command) if self.llm_command.strip() else [self.backend]
         if self.backend == "claude":
             # `-p` runs non-interactively; the committed .claude/settings.json supplies
@@ -1575,6 +1588,9 @@ class Conductor:
                 flags += ["--resume", resume_session_id, "--fork-session"]
             if session_id:
                 flags += ["--session-id", session_id]
+            if pure:
+                from tools.pure_leaf import pure_leaf_flags
+                flags += pure_leaf_flags()
             return [*base, *flags, "-p", prompt_text]
         if self.backend == "codex":
             return [*base, "exec", prompt_text]
