@@ -2597,3 +2597,70 @@ layout a conductor-spawned leaf actually produces, and keep the `subagents/` sca
 `_own_arid_of_transcript` disambiguation is unnecessary for the direct form: the filename **is** the arid. Deterministic
 in-process substeps (`Compile.static`, `Generate.{lint,syntax,static}`, `Build`, `Validate.{pre_judge,execute,post_judge}`)
 spawn no leaf and legitimately have no transcript; they must stay `unavailable` rather than be reported as zero-cost.
+
+## Z2 first billed A/B E2E — the pure executor had never run: one fixed defect, two open information gaps (FILED 2026-07-16)
+
+`Z2` above is recorded `LANDED`, and its unit suite is green, but the `pure` `generate-executor` had never executed
+against the real runtime. The first billed A/B E2E ran it and it failed twice, for three distinct reasons. `LANDED`
+there means "code merged", not "adopted": the billed A/B and the default flip were always the acceptance gate, and this
+entry is what that gate found.
+
+**Defect A — a passing pure leaf was always rejected by `finalize-child` (FIXED, `a237a29`).**
+`_validate_agent_summary_text` requires any terminal row that publishes no `output_refs` to explain itself.
+`_agent_run_json` assumed a dichotomy the pure executor breaks — pass ⇒ `output_refs` speaks for the row, fail ⇒
+`result_summary` speaks for it — and so set `result_summary` only on fail. A pure row's `output_refs` is **empty by
+contract** (the host writes the deliverables only after the child window closes), so a passing pure leaf satisfied
+neither branch and every one was rejected with `agent.summary.txt must include summary or failure reason`. The executor
+could not complete a single node. Fixed by keying the summary on "publishes no `output_refs`" rather than on `status`,
+and by giving the producer and reviewer a real `result_summary` on pass.
+
+This is the **third** `orchestration_runtime` enforcement point the pure path had to be wired into, after
+`_validate_terminal_run_payload` (M-C) and `_validate_step_result_payload` (M-D). The G1 rule — a new execution mode
+must be wired into *every* enforcement point or it is mock-green and fails closed on the real flow — has now recurred
+three times on the same migration. All three were invisible to the unit suite for the same reason: the pure tests stub
+`runtime()`, so the real validators were never exercised. The regression pins added with the fix drive the conductor's
+**actual** finalize payload through the **real** `_extract_agent_summary_text` + `_validate_agent_summary_text`; the
+same anti-mock-green shape as the bundle-meta writer↔reader contract test. Any further pure wiring should be pinned
+this way rather than against a stub.
+
+**Defect B — the certified exemplar is never injected into a pure `generate.generate` (OPEN).**
+The M-B payload contract requires the pure request to reuse the existing `exemplar` key for `generate.generate`. Every
+part of the path exists except the last one: the template carries an `<exemplar>` placeholder, the pure renderer
+substitutes `_build_exemplar(request_payload)`, and `build_launch_request` attaches the key when given a value — but
+`_run_pure_generate_substep`'s `build_launch_request(...)` call passes no `exemplar=` argument. `_build_exemplar` then
+returns `""` and the section vanishes from the prompt. Measured on a real cold pure launch: the 467-line prompt carries
+no exemplar, and the request payload's keys are `leaf_mode` / `pure_context` / `resolved_dependencies` only.
+**Required:** resolve and pass the exemplar on a cold pure launch, mirroring the legacy condition
+(`generate.generate` ∧ not deterministic ∧ not `warm_resume` — a resumed session already holds it).
+
+**Defect C — the pure prompt carries no authoring rules (OPEN, needs a scope decision).**
+A `pure-function leaf` reads no `SKILL` and no contract doc by design; the host is supposed to inline everything it
+needs. The static section of `pure_generate_generate.txt` distills the **output contract** only — the `CodegenBundle`
+schema — because that is all the Z2 design specified to distil. It carries none of the authoring rules the agentic leaf
+gets from `skills/workflow-generate-generate/SKILL.md` and this phase doc: the fortitude idiom checklist, the
+`Generate.syntax` legality rules, the inert-dependency-call rule. The pure leaf therefore authors Fortran with strictly
+less knowledge than the leaf it replaces.
+
+The measured consequence is the documented `C003` ↔ `-std=f2008` trap. On `dynamics_advdiff_flux_1d_upwind_center2`
+the pure producer returned a valid bundle on all four attempts, and the phase still exhausted its retry budget by
+oscillating between exactly the two forms `phase_02_generate.md` names as wrong:
+
+| attempt | generate.generate | Generate.lint | Generate.syntax |
+|---|---|---|---|
+| 1 | ok | fail (`C003 'implicit none' missing 'external'`) | — |
+| 2 | ok | ok | fail |
+| 3 | ok | fail (`C003`) | — |
+| 4 | ok | ok | fail |
+
+The generated source even carries a comment stating that the spec-list form "is a Fortran 2018 feature and is rejected
+by the f2008 syntax check", while omitting the `! allow(C003)` directive that resolves the conflict — the leaf inferred
+the constraint and did not know the workaround. The same node under the `legacy` executor emits the correct
+`! allow(C003)` form and clears lint and syntax on the first attempt.
+
+**The scope decision this needs.** Which authoring rules must the pure static section carry, and in what order (the
+static prefix is byte-stable and precedes the variable context). Candidates: the fortitude idiom checklist, the
+`Generate.syntax` legality rules including the `associate (unused_<name> => <name>)` binding, the JSON descriptor rules,
+and the inert-dependency-call rule. Defect B may reduce how much is required — a certified sibling exemplar exhibits
+the correct forms as prior art — but an exemplar is **prior art, not a gate** (R5), so it is not a substitute for
+stating a rule the leaf must follow. Both defects must be closed and the P arm re-run before the A/B can be evaluated;
+the L arm baseline is unaffected (its generate path is `legacy`) and remains comparable.
