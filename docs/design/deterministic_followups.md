@@ -2506,3 +2506,94 @@ Criteria). A commit-crossing `--resume` is unsupported, so the executor-immutabi
 The Z4 enforcement-retirement of the migrated stages (capability/hook/preflight/contract-doc removal) is out of scope
 here; the pure leaf keeps the truthful minimal `pure_readonly` capability doc so the ≥4 per-arid-capability verifiers
 still anchor.
+
+## Problem certified-dependency interface drift — a regenerated `component` republishes a different interface and strands its non-regenerated consumers (FILED 2026-07-16)
+
+A `component`'s published interface is not pinned by its IR. It is derived post-hoc from the generated source
+(`phase_01_compile.md`), so **regenerating the same `spec` at the same `spec_version` can republish a different
+interface**. Measured on `dynamics_advdiff_flux_1d_upwind_center2@0.1.0`, regenerated during the `Z2` A/B E2E:
+
+```fortran
+! certified 2026-07-13
+compute_flux(nx, u, a, nu, dx, guard_pass, flux_adv, flux_dif)
+! certified 2026-07-16 — same spec, same spec_version, re-run only
+compute_flux(nx, nfaces, u, a, nu, dx, dt, flux_adv, flux_dif, guard_pass)
+```
+
+Two arguments were added and one was reordered. This is not a defect in either source: an `infrastructure` node's
+surface is pinned verbatim by `public_api.signatures` (R1/M3c-α), but a physics `component` has no such pin, so the
+interface is whatever the generation produced.
+
+**A regenerated consumer follows; a non-regenerated one does not.** The host injects the dependency's published
+interface into the consumer's launch prompt (`<dependency_facts>`, Model B), so a consumer regenerated after the drift
+binds to the new interface. A consumer that is *not* regenerated keeps its old call. Because `_certified_model_source`
+stages the **latest** certified source, that consumer's next downstream build silently receives an interface it was
+never certified against.
+
+**Live instance — `dynamics_advdiff_profile_1d_upwind_center2_euler1@0.1.0` is certified but does not compile in its
+dependents' closure.** Its certified `model` source carries an **inert dependency call** (the profile publishes no
+`operation`; it is consumed through its selection result, so the dependency-call obligation is met by a call whose
+actuals are locals assigned beforehand — `phase_02_generate.md`). The actuals do not match the callee's published
+interface:
+
+```
+Error: Type mismatch in argument 'nfaces'; passed REAL(8) to INTEGER(4)
+Error: Rank mismatch in argument 'u' (rank-1 and scalar)
+Error: Type mismatch in argument 'dx'; passed LOGICAL(4) to REAL(8)
+```
+
+Consequence: `advdiff1d_linear@0.3.0`'s `Generate.syntax` gate stages the closure, compiles it, and terminalizes
+`fail_closed` with `leaf_transport_error`. The gate's attribution is **correct** — the leaf authors neither the IR nor a
+dependency's certified source, so no retry of this node could clear it. The node is unusable for any E2E until the
+profile is re-certified, under `legacy` and `pure` alike (`Generate.syntax` is a deterministic in-process substep and
+does not depend on the `generate-executor`).
+
+**The drift is not the cause of this instance.** The profile's certified source fails against the flux's `2026-07-12`,
+`2026-07-13`, and `2026-07-16` certifications alike, so its inert call was already mismatched at certification time.
+**Undetermined:** why the profile certified at all (its own `Generate.syntax` must have staged the flux, since the
+profile `use`s the flux module and does not compile without it), and why `advdiff1d_linear` passed E2E #5/#6. Neither
+has been established; do not assume the `Generate.syntax` closure staging post-dates those runs without checking.
+
+**The structural gap.** Nothing detects a stale certified closure. `_certified_model_source` resolves the latest
+certified source at stage time, so re-certifying an upstream node can invalidate a downstream node's certified source
+**with no signal at all**. The only detector is the downstream node's own `Generate.syntax` gate, and only when that
+node is next re-run. `Z0`'s note that "a dependency certified before a gate rule existed is not clean by induction"
+names the same hazard from the gate-history direction; this is the interface direction of it.
+
+**What is required.**
+- Re-certify `dynamics_advdiff_profile_1d_upwind_center2_euler1` so its inert call matches the flux's published
+  interface. Until then the advdiff family cannot complete an E2E.
+- Selecting nodes for an A/B or a controlled experiment must exclude any node that is a dependency of another target:
+  re-certifying a shared dependency perturbs every downstream consumer's staged closure.
+- The structural answer is `Z5`'s derivation-keyed store: content-hash derivation keys make an upstream re-certification
+  invalidate the closure that consumed it. Until `Z5`, the gap is accepted and this entry is its record.
+
+## Problem leaf token usage is unmeasurable from `agent_runs.jsonl` — the transcript lookup targets the wrong layout (FILED 2026-07-16)
+
+`finalize_child` records each child's token usage into `agent_runs.jsonl` so the cost survives `~/.claude` cleanup. It
+resolves that usage through `aggregate_child_usage`, which scans
+`~/.claude/projects/<slug>/<host_session>/subagents/agent-*.jsonl` — the layout of a child `Agent` **tool** subagent.
+The conductor does not launch leaves that way: it spawns each leaf as a `claude -p --session-id <agent_run_id>`
+subprocess, whose transcript is written to `~/.claude/projects/<slug>/<agent_run_id>.jsonl`. The scan therefore matches
+nothing and every leaf row records:
+
+```json
+"usage": {"status": "unavailable", "reason": "no locatable child transcript"}
+```
+
+Measured across a full conductor-driven node (`orch_20260716T094248Z_fa4e8d56`): 0 of 5 LLM leaves carried usage, while
+all 5 transcripts were present on disk under their `<agent_run_id>.jsonl` names. Consequence: the "Token cost breakdown"
+section of `tools/audit_orchestration.py` reports `available=False` for every conductor-driven orchestration, which is
+the whole of the current workflow. This is the measurement blind spot recorded in the workflow-token-cost analysis,
+located.
+
+A `pure-function leaf` is unaffected — its per-attempt `model` / `usage` come from the CLI result envelope and are
+persisted to `bundle_meta.json` / `verdict_meta.json` (`Z2` M-E), which is why the `Z2` A/B reads its `pure` arm from
+the pure-leaf metrics section and its `legacy` arm by summing `<agent_run_id>.jsonl` directly
+(`orchestration_diagnostics.summarize_transcript_usage`).
+
+**What is required.** `aggregate_child_usage` must also resolve `~/.claude/projects/<slug>/<agent_run_id>.jsonl`, the
+layout a conductor-spawned leaf actually produces, and keep the `subagents/` scan for the Agent-tool case. The existing
+`_own_arid_of_transcript` disambiguation is unnecessary for the direct form: the filename **is** the arid. Deterministic
+in-process substeps (`Compile.static`, `Generate.{lint,syntax,static}`, `Build`, `Validate.{pre_judge,execute,post_judge}`)
+spawn no leaf and legitimately have no transcript; they must stay `unavailable` rather than be reported as zero-cost.
