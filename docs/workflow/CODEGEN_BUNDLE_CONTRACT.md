@@ -1,14 +1,15 @@
 # CodegenBundle contract (`bundle_schema_version` 1.0.0)
 
-> **Scope note. This document does not describe current `Generate` behavior.** The
-> canonical source for what the `Generate` leaves author today is
-> `docs/workflow/phases/phase_02_generate.md` (two leaf-authored Fortran sources,
-> host-rendered runner and Makefile) together with `CHECKS_MODULE_CONTRACT.md`. No
-> producer of a `CodegenBundle` exists in the workflow: the bundle is the output
-> boundary that `Z2` (`docs/design/zero_base_architecture.md`) introduces, and this
-> contract is pinned first so `Z2` has a fixed target. Until `Z2` lands, the schema,
-> the validator module `tools/codegen_bundle.py`, and this document are the whole of
-> the contract; no phase reads or writes a bundle.
+> **Scope note.** Under `Z2` (`docs/design/zero_base_architecture.md`) the pure
+> `Generate.generate` leaf produces exactly one `CodegenBundle`; the host validates
+> it with `validate_bundle` (the post-generate gate), writes the declared files, and
+> assembles the build graph. When the `generate-executor` is `legacy`, no bundle is
+> produced — the agentic `Generate.generate` leaf writes two Fortran sources directly
+> with a host-rendered runner and Makefile, as described in
+> `docs/workflow/phases/phase_02_generate.md` together with `CHECKS_MODULE_CONTRACT.md`.
+> This document is the canonical contract for the bundle document itself; the schema
+> (`spec/schema/generate/codegen_bundle.schema.json`) and the validator module
+> `tools/codegen_bundle.py` are pinned at `bundle_schema_version` 1.0.0.
 
 ## Purpose
 
@@ -41,9 +42,10 @@ optimization boundary.
   allowlist, the capability vocabulary, and every cross-field invariant. Validation itself
   reads only the module constants, so a missing or unreadable schema file cannot fail-open
   a running gate; the unit suite enforces that the two copies agree.
-- Out of scope: how a bundle is requested from a model, how repair turns are routed,
-  and how the build graph is turned into commands. Those are `Z2` and target-backend
-  concerns.
+- Out of scope: how a bundle is requested from a model (the pure-leaf launch prompt,
+  `docs/workflow/LAUNCH_PROMPT_REFERENCE.md`), how repair turns are routed
+  (`docs/ORCHESTRATION.md`), and how the build graph is turned into commands (a
+  target-backend concern).
 
 ### Terminology disambiguation: two unrelated uses of "capability"
 
@@ -117,7 +119,10 @@ still accepts.
 
 `optimization_unit.members` is an ordered list of `node_key`
 (`<spec_kind>/<spec_id>@<spec_version>`), of length at least 1, without duplicates. A
-single-member unit is the default and is what every current node produces.
+single-member unit is the default and is the only shape the pure `Generate.generate`
+producer emits on a live workflow; assembly rejects a multi-node unit
+(`bundle_shape_unsupported`). A multi-node unit is exercised by the validator unit
+suite only.
 
 The ordered member list **is** the unit's identity. No derived `unit_id` is stored:
 the order is itself a contract input to code generation (a fused unit's member order
@@ -488,12 +493,19 @@ the staged closure, so the bundle's own `<spec_id>_model` module never false-col
 result: `json.dumps(graph, sort_keys=True)` is byte-identical. This is what lets the
 graph become a derivation input in `Z5`.
 
-**Parity.** For a bundle of the current `M3c` shape (one member, `model` + `checks`, a
+**Parity.** For a bundle of the `M3c` shape (one member, `model` + `checks`, a
 dependency closure, host-rendered runner glue), the derived object order equals the
-object order of the Makefile the conductor renders today (dependency objects → model →
-checks → runner). `Z2` replaces the body of `_write_makefile` with a synthesis over this
-graph; until then `_write_makefile` is unchanged and the parity test is what pins the two
-together.
+object order of the Makefile the conductor renders on the `legacy` executor
+(dependency objects → model → checks → runner). That equality is what the parity test
+pins: it compares `derive_build_graph(...)["link"]["objects"]` against the object list
+parsed out of the `legacy`-authored Makefile. Under `Z2` the pure executor renders its
+Makefile from this derived graph (`_render_pure_makefile_from_graph`) while the
+`legacy` `_write_makefile` is unchanged, so the two renders are **not** byte-identical
+(they differ in header comments and in whether object paths are carried by
+`MODEL_SRC` / `MODEL_OBJ` variables or inlined per compile unit). What both must agree
+on is the derived build graph — the object set and its order — plus the overridable
+`FC` / `OBJDIR` / `BINDIR` / `BIN` / `SPEC` / `CASES` surface and the `test` / `clean`
+targets that `Build` and `Validate.execute` drive.
 
 ### Design Policy: the command prohibition is structural
 

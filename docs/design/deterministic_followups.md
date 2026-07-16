@@ -2431,3 +2431,78 @@ compiler-selector allowlist by LANGUAGE: the flat allowlist accepted C/C++-only 
 `nvc`) as `toolchain.compiler`, and since the backend pins `FC` to that value, a fortran bundle carrying `compiler: gcc`
 would deterministically fail on `.f90`; the compiler/linker is now validated against the bundle's own languages
 (`COMPILER_SELECTOR_FAMILIES_BY_LANGUAGE`; v1 fortran-only).
+
+## Z2 — Host-mediated `generate.generate` + `generate.verify` (pure-function leaf) (LANDED 2026-07-16)
+
+`zero_base_architecture.md` Z2. The Z0-pinned `CodegenBundle` contract now has a producer: the dominant-cost Generate
+leaves run as **pure-function leaves** (`claude -p` with tools disabled, the host inlining a fully closed context, the
+model returning exactly one JSON document) under an opt-in `generate-executor` selection. The default remains `legacy`;
+the billed A/B adoption commit flips it. What landed:
+
+- `tools/pure_leaf.py` — the stage-independent transport module (`pure_leaf_flags` with `--safe-mode` + a fixed system
+  prompt to block CLAUDE.md/hooks/skills/MCP, `parse_result_envelope` with the `_MISSING` sentinel, `extract_json_document`
+  with the `pure_response_unparseable` / `pure_response_truncated` split, `verify_verdict_violations`,
+  `PURE_PROMPT_CONTRACT_VERSION="pure-1"`, `PURE_PROMPT_SENTINEL`). Reused unchanged by later Z1/Z3.
+- `tools/orchestration_runtime.py` — the `leaf_mode="pure"` wiring across all enforcement points (payload accept gate
+  confined to the `(generate, generate)` / `(generate, verify)` substeps — the `claude`-only restriction is not here but
+  in the conductor, below; record-launch pure branch: empty `allowed_output_paths`,
+  `mode:"pure_readonly"` capability with empty `write_roots` + `mcp_permissions`, deny-all read manifest, read-only
+  bwrap profile, write-family surface skipped; terminal-payload carve-out enforcing `output_refs == []` in both
+  directions; step-result vouch by on-disk existence; the two pure prompt renderers + marker/constraint exemptions).
+  The empty-`write_roots` containment fail-open discovered during M-B (a child-window write escaping an empty allowlist)
+  was root-fixed so the pure leaf's no-write guarantee holds.
+- `tools/workflow_conductor.py` — the pure producer (`_run_pure_generate_substep`) and reviewer
+  (`_run_pure_verify_substep`): spawn → persist → envelope parse → `validate_bundle` / `verify_verdict_violations` →
+  bounded in-conversation warm repair (cold fallback carries `<output_contract>` + `<prior_document>`) → `finalize_child`
+  → **then** host write (files → `src/`, `codegen_bundle.json`, `bundle_meta.json` / `verdict_meta.json`, Makefile
+  synthesized from the derived build graph via `_render_pure_makefile_from_graph`, `source_meta.json` projected from the
+  verdict). The finalize→host-write order is load-bearing (a pre-finalize host write is charged to the child window and
+  rejected) and pinned by conformance test. A post-finalize host-write failure recovers via the `pure_host_write_failed`
+  tombstone pattern (fail-closed, no auto-retry). UTF-8 encodability is checked before accept so a lone-surrogate bundle
+  routes as a repairable schema violation, not a mis-classified transport failure.
+- `tools/validate_pipeline_semantics.py` — the `post_generate` bundle re-validation (parse + `validate_bundle == []`,
+  staged-source == `files[]` ∪ host glue byte-for-byte, single-node `optimization_unit.members`, literal `<spec_id>_model.f90`
+  + module name) and the launch-record sweep mirror (pure↔prompt consistency, no output manifest, `pure_readonly`
+  capability, pure terminal `output_refs` non-empty = violation).
+- `tools/run_workflow.py` — the `--generate-executor {legacy,pure}` flag (env `METDSL_GENERATE_EXECUTOR`), persisted once
+  to `orchestration_meta.json#invocation.generate_executor` and **immutable across `--resume`** (recovered value always
+  wins; a resume-time flag conflict is rejected; the ambient env is ignored — validated on cold init only).
+- Tests: `tools/tests/test_pure_leaf.py`, `test_pure_leaf_wiring.py`, `test_pure_leaf_producer.py`, `test_pure_leaf_verify.py`.
+
+**Routing (deviation from the plan draft).** A pure `generate.verify` schema-failure category routes `restart` → **cold
+`generate.generate`**, not `reuse` to the verify session: a cross-phase reopen structurally returns to the producer, and
+the exhausted reviewer session has no reuse value. A `minor` finding on a schema-valid verdict still routes `reuse` →
+same-phase producer reopen. A schema-valid verdict (pass or fail) ends the repair loop; only malformed verdicts consume
+the bounded warm-repair budget, and on exhaustion no `source_meta.json` / verdict projection is written (proof-of-work).
+
+**Persona separation** is structural rather than checked: producer and reviewer launch under fresh distinct
+`--session-id`s, and `_run_pure_verify_substep` accepts no external resume seed — the only session it ever resumes is
+its own prior attempt's arid, so a producer arid is unreachable rather than rejected. (The producer does accept an
+external reopen seed; the two are deliberately not symmetric.)
+
+**Deliberately absent: a new `claude --version` record and a default flip.** `claude --version` is already persisted per
+orchestration in `preflight.json#agent_version`, so the M-E A/B measurement reads it there rather than adding a redundant
+field (no-redundant-persistence policy). That field is backend-agnostic — it holds whichever CLI was probed, so it is
+`codex --version` on a `codex` run — and the rollup carries `preflight.json#backend` with it and labels the version by
+that backend; a fixed "claude" label would report false provenance for every codex orchestration (which the section still
+renders, since a codex node stays legacy even under `--generate-executor pure`). The M-E measurement is `tools/orchestration_diagnostics.summarize_pure_leaf_metas`
++ `tools/audit_orchestration.collect_pure_leaf_ab_summary` — a read-only rollup over `bundle_meta.json` / `verdict_meta.json`
+(per-attempt model/usage, attempts, failure category) + the recorded executor + `preflight.json#agent_version`, reading no
+`~/.claude` transcript. It discovers the node's source dirs from the orchestration's own pipeline **reservation**
+(`reservations/<node_key_safe>/generate.json#reserved_ir_id`, written by `prepare_node` before Compile runs and already the
+authority for `resume_node_refs`), then globs `<pipeline_ref>/source/*`. Neither `orchestration_checkpoint.json` nor its
+`output_refs` is usable here: `update_checkpoint` fills `pipeline_ref` only for the `validate` step (every real
+`compile` / `generate` / `build` entry records `""`), and `completed_steps` is pass-only — so a checkpoint-based discovery
+would measure nothing on a `generate`-only run (the A/B command) and nothing for a terminally-failed generate. The glob
+(rather than `output_refs`) is what keeps a failed generate and every cold-restart-rotated source dir measured.
+The billed A/B E2E (L-arm `legacy` vs P-arm `pure` over a single kernel and a dependency-bearing
+multi-module node) and the adoption commit that flips the default to `pure` are operator-run and gated on
+`aggregate_verdict=pass` at equal-or-better certified-outcome accuracy.
+
+**Residuals.** Multi-node optimization units are validator-unit-only (a live pure node fails closed on a non-single
+member with `bundle_shape_unsupported`); non-`M3c` and `codex` nodes stay `legacy` even under `--generate-executor pure`
+(no runner role in bundle v1); accelerator / target-optimized coverage is future (`zero_base_architecture.md` Decision
+Criteria). A commit-crossing `--resume` is unsupported, so the executor-immutability guarantee is a within-commit one.
+The Z4 enforcement-retirement of the migrated stages (capability/hook/preflight/contract-doc removal) is out of scope
+here; the pure leaf keeps the truthful minimal `pure_readonly` capability doc so the ≥4 per-arid-capability verifiers
+still anchor.

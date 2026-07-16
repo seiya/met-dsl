@@ -32,6 +32,8 @@ launch and must **not** `Read` the raw templates under `tools/prompt_templates/`
 | judge | — | workflow-validate-judge | skills/workflow-validate-judge/SKILL.md |
 | promote | — | workflow-promote | skills/workflow-promote/SKILL.md |
 
+The `generate/generate` and `generate/verify` rows apply to the `legacy` `generate-executor` only. Under the `pure` executor (`Z2`, see the Z2 section below) those substeps carry **no** `skill_name` / `skill_ref` — a `pure-function leaf` reads no SKILL, and the host inlines the closed context into the `-p` body; `validate_bundle` is the post-generate gate the host runs on the returned `CodegenBundle`.
+
 `skills/workflow-escalate/SKILL.md` (the escalate/diagnostician persona) is intentionally ABSENT from this table: it is a conductor-consumed SKILL rendered host-side into the read-only diagnostician prompt (`_diagnosis_prompt`), never launched as a phase leaf via `skill_ref`.
 
 **Negative constraint:** do not Read a SKILL.md of any phase other than your own (e.g. a generate substep reading `skills/workflow-compile-verify/SKILL.md` fires `rule_source_violation`). Read only the single file passed via the launch prompt's `skill_ref`.

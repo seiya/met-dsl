@@ -53,9 +53,13 @@ _INTERRUPT_MARKERS: tuple[str, ...] = (
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
+    # `ValueError` (not just `json.JSONDecodeError`, which subclasses it) because
+    # `read_text` raises `UnicodeDecodeError` — also a `ValueError`, NOT an `OSError`
+    # — on non-UTF-8 bytes. Catching only the narrower pair let a corrupt-byte file
+    # escape this module's "degrade, never raise" contract.
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -541,11 +545,23 @@ def summarize_transcript_usage(path: Path) -> dict[str, Any]:
     return summary
 
 
-_USAGE_SUM_KEYS: tuple[str, ...] = (
+# The four token classes a Claude CLI `usage` object reports. Both sum-key tuples
+# below derive from this one, so a new token class (or a rename) cannot land in one
+# aggregation and silently miss the other — the transcript sum would then disagree
+# with the pure-leaf sum with nothing to catch it.
+_CLI_TOKEN_USAGE_KEYS: tuple[str, ...] = (
     "input_tokens",
     "output_tokens",
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
+)
+
+# Transcript-usage sum keys: the token classes plus the two values
+# `summarize_jsonl_usage` derives itself. `total_tokens` is load-bearing here (it is
+# summed across transcripts by `aggregate_child_usage` / `aggregate_parent_usage`)
+# and must not be dropped when re-deriving this tuple.
+_USAGE_SUM_KEYS: tuple[str, ...] = (
+    *_CLI_TOKEN_USAGE_KEYS,
     "total_tokens",
     "assistant_turns",
 )
@@ -769,6 +785,129 @@ def aggregate_parent_usage(
     result["session_count"] = len(sessions)
     result["sessions"] = sessions
     return result
+
+
+# Token fields summed across a pure leaf's repair attempts: the CLI result-envelope
+# `usage` keys the conductor persists per attempt into bundle_meta.json /
+# verdict_meta.json (`per_attempt[].usage`), the ~/.claude-free provenance for
+# pure-leaf cost (transcripts are ephemeral; these files are in-repo). Exactly the
+# CLI token classes — `total_tokens` is derived here, and `assistant_turns` is
+# meaningless for a single-turn pure envelope, so neither belongs.
+_PURE_ATTEMPT_USAGE_KEYS: tuple[str, ...] = _CLI_TOKEN_USAGE_KEYS
+
+
+# The structural discriminator of a pure-leaf meta envelope. `per_attempt` is the
+# measurement payload the conductor always writes (`_write_bundle_meta` /
+# `_write_verdict_meta`) and is what an unrelated or stale JSON document at the
+# same path will not carry. Keying on it (rather than on common keys like `result`
+# / `attempts`) keeps a foreign `{"result": "ok"}` from being reported as a
+# pure-leaf row of all-zero metrics.
+_PURE_META_PAYLOAD_KEY = "per_attempt"
+
+
+def _nonneg_int_or_none(value: Any) -> int | None:
+    """Return a JSON value as a non-negative count, or None when it is not one.
+
+    Only a real non-negative `int` qualifies. A `bool` (an `int` subclass), a
+    float (`1.9`; or `Infinity`, which Python's JSON decoder accepts), a numeric
+    string, or a negative value is corrupt metadata and yields None. Rejection is
+    structural — the `isinstance` guard runs *before* any coercion, so nothing is
+    ever passed to `int()` and the aggregation cannot truncate `1.9`, sign-flip a
+    negative, or raise `OverflowError` on `Infinity`. Callers pick their own
+    fallback (0 for a token sum, the valid-attempt count for `attempts`).
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _nonneg_int(value: Any) -> int:
+    """`_nonneg_int_or_none` with 0 as the fallback (token sums)."""
+    coerced = _nonneg_int_or_none(value)
+    return 0 if coerced is None else coerced
+
+
+def _sum_pure_attempt_usage(
+    per_attempt: list[dict[str, Any]],
+) -> tuple[dict[str, int], list[str]]:
+    """Sum `per_attempt[].usage` token counts and collect the per-attempt models.
+
+    Each attempt is `{"agent_run_id", "model": str|None, "usage": dict|None}`
+    (conductor `_run_pure_generate_substep` / `_run_pure_verify_substep`). Missing
+    or malformed `usage` / `model` entries are skipped rather than raising —
+    diagnostics degrade, never break (see `_nonneg_int`). `models` preserves
+    attempt order (a repair loop may resolve a different model per turn; the alias
+    is recorded, never pinned).
+    """
+    totals = {k: 0 for k in _PURE_ATTEMPT_USAGE_KEYS}
+    models: list[str] = []
+    for attempt in per_attempt:
+        if not isinstance(attempt, dict):
+            continue
+        usage = attempt.get("usage")
+        if isinstance(usage, dict):
+            for key in _PURE_ATTEMPT_USAGE_KEYS:
+                totals[key] += _nonneg_int(usage.get(key))
+        model = attempt.get("model")
+        if isinstance(model, str) and model:
+            models.append(model)
+    totals["total_tokens"] = sum(totals[k] for k in _PURE_ATTEMPT_USAGE_KEYS)
+    return totals, models
+
+
+def _summarize_one_pure_meta(meta: dict[str, Any] | None) -> dict[str, Any]:
+    """Project one bundle_meta.json / verdict_meta.json into an A/B metrics row.
+
+    `bundle_meta.json` (producer) and `verdict_meta.json` (reviewer) share a
+    schema: `{result, failure_category, attempts, prompt_contract_version,
+    per_attempt[], failure_excerpt?}`. `result` is `pass`/`fail`; `attempts`
+    counts turns, so `repair_turns = attempts - 1` is the bounded-repair count.
+    `found=False` when the file is absent, unparseable, or not a pure-leaf meta
+    envelope (see `_PURE_META_PAYLOAD_KEY`). When `attempts` is absent or corrupt
+    it falls back to the count of structurally valid (dict) attempt entries.
+    """
+    if not isinstance(meta, dict) or _PURE_META_PAYLOAD_KEY not in meta:
+        return {"found": False}
+    per_attempt = meta.get(_PURE_META_PAYLOAD_KEY)
+    per_attempt = per_attempt if isinstance(per_attempt, list) else []
+    valid_attempt_count = sum(1 for a in per_attempt if isinstance(a, dict))
+    usage_total, models = _sum_pure_attempt_usage(per_attempt)
+    attempts = _nonneg_int_or_none(meta.get("attempts"))
+    if attempts is None:
+        attempts = valid_attempt_count
+    return {
+        "found": True,
+        "result": meta.get("result"),
+        "attempts": attempts,
+        "repair_turns": max(attempts - 1, 0),
+        "failure_category": meta.get("failure_category"),
+        "prompt_contract_version": meta.get("prompt_contract_version"),
+        "usage_total": usage_total,
+        "models": models,
+    }
+
+
+def summarize_pure_leaf_metas(source_dir: Path) -> dict[str, Any]:
+    """A/B metrics for the pure `generate.generate` / `generate.verify` leaves of
+    one source directory (Z2, milestone M-E).
+
+    Reads `<source_dir>/bundle_meta.json` (producer) and `verdict_meta.json`
+    (reviewer) — the in-repo, ~/.claude-free per-attempt usage/model provenance —
+    and returns `{generate, verify, found}`. `generate` / `verify` are per-leaf
+    rows (see `_summarize_one_pure_meta`); `found` is true when either file was
+    present. Best-effort: never raises. A legacy (agentic) node has neither file
+    and yields `found=False`, so the caller can tell a pure node from a legacy one
+    by presence alone. The row carries no `source_dir` key: the caller passes the
+    directory in and owns how it labels the result (the audit rollup labels it
+    repo-relative), so there is no second, conflicting notion of the same field.
+    """
+    generate = _summarize_one_pure_meta(_read_json(source_dir / "bundle_meta.json"))
+    verify = _summarize_one_pure_meta(_read_json(source_dir / "verdict_meta.json"))
+    return {
+        "generate": generate,
+        "verify": verify,
+        "found": bool(generate.get("found") or verify.get("found")),
+    }
 
 
 def build_launch_incident(

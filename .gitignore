@@ -42,3 +42,8 @@ Thumbs.db
 *.tmp
 mcp_command_log.jsonl
 command_log.jsonl
+
+# rikyu-review-logs
+.rikyu-review-logs/
+review-tasks.json
+review-experiment.json

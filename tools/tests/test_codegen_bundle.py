@@ -443,10 +443,15 @@ class DeterministicBuildGraphTest(unittest.TestCase):
         self.assertIn("core__util.o", objects)
 
     def test_m3c_parity_with_the_conductor_authored_makefile(self) -> None:
-        """The derived object order for a current-shape bundle equals the object order of
-        the Makefile the conductor renders today (`_write_makefile`). Z2 replaces that
-        method's body with a synthesis over this graph; until then this test is what pins
-        the two together."""
+        """The derived object order for an M3c-shape bundle equals the object order of the
+        Makefile the conductor renders on the `legacy` executor (`_write_makefile`).
+
+        Z2 landed WITHOUT replacing `_write_makefile`: the pure executor renders from this
+        graph via its own `_render_pure_makefile_from_graph`, and `_write_makefile` is
+        unchanged. So the two renders are NOT byte-identical (header comments differ, and
+        legacy carries `MODEL_SRC`/`MODEL_OBJ` variables where pure inlines per-compile-unit
+        paths). What must agree is the derived build graph — the object set and its order —
+        which is what this test pins. Canonical: `CODEGEN_BUNDLE_CONTRACT.md` §Parity."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             refs = wc.NodeRefs(node_key="problem/adv1d@0.1.0", spec_path="spec/problem/adv1d",

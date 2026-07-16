@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from tools import orchestration_diagnostics as diag
+from tools.pure_leaf import PURE_PROMPT_CONTRACT_VERSION
 
 ORCH_ID = "orch_test"
 CHILD_ARID = "f00d83b5-bfbf-4c0b-8e78-95da6bf6ba5e"
@@ -609,6 +610,279 @@ class AggregateParentUsageTests(unittest.TestCase):
 
     def test_empty_arid_unavailable(self) -> None:
         self.assertFalse(diag.aggregate_parent_usage(Path("/x"), "")["available"])
+
+
+class SummarizePureLeafMetasTest(unittest.TestCase):
+    """tools/orchestration_diagnostics.summarize_pure_leaf_metas (Z2 M-E)."""
+
+    def _bundle_meta(self, **overrides) -> dict:
+        meta = {
+            "result": "pass",
+            "failure_category": None,
+            "attempts": 2,
+            "prompt_contract_version": "pure-1",
+            "per_attempt": [
+                {
+                    "agent_run_id": "arid-1",
+                    "model": "claude-opus-4-8",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "cache_read_input_tokens": 10,
+                        "cache_creation_input_tokens": 5,
+                    },
+                },
+                {
+                    "agent_run_id": "arid-2",
+                    "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 200, "output_tokens": 80},
+                },
+            ],
+        }
+        meta.update(overrides)
+        return meta
+
+    def test_reads_both_metas_and_sums_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "source" / "src_x"
+            src.mkdir(parents=True)
+            (src / "bundle_meta.json").write_text(
+                json.dumps(self._bundle_meta()), encoding="utf-8"
+            )
+            (src / "verdict_meta.json").write_text(
+                json.dumps(
+                    {
+                        "result": "fail",
+                        "failure_category": "verdict_schema_violation",
+                        "attempts": 1,
+                        "prompt_contract_version": "pure-1",
+                        "per_attempt": [
+                            {"agent_run_id": "v-1", "model": "claude-opus-4-8", "usage": {"input_tokens": 300, "output_tokens": 20}}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            out = diag.summarize_pure_leaf_metas(src)
+        self.assertTrue(out["found"])
+        gen = out["generate"]
+        self.assertTrue(gen["found"])
+        self.assertEqual(gen["result"], "pass")
+        self.assertEqual(gen["attempts"], 2)
+        self.assertEqual(gen["repair_turns"], 1)
+        self.assertEqual(gen["usage_total"]["input_tokens"], 300)
+        self.assertEqual(gen["usage_total"]["output_tokens"], 130)
+        self.assertEqual(gen["usage_total"]["cache_read_input_tokens"], 10)
+        self.assertEqual(gen["usage_total"]["total_tokens"], 300 + 130 + 10 + 5)
+        self.assertEqual(gen["models"], ["claude-opus-4-8", "claude-opus-4-8"])
+        ver = out["verify"]
+        self.assertEqual(ver["result"], "fail")
+        self.assertEqual(ver["failure_category"], "verdict_schema_violation")
+        self.assertEqual(ver["repair_turns"], 0)
+
+    def test_legacy_node_has_no_metas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src_legacy"
+            src.mkdir(parents=True)
+            out = diag.summarize_pure_leaf_metas(src)
+        self.assertFalse(out["found"])
+        self.assertFalse(out["generate"]["found"])
+        self.assertFalse(out["verify"]["found"])
+
+    def test_malformed_usage_and_missing_attempts_do_not_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src_bad"
+            src.mkdir(parents=True)
+            (src / "bundle_meta.json").write_text(
+                json.dumps(
+                    {
+                        "result": "pass",
+                        "per_attempt": [
+                            {"agent_run_id": "a", "model": None, "usage": None},
+                            {"agent_run_id": "b", "usage": {"input_tokens": "oops"}},
+                            "not-a-dict",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            out = diag.summarize_pure_leaf_metas(src)
+        gen = out["generate"]
+        self.assertTrue(gen["found"])
+        # attempts falls back to the count of structurally-valid (dict) attempts
+        # when absent — the "not-a-dict" entry is not counted.
+        self.assertEqual(gen["attempts"], 2)
+        # non-int usage values ("oops", None) coerce to 0, never raise
+        self.assertEqual(gen["usage_total"]["total_tokens"], 0)
+        self.assertEqual(gen["models"], [])
+
+    def test_non_pure_dict_and_infinity_usage_do_not_mislead_or_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src_edge"
+            src.mkdir(parents=True)
+            # An empty / unrelated JSON object is not a pure-leaf meta envelope.
+            (src / "bundle_meta.json").write_text(json.dumps({}), encoding="utf-8")
+            # Infinity is a valid JSON value to Python's decoder; int(inf) would
+            # raise OverflowError — the coercion must swallow it as 0.
+            (src / "verdict_meta.json").write_text(
+                '{"result": "pass", "per_attempt": [{"usage": {"input_tokens": Infinity, "output_tokens": -5}}]}',
+                encoding="utf-8",
+            )
+            out = diag.summarize_pure_leaf_metas(src)
+        self.assertFalse(out["generate"]["found"])  # empty dict → not a pure meta
+        ver = out["verify"]
+        self.assertTrue(ver["found"])
+        self.assertEqual(ver["usage_total"]["total_tokens"], 0)  # inf→0, -5→0
+
+    def test_unparseable_meta_degrades_to_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src_broken"
+            src.mkdir(parents=True)
+            (src / "bundle_meta.json").write_text("{not json", encoding="utf-8")
+            out = diag.summarize_pure_leaf_metas(src)
+        self.assertFalse(out["generate"]["found"])
+
+    def test_non_utf8_meta_degrades_and_does_not_raise(self) -> None:
+        # `read_text(encoding="utf-8")` raises UnicodeDecodeError — a ValueError, NOT
+        # an OSError — so a narrow `(OSError, JSONDecodeError)` catch would let a
+        # corrupt-byte file escape the "degrade, never raise" contract.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src_badbytes"
+            src.mkdir(parents=True)
+            (src / "bundle_meta.json").write_bytes(
+                b'{"per_attempt": [], "result": "\xff\xfe pass"}'
+            )
+            out = diag.summarize_pure_leaf_metas(src)  # must not raise
+        self.assertFalse(out["generate"]["found"])
+        self.assertFalse(out["found"])
+
+    def test_bools_are_not_counted_as_ints(self) -> None:
+        # bool IS an int subclass, so a missing isinstance(value, bool) guard would
+        # let attempts=True render verbatim and sum booleans as tokens.
+        row = diag._summarize_one_pure_meta(
+            {
+                "result": "pass",
+                "attempts": True,
+                "per_attempt": [{"usage": {"input_tokens": True, "output_tokens": 5}}],
+            }
+        )
+        self.assertEqual(row["attempts"], 1)  # True rejected → falls back to 1 valid attempt
+        self.assertIsNot(row["attempts"], True)
+        self.assertEqual(row["usage_total"]["input_tokens"], 0)  # True is not 1 token
+        self.assertEqual(row["usage_total"]["output_tokens"], 5)
+
+    def test_non_list_per_attempt_does_not_raise(self) -> None:
+        # A corrupt scalar per_attempt must degrade, not TypeError out of the
+        # "never raises" contract.
+        for bad in (5, "x", {"a": 1}, None):
+            row = diag._summarize_one_pure_meta({"result": "pass", "per_attempt": bad})
+            self.assertTrue(row["found"])
+            self.assertEqual(row["attempts"], 0)
+            self.assertEqual(row["usage_total"]["total_tokens"], 0)
+            self.assertEqual(row["models"], [])
+
+    def test_models_preserve_attempt_order_and_skip_empty(self) -> None:
+        # `models` is distinct-IN-ORDER: a set-based dedup would sort and lose the
+        # per-attempt sequence. An empty-string model is not a model.
+        _, models = diag._sum_pure_attempt_usage(
+            [
+                {"model": "zeta"}, {"model": "alpha"}, {"model": "zeta"},
+                {"model": ""}, {"model": None},
+            ]
+        )
+        self.assertEqual(models, ["zeta", "alpha", "zeta"])  # order kept, empties dropped
+
+    def test_zero_attempts_does_not_produce_negative_repair_turns(self) -> None:
+        # repair_turns is clamped: a corrupt attempts=0 must not render as -1.
+        row = diag._summarize_one_pure_meta({"result": "fail", "attempts": 0, "per_attempt": []})
+        self.assertEqual(row["attempts"], 0)
+        self.assertEqual(row["repair_turns"], 0)
+
+    def test_foreign_json_without_payload_key_is_not_a_pure_meta(self) -> None:
+        # A stale/hand-edited document carrying only common keys must NOT be
+        # reported as a pure-leaf row of all-zero metrics: `per_attempt` (the
+        # measurement payload) is the discriminator, not `result`/`attempts`.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src_foreign"
+            src.mkdir(parents=True)
+            (src / "bundle_meta.json").write_text(
+                json.dumps({"result": "ok", "attempts": 7}), encoding="utf-8"
+            )
+            out = diag.summarize_pure_leaf_metas(src)
+        self.assertFalse(out["generate"]["found"])
+        self.assertFalse(out["found"])
+
+    def test_usage_key_tuples_stay_consistent(self) -> None:
+        # Both sum-key tuples derive from the CLI token classes. Pin the relation AND
+        # the derived contents: the obvious re-derivation
+        # `(*_CLI_TOKEN_USAGE_KEYS, "assistant_turns")` silently drops "total_tokens",
+        # which the transcript aggregators sum.
+        self.assertEqual(diag._PURE_ATTEMPT_USAGE_KEYS, diag._CLI_TOKEN_USAGE_KEYS)
+        self.assertTrue(set(diag._PURE_ATTEMPT_USAGE_KEYS) < set(diag._USAGE_SUM_KEYS))
+        self.assertIn("total_tokens", diag._USAGE_SUM_KEYS)
+        self.assertIn("assistant_turns", diag._USAGE_SUM_KEYS)
+        # total_tokens/assistant_turns are derived, not per-attempt CLI fields.
+        self.assertNotIn("total_tokens", diag._PURE_ATTEMPT_USAGE_KEYS)
+        self.assertNotIn("assistant_turns", diag._PURE_ATTEMPT_USAGE_KEYS)
+        self.assertEqual(
+            diag._USAGE_SUM_KEYS,
+            ("input_tokens", "output_tokens", "cache_read_input_tokens",
+             "cache_creation_input_tokens", "total_tokens", "assistant_turns"),
+        )
+
+    def test_row_carries_no_source_dir_key(self) -> None:
+        # The caller owns the label (the audit rollup attaches a repo-relative
+        # path); the callee must not publish a second, absolute notion of it.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src_x"
+            src.mkdir(parents=True)
+            out = diag.summarize_pure_leaf_metas(src)
+        self.assertNotIn("source_dir", out)
+
+
+class PureLeafMetaWriterReaderContractTest(unittest.TestCase):
+    """The conductor writes bundle_meta/verdict_meta; this module reads them. The
+    two live in different modules with no shared schema constant, so drive the REAL
+    writer into the reader — a renamed/dropped field breaks here rather than
+    silently reporting zero tokens (both modules' own suites would stay green)."""
+
+    def test_conductor_written_metas_round_trip_through_reader(self) -> None:
+        from tools.tests.test_pure_leaf_producer import _conductor, _write_node
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            c = _conductor(repo)
+            src_dir = repo / refs.source_dir()
+            src_dir.mkdir(parents=True, exist_ok=True)
+            per_attempt = [
+                {"agent_run_id": "a1", "model": "claude-opus-4-8",
+                 "usage": {"input_tokens": 11, "output_tokens": 22,
+                           "cache_read_input_tokens": 33, "cache_creation_input_tokens": 44}},
+            ]
+            c._write_bundle_meta(
+                refs, result="fail", failure_category="bundle_schema_violation",
+                failure_excerpt="boom", attempts=2, per_attempt=per_attempt,
+            )
+            c._write_verdict_meta(
+                refs, result="pass", failure_category=None, failure_excerpt=None,
+                attempts=1, per_attempt=per_attempt,
+            )
+            out = diag.summarize_pure_leaf_metas(src_dir)
+
+        self.assertTrue(out["found"])
+        gen = out["generate"]
+        self.assertTrue(gen["found"], "reader must recognize the conductor's bundle_meta envelope")
+        self.assertEqual(gen["result"], "fail")
+        self.assertEqual(gen["attempts"], 2)
+        self.assertEqual(gen["failure_category"], "bundle_schema_violation")
+        # The writer stamps the contract version; the reader must surface it.
+        self.assertEqual(gen["prompt_contract_version"], PURE_PROMPT_CONTRACT_VERSION)
+        # Every usage class the writer persists must be summed by the reader.
+        self.assertEqual(gen["usage_total"]["total_tokens"], 11 + 22 + 33 + 44)
+        self.assertEqual(gen["models"], ["claude-opus-4-8"])
+        self.assertTrue(out["verify"]["found"])
+        self.assertEqual(out["verify"]["result"], "pass")
 
 
 if __name__ == "__main__":

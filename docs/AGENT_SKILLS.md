@@ -39,11 +39,11 @@ This document defines the reference conventions for the `skills` used in the pro
 - `Compile generate`: `skills/workflow-compile-generate/SKILL.md`
 - `Compile static`: conductor in-process (no SKILL; deterministic `validate_workspace_root` + `check_artifact_syntax` + `validate_pipeline_semantics --stage compile`, see `docs/workflow/phases/phase_01_compile.md`)
 - `Compile verify`: `skills/workflow-compile-verify/SKILL.md`
-- `Generate generate`: `skills/workflow-generate-generate/SKILL.md`
+- `Generate generate`: `skills/workflow-generate-generate/SKILL.md` (`legacy` `generate-executor` only; under `pure` the `pure-function leaf` reads no SKILL — the host inlines the closed context into the launch prompt, see `docs/workflow/LAUNCH_PROMPT_REFERENCE.md`)
 - `Generate lint`: conductor in-process (no SKILL; deterministic `run_linter`, see `docs/workflow/phases/phase_02_generate.md`)
 - `Generate syntax`: conductor in-process (no SKILL; deterministic `run_syntax_check` compiler front-end gate, gfortran `-fsyntax-only`, see `docs/workflow/phases/phase_02_generate.md`)
 - `Generate static`: conductor in-process (no SKILL; deterministic `validate_workspace_root` + `validate_pipeline_semantics --stage post_generate`, see `docs/workflow/phases/phase_02_generate.md`)
-- `Generate verify`: `skills/workflow-generate-verify/SKILL.md`
+- `Generate verify`: `skills/workflow-generate-verify/SKILL.md` (`legacy` `generate-executor` only; under `pure` the `pure-function leaf` reads no SKILL, as with `Generate generate` above)
 - `Build`: conductor in-process (no SKILL; see `docs/workflow/phases/phase_03_build.md`)
 - `Validate execute`: conductor in-process (no SKILL; see `docs/workflow/phases/phase_04_validate.md`)
 - `Validate judge`: `skills/workflow-validate-judge/SKILL.md`

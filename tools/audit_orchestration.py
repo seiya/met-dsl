@@ -23,7 +23,7 @@ import json
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 try:  # script run: sys.path[0] is tools/ ; package import: repo root on path
@@ -33,6 +33,7 @@ try:  # script run: sys.path[0] is tools/ ; package import: repo root on path
         aggregate_child_usage,
         aggregate_parent_usage,
         summarize_transcript_usage,
+        summarize_pure_leaf_metas,
         _claude_projects_dir,
     )
 except ImportError:  # pragma: no cover - import-path shim
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover - import-path shim
         aggregate_child_usage,
         aggregate_parent_usage,
         summarize_transcript_usage,
+        summarize_pure_leaf_metas,
         _claude_projects_dir,
     )
 
@@ -505,6 +507,172 @@ def collect_token_cost_summary(
     return summary
 
 
+# The `generate-executor` vocabulary (canonical allowlist: `run_workflow.py`, which
+# validates it on cold init). Duplicated as a literal rather than imported so the
+# read-only audit does not pull in the workflow launcher; the render only uses it to
+# flag an out-of-vocabulary value, never to reject one.
+_KNOWN_GENERATE_EXECUTORS: tuple[str, ...] = ("legacy", "pure")
+
+
+def _clean_str(value: Any) -> str | None:
+    """Return a stripped non-empty string, else None.
+
+    A missing / null / wrong-typed provenance field (`generate_executor`,
+    `agent_version`) is reported as absent rather than rendered as a spurious
+    recorded value. The value is stripped, not just validated: these render inline
+    into markdown, so surrounding whitespace from a hand-edited or foreign
+    artifact would otherwise break the line. (The live writers already strip —
+    `_probe_claude_backend` stores `claude --version` as `stdout.strip()` — so
+    this is defence in depth, not a live defect.)"""
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def _pure_source_dirs_of(
+    repo_root: Path, orchestration_id: str
+) -> tuple[list[str], list[str]]:
+    """Every repo-relative source directory under this orchestration's node
+    pipeline(s), in sorted order.
+
+    Discovery reads this orchestration's OWN pipeline reservations
+    (`reservations/<node_key_safe>/generate.json#reserved_ir_id`), which
+    `prepare_node` writes before Compile runs and which `resume_node_refs` already
+    treats as the authority for the pipeline id.
+
+    The `orchestration_checkpoint.json` is NOT usable for this: `update_checkpoint`
+    fills `pipeline_ref` from the step result, and the conductor only supplies it
+    (via `launch_request_ref`) for the `validate` step — so every real
+    `compile` / `generate` / `build` entry records `pipeline_ref: ""`. Discovering
+    from the checkpoint would therefore find nothing on a `generate`-only run, which
+    is exactly the A/B command, and nothing for a terminally-failed generate.
+
+    Globbing `<pipeline_ref>/source/*` (rather than reading pass-only
+    `completed_steps[].output_refs`) is what keeps a terminally-failed generate and
+    every cold-restart-rotated source dir measured — otherwise the pure-arm totals
+    silently undercount. The node's `pipeline_id` is allocated once per orchestration
+    node and reused across restarts, so the glob is exactly this orchestration's
+    generate attempts. A legacy source dir under the same pipeline carries no
+    bundle_meta/verdict_meta and is dropped by the caller's `found` filter.
+
+    Returns `(source_dirs, pipeline_refs)`. The accepted `pipeline_refs` are returned
+    alongside so the caller can tell an EMPTY result apart: no pipeline reservation
+    at all (the node was never prepared) versus a reserved pipeline whose `source/`
+    does not exist yet (`Generate` has not run — the normal state of a run stopped at
+    Compile, e.g. `run_workflow.py <spec> Compile`, and of a `--with-deps` dependency
+    node when the TARGET stops at Compile: `dep_until_phase` follows the target, so a
+    `generate`/`validate` target drives its deps all the way to Validate and those do
+    produce source dirs). Those two states must not share a diagnosis. A
+    `reserved_ir_id` that is not a single clean path segment is rejected (it would
+    escape the pipeline root).
+    """
+    dirs: list[str] = []
+    pipeline_refs: list[str] = []
+    res_root = _orch_root(repo_root, orchestration_id) / "reservations"
+    if not res_root.is_dir():
+        return dirs, pipeline_refs
+    for node_dir in sorted(res_root.iterdir()):
+        if not node_dir.is_dir():
+            continue
+        reserved = (_load_json_if_dict(node_dir / "generate.json") or {}).get("reserved_ir_id")
+        if not (isinstance(reserved, str) and reserved):
+            continue
+        # The reserved id is JSON-sourced: require a single clean segment so it can
+        # never traverse out of `workspace/pipelines/<node_key_safe>/`.
+        if reserved in {".", ".."} or PurePosixPath(reserved).parts != (reserved,):
+            continue
+        pref = f"workspace/pipelines/{node_dir.name}/{reserved}"
+        if pref not in pipeline_refs:
+            pipeline_refs.append(pref)
+    for pref in pipeline_refs:
+        source_root = repo_root / pref / "source"
+        if not source_root.is_dir():
+            continue
+        for child in sorted(source_root.iterdir()):
+            if not child.is_dir():
+                continue
+            rel = f"{pref}/source/{child.name}"
+            if rel not in dirs:
+                dirs.append(rel)
+    return dirs, pipeline_refs
+
+
+def collect_pure_leaf_ab_summary(
+    repo_root: Path,
+    orchestration_id: str,
+    meta: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """A/B-measurement rollup for the Z2 pure `generate` leaves (milestone M-E).
+
+    Surfaces the executor selection (`orchestration_meta.json#invocation.
+    generate_executor`) and the probed backend's CLI version
+    (`preflight.json#agent_version` — already persisted, so no new file is written;
+    it is `claude --version` on a claude run and `codex --version` on a codex run,
+    so `backend` is carried with it) alongside per-node pure-leaf metrics read from
+    `bundle_meta.json` / `verdict_meta.json`. `available` is true only when a pure node was located,
+    so a legacy (agentic) run reports `available=False` with the executor still
+    surfaced; `reason` then says why, distinguishing "this run wrote no pure meta"
+    from "Generate has not produced a source dir yet" and from "the node was never
+    prepared", which would otherwise all render as a silent, legacy-looking zero.
+
+    I/O: `meta` is passed in because `audit()` already loads it for its other
+    sections; `preflight.json` and the pipeline reservations are read here because
+    this is their only consumer. Best-effort — the caller wraps it so a diagnostics
+    failure never breaks the audit.
+    """
+    meta = meta or {}
+    invocation = meta.get("invocation")
+    invocation = invocation if isinstance(invocation, dict) else {}
+    generate_executor = _clean_str(invocation.get("generate_executor"))
+
+    root = _orch_root(repo_root, orchestration_id)
+    preflight = _load_json_if_dict(root / "preflight.json") or {}
+    # `agent_version` is backend-agnostic: `probe_execution_platform` stores whatever
+    # the selected backend's prober returned — `claude --version` on a claude run,
+    # `codex --version` on a codex run. Carry the recorded `backend` so the renderer
+    # can label it truthfully; naming it "claude" unconditionally would report false
+    # provenance for every codex orchestration (which this section still renders,
+    # since a codex node stays legacy even under --generate-executor pure).
+    backend = _clean_str(preflight.get("backend"))
+    agent_cli_version = _clean_str(preflight.get("agent_version"))
+
+    source_dirs, pipeline_refs = _pure_source_dirs_of(repo_root, orchestration_id)
+    nodes: list[dict[str, Any]] = []
+    for source_dir in source_dirs:
+        summary = summarize_pure_leaf_metas(repo_root / source_dir)
+        if summary.get("found"):
+            # Label repo-relative here (the callee sets no `source_dir`). Build a new
+            # dict rather than mutating the returned one, so the ownership is a
+            # visible fact of this expression, not an implicit callee obligation.
+            nodes.append({**summary, "source_dir": source_dir})
+
+    result: dict[str, Any] = {
+        "available": bool(nodes),
+        "generate_executor": generate_executor,
+        "backend": backend,
+        "agent_cli_version": agent_cli_version,
+        "pure_nodes": nodes,
+    }
+    if not nodes:
+        if not pipeline_refs:
+            # No pipeline reservation at all: `prepare_node` never ran for any node of
+            # this orchestration (or the reservations were removed). Name it — this is
+            # the only case where discovery itself could not proceed, and it must not
+            # be confused with the routine "Generate hasn't run yet" below.
+            result["reason"] = (
+                "no pipeline reservation under this orchestration "
+                "— discovery found no node to measure"
+            )
+        elif not source_dirs:
+            result["reason"] = (
+                "no generate source directory under the pipeline yet "
+                "(Generate has not produced one)"
+            )
+        else:
+            result["reason"] = "no pure-leaf meta located"
+    return result
+
+
 def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
     root = _orch_root(repo_root, orchestration_id)
     hook_events, hook_errs = _load_jsonl_with_errors(root / "hooks" / "native_hook_events.jsonl")
@@ -536,6 +704,13 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
         )
     except Exception:  # noqa: BLE001 - diagnostics must never break the audit
         token_cost_summary = {"available": False, "reason": "token-cost collection failed"}
+    # Pure-leaf A/B rollup (Z2 M-E): executor selection + claude --version +
+    # per-node bundle_meta/verdict_meta metrics. Reads only in-repo artifacts
+    # (no ~/.claude). Best-effort — must never break the audit.
+    try:
+        pure_leaf_ab_summary = collect_pure_leaf_ab_summary(repo_root, orchestration_id, meta)
+    except Exception:  # noqa: BLE001 - diagnostics must never break the audit
+        pure_leaf_ab_summary = {"available": False, "reason": "pure-leaf A/B collection failed"}
     # Persisted incident snapshots captured at run time. These survive after
     # `--resume` clears the active-child markers (live detection then returns None)
     # and after ~/.claude cleanup removes the transcript, so they are the durable
@@ -566,6 +741,7 @@ def audit(repo_root: Path, orchestration_id: str) -> dict[str, Any]:
         "launch_incident_snapshots": launch_incident_snapshots,
         "agent_run_summary": collect_agent_run_summary(agent_runs, invalid_runs),
         "token_cost_summary": token_cost_summary,
+        "pure_leaf_ab_summary": pure_leaf_ab_summary,
         "invalid_run_count": len(invalid_runs),
         "invalid_run_ids": [r.get("agent_run_id") for r in invalid_runs if r.get("agent_run_id")],
         "data_integrity_warning": (len(parse_errors) > 0) or (unparseable_count > 0),
@@ -777,6 +953,90 @@ def _render_token_cost(summary: dict[str, Any] | None, lines: list[str]) -> None
         lines.append("")
 
 
+def _render_pure_leaf_row(label: str, row: dict[str, Any], lines: list[str]) -> None:
+    """Render one pure-leaf (`generate` / `verify`) metrics row. Within a located
+    pure node an absent sub-row means only that leaf's meta was not written (not
+    that the node is legacy)."""
+    if not isinstance(row, dict) or not row.get("found"):
+        lines.append(f"- `{label}`: no {label} meta recorded")
+        return
+    usage = row.get("usage_total") or {}
+    # Collapse the per-attempt model list: a repair loop normally resolves the same
+    # alias every turn, and joining it raw renders "model(s): m, m, m", which reads
+    # as several distinct models (or as an attempt count). Distinct-in-order keeps
+    # the genuine multi-model case visible.
+    models = list(dict.fromkeys(row.get("models") or []))
+    model_str = f", model(s): {', '.join(models)}" if models else ""
+    cat = row.get("failure_category")
+    cat_str = f", failure: `{cat}`" if cat else ""
+    # The prompt contract version is the A/B comparability check — two arms run
+    # under different contract versions are not measuring the same thing.
+    contract = row.get("prompt_contract_version")
+    contract_str = f", contract=`{contract}`" if contract else ""
+    lines.append(
+        f"- `{label}`: result=`{row.get('result')}`, attempts={row.get('attempts')} "
+        f"(repair turns={row.get('repair_turns')}){cat_str}{contract_str}"
+    )
+    # `total` sums all four token classes; show cache_creation too so the four
+    # displayed numbers reconcile with `total`.
+    lines.append(
+        f"  - tokens — in {_fmt_tok(usage.get('input_tokens'))}, "
+        f"out {_fmt_tok(usage.get('output_tokens'))}, "
+        f"cache_read {_fmt_tok(usage.get('cache_read_input_tokens'))}, "
+        f"cache_creation {_fmt_tok(usage.get('cache_creation_input_tokens'))}, "
+        f"total {_fmt_tok(usage.get('total_tokens'))}{model_str}"
+    )
+
+
+def _render_pure_leaf_ab(summary: dict[str, Any] | None, lines: list[str]) -> None:
+    """Render the Z2 pure-leaf A/B rollup: executor + claude --version + per-node
+    generate/verify attempt and token metrics (the P-arm provenance of a billed
+    A/B comparison)."""
+    lines.append("## Pure-leaf A/B metrics (Z2)")
+    lines.append("")
+    summary = summary if isinstance(summary, dict) else {}
+    recorded_executor = summary.get("generate_executor")
+    executor = recorded_executor or "unknown"
+    version = summary.get("agent_cli_version") or "unrecorded"
+    backend = summary.get("backend")
+    lines.append(f"- generate-executor: `{executor}`")
+    # Report the recorded value verbatim (diagnostics say what IS recorded, not what
+    # should be) but flag an out-of-vocabulary one: the branches below key on the
+    # exact value, so an unrecognized executor must not be silently read as legacy.
+    if recorded_executor and recorded_executor not in _KNOWN_GENERATE_EXECUTORS:
+        lines.append(
+            f"  - ⚠ unrecognized executor value (expected one of "
+            f"{', '.join(f'`{e}`' for e in _KNOWN_GENERATE_EXECUTORS)})"
+        )
+    # Label the version by the backend that was actually probed. `agent_version` is
+    # whichever CLI ran, so a fixed "claude --version" label would misreport every
+    # codex orchestration's version as Claude's.
+    version_label = f"{backend} --version" if backend else "backend CLI --version"
+    lines.append(f"- {version_label}: `{version}` (from `preflight.json#agent_version`)")
+    nodes = summary.get("pure_nodes") or []
+    if not summary.get("available") or not nodes:
+        # Say which case this is. Under executor=pure, "legacy/agentic run" would
+        # contradict the executor line rendered directly above; under an unknown or
+        # unrecognized executor we cannot claim either arm.
+        reason = summary.get("reason")
+        if executor == "pure":
+            hint = reason or "pure run with no `bundle_meta.json` / `verdict_meta.json` written"
+        elif executor == "legacy":
+            hint = "legacy/agentic run"
+            hint += f", or {reason}" if reason else ", or the pure metas are absent"
+        else:
+            hint = reason or "executor not recorded or unrecognized; no pure metas on disk"
+        lines.append(f"- no pure-leaf node located ({hint})")
+        lines.append("")
+        return
+    lines.append("")
+    for node in nodes:
+        lines.append(f"### `{node.get('source_dir')}`")
+        _render_pure_leaf_row("generate", node.get("generate") or {}, lines)
+        _render_pure_leaf_row("verify", node.get("verify") or {}, lines)
+        lines.append("")
+
+
 def _render_markdown(result: dict[str, Any]) -> str:
     lines: list[str] = []
     orch_id = result["orchestration_id"]
@@ -904,6 +1164,8 @@ def _render_markdown(result: dict[str, Any]) -> str:
         lines.append("")
 
     _render_token_cost(result.get("token_cost_summary"), lines)
+
+    _render_pure_leaf_ab(result.get("pure_leaf_ab_summary"), lines)
 
     ar = result["agent_run_summary"]
     lines.append("## agent_runs summary")

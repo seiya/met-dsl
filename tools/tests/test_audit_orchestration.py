@@ -17,9 +17,12 @@ from tools.audit_orchestration import (
     collect_fail_closed_timeline,
     collect_agent_run_summary,
     collect_token_cost_summary,
+    collect_pure_leaf_ab_summary,
     detect_suspicious_benign_volume,
     split_substantive_and_benign,
     _render_markdown,
+    _render_pure_leaf_ab,
+    _render_pure_leaf_row,
     _render_incident_body,
 )
 
@@ -889,6 +892,396 @@ class LegacyIncidentApiErrorRenderTests(unittest.TestCase):
         self.assertIn("transient API error", md)
         self.assertIn("529", md)
         self.assertIn("safe to", md)
+
+
+class PureLeafABSummaryTest(unittest.TestCase):
+    """collect_pure_leaf_ab_summary + _render_pure_leaf_ab (Z2 M-E)."""
+
+    ORCH = "orch_pure_ab"
+    SAFE = "comp__demo__0.1.0"
+    PIPELINE_ID = "demo_20260716_001"
+    PIPE = f"workspace/pipelines/{SAFE}/{PIPELINE_ID}"
+    SRC = f"workspace/pipelines/{SAFE}/{PIPELINE_ID}/source/src_20260716_001"
+
+    def _reserve(self, repo: Path, *, pipeline_id: str | None = None) -> None:
+        """Write the pipeline reservation `prepare_node` writes before Compile runs.
+
+        This — NOT `orchestration_checkpoint.json` — is what discovery reads. The
+        checkpoint only ever carries a non-empty `pipeline_ref` for the `validate`
+        step (verified against every real orchestration in-repo), so a fixture that
+        hand-builds a compile/generate entry WITH a `pipeline_ref` encodes a shape
+        the runtime never produces, and would hide a generate-only run finding nothing.
+        """
+        res = repo / "workspace" / "orchestrations" / self.ORCH / "reservations" / self.SAFE
+        res.mkdir(parents=True, exist_ok=True)
+        (res / "generate.json").write_text(
+            json.dumps(
+                {
+                    "node_key": "comp/demo@0.1.0",
+                    "step": "generate",
+                    # `is not None`, not `or`: an empty-string id is a case under test
+                    # and `or` would silently swallow it into the default.
+                    "reserved_ir_id": (
+                        pipeline_id if pipeline_id is not None else self.PIPELINE_ID
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _lay_out(self, repo: Path, *, executor="pure", with_metas=True) -> None:
+        root = repo / "workspace" / "orchestrations" / self.ORCH
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "orchestration_meta.json").write_text(
+            json.dumps({"invocation": {"generate_executor": executor}}), encoding="utf-8"
+        )
+        (root / "preflight.json").write_text(
+            json.dumps({"backend": "claude", "agent_version": "1.2.3 (Claude Code)"}),
+            encoding="utf-8",
+        )
+        self._reserve(repo)
+        if with_metas:
+            src = repo / self.SRC
+            src.mkdir(parents=True, exist_ok=True)
+            (src / "bundle_meta.json").write_text(
+                json.dumps(
+                    {
+                        "result": "pass",
+                        "failure_category": None,
+                        "attempts": 1,
+                        "prompt_contract_version": "pure-1",
+                        "per_attempt": [
+                            {"agent_run_id": "g1", "model": "claude-opus-4-8", "usage": {"input_tokens": 400, "output_tokens": 900}}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (src / "verdict_meta.json").write_text(
+                json.dumps(
+                    {
+                        "result": "pass",
+                        "failure_category": None,
+                        "attempts": 1,
+                        "prompt_contract_version": "pure-1",
+                        "per_attempt": [
+                            {"agent_run_id": "v1", "model": "claude-opus-4-8", "usage": {"input_tokens": 500, "output_tokens": 30}}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    def test_collect_surfaces_executor_version_and_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._lay_out(repo)
+            meta = json.loads(
+                (repo / "workspace" / "orchestrations" / self.ORCH / "orchestration_meta.json").read_text()
+            )
+            out = collect_pure_leaf_ab_summary(repo, self.ORCH, meta)
+        self.assertTrue(out["available"])
+        self.assertEqual(out["generate_executor"], "pure")
+        self.assertEqual(out["agent_cli_version"], "1.2.3 (Claude Code)")
+        self.assertEqual(len(out["pure_nodes"]), 1)
+        node = out["pure_nodes"][0]
+        self.assertEqual(node["source_dir"], self.SRC)  # repo-relative
+        self.assertEqual(node["generate"]["usage_total"]["total_tokens"], 1300)
+        self.assertEqual(node["verify"]["result"], "pass")
+
+    def test_legacy_run_reports_unavailable_but_keeps_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._lay_out(repo, executor="legacy", with_metas=False)
+            meta = {"invocation": {"generate_executor": "legacy"}}
+            out = collect_pure_leaf_ab_summary(repo, self.ORCH, meta)
+        self.assertFalse(out["available"])
+        self.assertEqual(out["generate_executor"], "legacy")
+        self.assertEqual(out["pure_nodes"], [])
+
+    def test_audit_includes_pure_leaf_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._lay_out(repo)
+            result = audit(repo, self.ORCH)
+            self.assertIn("pure_leaf_ab_summary", result)
+            self.assertTrue(result["pure_leaf_ab_summary"]["available"])
+            md = _render_markdown(result)
+        self.assertIn("Pure-leaf A/B metrics (Z2)", md)
+        self.assertIn("generate-executor: `pure`", md)
+        self.assertIn("claude --version", md)
+        self.assertIn(self.SRC, md)
+
+    def test_discovers_failed_and_rotated_source_dirs_with_no_checkpoint_at_all(self) -> None:
+        # A terminally-failed generate is never checkpointed, and a cold restart
+        # rotates to a fresh source dir. Discovery must find BOTH from the pipeline
+        # reservation alone — this fixture writes NO orchestration_checkpoint.json,
+        # which is also the real shape of a generate-only run.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            root = repo / "workspace" / "orchestrations" / self.ORCH
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "preflight.json").write_text(
+                json.dumps({"backend": "claude", "agent_version": "9.9"}), encoding="utf-8"
+            )
+            self._reserve(repo)
+            # Two source dirs under the pipeline: a rotated failed attempt + the retry.
+            for sid, result, cat in (("src_001", "fail", "bundle_schema_violation"), ("src_002", "pass", None)):
+                sdir = repo / self.PIPE / "source" / sid
+                sdir.mkdir(parents=True, exist_ok=True)
+                (sdir / "bundle_meta.json").write_text(
+                    json.dumps(
+                        {
+                            "result": result,
+                            "failure_category": cat,
+                            "attempts": 2,
+                            "prompt_contract_version": "pure-1",
+                            "per_attempt": [
+                                {"agent_run_id": f"{sid}-a", "model": "m", "usage": {"input_tokens": 10, "output_tokens": 1}},
+                                {"agent_run_id": f"{sid}-b", "model": "m", "usage": {"input_tokens": 20, "output_tokens": 2}},
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            out = collect_pure_leaf_ab_summary(
+                repo, self.ORCH, {"invocation": {"generate_executor": "pure"}}
+            )
+        self.assertTrue(out["available"])
+        self.assertEqual(len(out["pure_nodes"]), 2)  # failed + retry both measured
+        results = {n["source_dir"].split("/")[-1]: n["generate"]["result"] for n in out["pure_nodes"]}
+        self.assertEqual(results, {"src_001": "fail", "src_002": "pass"})
+
+    def test_provenance_strings_are_stripped_not_just_validated(self) -> None:
+        # _clean_str must clean, not merely validate: these render inline into
+        # markdown, so surrounding whitespace would break the line.
+        from tools.audit_orchestration import _clean_str
+
+        self.assertEqual(_clean_str("  pure  "), "pure")
+        self.assertEqual(_clean_str("1.2.3 (Claude Code)\n"), "1.2.3 (Claude Code)")
+        self.assertIsNone(_clean_str("   "))  # whitespace-only is absent
+        self.assertIsNone(_clean_str(""))
+        self.assertIsNone(_clean_str(None))
+        self.assertIsNone(_clean_str(["pure"]))
+
+    def test_wrong_typed_provenance_reported_absent(self) -> None:
+        out = collect_pure_leaf_ab_summary(
+            Path("/nonexistent"),
+            "orch_x",
+            {"invocation": {"generate_executor": ["not", "a", "string"]}},
+        )
+        self.assertIsNone(out["generate_executor"])
+        self.assertIsNone(out["agent_cli_version"])
+
+    def test_traversal_reserved_pipeline_id_is_skipped(self) -> None:
+        # `reserved_ir_id` is JSON-sourced: a non-segment value would escape the
+        # pipeline root (`repo_root / "workspace/pipelines/<safe>" / "../.."`).
+        from tools.audit_orchestration import _pure_source_dirs_of
+
+        for bad in ("..", ".", "/abs", "a/b", "../evil", ""):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                self._reserve(repo, pipeline_id=bad)
+                dirs, refs = _pure_source_dirs_of(repo, self.ORCH)
+            self.assertEqual(dirs, [], f"{bad!r} must not be globbed")
+            # A rejected id must not count as "accepted" either, or the caller would
+            # misreport it as a benign not-yet-generated run.
+            self.assertEqual(refs, [], f"{bad!r} must not be an accepted ref")
+
+    def test_compile_only_run_is_not_reported_as_a_discovery_failure(self) -> None:
+        # A reserved pipeline whose source/ does not exist yet is the NORMAL state of a
+        # run stopped at Compile (and of a --with-deps dependency node when the TARGET
+        # stops at Compile — `dep_until_phase` follows the target). It must not be
+        # reported as a discovery failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "workspace" / "orchestrations" / self.ORCH).mkdir(parents=True)
+            self._reserve(repo)
+            (repo / self.PIPE).mkdir(parents=True)  # pipeline exists, no source/ yet
+            out = collect_pure_leaf_ab_summary(
+                repo, self.ORCH, {"invocation": {"generate_executor": "pure"}}
+            )
+        self.assertFalse(out["available"])
+        self.assertIn("Generate has not produced one", out["reason"])
+        self.assertNotIn("discovery found no node", out["reason"])
+
+    def test_generate_only_run_is_measured_without_any_checkpoint(self) -> None:
+        # REGRESSION: discovery previously read completed_steps[].pipeline_ref, which
+        # update_checkpoint only populates for the `validate` step — so the natural A/B
+        # command (`run_workflow.py <spec> generate --generate-executor pure`) measured
+        # NOTHING. This fixture writes no checkpoint at all, which is that run's shape.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._lay_out(repo)  # reservation + metas, no orchestration_checkpoint.json
+            ck = repo / "workspace" / "orchestrations" / self.ORCH / "orchestration_checkpoint.json"
+            self.assertFalse(ck.exists(), "fixture must have no checkpoint")
+            out = collect_pure_leaf_ab_summary(
+                repo, self.ORCH, {"invocation": {"generate_executor": "pure"}}
+            )
+        self.assertTrue(out["available"], "a generate-only pure run must still be measured")
+        self.assertEqual(len(out["pure_nodes"]), 1)
+        self.assertEqual(out["pure_nodes"][0]["generate"]["result"], "pass")
+
+    def test_codex_backend_version_is_not_labelled_claude(self) -> None:
+        # REGRESSION: `preflight.json#agent_version` holds whatever backend was probed
+        # (`_probe_codex_backend` runs `codex --version`). Labelling it "claude
+        # --version" reported false provenance on every codex orchestration — which
+        # this section still renders, since a codex node stays legacy even under
+        # --generate-executor pure.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            root = repo / "workspace" / "orchestrations" / self.ORCH
+            root.mkdir(parents=True)
+            (root / "preflight.json").write_text(
+                json.dumps({"backend": "codex", "agent_version": "codex-cli 0.9.1"}),
+                encoding="utf-8",
+            )
+            out = collect_pure_leaf_ab_summary(
+                repo, self.ORCH, {"invocation": {"generate_executor": "legacy"}}
+            )
+        self.assertEqual(out["backend"], "codex")
+        self.assertEqual(out["agent_cli_version"], "codex-cli 0.9.1")
+        lines: list[str] = []
+        _render_pure_leaf_ab(out, lines)
+        md = "\n".join(lines)
+        self.assertIn("codex --version: `codex-cli 0.9.1`", md)
+        self.assertNotIn("claude --version", md)  # the false-provenance label
+
+    def test_unrecorded_backend_does_not_claim_a_cli_name(self) -> None:
+        lines: list[str] = []
+        _render_pure_leaf_ab(
+            {"available": False, "generate_executor": "pure", "backend": None,
+             "agent_cli_version": None, "pure_nodes": []},
+            lines,
+        )
+        md = "\n".join(lines)
+        self.assertNotIn("claude --version", md)
+        self.assertNotIn("codex --version", md)
+        self.assertIn("unrecorded", md)
+
+    def test_legacy_source_dir_on_disk_is_filtered_out(self) -> None:
+        # The `found` filter must exclude a source dir that EXISTS but carries no
+        # pure metas (a legacy node under the same pipeline). The sibling
+        # legacy test can't pin this: it creates no source dir at all, so discovery
+        # returns nothing regardless of the filter — it would pass even with the
+        # filter deleted.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._lay_out(repo, executor="legacy", with_metas=False)
+            legacy_src = repo / self.PIPE / "source" / "src_legacy_001"
+            legacy_src.mkdir(parents=True)
+            (legacy_src / "src").mkdir()  # a real legacy source dir, no bundle/verdict meta
+            out = collect_pure_leaf_ab_summary(
+                repo, self.ORCH, {"invocation": {"generate_executor": "legacy"}}
+            )
+        self.assertFalse(out["available"], "a legacy source dir must not become a pure node")
+        self.assertEqual(out["pure_nodes"], [])
+        self.assertIn("no pure-leaf meta located", out["reason"])
+
+    def test_render_keeps_distinct_models_in_attempt_order(self) -> None:
+        # Dedup must be distinct-in-order (dict.fromkeys), not sorted(set(...)):
+        # a repair loop that switched models must render in the order it used them.
+        lines: list[str] = []
+        _render_pure_leaf_row(
+            "generate",
+            {
+                "found": True, "result": "pass", "attempts": 3, "repair_turns": 2,
+                "failure_category": None, "prompt_contract_version": "pure-1",
+                "usage_total": {"total_tokens": 1},
+                "models": ["zeta", "alpha", "zeta"],
+            },
+            lines,
+        )
+        md = "\n".join(lines)
+        self.assertIn("model(s): zeta, alpha", md)  # first-seen order, not alphabetical
+        self.assertNotIn("alpha, zeta", md)
+
+    def test_no_reservation_reports_discovery_reason(self) -> None:
+        # No pipeline reservation at all (prepare_node never ran): the one case where
+        # discovery genuinely could not proceed. Must be named, not rendered as an
+        # indistinguishable legacy-looking zero.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "workspace" / "orchestrations" / self.ORCH).mkdir(parents=True)
+            out = collect_pure_leaf_ab_summary(
+                repo, self.ORCH, {"invocation": {"generate_executor": "pure"}}
+            )
+        self.assertFalse(out["available"])
+        self.assertIn("no pipeline reservation", out["reason"])
+        lines: list[str] = []
+        _render_pure_leaf_ab(out, lines)
+        md = "\n".join(lines)
+        # Must not claim "legacy/agentic run" while the executor line says pure.
+        self.assertNotIn("legacy/agentic run", md)
+        self.assertIn("no pipeline reservation", md)
+
+    def test_render_collapses_repeated_model_and_shows_contract(self) -> None:
+        lines: list[str] = []
+        _render_pure_leaf_ab(
+            {
+                "available": True,
+                "generate_executor": "pure",
+                "backend": "claude", "agent_cli_version": "1.0",
+                "pure_nodes": [
+                    {
+                        "source_dir": "p/source/s1",
+                        "generate": {
+                            "found": True, "result": "pass", "attempts": 3, "repair_turns": 2,
+                            "failure_category": None, "prompt_contract_version": "pure-1",
+                            "usage_total": {"input_tokens": 1, "output_tokens": 2,
+                                            "cache_read_input_tokens": 3,
+                                            "cache_creation_input_tokens": 4, "total_tokens": 10},
+                            "models": ["m-a", "m-a", "m-a"],
+                        },
+                        "verify": {"found": False},
+                    }
+                ],
+            },
+            lines,
+        )
+        md = "\n".join(lines)
+        self.assertIn("model(s): m-a", md)
+        self.assertNotIn("m-a, m-a", md)  # repeated alias collapsed
+        self.assertIn("contract=`pure-1`", md)
+        self.assertIn("cache_creation 4", md)  # reconciles with total 10
+        self.assertIn("no verify meta recorded", md)  # not "not a pure leaf"
+
+    def test_unrecognized_executor_is_flagged_not_read_as_legacy(self) -> None:
+        # A corrupt/typo'd executor must not be silently classified as legacy: the
+        # hint branches on the exact value, so an unknown one gets its own wording
+        # plus a warning. The recorded value is still shown verbatim.
+        lines: list[str] = []
+        _render_pure_leaf_ab(
+            {"available": False, "generate_executor": "purre",
+             "backend": "claude", "agent_cli_version": "1.0", "pure_nodes": []},
+            lines,
+        )
+        md = "\n".join(lines)
+        self.assertIn("generate-executor: `purre`", md)  # verbatim, not corrected
+        self.assertIn("unrecognized executor value", md)
+        self.assertNotIn("legacy/agentic run", md)
+
+    def test_unrecorded_executor_does_not_claim_legacy(self) -> None:
+        lines: list[str] = []
+        _render_pure_leaf_ab(
+            {"available": False, "generate_executor": None,
+             "backend": "claude", "agent_cli_version": None, "pure_nodes": []},
+            lines,
+        )
+        md = "\n".join(lines)
+        self.assertIn("generate-executor: `unknown`", md)
+        self.assertNotIn("legacy/agentic run", md)
+        self.assertNotIn("unrecognized executor value", md)  # absent != invalid
+
+    def test_render_legacy_notes_no_pure_node(self) -> None:
+        lines: list[str] = []
+        _render_pure_leaf_ab(
+            {"available": False, "generate_executor": "legacy", "backend": "claude", "agent_cli_version": None, "pure_nodes": []},
+            lines,
+        )
+        md = "\n".join(lines)
+        self.assertIn("no pure-leaf node located", md)
+        self.assertIn("unrecorded", md)
 
 
 if __name__ == "__main__":
