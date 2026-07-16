@@ -2679,7 +2679,14 @@ clean:
             target = str(repair.get("repair_target_agent_run_id", "")).strip()
             if target and target != "none" and self._claude_session_resumable(target):
                 resume_session_id = target
-                last_excerpt = str(repair.get("repair_findings", "")).strip() or None
+                # The outer-reopen excerpt is threaded into the first repair turn's
+                # `repair_findings` (a UTF-8-persisted prompt). Its writers under the pure executor
+                # (bundle_meta / source_meta) are already surrogate-safe, so this is safe by that
+                # invariant today; normalize at capture anyway so the seed is safe by construction
+                # (identity on clean text) rather than relying on every upstream writer staying so.
+                seed = str(repair.get("repair_findings", "")).strip() or None
+                last_excerpt = (seed.encode("utf-8", "backslashreplace").decode("utf-8")
+                                if seed is not None else None)
         attempt = 0
         while True:
             child_arid = self.new_agent_run_id()
@@ -2768,17 +2775,45 @@ clean:
                     if result is not None:
                         category, findings = result
                     else:
-                        accepted_doc = extracted
+                        # A bundle can pass every content layer yet not be persistable:
+                        # `json.loads` accepts a lone surrogate (e.g. `"\ud800"` inside a
+                        # files[].content or a metadata string), but UTF-8-encoding it to author
+                        # codegen_bundle.json / src/<file> (`_write_pure_bundle_artifacts`,
+                        # ensure_ascii=False) raises. Catch that HERE as a schema violation
+                        # (repairable — the producer re-emits valid text) rather than accepting it
+                        # and letting the later host-write raise, which the pass branch's except
+                        # would mis-route through pure_host_write_failed (a transport fail_closed)
+                        # instead of a bounded repair. Mirrors the verify reviewer's check.
+                        try:
+                            json.dumps(extracted, ensure_ascii=False).encode("utf-8")
+                        except UnicodeEncodeError:
+                            category = "bundle_schema_violation"
+                            findings = ("the bundle contains characters that cannot be encoded as "
+                                        "UTF-8 (e.g. an unpaired surrogate); re-emit the bundle "
+                                        "with valid text")
+                        else:
+                            accepted_doc = extracted
 
             status = "pass" if category is None else "fail"
             if status != "pass":
                 last_category = category
-                last_excerpt = findings
                 # Carry the prior document into a cold-fallback repair: re-serialize the parsed
                 # bundle (even though it failed validation), else the raw reply text.
                 prior_document = (json.dumps(parsed_bundle, indent=2, ensure_ascii=False)
                                   if parsed_bundle is not None
                                   else (envelope.result if isinstance(envelope.result, str) else None))
+                # Both `last_excerpt` (-> the repair turn's `repair_findings` AND bundle_meta's
+                # failure_excerpt) and `prior_document` (-> the cold-fallback repair prompt) are
+                # echoed into a request/meta persisted as UTF-8. Leaf-derived text can carry an
+                # unpaired surrogate (the encodability case caught above, or a raw reply the CLI
+                # passed through), which would raise UnicodeEncodeError at that write — a crash
+                # instead of a repair turn / fail_closed. Normalize any non-encodable code point to
+                # its readable backslash escape at capture so every downstream write is safe by
+                # construction. Mirrors the verify reviewer.
+                last_excerpt = (findings.encode("utf-8", "backslashreplace").decode("utf-8")
+                                if findings is not None else None)
+                if prior_document is not None:
+                    prior_document = prior_document.encode("utf-8", "backslashreplace").decode("utf-8")
 
             reply = (f"status: {status}\nleaf rc={proc.returncode}\n"
                      f"category: {category or 'none'}")
@@ -2838,10 +2873,25 @@ clean:
             if not can_repair:
                 # Terminal: record bundle_meta with the last category/excerpt for the outer
                 # route (_read_repair_findings). Tombstone the superseded producer attempts so a
-                # later completion vouch does not trip on the un-vouched arids.
-                self._write_bundle_meta(
-                    refs, result="fail", failure_category=last_category,
-                    failure_excerpt=last_excerpt, attempts=attempt + 1, per_attempt=per_attempt)
+                # later completion vouch does not trip on the un-vouched arids. The bundle_meta
+                # write is the LAST host action here; it can still fail (ENOSPC, or a
+                # leaf-controlled failure_excerpt that is not UTF-8 encodable), so guard it the
+                # same way the pass path guards its writes — a host-write failure must recover as a
+                # fail_closed transport outcome, never escape run_substep uncaught and crash the
+                # conductor. Mirrors the verify reviewer's exhaustion guard.
+                try:
+                    self._write_bundle_meta(
+                        refs, result="fail", failure_category=last_category,
+                        failure_excerpt=last_excerpt, attempts=attempt + 1, per_attempt=per_attempt)
+                except Exception as exc:  # noqa: BLE001 — any host-write failure must recover
+                    if attempt > 0:
+                        self._add_superseded_run_ids(
+                            [a["agent_run_id"] for a in per_attempt[:-1]],
+                            reason=f"pure_host_write_failed_superseded: {type(exc).__name__}")
+                    return SubstepOutcome(
+                        child_arid, "fail", [], 1,
+                        ("pure_host_write_failed", f"{type(exc).__name__}: {exc}"),
+                        launched_at, attempt + 1)
                 if attempt > 0:
                     self._add_superseded_run_ids(
                         [a["agent_run_id"] for a in per_attempt[:-1]],

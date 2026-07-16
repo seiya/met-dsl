@@ -369,6 +369,99 @@ class PureProducerSubstepTests(unittest.TestCase):
             self.assertNotEqual(json.loads((base / "bundle_meta.json").read_text())["result"],
                                 "pass")
 
+    def test_unencodable_valid_bundle_is_schema_violation_not_transport(self) -> None:
+        # M-D2 (D1 mirror of the verify reviewer): a bundle that passes every content layer but
+        # carries a lone surrogate in a files[].content is not UTF-8 persistable. It must be caught
+        # BEFORE accept as a schema violation (repairable, routable via the bundle table) — NOT
+        # accepted and then mis-routed through the pass branch's host-write/transport recovery.
+        bad = _valid_bundle()
+        bad["files"][0]["content"] += "\ud800"
+        c, refs, oc = self._run([_envelope(bad)])  # persistently unencodable -> exhaustion
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.leaf_returncode, 0)          # routable, NOT a transport fail_closed
+        base = c.repo_root / refs.source_dir()
+        # Never accepted => no bundle artifacts authored.
+        self.assertFalse((base / "codegen_bundle.json").exists())
+        meta = json.loads((base / "bundle_meta.json").read_text())
+        self.assertEqual(meta["failure_category"], "bundle_schema_violation")
+
+    def test_bundle_meta_write_failure_on_exhaustion_recovers(self) -> None:
+        # M-D2 (D2 mirror of the verify reviewer): the exhaustion-path bundle_meta write must be
+        # guarded like the pass path — a host-write failure (ENOSPC, or a non-encodable excerpt)
+        # recovers as a fail_closed transport outcome, never an uncaught exception escaping
+        # run_substep and crashing the conductor.
+        class _C(_PureFakeConductor):
+            def _write_bundle_meta(self, *a, **k):  # type: ignore[override]
+                raise OSError(28, "No space left on device")
+        self._tmp = tempfile.TemporaryDirectory()
+        repo = Path(self._tmp.name)
+        refs = _write_node(repo)
+        (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
+        c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
+               backend="claude", env={}, generate_executor="pure")
+        bad = _valid_bundle()
+        del bad["capability_requirements"]  # persistently schema-invalid -> exhaustion
+        c.envelopes = [_envelope(bad)]
+        oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+        self.assertEqual(oc.status, "fail")
+        self.assertNotEqual(oc.leaf_returncode, 0)
+        self.assertEqual(oc.infra_error[0], "pure_host_write_failed")
+
+
+# ======================================================================================
+# M-D2: producer cold-fallback / capture-time surrogate safety (verify-side mirror)
+# ======================================================================================
+class PureProducerColdFallbackSurrogateTests(unittest.TestCase):
+    def test_cold_fallback_repair_with_surrogate_does_not_crash(self) -> None:
+        # M-D2 (G1 mirror): a bundle carrying an unpaired surrogate goes to the
+        # bundle_schema_violation repair path; on a COLD fallback (session not resumable) its
+        # prior_document is echoed into the repair prompt that record_launch writes as UTF-8. It
+        # must be normalized so the write does not raise UnicodeEncodeError mid-repair.
+        class _C(_PureFakeConductor):
+            def _claude_session_resumable(self, arid):  # type: ignore[override]
+                return False  # force the cold-fallback repair branch on every turn
+            def record_launch(self, child_arid, request):  # type: ignore[override]
+                # Emulate the real record_launch's UTF-8 prompt persistence to surface any
+                # non-encodable prior_document as the real path would.
+                json.dumps(request, ensure_ascii=False).encode("utf-8")
+                return {"launch_prompt_text": "PROMPT"}
+        bad = _valid_bundle()
+        bad["files"][0]["content"] += "\ud800"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
+            c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
+                   backend="claude", env={}, generate_executor="pure")
+            c.envelopes = [_envelope(bad)]
+            oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())  # must not raise
+            self.assertEqual(oc.status, "fail")
+
+    def test_surrogate_in_findings_does_not_crash_repair_or_meta(self) -> None:
+        # M-D2 (G3 mirror): `last_excerpt` (findings) flows into both the repair turn's
+        # repair_findings AND bundle_meta's failure_excerpt, both persisted as UTF-8. Capture-time
+        # normalization must keep every downstream write from raising even if a violation message
+        # ever carried a lone surrogate. Force it by making the validator emit one.
+        class _C(_PureFakeConductor):
+            def _pure_bundle_violations(self, refs, doc):  # type: ignore[override]
+                return ("bundle_schema_violation", "bad field value \ud800 here")
+            def record_launch(self, child_arid, request):  # type: ignore[override]
+                json.dumps(request, ensure_ascii=False).encode("utf-8")  # emulate prompt persist
+                return {"launch_prompt_text": "PROMPT"}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
+            c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
+                   backend="claude", env={}, generate_executor="pure")
+            c.envelopes = [_envelope(_valid_bundle())]  # valid doc; validator forces the violation
+            oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())  # must not raise
+            self.assertEqual(oc.status, "fail")
+            # bundle_meta persisted cleanly (excerpt normalized), and its write did not fail_close.
+            meta = json.loads((c.repo_root / refs.source_dir() / "bundle_meta.json").read_text())
+            self.assertEqual(meta["failure_category"], "bundle_schema_violation")
+            self.assertEqual(oc.leaf_returncode, 0)   # NOT a host-write fail_close
+
 
 # ======================================================================================
 # build_launch_request pure variant
