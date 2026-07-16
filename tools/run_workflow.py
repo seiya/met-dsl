@@ -865,6 +865,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--llm", default=None, choices=SUPPORTED_LLMS)
     parser.add_argument("--llm-command", help="Override backend command used by preflight and optional launch.")
     parser.add_argument(
+        "--generate-executor",
+        choices=("legacy", "pure"),
+        default=None,
+        help=(
+            "Z2 generate-phase executor: 'legacy' (the agentic generate.generate leaf) or "
+            "'pure' (the host-mediated CodegenBundle producer). Defaults to legacy (or "
+            "METDSL_GENERATE_EXECUTOR). NOTE: 'pure' is not yet selectable — it requires the "
+            "verify-persona migration (Z2 M-D); selecting it errors until then."
+        ),
+    )
+    parser.add_argument(
         "--agent-model",
         default=None,
         help=(
@@ -956,6 +967,51 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     repo_root = Path(args.repo_root).resolve()
+
+    # Z2 generate-executor selection. Threaded to the conductor via env
+    # (METDSL_GENERATE_EXECUTOR, restored with the rest of the environment on resume). The
+    # explicit flag wins over the env var. `pure` is inert in M-C: the pure producer path
+    # exists and is unit-driven, but a full pure generate phase needs the verify persona
+    # (M-D), so selecting it errors here rather than running a producer whose verify half is
+    # still the legacy leaf.
+    generate_executor = (
+        args.generate_executor or os.environ.get("METDSL_GENERATE_EXECUTOR") or "legacy"
+    ).strip().lower() or "legacy"
+    # argparse's `choices` guards only the flag; a value from METDSL_GENERATE_EXECUTOR bypasses
+    # it. Validate the resolved value against the SAME set so a typo (e.g. `pur`) fails loudly
+    # here rather than falling through to the legacy path — `_pure_leaf_substep` matches only the
+    # exact literal `pure`, so an unrecognized value would silently run an unintended executor.
+    if generate_executor not in {"legacy", "pure"}:
+        print(
+            json.dumps(
+                {
+                    "status": "fail",
+                    "reason": "generate_executor_invalid",
+                    "detail": (
+                        f"generate-executor must be 'legacy' or 'pure'; got "
+                        f"{generate_executor!r} (from METDSL_GENERATE_EXECUTOR or --generate-executor)"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+    if generate_executor == "pure":
+        print(
+            json.dumps(
+                {
+                    "status": "fail",
+                    "reason": "generate_executor_pure_unavailable",
+                    "detail": (
+                        "--generate-executor pure is not available until the verify persona "
+                        "is migrated (Z2 M-D); only 'legacy' is selectable"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+    os.environ["METDSL_GENERATE_EXECUTOR"] = generate_executor
 
     # Resolve effective startup inputs. With --resume, omitted spec_ref /
     # until_phase / --llm / --mode are recovered from the target orchestration's

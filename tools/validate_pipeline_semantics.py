@@ -8958,6 +8958,23 @@ def _validate_orchestration_hierarchy(
                                                 f"profile write_roots must be [] (got "
                                                 f"{sbx_doc.get('write_roots')!r})"
                                             )
+                                    # (5) M-C 修正2 mirror: a PASSING pure terminal row carries an
+                                    # output_refs of EXACTLY [] (the host writes the bundle artifacts
+                                    # after the child window; a pure leaf holds no write authority). A
+                                    # non-empty output_refs is forged provenance, and a MISSING field
+                                    # is not "empty" either — a tampered record that drops it must be
+                                    # rejected, not waved through. The same exact-[] invariant
+                                    # _validate_terminal_run_payload enforces at record time, re-audited
+                                    # here for a persisted record.
+                                    if str(item.get("status", "")).strip().lower() == "pass":
+                                        pure_orefs = item.get("output_refs")
+                                        if pure_orefs != []:
+                                            violations.append(
+                                                f"{runs_path}:line {idx + 1} pure pass row must have "
+                                                f"output_refs of exactly [] (the host writes bundle "
+                                                f"artifacts after the child window; got "
+                                                f"{pure_orefs!r})"
+                                            )
 
                     for key in ("agent_result_ref", "agent_summary_ref"):
                         agent_ref = item.get(key)
@@ -10483,6 +10500,156 @@ def _latest_source_id(pipeline_dir: Path) -> str | None:
     return latest_name
 
 
+def _pure_gate_build_graph_inputs(
+    repo_root: Path, ir_ref: str | None, ir: dict[str, Any], node_key: str
+) -> tuple[dict[str, str], tuple[str, ...], dict[str, list[str]]]:
+    """(toolchain, dependency_closure, dependency_edges) for the tamper gate's assembly check.
+
+    Mirrors `workflow_conductor._read_toolchain` + `_dependency_closure_nodes` +
+    `_build_pure_bundle_graph`'s edge derivation from the SAME dependency sidecar, so the graph
+    the gate assembles is the graph the producer's acceptance built. The L6 spec_id-clash raise
+    of `_dependency_closure_nodes` is not replicated: at gate time the closure is identical to
+    the accepted production closure (same sidecar), so it cannot introduce a new clash — only a
+    tampered bundle's own files can collide, which `derive_build_graph` itself detects."""
+    impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+    tc = (impl.get("toolchain") or {}) if isinstance(impl, dict) else {}
+    target = (impl.get("target") or {}) if isinstance(impl, dict) else {}
+    toolchain = {
+        "language": str(tc.get("language") or "fortran").lower(),
+        "standard": str(tc.get("standard") or "f2008").lower(),
+        "build_system": str(tc.get("build_system") or "make").lower(),
+        "backend": str(target.get("backend") or "").lower(),
+    }
+    if str(tc.get("compiler") or "").strip():
+        toolchain["compiler"] = str(tc.get("compiler")).strip()
+    sidecar = _read_dependency_graph_sidecar(repo_root, ir_ref) or {}
+    all_nodes = sidecar.get("all_nodes") if isinstance(sidecar, dict) else None
+    levels: dict[str, int] = {}
+    closure: list[str] = []
+    edges: dict[str, list[str]] = {}
+    for entry in all_nodes or []:
+        if not (isinstance(entry, dict) and isinstance(entry.get("node_key"), str)):
+            continue
+        nk = entry["node_key"].strip()
+        deps = [d.get("node_key") if isinstance(d, dict) else d
+                for d in (entry.get("direct_deps") or [])]
+        edges[nk] = [d for d in deps if isinstance(d, str)]
+        if nk and nk != node_key and nk not in levels:
+            levels[nk] = entry.get("topo_level") or 0
+            closure.append(nk)
+    closure.sort(key=lambda n: levels.get(n, 0))
+    return toolchain, tuple(closure), edges
+
+
+def _validate_post_generate_bundle(
+    repo_root: Path, gen_dir: Path, node_key: str, ir_ref: str | None, violations: list[str]
+) -> None:
+    """Z2 pure producer (M-C): when the source dir carries a host-written `codegen_bundle.json`,
+    re-check the bundle the host accepted against the same contract at the deterministic
+    post_generate gate — proof-of-work independent of the producer's own in-conversation
+    validation, and a tamper check that the staged source is exactly what the bundle declared.
+
+    Fires ONLY when `codegen_bundle.json` exists (the legacy leaf-authored source tree has none),
+    so it is inert on every legacy node. Re-runs the FULL host acceptance contract
+    (`codegen_bundle.pure_bundle_contract_violation`: schema + single-node shape + harness
+    capability negotiation + IR state bindings + M3c model/checks names + assembly-graph
+    collisions) — the SAME layers the producer accepted, reconstructed from the IR + dependency
+    sidecar — so a post-write edit that stays schema-valid (e.g. swapping in an unsupported
+    `capability_requirements`) cannot slip past a validator that only re-ran `validate_bundle`.
+    Then verifies every declared `files[]` entry exists on disk with byte-identical content (a
+    post-write mutation is a violation), with no UNDECLARED `.f90` staged beyond the host glue
+    (`<spec_id>_runner.f90`)."""
+    bundle_path = gen_dir / "codegen_bundle.json"
+    if not bundle_path.exists():
+        return
+    from tools.codegen_bundle import (
+        pure_bundle_contract_violation, harness_provided_capabilities, derive_build_graph)
+    try:
+        doc = _read_json(bundle_path)
+    except json.JSONDecodeError:
+        violations.append(f"{bundle_path}: invalid json")
+        return
+    if not isinstance(doc, dict):
+        violations.append(f"{bundle_path}: must be a JSON object")
+        return
+    spec_id = node_key.split("/", 1)[1].split("@", 1)[0] if "/" in node_key else ""
+    # Reconstruct the acceptance inputs (harness capabilities, IR state vars, build graph) from
+    # the IR + dependency sidecar so the tamper gate re-runs the producer's FULL contract, not
+    # just schema re-validation.
+    ir = _read_yaml(repo_root / ir_ref / "spec.ir.yaml") if ir_ref else {}
+    if not isinstance(ir, dict):
+        ir = {}
+    infra = _infra_direct_dep_node_keys(ir)
+    harness_nk = infra[0] if len(infra) == 1 else None
+    provided = harness_provided_capabilities(harness_nk) if harness_nk else None
+    algorithm = (ir.get("algorithm") or {}) if isinstance(ir, dict) else {}
+    toolchain, closure, edges = _pure_gate_build_graph_inputs(repo_root, ir_ref, ir, node_key)
+
+    def _build_graph(d: Any) -> Any:
+        return derive_build_graph(
+            d, dependency_closure=closure, toolchain=toolchain,
+            host_glue_sources=(f"{spec_id}_runner.f90",),
+            dependency_edges=edges or None)
+
+    contract = pure_bundle_contract_violation(
+        doc, node_key=node_key, spec_id=spec_id,
+        ir_state_variables=(algorithm.get("state_variables") or []),
+        harness_provided=provided, harness_label=harness_nk, build_graph=_build_graph)
+    if contract is not None:
+        violations.append(
+            f"{bundle_path}: host acceptance contract re-check failed ({contract[0]}): "
+            f"{contract[1]}")
+        return
+    files = [e for e in (doc.get("files") or []) if isinstance(e, dict)]
+    src_dir = gen_dir / "src"
+    src_root = src_dir.resolve()
+    declared: set[str] = set()
+    for entry in files:
+        logical = str(entry.get("logical_path") or "")
+        content = entry.get("content")
+        if not logical or not isinstance(content, str):
+            continue
+        declared.add(logical.casefold())
+        disk = src_dir / logical
+        # `validate_bundle` above already rejected any `..` / absolute logical_path (this
+        # returns on its violations), so `disk` is inside src/; the containment check is
+        # belt-and-suspenders against a validator bypass on a tampered bundle.
+        if not disk.resolve().is_relative_to(src_root):
+            violations.append(f"{disk}: logical_path escapes the source tree")
+            continue
+        if not disk.exists():
+            violations.append(f"{disk}: declared by codegen_bundle but not staged")
+            continue
+        try:
+            # Byte comparison (not read_text): avoids a UnicodeDecodeError crash on a tampered
+            # binary file (UnicodeDecodeError is a ValueError, NOT an OSError) and sidesteps
+            # read_text's universal-newline translation, which would false-flag a CRLF file.
+            if disk.read_bytes() != content.encode("utf-8"):
+                violations.append(
+                    f"{disk}: staged content differs from codegen_bundle.files[] (post-write tamper)")
+        except OSError as exc:
+            violations.append(f"{disk}: unreadable ({exc})")
+    # No UNDECLARED .f90 beyond the single host-rendered runner glue. Match the suffix
+    # case-INSENSITIVELY: `rglob("*.f90")` misses an uppercase `extra.F90` on a case-sensitive
+    # filesystem, which would let an undeclared Fortran source slip past this provenance check
+    # while the rest of the gate treats suffixes case-insensitively.
+    allowed_extra = {f"{spec_id}_runner.f90".casefold()}
+    if src_dir.is_dir():
+        f90_paths = [p for p in src_dir.rglob("*")
+                     if p.is_file() and p.suffix.lower() == ".f90"]
+        for path in sorted(f90_paths):
+            try:
+                rel = str(path.relative_to(src_dir)).replace("\\", "/").casefold()
+            except ValueError:
+                # rglob followed a symlink out of the tree — an undeclared escape, flag it.
+                violations.append(f"{path}: staged file escapes the source tree")
+                continue
+            if rel not in declared and rel not in allowed_extra:
+                violations.append(
+                    f"{path}: undeclared .f90 staged (not in codegen_bundle.files[] nor the "
+                    "host-rendered runner glue)")
+
+
 def validate_post_generate_stage(
     repo_root: Path,
     workspace_root: str,
@@ -10550,6 +10717,9 @@ def _validate_post_generate_stage_impl(
     )
 
     gen_dir = pipeline_dir / "source" / gen_id
+    # Z2 pure producer: re-validate + tamper-check a host-written CodegenBundle (inert when
+    # absent, i.e. on every legacy node).
+    _validate_post_generate_bundle(repo_root, gen_dir, node_key, ir_ref, violations)
     meta_path = gen_dir / "source_meta.json"
     if meta_path.exists():
         try:

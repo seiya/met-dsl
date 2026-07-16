@@ -300,6 +300,30 @@ VALIDATE_EXECUTE_REASON_PREFIX = "validate_execute_"
 # is exactly what a warm repair fixes.
 HOST_RENDERED_RUNNER_UNREPAIRABLE: frozenset[str] = frozenset({"snapshot_deliverable_gap"})
 
+# --- Z2 pure-leaf CodegenBundle producer routing (M-C) -------------------------
+# The pure `generate.generate` producer returns exactly one CodegenBundle JSON document;
+# the host validates it (transport parse, `validate_bundle`, assembly preflight) and repairs
+# a violation in a bounded in-conversation warm-resume loop (MAX_BUNDLE_REPAIR_TURNS,
+# `tools/pure_leaf`). Only when that budget is exhausted does the substep fail with the
+# terminal category recorded in `bundle_meta.json#failure_category`; run_phase then routes it
+# here. Every category is a defect in the model's returned document, so the route is a fresh
+# (generate, generate) attempt with a warm reuse repair — the same "this phase's own producer"
+# recovery the deterministic-gate tables use. The route reason is `<prefix><category>`, so
+# `_read_repair_findings` threads `bundle_meta.json#failure_excerpt` through the repair.
+GENERATE_BUNDLE_REASON_PREFIX = "generate_bundle_"
+GENERATE_BUNDLE_FAILURE_CATEGORIES: tuple[str, ...] = (
+    "pure_response_unparseable",
+    "pure_response_truncated",
+    "bundle_schema_violation",
+    "bundle_capability_unsatisfied",
+    "bundle_state_binding_mismatch",
+    "bundle_assembly_collision",
+    "bundle_shape_unsupported",
+)
+GENERATE_BUNDLE_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+    category: ("generate", "reuse") for category in GENERATE_BUNDLE_FAILURE_CATEGORIES
+}
+
 # Validate.judge (failure_class, attribution) -> routing action.
 # Action is one of:
 #   ("generate", strategy) | ("compile", "reopen") | ("validate", "re_execute")
@@ -865,6 +889,8 @@ def build_launch_request(
     resolved_dependencies: tuple[dict[str, str], ...] = (),
     exemplar: dict[str, Any] | None = None,
     warm_resume: bool = False,
+    pure_leaf: bool = False,
+    pure_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Construct the record-launch --request-json payload for one substep.
 
@@ -1190,6 +1216,25 @@ def build_launch_request(
             and str(rep.get("repair_findings", "")).strip()):
         req["warm_resume"] = True
         req["skill_must_read_refs"] = ""
+    # Z2 pure-function producer variant (M-C): the leaf is a host-mediated pure function with no
+    # write authority, so it carries `leaf_mode=pure`, the exact transport contract version, the
+    # host-assembled `pure_context` (each inlined document a data-fenced string), and EMPTY
+    # write/skill fields. `allowed_output_paths` is forced empty (the host writes files[] + the
+    # bundle + the Makefile AFTER the child window closes — see run_substep's pure branch), and
+    # the three skill fields are emptied (no SKILL is read). Applied LAST so it overrides the
+    # generate branch's leaf-authored output set. On a warm-resume repair the resumed session
+    # already holds the context, so pure_context is omitted (the validator exempts it for a
+    # warm+reuse+findings request); a cold launch/fallback carries it.
+    if pure_leaf:
+        from tools.pure_leaf import PURE_LEAF_MODE, PURE_PROMPT_CONTRACT_VERSION
+        req["leaf_mode"] = PURE_LEAF_MODE
+        req["prompt_contract_version"] = PURE_PROMPT_CONTRACT_VERSION
+        req["allowed_output_paths"] = []
+        req["skill_name"] = ""
+        req["skill_ref"] = ""
+        req["skill_must_read_refs"] = ""
+        if pure_context is not None:
+            req["pure_context"] = dict(pure_context)
     return req
 
 
@@ -1472,6 +1517,12 @@ class Conductor:
     # The resolved backend command (may be a wrapper with flags, e.g. from
     # --llm-command); empty falls back to the bare backend name.
     llm_command: str = ""
+    # Z2 generate-phase executor: "legacy" (the agentic `generate.generate` leaf) or "pure"
+    # (the host-mediated CodegenBundle producer). Defaults to legacy; run_workflow flips it via
+    # `--generate-executor` / `METDSL_GENERATE_EXECUTOR`. `_pure_leaf_substep` gates the pure
+    # path on this AND backend==claude AND the node's M3c shape, so an unmigrated (non-M3c /
+    # codex) node stays legacy even under executor=pure.
+    generate_executor: str = "legacy"
 
     def emit(self, event: str, **fields: Any) -> None:
         """Write one JSONL info event to stdout (the conductor runs in-process
@@ -1688,13 +1739,14 @@ class Conductor:
         resume_session_id: str | None = None,
         child_arid: str | None = None,
         profile: dict[str, Any] | None = None,
+        pure: bool = False,
     ) -> ProcResult:
         # Host-certify the codex hooks feature into the leaf-unwritable cache before the
         # codex leaf launches (the in-sandbox hook reads it read-only; see
         # _ensure_codex_feature_cache). Memoized; no-op for claude.
         self._ensure_codex_feature_cache()
         argv = self.leaf_command(
-            prompt_text, session_id=session_id, resume_session_id=resume_session_id)
+            prompt_text, session_id=session_id, resume_session_id=resume_session_id, pure=pure)
         # Wrap the leaf in the bwrap sandbox that record-launch already built (repo
         # read-only; writes confined to the child's write_roots + workspace/tmp).
         # record-launch records sandbox_enforced=True for every backend, so applying it
@@ -1928,6 +1980,27 @@ class Conductor:
         if str(meta.get("spec_kind") or "").strip() == "infrastructure":
             return False
         return len(self._infra_direct_deps(ir)) == 1
+
+    def _pure_leaf_substep(self, refs: NodeRefs, phase: str, substep: str | None) -> bool:
+        """True when this substep runs as a Z2 host-mediated pure-function leaf.
+
+        Gated on the executor selection (`generate_executor == "pure"`), the claude backend
+        (the ONLY pure producer; codex fail-closes in `leaf_command`), and the node's M3c shape
+        (`_conductor_authors_makefile` ∧ `_conductor_authors_runner`) — the shape the
+        CodegenBundle v1 producer can express (the leaf authors model+checks; the host renders
+        the runner glue + the Makefile). A non-M3c node (harness self-test, c/cpp/mixed, a
+        physics node with no infra dep) has no bundle representation for its runner, so it stays
+        on the legacy agentic leaf even under executor=pure (a residual, per the plan).
+
+        M-C migrates ONLY the producer `(generate, generate)`; `generate.verify` stays legacy
+        until M-D, so a pure-executor run does a pure producer followed by an agentic verify.
+        Deterministic generate substeps (lint/syntax/static) are never pure — they run
+        in-process regardless."""
+        if self.generate_executor != "pure" or self.backend != "claude":
+            return False
+        if (phase, substep) != ("generate", "generate"):
+            return False
+        return self._conductor_authors_makefile(refs) and self._conductor_authors_runner(refs)
 
     @staticmethod
     def _infra_direct_deps(ir: dict[str, Any]) -> list[str]:
@@ -2295,6 +2368,457 @@ clean:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(template, encoding="utf-8")
 
+    # -- Z2 pure-function CodegenBundle producer (M-C) ------------------------
+    # The pure `generate.generate` producer returns one CodegenBundle JSON document; the host
+    # validates it, assembles it against the IR + the certified harness, and writes the files +
+    # the derived Makefile. The leaf holds no write authority, so every artifact is host-written
+    # AFTER the child window closes (finalize_child). The methods below are the host side of
+    # that channel: context assembly, bundle validation + assembly preflight, artifact writes,
+    # and the bundle-derived Makefile. Gated by `_pure_leaf_substep`; unreachable on the legacy
+    # path (existing suite green proves legacy is byte-for-byte unchanged).
+
+    def _build_pure_context(self, refs: NodeRefs) -> dict[str, str]:
+        """Assemble the closed context a pure `generate.generate` leaf sees, each value a plain
+        string the renderer data-fences. All data is host-resolved from disk here (the leaf has
+        no filesystem): the harness capability manifest (A6), the node's toolchain/target
+        defaults, the lowered IR, and the tests. Mirrors the must-read set the legacy
+        `generate.generate` leaf reads, minus controlled_spec.md (phase_02 §2-1 forbids it as a
+        generate input)."""
+        from tools.codegen_bundle import harness_capability_manifest_document
+        ir_text = ""
+        ir_path = self.repo_root / refs.ir_ref / "spec.ir.yaml"
+        try:
+            ir_text = ir_path.read_text(encoding="utf-8")
+        except OSError:
+            ir_text = ""
+        tests_text = ""
+        try:
+            tests_text = (self.repo_root / refs.spec_path / "tests.md").read_text(encoding="utf-8")
+        except OSError:
+            tests_text = ""
+        ir = _read_yaml(ir_path) or {}
+        impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        return {
+            "harness_capabilities": json.dumps(
+                harness_capability_manifest_document(), indent=2, ensure_ascii=False),
+            "target_profile": json.dumps(impl, indent=2, ensure_ascii=False),
+            "ir_document": ir_text,
+            "tests_document": tests_text,
+        }
+
+    def _pure_bundle_violations(self, refs: NodeRefs,
+                                doc: Any) -> tuple[str, str] | None:
+        """Validate + assembly-preflight a producer's CodegenBundle. Returns None for a clean
+        bundle, else `(failure_category, findings_text)` for the bounded repair / bundle_meta.
+
+        Fail-closed layers, in order (each stops at the first that fails so one defect is one
+        report): `validate_bundle` (schema + cross-field invariants) -> single-node unit shape
+        -> harness capability negotiation (the manifest MUST exist — an undeclared harness
+        satisfies nothing) -> state_variable ∈ IR algorithm.state_variables -> the M3c literal
+        name constraint the host-rendered runner glue `use`s -> `derive_build_graph` cross-origin
+        object/module collisions. The pure leaf has no tools, so a corrupted bundle can only
+        propagate as content here — these layers are what catch it before any file is written.
+
+        The layers themselves live in `codegen_bundle.pure_bundle_contract_violation` (the SINGLE
+        source shared with the deterministic post-generate tamper gate, so the two cannot drift);
+        this method only assembles the conductor-side inputs (IR state vars, resolved harness
+        capabilities, the build-graph derivation) and delegates."""
+        from tools.codegen_bundle import (
+            pure_bundle_contract_violation, harness_provided_capabilities)
+        ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
+        # Capability negotiation against the SINGLE infrastructure (harness) dependency. A pure
+        # node is M3c by `_pure_leaf_substep`, so it has exactly one infra dep; its manifest MUST
+        # be declared (None => nothing provided => every requirement unsatisfied, fail-closed).
+        infra = self._infra_direct_deps(ir)
+        harness_nk = infra[0] if len(infra) == 1 else None
+        provided = harness_provided_capabilities(harness_nk) if harness_nk else None
+        algorithm = (ir.get("algorithm") or {}) if isinstance(ir, dict) else {}
+        return pure_bundle_contract_violation(
+            doc, node_key=refs.node_key, spec_id=refs.spec_id,
+            ir_state_variables=(algorithm.get("state_variables") or []),
+            harness_provided=provided, harness_label=harness_nk,
+            build_graph=lambda d: self._build_pure_bundle_graph(refs, d))
+
+    def _build_pure_bundle_graph(self, refs: NodeRefs, doc: Any) -> dict[str, Any]:
+        """The deterministic build graph of a bundle (`derive_build_graph`), with the closure,
+        toolchain, host glue, and dependency edges the host owns. Raises RuntimeError on a
+        cross-origin collision or a staged-dependency straddle (surfaced as an assembly failure
+        by the caller). The single derivation source for both the assembly preflight and the
+        Makefile renderer, so the graph the host validates is the graph it builds."""
+        from tools.codegen_bundle import derive_build_graph
+        from tools.validate_pipeline_semantics import _read_dependency_graph_sidecar
+        tc = self._read_toolchain(refs)
+        toolchain = {
+            "language": tc["language"], "standard": tc["standard"],
+            "build_system": tc["build_system"], "backend": tc["backend"],
+        }
+        if tc["compiler"]:
+            toolchain["compiler"] = tc["compiler"]
+        closure_nodes = self._dependency_closure_nodes(refs)
+        # Dependency edges from the conductor-authored sidecar, so a staged dep depending on an
+        # absorbed member is rejected (a v1 single-node unit has none, but the check is honest).
+        sidecar = _read_dependency_graph_sidecar(self.repo_root, refs.ir_ref) or {}
+        edges: dict[str, list[str]] = {}
+        for entry in (sidecar.get("all_nodes") or []) if isinstance(sidecar, dict) else []:
+            if not isinstance(entry, dict):
+                continue
+            nk = entry.get("node_key")
+            deps = [d.get("node_key") if isinstance(d, dict) else d
+                    for d in (entry.get("direct_deps") or [])]
+            if isinstance(nk, str):
+                edges[nk] = [d for d in deps if isinstance(d, str)]
+        return derive_build_graph(
+            doc, dependency_closure=tuple(closure_nodes), toolchain=toolchain,
+            host_glue_sources=(f"{refs.spec_id}_runner.f90",),
+            dependency_edges=edges or None)
+
+    def _render_pure_makefile_from_graph(self, refs: NodeRefs, graph: dict[str, Any]) -> str:
+        """Render `src/Makefile` from a bundle's derived build graph (`derive_build_graph`).
+
+        Unlike the legacy IR-shaped `_write_makefile` (which assumes a fixed model/checks/runner
+        set), this compiles EXACTLY the graph's `compile_units` — so a bundle that declares a
+        helper / internal_module file is built too. The overridable FC/OBJDIR/BINDIR/RUNDIR/BIN/
+        SPEC/CASES surface and the test/clean targets match the legacy Makefile so Build
+        (`compile_project`) and Validate.execute (`run_quality_checks`) drive it identically.
+        Source paths: a `staged:` dep is `$(OBJDIR)/<name>` (staged by `_stage_dependency_sources`
+        before make), a `bundle:` / `glue:` source is a filename in the src/ cwd. Objects live
+        under `$(OBJDIR)`; the conservative total prerequisite order comes from the graph."""
+        tc = self._read_toolchain(refs)
+        fc = tc["compiler"] or "gfortran"
+        flags = f"-std={tc['standard']} -O2"
+        if tc["backend"] == "openmp":
+            flags += " -fopenmp"
+        flags += " -J$(OBJDIR) -I$(OBJDIR)"
+        exe = self._resolve_exe_name(refs)
+        cases_default = " ".join(self.read_case_ids(refs))
+
+        def _src_path(source: str) -> str:
+            kind, _, name = source.partition(":")
+            return f"$(OBJDIR)/{name}" if kind == "staged" else name
+
+        compile_units = graph.get("compile_units") or []
+        rules: list[str] = []
+        for unit in compile_units:
+            src = _src_path(str(unit.get("source", "")))
+            obj = f"$(OBJDIR)/{unit.get('object')}"
+            prereqs = " ".join(f"$(OBJDIR)/{o}" for o in (unit.get("prerequisite_objects") or []))
+            prereqs = (prereqs + " ") if prereqs else ""
+            rules.append(
+                f"{obj}: {src} {prereqs}| $(OBJDIR)\n"
+                f"\t$(FC) $(FFLAGS) -c {src} -o {obj}")
+        link_objs = " ".join(f"$(OBJDIR)/{o}" for o in (graph.get("link") or {}).get("objects") or [])
+        rules_block = "\n\n".join(rules)
+        return f"""\
+# Deterministic Makefile authored by the conductor from the CodegenBundle build graph
+# (Z2 pure producer). Out-of-source capable: OBJDIR/BINDIR/RUNDIR default to "." and are
+# overridden by Build (compile_project) and Validate.execute (run_quality_checks).
+FC      := {fc}
+OBJDIR  ?= .
+BINDIR  ?= .
+RUNDIR  ?= .
+FFLAGS  ?= {flags}
+
+BIN ?= {exe}
+SPEC ?= spec.ir.yaml
+CASES ?= {cases_default}
+
+.PHONY: all test clean
+.DEFAULT_GOAL := all
+
+all: $(BINDIR)/$(BIN)
+
+{rules_block}
+
+$(BINDIR)/$(BIN): {link_objs} | $(BINDIR)
+\t$(FC) $(FFLAGS) {link_objs} -o $(BINDIR)/$(BIN)
+
+# $(sort ...) dedups the target list when OBJDIR==BINDIR (in-source make, both ".").
+$(sort $(OBJDIR) $(BINDIR)):
+\tmkdir -p $@
+
+test:
+\ttest -x $(BINDIR)/$(BIN) || {{ echo "error: $(BINDIR)/$(BIN) not built; run 'make all' first" >&2; exit 1; }}
+\tmkdir -p $(RUNDIR)/raw/state_snapshots
+\tcd $(RUNDIR) && $(BINDIR)/$(BIN) --cases $(SPEC) $(CASES)
+
+clean:
+\trm -f $(OBJDIR)/*.o $(OBJDIR)/*.mod $(BINDIR)/$(BIN)
+"""
+
+    def _write_pure_bundle_artifacts(self, refs: NodeRefs, doc: dict[str, Any],
+                                     graph: dict[str, Any]) -> list[str]:
+        """Write a validated bundle's artifacts host-side, AFTER the producer's child window
+        closes: each `files[]` entry to `src/<logical_path>`, the canonical `codegen_bundle.json`
+        (the accepted document, for provenance + verify's input), and the bundle-derived
+        `src/Makefile`. The host holds every path and runs unconfined, so these writes are not
+        leaf-attributed (finalize_child already closed the FS-diff window). Returns the written
+        source paths (repo-relative) for logging. The runner glue is host-rendered separately
+        (`_write_runner`, at phase start)."""
+        src_dir = self.repo_root / refs.source_dir() / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        src_root = src_dir.resolve()
+        written: list[str] = []
+        for entry in doc.get("files") or []:
+            if not isinstance(entry, dict):
+                continue
+            logical = str(entry.get("logical_path") or "")
+            content = entry.get("content")
+            if not logical or not isinstance(content, str):
+                continue
+            target = src_dir / logical
+            # Defense-in-depth containment: `validate_bundle`'s `logical_path_violations`
+            # already rejected any absolute / `..` / non-normalized path before this doc was
+            # accepted, so a path escaping src/ here means a validator bypass — fail closed
+            # loudly rather than writing outside the source tree. (Belt-and-suspenders over the
+            # gated pass path; never fires on a validated bundle.)
+            if not target.resolve().is_relative_to(src_root):
+                raise RuntimeError(
+                    f"pure bundle file {logical!r} resolves outside the source tree "
+                    f"({target.resolve()} not under {src_root}) — refusing to write")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            written.append(f"{refs.source_dir()}/src/{logical}")
+        # The accepted bundle, host-authored at the source root (leaf-non-writable), for
+        # provenance and as the verify persona's input (M-D). Not a leaf deliverable.
+        bundle_path = self.repo_root / refs.source_dir() / "codegen_bundle.json"
+        bundle_path.write_text(
+            json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        makefile = self.repo_root / refs.source_dir() / "src" / "Makefile"
+        makefile.write_text(self._render_pure_makefile_from_graph(refs, graph), encoding="utf-8")
+        return written
+
+    def _write_bundle_meta(self, refs: NodeRefs, *, result: str,
+                           failure_category: str | None, failure_excerpt: str | None,
+                           attempts: int, per_attempt: list[dict[str, Any]]) -> None:
+        """Author `<source_dir>/bundle_meta.json` — the pure producer's terminal record and the
+        freshness-gated deliverable of the pure `generate.generate` substep. Carries the outcome
+        (`result` pass/fail), the terminal `failure_category` + `failure_excerpt` on exhaustion
+        (`_read_repair_findings` reads the excerpt for the outer repair route), the attempt count,
+        the prompt-contract version (an A7 observable event), and per-attempt model/usage from the
+        CLI result envelope (the ~/.claude-free provenance source). A re-derivable value is not
+        introduced beyond what only the transcript would otherwise hold."""
+        from tools.pure_leaf import PURE_PROMPT_CONTRACT_VERSION
+        meta: dict[str, Any] = {
+            "result": result,
+            "failure_category": failure_category,
+            "attempts": attempts,
+            "prompt_contract_version": PURE_PROMPT_CONTRACT_VERSION,
+            "per_attempt": per_attempt,
+        }
+        if failure_excerpt:
+            meta["failure_excerpt"] = failure_excerpt
+        path = self.repo_root / refs.source_dir() / "bundle_meta.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _run_pure_generate_substep(self, refs: NodeRefs, phase: str, substep: str | None,
+                                   repair: dict[str, str] | None,
+                                   resolved_dependencies: tuple[dict[str, str], ...]
+                                   ) -> "SubstepOutcome":
+        """Run `generate.generate` as a Z2 pure-function producer: spawn a tool-less `claude -p`
+        leaf that returns one CodegenBundle, validate + assembly-preflight it, repair a violation
+        in a bounded warm-resume loop, finalize the accepted attempt with an EMPTY output_refs
+        row, and ONLY THEN write the bundle's artifacts host-side.
+
+        The finalize-before-write ordering is load-bearing: the pure capability's empty
+        write_roots make ANY write inside the child window an unauthorized write
+        (`_validate_actual_write_paths`), so the host must close the window (finalize_child)
+        before it writes files[] / codegen_bundle.json / bundle_meta.json / Makefile. Reversing
+        the order attributes the host writes to the dying leaf and fails closed — pinned by a
+        conformance test."""
+        from tools.pure_leaf import (
+            parse_result_envelope, extract_json_document, MAX_BUNDLE_REPAIR_TURNS,
+            RESPONSE_UNPARSEABLE, _MISSING)
+        pure_context = self._build_pure_context(refs)
+        per_attempt: list[dict[str, Any]] = []
+        resume_session_id: str | None = None
+        prior_document: str | None = None
+        last_category: str | None = None
+        last_excerpt: str | None = None
+        # An OUTER cross-phase reopen (run_phase routed a terminal bundle failure to
+        # (generate, reuse)) threads the prior producer's arid + its bundle_meta findings excerpt
+        # here. Seed the loop so the FIRST attempt warm-resumes that session (when still
+        # resumable) and carries the diagnosis, rather than cold-restarting and re-deriving
+        # everything from pure_context — the M-C carry-forward contract. When the session is gone,
+        # resume_session_id stays None and the first attempt is a cold launch (findings dropped,
+        # the safe degradation the pure launch template has no slot for).
+        if repair and str(repair.get("repair_strategy", "")).strip() == "reuse":
+            target = str(repair.get("repair_target_agent_run_id", "")).strip()
+            if target and target != "none" and self._claude_session_resumable(target):
+                resume_session_id = target
+                last_excerpt = str(repair.get("repair_findings", "")).strip() or None
+        attempt = 0
+        while True:
+            child_arid = self.new_agent_run_id()
+            warm = (resume_session_id is not None
+                    and self._claude_session_resumable(resume_session_id))
+            # A repair turn is any turn with a session to resume (an inner repair — resume_session_id
+            # was set to the prior attempt below — or the seeded outer reopen). `warm` may still be
+            # False if that session has since been GC'd, in which case the repair renders as a
+            # cold fallback (prior_document + re-inlined context) but keeps the reuse repair shape.
+            repair_payload: dict[str, str] | None = None
+            if resume_session_id is not None:
+                repair_payload = {
+                    "issue_severity": "major",
+                    "repair_strategy": "reuse",
+                    "repair_target_agent_run_id": resume_session_id,
+                    "repair_reason": "pure_bundle_repair",
+                }
+                if last_excerpt:
+                    repair_payload["repair_findings"] = last_excerpt
+            request = build_launch_request(
+                refs, step=phase, substep=substep,
+                orchestration_id=self.orchestration_id,
+                orchestration_agent_run_id=self.orchestration_agent_run_id,
+                child_agent_run_id=child_arid,
+                agent_model=self.agent_model, workflow_mode=self.workflow_mode,
+                makefile_host_authored=True, runner_host_authored=True,
+                repair=repair_payload,
+                resolved_dependencies=resolved_dependencies,
+                warm_resume=warm,
+                pure_leaf=True,
+                # On a warm reuse repair the resumed session already holds the context, so it is
+                # omitted — but ONLY when the validator's exemption holds (warm + reuse +
+                # findings). A cold launch, or a cold-fallback repair (session GC'd), carries the
+                # full context; the cold fallback also carries the prior document to correct.
+                pure_context=(None if (warm and repair_payload is not None
+                                       and repair_payload.get("repair_findings"))
+                              else pure_context),
+            )
+            if repair_payload is not None and not warm and prior_document:
+                request["prior_document"] = prior_document
+            rec = self.record_launch(child_arid, request)
+            launched_at = time.time()
+            proc = self.spawn_leaf(
+                rec["launch_prompt_text"], self._child_env(child_arid),
+                session_id=child_arid,
+                resume_session_id=(resume_session_id if warm else None),
+                child_arid=child_arid, pure=True)
+            self._persist_leaf_output(child_arid, proc)
+            token = self.read_parent_return_token(child_arid)
+
+            envelope = parse_result_envelope(proc.stdout)
+            model = None if envelope.model is _MISSING else envelope.model
+            usage = None if envelope.usage is _MISSING else envelope.usage
+            per_attempt.append({"agent_run_id": child_arid, "model": model, "usage": usage})
+
+            infra_error: tuple[str, str] | None = None
+            category: str | None = None
+            findings: str | None = None
+            # The parsed document (whatever json.loads produced), kept for the prior-document
+            # carry-forward even when it later fails validation; `accepted_doc` is set ONLY when
+            # the bundle passes every layer.
+            parsed_bundle: dict[str, Any] | None = None
+            accepted_doc: dict[str, Any] | None = None
+            if proc.returncode != 0:
+                # A nonzero leaf exit is a transport/infra failure (not a content defect the
+                # bundle repair can fix): finalize fail and let run_phase route it fail_closed.
+                infra_error = _classify_leaf_infra_error(proc.stderr or "", proc.stdout or "")
+                category = "pure_transport"
+                findings = self._leaf_failure_summary(proc)
+            elif not envelope.parsed or envelope.is_error is True:
+                category = RESPONSE_UNPARSEABLE
+                findings = ("the CLI result envelope was unparseable or reported is_error: "
+                            + (str(envelope.parse_error or "")[:400] or "no result document"))
+            else:
+                extracted, extract_category = extract_json_document(envelope.result)
+                if extract_category is not None:
+                    category = extract_category
+                    findings = ("the reply was not a single parseable JSON document "
+                                f"({extract_category})")
+                elif not isinstance(extracted, dict):
+                    category = RESPONSE_UNPARSEABLE
+                    findings = "the reply parsed to a non-object JSON value (expected a bundle)"
+                else:
+                    parsed_bundle = extracted
+                    result = self._pure_bundle_violations(refs, extracted)
+                    if result is not None:
+                        category, findings = result
+                    else:
+                        accepted_doc = extracted
+
+            status = "pass" if category is None else "fail"
+            if status != "pass":
+                last_category = category
+                last_excerpt = findings
+                # Carry the prior document into a cold-fallback repair: re-serialize the parsed
+                # bundle (even though it failed validation), else the raw reply text.
+                prior_document = (json.dumps(parsed_bundle, indent=2, ensure_ascii=False)
+                                  if parsed_bundle is not None
+                                  else (envelope.result if isinstance(envelope.result, str) else None))
+
+            reply = (f"status: {status}\nleaf rc={proc.returncode}\n"
+                     f"category: {category or 'none'}")
+            result_summary = (f"pure_generate_fail: {category}" if status != "pass" else None)
+            # Finalize the attempt FIRST (close the child FS-diff window) — the pure terminal row
+            # carries an EMPTY output_refs (the host has written nothing yet). ONLY AFTER this may
+            # the host write the bundle artifacts.
+            self.finalize_child(
+                child_arid, token, reply,
+                self._agent_run_json(refs, phase, substep, child_arid, status,
+                                     [], result_summary, agent_model_override=model, pure=True))
+
+            if status == "pass":
+                assert accepted_doc is not None
+                try:
+                    graph = self._build_pure_bundle_graph(refs, accepted_doc)
+                    self._write_pure_bundle_artifacts(refs, accepted_doc, graph)
+                    self._write_bundle_meta(
+                        refs, result="pass", failure_category=None, failure_excerpt=None,
+                        attempts=attempt + 1, per_attempt=per_attempt)
+                except Exception as exc:  # noqa: BLE001 — any host-write failure must recover
+                    # finalize_child ALREADY recorded this attempt as a passing terminal `substep`
+                    # row, but a host-side write AFTER the window closed failed (ENOSPC, a
+                    # permission/IO error, or a late assembly RuntimeError). No step_result will be
+                    # written, so without recovery this passing row is an UN-VOUCHED orphan the
+                    # completion gate (`_validate_orchestration_completion_for_pass`) rejects on the
+                    # eventual resume (which rotates to a fresh source_id and never revisits it).
+                    # Tombstone the earlier repair attempts here (as the pass/fail branches do) and
+                    # route fail_closed via a non-zero leaf_returncode — run_phase's transport branch
+                    # then tombstones THIS child_arid orphan too and fail-closes for an operator
+                    # resume, rather than auto-retrying a write that a full disk would only repeat.
+                    if attempt > 0:
+                        self._add_superseded_run_ids(
+                            [a["agent_run_id"] for a in per_attempt[:-1]],
+                            reason=f"pure_host_write_failed_superseded: {type(exc).__name__}")
+                    return SubstepOutcome(child_arid, "fail", [], 1,
+                                          ("pure_host_write_failed", f"{type(exc).__name__}: {exc}"),
+                                          launched_at, attempt + 1)
+                # Tombstone the superseded producer attempts of a repaired pass: each earlier
+                # attempt was finalized as a terminal `substep` row, but only THIS (passing)
+                # arid goes into the step_result's substep_agent_run_ids, so the earlier arids
+                # are un-vouched orphans the completion gate would reject at run end. Same
+                # treatment as the terminal-fail branch below and the transient-retry loop.
+                if attempt > 0:
+                    self._add_superseded_run_ids(
+                        [a["agent_run_id"] for a in per_attempt[:-1]],
+                        reason=f"pure_bundle_repair_superseded_pass: attempts={attempt + 1}")
+                return SubstepOutcome(child_arid, "pass", [], proc.returncode,
+                                      None, launched_at, attempt + 1)
+
+            # A content violation within budget: warm-resume the SAME producer session for a
+            # bounded repair. A transport failure ("pure_transport") is NOT bundle-repairable —
+            # it has no fixable document — so it is excluded here and routed fail_closed by
+            # run_phase's transport branch (leaf_returncode != 0).
+            can_repair = (category is not None and category != "pure_transport"
+                          and attempt < MAX_BUNDLE_REPAIR_TURNS)
+            if not can_repair:
+                # Terminal: record bundle_meta with the last category/excerpt for the outer
+                # route (_read_repair_findings). Tombstone the superseded producer attempts so a
+                # later completion vouch does not trip on the un-vouched arids.
+                self._write_bundle_meta(
+                    refs, result="fail", failure_category=last_category,
+                    failure_excerpt=last_excerpt, attempts=attempt + 1, per_attempt=per_attempt)
+                if attempt > 0:
+                    self._add_superseded_run_ids(
+                        [a["agent_run_id"] for a in per_attempt[:-1]],
+                        reason=f"pure_bundle_repair_superseded: {last_category}")
+                return SubstepOutcome(child_arid, "fail", [], proc.returncode,
+                                      infra_error, launched_at, attempt + 1)
+            # Set up the next (repair) turn: resume this attempt's session.
+            resume_session_id = child_arid
+            attempt += 1
+
     def write_step_result(self, node_key: str, step: str, executor_arid: str,
                           result: dict[str, Any]) -> dict[str, Any]:
         return self.runtime([
@@ -2518,6 +3042,20 @@ clean:
                 return False
             return all((self.repo_root / p).stat().st_mtime >= min_mtime for p in present)
 
+        if (phase == "generate" and substep == "generate"
+                and self._pure_leaf_substep(refs, phase, substep)):
+            # Z2 pure producer freshness (M-C 修正1): the pure `generate.generate` has NO
+            # leaf-authored deliverables (allowed_output_paths == []); its freshness-gated
+            # outputs are the HOST-written bundle_meta.json (result==pass) and codegen_bundle.json,
+            # both authored AFTER the child window closes. A stale-artifact reuse on a retry is
+            # prevented by the mtime guard on codegen_bundle.json (the source dir is rotated per
+            # attempt anyway). This branch is defensive — the pure substep computes its own status
+            # from validate_bundle — but keeps the freshness contract stated in one place.
+            bmeta = _read_json(self.repo_root / refs.source_dir() / "bundle_meta.json") or {}
+            bundle = self.repo_root / refs.source_dir() / "codegen_bundle.json"
+            fresh = bundle.exists() and bundle.stat().st_mtime >= min_mtime
+            status = "pass" if (bmeta.get("result") == "pass" and fresh) else "fail"
+            return status, output_refs
         if phase == "compile" and substep == "static":
             # Deterministic compile gate: the conductor-authored compile_static_meta records the
             # workspace_root + check_artifact_syntax + --stage compile verdict. A violation is
@@ -2666,7 +3204,9 @@ clean:
     def _agent_run_json(self, refs: NodeRefs, phase: str, substep: str | None,
                         child_arid: str, status: str,
                         output_refs: list[str],
-                        result_summary: str | None = None) -> dict[str, Any]:
+                        result_summary: str | None = None,
+                        agent_model_override: str | None = None,
+                        pure: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "agent_run_id": child_arid,
             "agent_role": child_agent_role(phase),
@@ -2693,7 +3233,18 @@ clean:
         # outside ~/.claude, so it keeps the launch-request alias. If unresolvable
         # (no transcript yet, or a leaf that crashed before any assistant message),
         # we leave agent_model absent and let record_agent_run backfill the alias.
-        if self.backend == "claude":
+        if agent_model_override and str(agent_model_override).strip():
+            # Z2 pure leaf: the model the leaf ran under comes from the CLI result envelope
+            # (`--output-format json`), NOT the session transcript (~/.claude is not read on the
+            # pure path). A resolved override wins and skips the transcript lookup.
+            payload["agent_model"] = str(agent_model_override).strip()
+        elif pure:
+            # Pure path with no envelope model (a provenance gap): leave agent_model ABSENT for
+            # record_agent_run to backfill the launch-request alias. Crucially, do NOT fall back
+            # to the transcript resolver — the pure channel must not read ~/.claude (operator
+            # access boundary); the envelope is the only provenance source.
+            pass
+        elif self.backend == "claude":
             from tools.orchestration_runtime import resolve_claude_model_from_transcript
             resolved = resolve_claude_model_from_transcript(child_arid)
             if resolved:
@@ -4060,6 +4611,14 @@ clean:
         # Memoized per orchestration (no-op after the first); spawn_leaf also calls it as a
         # safety net for the record-launch-less diagnostician leaf.
         self._ensure_codex_feature_cache()
+        # Z2 pure-function producer (M-C): `generate.generate` on a claude M3c node under
+        # executor=pure runs as a host-mediated pure function with its OWN spawn/validate/
+        # repair/finalize/write loop (empty write authority; the host writes the bundle
+        # artifacts after the child window closes). It does not share the generic leaf loop
+        # below (no allowed_output_paths, no determine_substep_status-before-finalize).
+        if self._pure_leaf_substep(refs, phase, substep):
+            return self._run_pure_generate_substep(
+                refs, phase, substep, repair, resolved_dependencies)
         # Resolve the warm-resume decision BEFORE building the request so the slim-vs-full
         # prompt choice (build_launch_request) matches what record_launch persists and what
         # spawn_leaf sends below. None => cold launch (full prompt). Deterministic substeps
@@ -4354,6 +4913,9 @@ clean:
             meta_path = self.repo_root / refs.source_dir() / "syntax_meta.json"
         elif r.startswith("static_"):
             meta_path = self.repo_root / refs.source_dir() / "static_meta.json"
+        elif r.startswith(GENERATE_BUNDLE_REASON_PREFIX):
+            # Z2 pure producer: the exhausted bundle repair's terminal category/excerpt.
+            meta_path = self.repo_root / refs.source_dir() / "bundle_meta.json"
         elif r.startswith("verify_"):
             # The verify substep records its finding in the phase's meta `last_fail_reason`.
             field = "last_fail_reason"
@@ -4982,7 +5544,12 @@ clean:
         # template encodes the fixed runner->model use-graph and, for a dependency node, the
         # closure object rules (Model B); the dep sources are staged at build (see
         # _stage_dependency_sources). c/cpp/mixed keep LLM authoring (see _write_makefile).
-        if phase == "generate" and self._conductor_authors_makefile(refs):
+        # A pure producer authors the bundle-DERIVED Makefile after the producer returns
+        # (`_write_pure_bundle_artifacts`), so it compiles exactly the bundle's file set — skip
+        # the IR-shaped pre-authoring here for a pure node (the runner glue below is still
+        # host-rendered from the IR, independent of the bundle).
+        if (phase == "generate" and self._conductor_authors_makefile(refs)
+                and not self._pure_leaf_substep(refs, "generate", "generate")):
             self._write_makefile(refs)
         # R1/M3c-β: for a physics node with a harness dependency the conductor host-renders
         # src/<spec_id>_runner.f90 (glue over the certified harness plumbing + the leaf-authored
@@ -5295,6 +5862,21 @@ clean:
             # static failure routes via its deterministic table (warm resume); generate.generate
             # / generate.verify fall through to the verify-severity gate below.
             failed_substep = SUBSTEPS["generate"][len(outcomes) - 1]
+            if failed_substep == "generate" and self._pure_leaf_substep(refs, "generate", "generate"):
+                # Z2 pure producer exhausted its bounded in-conversation repair budget. Route on
+                # the terminal category recorded in bundle_meta.json: every bundle category is a
+                # document defect a fresh (generate, generate) attempt with a warm reuse repair
+                # can fix (its excerpt threaded via _read_repair_findings). A transport/unknown
+                # category has no bundle_meta route -> cold restart.
+                meta = _read_json(self.repo_root / refs.source_dir() / "bundle_meta.json") or {}
+                category = str(meta.get("failure_category") or "")
+                route = GENERATE_BUNDLE_FAILURE_ROUTING.get(category)
+                if route:
+                    target, strategy = route
+                    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
+                                         reason=f"{GENERATE_BUNDLE_REASON_PREFIX}{category}")
+                return RouteDecision("retry", target_phase="generate", repair_strategy="restart",
+                                     reason="generate_bundle_fail")
             if failed_substep == "lint":
                 meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
                 return classify_lint_failure(meta.get("failure_category"))
@@ -5975,12 +6557,16 @@ def run_conductor(*, repo_root: Path | str, orchestration_id: str,
     # pinned version: the exact version is resolved post-run from the leaf transcript.
     from tools.orchestration_runtime import default_agent_model_for_backend
     resolved_agent_model = agent_model or default_agent_model_for_backend(backend)
+    # Z2 generate-executor: threaded via env (METDSL_GENERATE_EXECUTOR), restored on resume with
+    # the rest of the environment. run_workflow blocks `pure` selection until M-D (verify
+    # migration), so in M-C this is always "legacy" in production; tests set it directly.
+    generate_executor = str(env.get("METDSL_GENERATE_EXECUTOR", "legacy")).strip().lower() or "legacy"
     conductor = Conductor(
         repo_root=root, orchestration_id=orchestration_id,
         orchestration_agent_run_id=orchestration_agent_run_id,
         backend=backend, env=env,
         agent_model=resolved_agent_model, workflow_mode=workflow_mode,
-        llm_command=llm_command,
+        llm_command=llm_command, generate_executor=generate_executor,
     )
     refs = (resume_node_refs(conductor, node_key, spec_path) if resume
             else prepare_node(conductor, node_key, spec_path))

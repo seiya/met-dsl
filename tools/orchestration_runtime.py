@@ -10068,20 +10068,41 @@ def _render_pure_launch_prompt(request_payload: dict[str, Any]) -> str:
     return _substitute_pure_placeholders(template, subs)
 
 
+def _pure_output_contract_text(request_payload: dict[str, Any]) -> str:
+    """The static output-contract paragraph of the pure launch template for this (step, substep).
+
+    A cold repair fallback has no prior turn that carried the schema, so it must re-state it. The
+    paragraph is lifted VERBATIM from the launch template (`pure_{step}_{substep}.txt`) — the one
+    beginning `Output contract` — so the repair and the cold launch describe the same contract
+    from a single source rather than a hand-copied duplicate that could drift. Returns '' when no
+    launch template matches (defensive: the caller then omits the section)."""
+    try:
+        templates = _load_launch_prompt_templates()
+        template = templates[_pure_launch_template_name(request_payload)]
+    except (KeyError, OSError):
+        return ""
+    for block in template.split("\n\n"):
+        if block.lstrip().startswith("Output contract"):
+            return block.strip()
+    return ""
+
+
 def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:
     """Render a bounded pure schema-repair turn (`pure_bundle_repair.txt`).
 
     The findings excerpt is wrapped in the same data-only fence as an inlined document so the
     single scan carve-out covers it. On a WARM repair the resumed session already holds the
     output-contract schema, the prior document under repair, and the full context, so
-    `<pure_context>` is empty. On the COLD fallback (`_claude_session_resumable` returned false —
-    no `warm_resume`) the input context documents (`pure_context`) are re-inlined, but the
-    output-contract SCHEMA and the model's PRIOR document are NOT (the schema lives in the
-    generate/verify launch templates, and a cold session has no prior turn to reference).
-    Threading those into a cold repair is deferred to M-C, which wires the producer repair loop
-    and owns how a failed bundle is carried forward — until then the cold fallback is a
-    context-complete but schema-thin turn, adequate for the inert wiring but NOT the final
-    cold-repair contract."""
+    `<output_contract>`, `<prior_document>`, and `<pure_context>` are all empty. On the COLD
+    fallback (`_claude_session_resumable` returned false — no `warm_resume`) the session has no
+    prior turn, so the repair re-states the output-contract SCHEMA (lifted from the launch
+    template), re-inlines the model's PRIOR document under repair (`prior_document`, threaded by
+    the producer repair loop — the parsed bundle re-serialized, or the raw unparseable reply
+    text), re-inlines the input context documents (`pure_context`), AND re-inlines the
+    host-resolved `dependency_facts` (the published-operation interfaces of the node's component
+    dependencies — the initial launch injects them, so a cold repair that dropped them could
+    re-author code that calls a dependency without its API). This is the M-C cold-repair contract
+    (the M-B stub was context-complete but schema-thin)."""
     templates = _load_launch_prompt_templates()
     template = templates["pure bundle repair"]
     findings = str(request_payload.get("repair_findings", "")).strip()
@@ -10095,6 +10116,17 @@ def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:
         "findings": _fence_pure_doc(findings),
     }
     if not request_payload.get("warm_resume"):
+        subs["output_contract"] = _pure_output_contract_text(request_payload)
+        prior = str(request_payload.get("prior_document", "")).strip()
+        subs["prior_document"] = (
+            "**Your prior document under repair (correct it — do not restart from scratch):**\n"
+            + _fence_pure_doc(prior)) if prior else ""
+        # dependency_facts stays UNFENCED (host-resolved orientation, must remain in the
+        # gate-allowlist scan text), sanitized like the initial launch so a stray fence marker in
+        # it cannot pair with a later legitimate fence END. Empty when the node has no resolved
+        # dependencies (`_build_dependency_facts` returns "").
+        subs["dependency_facts"] = _sanitize_pure_doc_body(
+            _build_dependency_facts(request_payload))
         pure_context = request_payload.get("pure_context")
         context_blocks: list[str] = []
         if isinstance(pure_context, dict):
@@ -10103,6 +10135,9 @@ def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:
                 context_blocks.append(_fence_pure_doc(str(pure_context[key])))
         subs["pure_context"] = "\n".join(context_blocks)
     else:
+        subs["output_contract"] = ""
+        subs["prior_document"] = ""
+        subs["dependency_facts"] = ""
         subs["pure_context"] = ""
     return _substitute_pure_placeholders(template, subs)
 
@@ -12919,12 +12954,33 @@ def _validate_terminal_run_payload(
 
     output_refs = payload.get("output_refs")
     if role_token in {"step", "substep"}:
-        # M-C PRECONDITION (Z2 pure leaf): a pure launch writes NO output manifest and the host
-        # writes the leaf's artifacts AFTER the child window, so a passing pure terminal row
-        # needs a carve-out here — otherwise the non-empty-output_refs requirement and
-        # `_validate_paths_against_allowed_output_manifest` (which raises on the absent manifest)
-        # fail-close it. Not added in M-B because no pure leaf terminalizes yet (inert) and the
-        # exact pure output_refs contract is defined in M-C; wire it when the producer flips.
+        # Z2 pure leaf (M-C): a pure launch writes NO output manifest, and the host writes the
+        # leaf's artifacts AFTER the child window closes (run_substep's pure branch), so at the
+        # terminal-record instant the pure arid has produced nothing under its own authority. Its
+        # passing row therefore carries `output_refs == []`, ENFORCED BIDIRECTIONALLY: an empty
+        # list is required (the bundle's provenance is `bundle_meta.json`, not this row), and a
+        # NON-empty one is rejected — a leaf with no write authority that claims outputs is a
+        # forged provenance, fail-closed. The output-manifest checks below (which raise on the
+        # absent manifest) and `_validate_pass_output_refs_against_launch` are skipped for pure.
+        # Detected from the launch request (`leaf_mode == "pure"`), the single source the
+        # producer stamps, not a field on this payload the leaf could set.
+        agent_run_id = str(payload.get("agent_run_id") or "").strip()
+        pure_launch = False
+        if agent_run_id:
+            launch_req = _read_launch_request_payload(
+                repo_root, orchestration_id, agent_run_id=agent_run_id)
+            pure_launch = isinstance(launch_req, dict) and _pure_leaf_is_pure_request(launch_req)
+        if pure_launch:
+            # Require EXACTLY an empty list. A missing field (`output_refs is None`) is NOT
+            # equivalent: the contract is that a pure pass row carries `output_refs: []`, so a
+            # malformed or tampered record that OMITS the field must be rejected here, not read
+            # as "empty" and waved through (and likewise a non-empty list is forged provenance).
+            if output_refs != []:
+                raise ValueError(
+                    "pure pass status for step/substep requires output_refs to be exactly [] (a "
+                    "pure leaf holds no write authority; the host writes the bundle artifacts "
+                    f"after the child window closes); got {output_refs!r}")
+            return
         if not isinstance(output_refs, list) or not output_refs:
             raise ValueError("pass status for step/substep requires non-empty output_refs")
         for idx, item in enumerate(output_refs):

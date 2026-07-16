@@ -34,7 +34,7 @@ import posixpath
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 # --------------------------------------------------------------------------------------
 # Contract constants — the ENFORCEMENT source. The schema JSON is the declarative copy of
@@ -1389,3 +1389,107 @@ def derive_build_graph(doc: Mapping[str, Any], *,
         "compile_units": compile_units,
         "link": {"objects": list(objects)},
     }
+
+
+def m3c_literal_name_violation(doc: Mapping[str, Any], spec_id: str) -> str | None:
+    """The M3c host-runner literal-name constraint on a bundle's model/checks files, or None.
+
+    The host-rendered runner glue emits `use <spec_id>_model` / `use <spec_id>_checks`, so the
+    bundle MUST carry a `model`-role file named `<spec_id>_model.f90` declaring module
+    `<spec_id>_model`, and a `checks`-role file `<spec_id>_checks.f90` declaring `<spec_id>_checks`.
+    A different name leaves the runner's `use` unresolved at link — a defect only the host (which
+    owns the runner) can see, so it is caught here rather than at build."""
+    want = {
+        "model": (f"{spec_id}_model.f90", f"{spec_id}_model"),
+        "checks": (f"{spec_id}_checks.f90", f"{spec_id}_checks"),
+    }
+    files = [e for e in (doc.get("files") or []) if isinstance(e, dict)]
+    for role, (want_path, want_module) in want.items():
+        candidates = [e for e in files if e.get("role") == role]
+        if not candidates:
+            return (f"the host-rendered runner requires a {role}-role file named "
+                    f"{want_path!r} declaring module {want_module!r}; the bundle has none")
+        match = next((e for e in candidates
+                      if str(e.get("logical_path", "")).casefold() == want_path.casefold()), None)
+        if match is None:
+            return (f"the {role}-role file must be named {want_path!r} (the host-rendered "
+                    f"runner `use`s module {want_module!r} by fixed name); got "
+                    f"{[e.get('logical_path') for e in candidates]}")
+        modules = {str(m).casefold() for m in (match.get("modules") or []) if isinstance(m, str)}
+        if want_module.casefold() not in modules:
+            return (f"{want_path} must declare module {want_module!r} (the host-rendered "
+                    f"runner `use`s it); its modules are {sorted(match.get('modules') or [])}")
+    return None
+
+
+def pure_bundle_contract_violation(
+    doc: Mapping[str, Any],
+    *,
+    node_key: str,
+    spec_id: str,
+    ir_state_variables: Iterable[str],
+    harness_provided: Iterable[str] | None,
+    harness_label: str | None = None,
+    build_graph: Callable[[Mapping[str, Any]], Any],
+) -> tuple[str, str] | None:
+    """The full Z2 pure-CodegenBundle host acceptance contract as `(category, findings)`, or None.
+
+    The SINGLE source of the acceptance layers shared by the producer's in-conversation gate
+    (`Conductor._pure_bundle_violations`) and the deterministic post-generate tamper gate
+    (`validate_pipeline_semantics._validate_post_generate_bundle`), so a bundle the producer
+    would reject can never be certified by the independent re-check (and the two cannot drift).
+
+    Fail-closed layers, in order, each STOPPING at the first that fails (so one defect is one
+    report AND a later layer never runs on a doc an earlier one already rejected): schema
+    (`validate_bundle`) -> single-node unit shape -> harness capability negotiation (the manifest
+    MUST exist — an undeclared harness satisfies nothing) -> state_variable ∈ IR
+    algorithm.state_variables -> the M3c literal name the host-rendered runner `use`s ->
+    `build_graph(doc)` (the caller's assembly derivation, which raises RuntimeError on a
+    cross-origin object/module collision or a straddle).
+
+    `harness_provided` is the caller-resolved harness capability set (`None` = undeclared harness
+    = nothing provided, fail-closed); `harness_label` only names it in the findings text.
+    `build_graph(doc)` performs the caller's `derive_build_graph` assembly."""
+    violations = validate_bundle(doc)
+    if violations:
+        return ("bundle_schema_violation",
+                "CodegenBundle failed validate_bundle:\n- " + "\n- ".join(violations))
+    members = optimization_unit_members(doc)
+    if members != (node_key,):
+        return ("bundle_shape_unsupported",
+                f"optimization_unit.members must be exactly [{node_key!r}] on the live "
+                f"pure path (single-node unit); got {list(members)}")
+    required = doc.get("capability_requirements") or []
+    unsatisfied = unsatisfied_capability_requirements(required, harness_provided)
+    if unsatisfied:
+        label = f" {harness_label!r}" if harness_label else ""
+        return ("bundle_capability_unsatisfied",
+                f"capability_requirements not satisfied by harness{label}: "
+                + ", ".join(unsatisfied))
+    # Canonical IRs carry `algorithm.state_variables` as OBJECTS (`{name, shape_expr, ...}`);
+    # older/degenerate specs may use a bare-string list. Accept both — a comprehension that kept
+    # only `str` entries would silently yield an EMPTY set on every canonical IR and reject every
+    # bundle that declares a state_binding as a mismatch.
+    ir_state_vars: set[str] = set()
+    for v in ir_state_variables:
+        if isinstance(v, str):
+            ir_state_vars.add(v)
+        elif isinstance(v, collections.abc.Mapping) and isinstance(v.get("name"), str):
+            ir_state_vars.add(v["name"])
+    for idx, binding in enumerate(doc.get("state_bindings") or []):
+        # Fail-CLOSED on an empty declared set too: a bundle that binds state a stateless IR
+        # never declared is an invented registration, so an EMPTY ir_state_vars rejects any
+        # binding rather than accepting all of them.
+        sv = binding.get("state_variable") if isinstance(binding, dict) else None
+        if isinstance(sv, str) and sv not in ir_state_vars:
+            return ("bundle_state_binding_mismatch",
+                    f"state_bindings[{idx}].state_variable {sv!r} is not an IR "
+                    f"algorithm.state_variable (declared: {sorted(ir_state_vars)})")
+    name_violation = m3c_literal_name_violation(doc, spec_id)
+    if name_violation is not None:
+        return ("bundle_assembly_collision", name_violation)
+    try:
+        build_graph(doc)
+    except RuntimeError as exc:
+        return ("bundle_assembly_collision", f"build-graph assembly failed: {exc}")
+    return None
