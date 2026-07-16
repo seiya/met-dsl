@@ -123,6 +123,7 @@ def _build_invocation_record(
     workflow_mode: str,
     agent_model: str | None,
     with_deps: bool,
+    generate_executor: str = "legacy",
     closure_id: str | None = None,
     closure_target_spec_ref: str | None = None,
     closure_until_phase: str | None = None,
@@ -146,6 +147,10 @@ def _build_invocation_record(
         "llm_command": llm_command,
         "mode": workflow_mode,
         "with_deps": bool(with_deps),
+        # Z2 executor selection (M-D). Persisted so an implicit resume (no flag / env in the
+        # fresh process) recovers the ORIGINAL choice via _load_resume_params — otherwise a pure
+        # run would resume as legacy, silently switching the execution + write-authority model.
+        "generate_executor": generate_executor,
     }
     if agent_model:
         record["agent_model"] = agent_model
@@ -825,6 +830,9 @@ def _load_resume_params(repo_root: Path, orchestration_id: str) -> dict[str, str
         "closure_id": _clean(invocation.get("closure_id")),
         "closure_target_spec_ref": _clean(invocation.get("closure_target_spec_ref")),
         "closure_until_phase": _clean(invocation.get("closure_until_phase")),
+        # Z2 executor (M-D). Older orchestrations predating the field → None → the caller keeps
+        # the default legacy (correct: those runs were legacy).
+        "generate_executor": _clean(invocation.get("generate_executor")),
     }
 
 
@@ -869,10 +877,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=("legacy", "pure"),
         default=None,
         help=(
-            "Z2 generate-phase executor: 'legacy' (the agentic generate.generate leaf) or "
-            "'pure' (the host-mediated CodegenBundle producer). Defaults to legacy (or "
-            "METDSL_GENERATE_EXECUTOR). NOTE: 'pure' is not yet selectable — it requires the "
-            "verify-persona migration (Z2 M-D); selecting it errors until then."
+            "Z2 generate-phase executor: 'legacy' (the agentic generate.generate + verify "
+            "leaves) or 'pure' (the host-mediated CodegenBundle producer + verdict reviewer). "
+            "Defaults to legacy (or METDSL_GENERATE_EXECUTOR). 'pure' applies to a claude M3c "
+            "node; a non-matching node stays legacy under executor=pure."
         ),
     )
     parser.add_argument(
@@ -968,56 +976,50 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     repo_root = Path(args.repo_root).resolve()
 
-    # Z2 generate-executor selection. Threaded to the conductor via env
-    # (METDSL_GENERATE_EXECUTOR, restored with the rest of the environment on resume). The
-    # explicit flag wins over the env var. `pure` is inert in M-C: the pure producer path
-    # exists and is unit-driven, but a full pure generate phase needs the verify persona
-    # (M-D), so selecting it errors here rather than running a producer whose verify half is
-    # still the legacy leaf.
-    generate_executor = (
-        args.generate_executor or os.environ.get("METDSL_GENERATE_EXECUTOR") or "legacy"
-    ).strip().lower() or "legacy"
-    # argparse's `choices` guards only the flag; a value from METDSL_GENERATE_EXECUTOR bypasses
-    # it. Validate the resolved value against the SAME set so a typo (e.g. `pur`) fails loudly
-    # here rather than falling through to the legacy path — `_pure_leaf_substep` matches only the
-    # exact literal `pure`, so an unrecognized value would silently run an unintended executor.
-    if generate_executor not in {"legacy", "pure"}:
-        print(
-            json.dumps(
-                {
-                    "status": "fail",
-                    "reason": "generate_executor_invalid",
-                    "detail": (
-                        f"generate-executor must be 'legacy' or 'pure'; got "
-                        f"{generate_executor!r} (from METDSL_GENERATE_EXECUTOR or --generate-executor)"
-                    ),
-                },
-                ensure_ascii=False,
+    resume_mode = bool(args.resume)
+
+    # Z2 generate-executor selection. Threaded to the conductor via env (METDSL_GENERATE_EXECUTOR).
+    # As of M-D both generate LLM substeps (the CodegenBundle producer and the verdict reviewer)
+    # are pure, so `pure` is a fully selectable executor: `_pure_leaf_substep` still narrows it to a
+    # claude M3c node, and a non-matching (codex / non-M3c) node stays legacy under executor=pure.
+    #
+    # COLD run: resolve from the flag or the ambient env, validate, and stamp the env. RESUME: the
+    # ambient env is IGNORED — the executor is recovered from the persisted invocation in the resume
+    # branch below (recovered ALWAYS wins; a conflicting --generate-executor FLAG is rejected
+    # there). So DEFER the env resolution+validation for a resume entirely: an unrelated shell typo
+    # in METDSL_GENERATE_EXECUTOR must not block an otherwise-valid resume (the flag itself is
+    # already validated by argparse `choices`). The placeholder here is overwritten by recovery.
+    generate_executor = "legacy"
+    if not resume_mode:
+        generate_executor = (
+            args.generate_executor or os.environ.get("METDSL_GENERATE_EXECUTOR") or "legacy"
+        ).strip().lower() or "legacy"
+        # argparse's `choices` guards only the flag; a value from METDSL_GENERATE_EXECUTOR bypasses
+        # it. Validate the resolved value against the SAME set so a typo (e.g. `pur`) fails loudly
+        # rather than falling through to legacy — `_pure_leaf_substep` matches only the exact literal
+        # `pure`, so an unrecognized value would silently run an unintended executor.
+        if generate_executor not in {"legacy", "pure"}:
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "generate_executor_invalid",
+                        "detail": (
+                            f"generate-executor must be 'legacy' or 'pure'; got "
+                            f"{generate_executor!r} (from METDSL_GENERATE_EXECUTOR or --generate-executor)"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             )
-        )
-        return 2
-    if generate_executor == "pure":
-        print(
-            json.dumps(
-                {
-                    "status": "fail",
-                    "reason": "generate_executor_pure_unavailable",
-                    "detail": (
-                        "--generate-executor pure is not available until the verify persona "
-                        "is migrated (Z2 M-D); only 'legacy' is selectable"
-                    ),
-                },
-                ensure_ascii=False,
-            )
-        )
-        return 2
-    os.environ["METDSL_GENERATE_EXECUTOR"] = generate_executor
+            return 2
+        os.environ["METDSL_GENERATE_EXECUTOR"] = generate_executor
 
     # Resolve effective startup inputs. With --resume, omitted spec_ref /
     # until_phase / --llm / --mode are recovered from the target orchestration's
     # existing artifacts (orchestration_meta.json + preflight.json + the start
-    # prompt). Without --resume the defaults (claude / dev) apply.
-    resume_mode = bool(args.resume)
+    # prompt). Without --resume the defaults (claude / dev) apply. (`resume_mode` is
+    # resolved above, before the executor block, which gates on it.)
     # Recovered resume metadata (populated in the resume branch). The reuse decision
     # in the try block compares the effective spec/backend against these to tell an
     # actual change from an explicit no-op restate.
@@ -1134,6 +1136,42 @@ def main(argv: list[str] | None = None) -> int:
         resume_recovered_dep_ref = recovered.get("source_dependency_ref")
         resume_recovered_llm = recovered.get("llm")
         resume_recovered_llm_command = recovered.get("llm_command")
+        # Z2 executor immutability on resume (Codex P1, two rounds). The generate-executor is a
+        # per-RUN choice recorded ONCE in the immutable invocation block (persisted on the cold
+        # init path only; a resume passes invocation=None and the runtime preserves the existing
+        # block). It therefore cannot change across a resume:
+        #   - Round 1: an IMPLICIT resume defaulted to legacy above, so a pure run resumed with
+        #     agentic leaves + expanded write authority. Fix: the recovered original ALWAYS wins.
+        #   - Round 2: an explicit override on resume would apply to THIS process but NOT persist
+        #     (the invocation is not rewritten), so a LATER implicit resume would silently revert
+        #     to the original — flipping the model mid-run. Fix: reject a conflicting explicit
+        #     FLAG (fail-closed) instead of honoring it non-durably.
+        # The conflict check keys on the deliberate CLI FLAG, NOT the env var: METDSL_GENERATE_
+        # EXECUTOR is the threading/default mechanism and may be ambiently set in the operator's
+        # shell (or by this process), so on resume the recovered value always takes precedence over
+        # it — only an explicit --generate-executor that disagrees is a deliberate, rejected change.
+        # Older orchestrations predating the field recover None → treated as legacy (they were).
+        recovered_executor = recovered.get("generate_executor")
+        recovered_executor = recovered_executor if recovered_executor in ("legacy", "pure") else "legacy"
+        flag_executor = (args.generate_executor or "").strip().lower() or None
+        if flag_executor and flag_executor != recovered_executor:
+            print(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "generate_executor_immutable_on_resume",
+                        "detail": (
+                            f"the resumed run was started with generate-executor "
+                            f"{recovered_executor!r}; it cannot be changed to {flag_executor!r} "
+                            f"on resume (start a fresh run to switch executors)"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        generate_executor = recovered_executor
+        os.environ["METDSL_GENERATE_EXECUTOR"] = generate_executor
         missing = [
             name
             for name, value, ok in (
@@ -1347,6 +1385,7 @@ def main(argv: list[str] | None = None) -> int:
             workflow_mode=workflow_mode,
             agent_model=args.agent_model,
             with_deps=False,
+            generate_executor=generate_executor,
         )
     )
     return _run_node(
@@ -2326,6 +2365,7 @@ def _run_with_dependency_closure(
             workflow_mode=workflow_mode,
             agent_model=agent_model,
             with_deps=True,
+            generate_executor=base_env.get("METDSL_GENERATE_EXECUTOR", "legacy"),
             closure_id=target_orchestration_id,
             closure_target_spec_ref=target_spec_ref,
             closure_until_phase=until_phase,
@@ -2438,6 +2478,7 @@ def _run_with_dependency_closure(
         workflow_mode=workflow_mode,
         agent_model=agent_model,
         with_deps=True,
+        generate_executor=base_env.get("METDSL_GENERATE_EXECUTOR", "legacy"),
         closure_id=target_orchestration_id,
         closure_target_spec_ref=target_spec_ref,
         closure_until_phase=until_phase,

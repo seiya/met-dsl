@@ -324,6 +324,38 @@ GENERATE_BUNDLE_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     category: ("generate", "reuse") for category in GENERATE_BUNDLE_FAILURE_CATEGORIES
 }
 
+# --- Z2 pure-leaf verify-verdict routing (M-D) ---------------------------------
+# The pure `generate.verify` reviewer returns exactly one verify-verdict JSON document; the host
+# validates it (transport parse, `verify_verdict_violations`) and repairs a SCHEMA violation in a
+# bounded in-conversation warm-resume loop (MAX_BUNDLE_REPAIR_TURNS, `tools/pure_leaf`). A
+# schema-VALID verdict (pass OR fail) is the reviewer's answer and is NEVER repaired here — a
+# `fail` verdict projects onto source_meta.json and routes through the normal verify-severity gate
+# (classify_verify_severity), exactly like the legacy verify leaf. Only a persistently MALFORMED
+# verdict (unparseable / truncated / schema-invalid past the repair budget) reaches this table:
+# that is a verify-LEAF behavior defect, not a bundle defect, and the reviewer's own broken output
+# gives the host nothing to hand a producer. So the route is a COLD generate restart (a fresh
+# producer AND a fresh reviewer), the sound analog of the producer's bundle-exhaustion route.
+#
+# DEVIATION (documented): the plan sketched `("verify","reuse")`, but a phase reopen hands its
+# repair to substep index 0 (the producer) only — `verify` is index 4 and cannot be the reopen
+# target, so a cross-phase "reuse the verify session" is structurally impossible. The in-session
+# reuse (warm-resume of the same reviewer) already happened inside `_run_pure_verify_substep` and
+# is what the budget bounds; once exhausted, reusing that same broken session again is pointless,
+# and threading a "your verdict was malformed" excerpt to the producer would risk perturbing a
+# GOOD bundle. A cold restart is therefore both the only valid and the safest recovery. The
+# terminal category/excerpt + per-attempt usage are still persisted (verdict_meta.json) for
+# provenance and A/B metering (M-E), mirroring bundle_meta.json.
+GENERATE_VERDICT_REASON_PREFIX = "generate_verdict_"
+GENERATE_VERDICT_SCHEMA_VIOLATION = "verdict_schema_violation"
+GENERATE_VERDICT_FAILURE_CATEGORIES: tuple[str, ...] = (
+    "pure_response_unparseable",
+    "pure_response_truncated",
+    GENERATE_VERDICT_SCHEMA_VIOLATION,
+)
+GENERATE_VERDICT_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+    category: ("generate", "restart") for category in GENERATE_VERDICT_FAILURE_CATEGORIES
+}
+
 # Validate.judge (failure_class, attribution) -> routing action.
 # Action is one of:
 #   ("generate", strategy) | ("compile", "reopen") | ("validate", "re_execute")
@@ -1992,13 +2024,14 @@ class Conductor:
         physics node with no infra dep) has no bundle representation for its runner, so it stays
         on the legacy agentic leaf even under executor=pure (a residual, per the plan).
 
-        M-C migrates ONLY the producer `(generate, generate)`; `generate.verify` stays legacy
-        until M-D, so a pure-executor run does a pure producer followed by an agentic verify.
-        Deterministic generate substeps (lint/syntax/static) are never pure — they run
-        in-process regardless."""
+        Both generate LLM substeps are pure under executor=pure: `(generate, generate)` (the
+        CodegenBundle producer, M-C) and `(generate, verify)` (the verdict reviewer, M-D). The
+        two are dispatched to their own loops in `run_substep`. Deterministic generate substeps
+        (lint/syntax/static) are never pure — they run in-process regardless — and compile.verify
+        stays legacy (Z2 migrates the generate phase only)."""
         if self.generate_executor != "pure" or self.backend != "claude":
             return False
-        if (phase, substep) != ("generate", "generate"):
+        if (phase, substep) not in (("generate", "generate"), ("generate", "verify")):
             return False
         return self._conductor_authors_makefile(refs) and self._conductor_authors_runner(refs)
 
@@ -2816,6 +2849,318 @@ clean:
                 return SubstepOutcome(child_arid, "fail", [], proc.returncode,
                                       infra_error, launched_at, attempt + 1)
             # Set up the next (repair) turn: resume this attempt's session.
+            resume_session_id = child_arid
+            attempt += 1
+
+    # --- Z2 pure-leaf verify reviewer (M-D) ------------------------------------
+    # The pure `generate.verify` reviewer returns exactly one verify-verdict JSON document; the
+    # host validates it (`verify_verdict_violations`), repairs a schema violation in a bounded
+    # warm-resume loop, finalizes the attempt with an EMPTY output_refs row, and ONLY THEN authors
+    # source_meta.json (the verdict projection) host-side. A schema-VALID verdict — pass OR fail —
+    # is the reviewer's answer and terminates the loop; only a malformed verdict is repaired. This
+    # mirrors the producer's loop; the differences are that the reviewer's terminal deliverable is
+    # a verdict (not a bundle) and that a valid `fail` verdict is a legitimate substep FAIL routed
+    # by the normal verify-severity gate, not a bundle/verdict category failure.
+
+    def _build_pure_verify_context(self, refs: NodeRefs) -> dict[str, str]:
+        """Assemble the closed context a pure `generate.verify` reviewer sees, each value a plain
+        string the renderer data-fences. Unlike the producer, the reviewer DOES read
+        controlled_spec.md (the human-authored behavioral contract it verifies against — phase_02
+        allows it for verify but forbids it for generate) and the producer's `codegen_bundle.json`
+        (the artifact under review), but NOT the host-rendered runner/Makefile glue (deterministic,
+        not the reviewer's concern). All host-resolved from disk here (the leaf has no filesystem)."""
+        def _read(rel: str) -> str:
+            try:
+                return (self.repo_root / rel).read_text(encoding="utf-8")
+            except OSError:
+                return ""
+        return {
+            "controlled_spec_document": _read(f"{refs.spec_path}/controlled_spec.md"),
+            "tests_document": _read(f"{refs.spec_path}/tests.md"),
+            "ir_document": _read(f"{refs.ir_ref}/spec.ir.yaml"),
+            "bundle_document": _read(f"{refs.source_dir()}/codegen_bundle.json"),
+        }
+
+    def _write_verdict_meta(self, refs: NodeRefs, *, result: str,
+                            failure_category: str | None, failure_excerpt: str | None,
+                            attempts: int, per_attempt: list[dict[str, Any]]) -> None:
+        """Author `<source_dir>/verdict_meta.json` — the pure reviewer's per-attempt record. It
+        mirrors bundle_meta.json: the outcome (`result` = whether a schema-valid verdict was
+        obtained, NOT the pass/fail of that verdict), the terminal `failure_category`/
+        `failure_excerpt` on schema exhaustion (`classify_failure`'s verdict route reads the
+        category), the attempt count, the prompt-contract version, and per-attempt model/usage from
+        the CLI result envelope. source_meta.json cannot hold this (its schema is fixed by
+        meta_contracts and carries no per-attempt usage), and the envelope usage is not recoverable
+        from any other artifact — so this file is a justified (non-redundant) persistence, exactly
+        as bundle_meta.json is for the producer."""
+        from tools.pure_leaf import PURE_PROMPT_CONTRACT_VERSION
+        meta: dict[str, Any] = {
+            "result": result,
+            "failure_category": failure_category,
+            "attempts": attempts,
+            "prompt_contract_version": PURE_PROMPT_CONTRACT_VERSION,
+            "per_attempt": per_attempt,
+        }
+        if failure_excerpt:
+            meta["failure_excerpt"] = failure_excerpt
+        path = self.repo_root / refs.source_dir() / "verdict_meta.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _write_verify_source_meta(self, refs: NodeRefs, verdict: dict[str, Any], *,
+                                  attempts: int) -> None:
+        """Project a schema-valid verify verdict onto the canonical `source_meta.json` host-side,
+        AFTER the reviewer's child window closes. The projection uses ONLY the existing stage-meta
+        keys (meta_contracts) plus the legacy `issue_severity` the verify-severity gate keys on —
+        no new schema. `last_fail_reason` carries the verdict's reason (null on pass), which
+        `_read_repair_findings` threads into the producer repair on a `fail` route. Never called on
+        a schema-exhausted attempt (proof-of-work: no valid verdict => no meta)."""
+        src_dir = self.repo_root / refs.source_dir()
+        src_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "source_id": refs.source_id,
+            "node_key": refs.node_key,
+            "attempt_count": attempts,
+            "verification_status": verdict["verification_status"],
+            "issue_severity": verdict["issue_severity"],
+            "last_fail_reason": verdict["last_fail_reason"],
+            "debug_mode": self.workflow_mode == "dev",
+            "context_isolated": True,
+        }
+        (src_dir / "source_meta.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _run_pure_verify_substep(self, refs: NodeRefs, phase: str, substep: str | None,
+                                 resolved_dependencies: tuple[dict[str, str], ...]
+                                 ) -> "SubstepOutcome":
+        """Run `generate.verify` as a Z2 pure-function reviewer: spawn a tool-less `claude -p`
+        reviewer that returns one verify verdict, validate it, repair a schema violation in a
+        bounded warm-resume loop, finalize the accepted attempt with an EMPTY output_refs row, and
+        ONLY THEN author source_meta.json host-side.
+
+        PERSONA SEPARATION (operator hard rule): the reviewer always spawns a FRESH `--session-id`
+        and the only session ever warm-resumed is the reviewer's OWN prior attempt (assigned
+        `resume_session_id = child_arid` inside this loop). It never seeds from an external arid —
+        in particular never from the producer session — so a resumed turn is structurally
+        guaranteed to be a verify session, and the generate↔verify context is never shared. (On a
+        cross-phase reopen the reviewer is dispatched with repair=None anyway — run_phase hands the
+        phase repair to the producer at index 0 — so there is no external seed to accept.)
+
+        The finalize-before-write ordering is load-bearing for the same reason as the producer:
+        the pure capability's empty write_roots make any write inside the child window an
+        unauthorized write, so the host closes the window (finalize_child) before it authors
+        source_meta.json / verdict_meta.json."""
+        from tools.pure_leaf import (
+            parse_result_envelope, extract_json_document, verify_verdict_violations,
+            MAX_BUNDLE_REPAIR_TURNS, RESPONSE_UNPARSEABLE, _MISSING)
+        pure_context = self._build_pure_verify_context(refs)
+        per_attempt: list[dict[str, Any]] = []
+        resume_session_id: str | None = None
+        prior_document: str | None = None
+        last_category: str | None = None
+        last_excerpt: str | None = None
+        attempt = 0
+        while True:
+            child_arid = self.new_agent_run_id()
+            warm = (resume_session_id is not None
+                    and self._claude_session_resumable(resume_session_id))
+            repair_payload: dict[str, str] | None = None
+            if resume_session_id is not None:
+                repair_payload = {
+                    "issue_severity": "major",
+                    "repair_strategy": "reuse",
+                    "repair_target_agent_run_id": resume_session_id,
+                    "repair_reason": "pure_verdict_repair",
+                }
+                if last_excerpt:
+                    repair_payload["repair_findings"] = last_excerpt
+            request = build_launch_request(
+                refs, step=phase, substep=substep,
+                orchestration_id=self.orchestration_id,
+                orchestration_agent_run_id=self.orchestration_agent_run_id,
+                child_agent_run_id=child_arid,
+                agent_model=self.agent_model, workflow_mode=self.workflow_mode,
+                makefile_host_authored=True, runner_host_authored=True,
+                repair=repair_payload,
+                resolved_dependencies=resolved_dependencies,
+                warm_resume=warm,
+                pure_leaf=True,
+                # Same context-omission rule as the producer: a warm reuse repair's resumed session
+                # already holds the context (the validator exempts it); a cold launch or a
+                # cold-fallback repair (session GC'd) carries the full context.
+                pure_context=(None if (warm and repair_payload is not None
+                                       and repair_payload.get("repair_findings"))
+                              else pure_context),
+            )
+            if repair_payload is not None and not warm and prior_document:
+                request["prior_document"] = prior_document
+            rec = self.record_launch(child_arid, request)
+            launched_at = time.time()
+            proc = self.spawn_leaf(
+                rec["launch_prompt_text"], self._child_env(child_arid),
+                session_id=child_arid,
+                resume_session_id=(resume_session_id if warm else None),
+                child_arid=child_arid, pure=True)
+            self._persist_leaf_output(child_arid, proc)
+            token = self.read_parent_return_token(child_arid)
+
+            envelope = parse_result_envelope(proc.stdout)
+            model = None if envelope.model is _MISSING else envelope.model
+            usage = None if envelope.usage is _MISSING else envelope.usage
+            per_attempt.append({"agent_run_id": child_arid, "model": model, "usage": usage})
+
+            infra_error: tuple[str, str] | None = None
+            category: str | None = None
+            findings: str | None = None
+            parsed_verdict: dict[str, Any] | None = None
+            accepted_verdict: dict[str, Any] | None = None
+            if proc.returncode != 0:
+                # A nonzero reviewer exit is a transport/infra failure (not a verdict the repair can
+                # fix): finalize fail and let run_phase route it fail_closed.
+                infra_error = _classify_leaf_infra_error(proc.stderr or "", proc.stdout or "")
+                category = "pure_transport"
+                findings = self._leaf_failure_summary(proc)
+            elif not envelope.parsed or envelope.is_error is True:
+                category = RESPONSE_UNPARSEABLE
+                findings = ("the CLI result envelope was unparseable or reported is_error: "
+                            + (str(envelope.parse_error or "")[:400] or "no result document"))
+            else:
+                extracted, extract_category = extract_json_document(envelope.result)
+                if extract_category is not None:
+                    category = extract_category
+                    findings = ("the reply was not a single parseable JSON document "
+                                f"({extract_category})")
+                elif not isinstance(extracted, dict):
+                    category = RESPONSE_UNPARSEABLE
+                    findings = "the reply parsed to a non-object JSON value (expected a verdict)"
+                else:
+                    parsed_verdict = extracted
+                    violations = verify_verdict_violations(extracted)
+                    if not violations:
+                        # A verdict can be schema-sound yet not persistable: `json.loads` accepts a
+                        # lone surrogate (e.g. `"\ud800"` in last_fail_reason), but UTF-8-encoding it
+                        # to author source_meta.json raises. Catch that HERE as a schema violation
+                        # (repairable — the reviewer re-emits valid text) rather than accepting it and
+                        # letting the later host-write raise, which would mis-route a schema-valid
+                        # `fail` through the host-write-failed transport branch instead of the
+                        # severity gate. The contract is that every schema-valid verdict reaches its
+                        # routing; an unencodable one is not schema-valid.
+                        try:
+                            json.dumps(extracted, ensure_ascii=False).encode("utf-8")
+                        except UnicodeEncodeError:
+                            violations = [
+                                "verdict contains characters that cannot be encoded as UTF-8 "
+                                "(e.g. an unpaired surrogate); re-emit the verdict with valid text"]
+                    if violations:
+                        category = GENERATE_VERDICT_SCHEMA_VIOLATION
+                        findings = "; ".join(violations)[:1000]
+                    else:
+                        accepted_verdict = extracted
+
+            # A schema-valid verdict terminates the loop regardless of pass/fail; the SUBSTEP status
+            # is the verdict's own verification_status (a `fail` verdict is a legitimate verify
+            # rejection, not a transport/schema error). A malformed verdict has category set and is
+            # repaired below within budget.
+            if accepted_verdict is not None:
+                verify_status = accepted_verdict["verification_status"]
+                reply = (f"verify verdict: {verify_status}\nleaf rc={proc.returncode}\n"
+                         f"severity: {accepted_verdict['issue_severity']}")
+                result_summary = (None if verify_status == "pass"
+                                  else f"pure_verify_fail: {accepted_verdict['last_fail_reason']}"[:400])
+                # Finalize FIRST (close the child FS-diff window); the pure row carries EMPTY
+                # output_refs. ONLY AFTER this may the host author source_meta.json / verdict_meta.
+                self.finalize_child(
+                    child_arid, token, reply,
+                    self._agent_run_json(refs, phase, substep, child_arid, verify_status,
+                                         [], result_summary, agent_model_override=model, pure=True))
+                try:
+                    self._write_verify_source_meta(refs, accepted_verdict, attempts=attempt + 1)
+                    self._write_verdict_meta(
+                        refs, result="pass", failure_category=None, failure_excerpt=None,
+                        attempts=attempt + 1, per_attempt=per_attempt)
+                except Exception as exc:  # noqa: BLE001 — any host-write failure must recover
+                    # A host-side write AFTER the window closed failed (ENOSPC, IO error). The
+                    # attempt is already a terminal `substep` row, so without recovery it is an
+                    # un-vouched orphan. Mirror the producer's pure_host_write_failed path: tombstone
+                    # earlier attempts and route fail_closed via a non-zero leaf_returncode so
+                    # run_phase's transport branch tombstones this arid too and the operator resumes
+                    # (rather than auto-retrying a write a full disk would only repeat).
+                    if attempt > 0:
+                        self._add_superseded_run_ids(
+                            [a["agent_run_id"] for a in per_attempt[:-1]],
+                            reason=f"pure_verify_host_write_failed_superseded: {type(exc).__name__}")
+                    return SubstepOutcome(child_arid, "fail", [], 1,
+                                          ("pure_verify_host_write_failed", f"{type(exc).__name__}: {exc}"),
+                                          launched_at, attempt + 1)
+                # Tombstone superseded reviewer attempts of a repaired verdict (each earlier attempt
+                # was finalized as a terminal `substep` row, but only THIS arid is vouched).
+                if attempt > 0:
+                    self._add_superseded_run_ids(
+                        [a["agent_run_id"] for a in per_attempt[:-1]],
+                        reason=f"pure_verdict_repair_superseded: verify_status={verify_status}")
+                return SubstepOutcome(child_arid, verify_status, [], proc.returncode,
+                                      None, launched_at, attempt + 1)
+
+            # A malformed / transport reply. Record the terminal record fields and carry the prior
+            # document into a cold-fallback repair (re-serialize the parsed verdict if any, else the
+            # raw reply text).
+            last_category = category
+            prior_document = (json.dumps(parsed_verdict, indent=2, ensure_ascii=False)
+                              if parsed_verdict is not None
+                              else (envelope.result if isinstance(envelope.result, str) else None))
+            # Both `last_excerpt` (-> the repair turn's `repair_findings` AND verdict_meta's
+            # failure_excerpt) and `prior_document` (-> the cold-fallback repair prompt) are echoed
+            # into a request/meta that is persisted as UTF-8. Leaf-derived diagnostic text can carry
+            # an unpaired surrogate (the `verdict_schema_violation` case the UTF-8 check above
+            # catches), which would raise UnicodeEncodeError at that write — a crash instead of a
+            # repair turn / a fail_closed. Normalize any non-encodable code point to its readable
+            # backslash escape at capture so every downstream write is safe by construction.
+            last_excerpt = (findings.encode("utf-8", "backslashreplace").decode("utf-8")
+                            if findings is not None else None)
+            if prior_document is not None:
+                prior_document = prior_document.encode("utf-8", "backslashreplace").decode("utf-8")
+            reply = (f"verify verdict: none\nleaf rc={proc.returncode}\n"
+                     f"category: {category or 'none'}")
+            result_summary = f"pure_verify_fail: {category}"
+            self.finalize_child(
+                child_arid, token, reply,
+                self._agent_run_json(refs, phase, substep, child_arid, "fail",
+                                     [], result_summary, agent_model_override=model, pure=True))
+
+            # A schema violation within budget: warm-resume the SAME reviewer session for a bounded
+            # repair. A transport failure ("pure_transport") has no fixable verdict, so it is
+            # excluded and routed fail_closed by run_phase's transport branch (leaf_returncode != 0).
+            can_repair = (category is not None and category != "pure_transport"
+                          and attempt < MAX_BUNDLE_REPAIR_TURNS)
+            if not can_repair:
+                # Terminal: record verdict_meta with the last category/excerpt for the outer route
+                # (classify_failure's verdict table). source_meta.json is intentionally NOT written
+                # (proof-of-work: no schema-valid verdict this attempt). Tombstone superseded arids.
+                # The verdict_meta write is the LAST host action here; it can still fail (ENOSPC, or
+                # a leaf-controlled failure_excerpt that is not UTF-8 encodable), so guard it the
+                # same way the accepted-verdict path guards its writes — a host-write failure must
+                # recover as a fail_closed transport outcome, never escape run_substep uncaught.
+                try:
+                    self._write_verdict_meta(
+                        refs, result="fail", failure_category=last_category,
+                        failure_excerpt=last_excerpt, attempts=attempt + 1, per_attempt=per_attempt)
+                except Exception as exc:  # noqa: BLE001 — any host-write failure must recover
+                    if attempt > 0:
+                        self._add_superseded_run_ids(
+                            [a["agent_run_id"] for a in per_attempt[:-1]],
+                            reason=f"pure_verify_host_write_failed_superseded: {type(exc).__name__}")
+                    return SubstepOutcome(
+                        child_arid, "fail", [], 1,
+                        ("pure_verify_host_write_failed", f"{type(exc).__name__}: {exc}"),
+                        launched_at, attempt + 1)
+                if attempt > 0:
+                    self._add_superseded_run_ids(
+                        [a["agent_run_id"] for a in per_attempt[:-1]],
+                        reason=f"pure_verdict_repair_superseded: {last_category}")
+                return SubstepOutcome(child_arid, "fail", [], proc.returncode,
+                                      infra_error, launched_at, attempt + 1)
+            # Set up the next (repair) turn: resume this attempt's OWN reviewer session (persona
+            # separation — never an external/producer arid).
             resume_session_id = child_arid
             attempt += 1
 
@@ -4617,6 +4962,11 @@ clean:
         # artifacts after the child window closes). It does not share the generic leaf loop
         # below (no allowed_output_paths, no determine_substep_status-before-finalize).
         if self._pure_leaf_substep(refs, phase, substep):
+            if substep == "verify":
+                # Z2 pure reviewer (M-D): its own spawn/validate/repair/finalize loop, host-authors
+                # source_meta.json from the returned verdict after the child window closes.
+                return self._run_pure_verify_substep(
+                    refs, phase, substep, resolved_dependencies)
             return self._run_pure_generate_substep(
                 refs, phase, substep, repair, resolved_dependencies)
         # Resolve the warm-resume decision BEFORE building the request so the slim-vs-full
@@ -5433,6 +5783,15 @@ clean:
             return outcomes
         if SUBSTEPS[phase][len(outcomes) - 1] != "verify":
             return outcomes
+        # Z2 pure reviewer (M-D): the pure `generate.verify` OWNS its in-conversation verdict
+        # repair (bounded warm-resume of its own session inside `_run_pure_verify_substep`) and
+        # the host authors source_meta.json from the returned verdict — there is no leaf-authored
+        # meta to re-author here. A schema-exhausted pure verify is routed by classify_failure's
+        # verdict table (a cold generate restart), not by this legacy meta warm-resume loop. Only
+        # (generate, verify) is pure (compile.verify stays legacy), so this fires solely for the
+        # generate phase under executor=pure.
+        if self._pure_leaf_substep(refs, phase, "verify"):
+            return outcomes
         failed = outcomes[-1]
         # A leaf that died of an infra/transport error (usage limit, OOM) did not "author a bad
         # meta" — it authored nothing. Repairing here would overwrite outcomes[-1] and erase the
@@ -5877,6 +6236,25 @@ clean:
                                          reason=f"{GENERATE_BUNDLE_REASON_PREFIX}{category}")
                 return RouteDecision("retry", target_phase="generate", repair_strategy="restart",
                                      reason="generate_bundle_fail")
+            if failed_substep == "verify" and self._pure_leaf_substep(refs, "generate", "verify"):
+                # Z2 pure reviewer (M-D). Two failure shapes reach here:
+                #   (a) a schema-EXHAUSTED verdict (unparseable / truncated / schema-invalid past
+                #       the in-conversation repair budget): verdict_meta.json carries the terminal
+                #       category, source_meta.json was NOT written (proof-of-work). Route on the
+                #       category -> a cold generate restart (fresh producer + fresh reviewer). See
+                #       GENERATE_VERDICT_FAILURE_ROUTING for why reuse is not an option here.
+                #   (b) a schema-VALID `fail` verdict (the reviewer legitimately rejected the
+                #       source): verdict_meta.json has no routed category, source_meta.json WAS
+                #       written with the verdict projection -> fall through to the verify-severity
+                #       gate below (classify_verify_severity), identical to the legacy verify leaf.
+                vmeta = _read_json(self.repo_root / refs.source_dir() / "verdict_meta.json") or {}
+                category = str(vmeta.get("failure_category") or "")
+                route = GENERATE_VERDICT_FAILURE_ROUTING.get(category)
+                if route:
+                    target, strategy = route
+                    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
+                                         reason=f"{GENERATE_VERDICT_REASON_PREFIX}{category}")
+                # No routed category -> a valid `fail` verdict; fall through to the severity gate.
             if failed_substep == "lint":
                 meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
                 return classify_lint_failure(meta.get("failure_category"))

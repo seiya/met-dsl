@@ -13572,9 +13572,26 @@ def _validate_step_result_payload(
         raise ValueError("step_result.required_outputs must be list")
     declared_outputs = {item.strip() for item in required_outputs if isinstance(item, str) and item.strip()}
 
+    # Z2 pure substeps (leaf_mode==pure, the M-C producer + M-D verify reviewer) hold NO write
+    # authority: each finalizes with output_refs==[] (enforced bidirectionally by
+    # _validate_terminal_run_payload) and the HOST authors the phase's deliverables AFTER the child
+    # window closes. So a pure substep is exempt from the non-empty-output_refs requirement and its
+    # (empty) refs contribute nothing to substep_outputs. When ANY effective substep is pure the
+    # whole phase is host-authored: the deliverables in required_outputs (model/checks/source_meta)
+    # are not published by any substep, so they are vouched by ON-DISK EXISTENCE instead of substep
+    # coverage below (anti-mock-green: a declared-but-absent deliverable still fails). Detected from
+    # the launch request (the single source the producer stamps), mirroring the pure carve-out in
+    # _validate_terminal_run_payload — the two per-record/per-step contracts would otherwise be
+    # mutually contradictory for a pure phase (empty refs required there, non-empty required here).
     substep_outputs: set[str] = set()
+    phase_is_pure = False
     for substep_run_id in effective_run_ids:
         substep_record = run_records[substep_run_id]
+        launch_req = _read_launch_request_payload(
+            repo_root, orchestration_id, agent_run_id=substep_run_id)
+        if isinstance(launch_req, dict) and _pure_leaf_is_pure_request(launch_req):
+            phase_is_pure = True
+            continue
         output_refs = substep_record.get("output_refs")
         if not isinstance(output_refs, list) or not output_refs:
             raise ValueError(f"substep {substep_run_id} must publish non-empty output_refs")
@@ -13595,7 +13612,9 @@ def _validate_step_result_payload(
                 f"pass step_result for {step_token} requires exactly one final {meta_filename} in required_outputs"
             )
         meta_ref = meta_refs[0]
-        if meta_ref not in substep_outputs:
+        # A pure phase's final meta is host-authored (not in any substep's output_refs); its vouch
+        # is on-disk existence + the schema check below, which run unconditionally.
+        if meta_ref not in substep_outputs and not phase_is_pure:
             raise ValueError(
                 f"step_result.required_outputs must reference final {meta_filename} from effective substep output_refs: {meta_ref}"
             )
@@ -13620,10 +13639,23 @@ def _validate_step_result_payload(
 
     missing_outputs = sorted(ref for ref in declared_outputs if ref not in substep_outputs)
     if missing_outputs:
-        raise ValueError(
-            "step_result.required_outputs must be satisfied by substep output_refs: "
-            + ", ".join(missing_outputs)
-        )
+        if phase_is_pure:
+            # Pure phase: the host authors the deliverables after the child windows close, so they
+            # are absent from every substep's output_refs. Vouch them by on-disk existence instead
+            # (a declared-but-unauthored deliverable still fails — the host must actually have
+            # written it). Any that a non-pure substep DID publish are already covered above.
+            absent = sorted(ref for ref in missing_outputs
+                            if not (repo_root / _normalize_rel_posix(ref)).exists())
+            if absent:
+                raise ValueError(
+                    "pure step_result.required_outputs were not authored on disk by the host: "
+                    + ", ".join(absent)
+                )
+        else:
+            raise ValueError(
+                "step_result.required_outputs must be satisfied by substep output_refs: "
+                + ", ".join(missing_outputs)
+            )
 
 
 def parse_feature_list(raw: str) -> dict[str, bool]:

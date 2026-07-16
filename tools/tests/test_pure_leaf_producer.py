@@ -568,7 +568,10 @@ class PurePostGenerateBundleTests(unittest.TestCase):
 # run_workflow --generate-executor pure block (M-C inert)
 # ======================================================================================
 class GenerateExecutorFlagTests(unittest.TestCase):
-    def test_pure_selection_errors_until_md(self) -> None:
+    def test_pure_selection_accepted_after_md(self) -> None:
+        # M-D unlocks `--generate-executor pure`: the gate no longer errors, so a pure selection
+        # passes the executor block and proceeds to normal startup resolution (here failing on the
+        # bogus spec, NOT on `generate_executor_pure_unavailable`).
         import io
         from contextlib import redirect_stdout
         import tools.run_workflow as rw
@@ -576,12 +579,18 @@ class GenerateExecutorFlagTests(unittest.TestCase):
         prev = os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
         try:
             with redirect_stdout(buf):
-                rc = rw.main(["spec/x", "generate", "--generate-executor", "pure"])
+                rc = rw.main(["spec/nonexistent_xyz", "generate", "--generate-executor", "pure"])
+            self.assertNotIn("generate_executor_pure_unavailable", buf.getvalue())
+            self.assertIn("invalid_startup_input", buf.getvalue())
             self.assertEqual(rc, 2)
-            self.assertIn("generate_executor_pure_unavailable", buf.getvalue())
         finally:
+            # main() sets os.environ["METDSL_GENERATE_EXECUTOR"] to the resolved value, so restore
+            # the ORIGINAL state fully — including deleting it when it was absent before — or the
+            # leaked "pure" pollutes every later test's ambient env.
             if prev is not None:
                 os.environ["METDSL_GENERATE_EXECUTOR"] = prev
+            else:
+                os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
 
     def test_invalid_env_executor_rejected(self) -> None:
         # Codex P2 (finding 3): a typo in METDSL_GENERATE_EXECUTOR bypasses argparse's `choices`;

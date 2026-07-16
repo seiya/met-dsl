@@ -41,3 +41,4 @@ Thumbs.db
 *.log
 *.tmp
 mcp_command_log.jsonl
+command_log.jsonl

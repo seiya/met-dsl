@@ -1088,6 +1088,140 @@ class RunWorkflowTests(unittest.TestCase):
             # non-closure params still recovered
             self.assertEqual(params["spec_ref"], "spec/problem/test.md")
 
+    # --- Z2 executor persistence + resume recovery (Codex P1) ------------------
+    def test_build_invocation_record_persists_generate_executor(self) -> None:
+        rec = run_workflow._build_invocation_record(
+            argv=["spec/problem/a", "generate"], spec_ref="spec/problem/a",
+            until_phase="Generate", llm="claude", llm_command="claude",
+            workflow_mode="dev", agent_model=None, with_deps=False,
+            generate_executor="pure")
+        self.assertEqual(rec["generate_executor"], "pure")
+        # Defaults to legacy when omitted (older cold runs are legacy).
+        rec2 = run_workflow._build_invocation_record(
+            argv=["spec/problem/a", "generate"], spec_ref="spec/problem/a",
+            until_phase="Generate", llm="claude", llm_command="claude",
+            workflow_mode="dev", agent_model=None, with_deps=False)
+        self.assertEqual(rec2["generate_executor"], "legacy")
+
+    def test_load_resume_params_recovers_generate_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_pure0000"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md",
+                until_phase="Generate", mode="dev", backend="claude",
+                invocation={"generate_executor": "pure"})
+            params = run_workflow._load_resume_params(repo_root, oid)
+            self.assertEqual(params["generate_executor"], "pure")
+            # A legacy orchestration predating the field recovers None (caller stays legacy).
+            oid2 = "orch_20260101T000000Z_nofield0"
+            self._seed_resumable_orchestration(
+                repo_root, oid2, spec_ref="spec/problem/test.md",
+                until_phase="Generate", mode="dev", backend="claude", invocation={})
+            self.assertIsNone(run_workflow._load_resume_params(repo_root, oid2)["generate_executor"])
+
+    def _resume_and_capture_executor(self, repo_root: Path, oid: str,
+                                     extra_argv: list[str]) -> str:
+        """Resume with the fake runtime and return the executor main() resolved into env."""
+        prev = os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
+        try:
+            code, out, _ = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm", *extra_argv])
+            self.assertEqual(code, 0, out)
+            return os.environ.get("METDSL_GENERATE_EXECUTOR", "")
+        finally:
+            if prev is not None:
+                os.environ["METDSL_GENERATE_EXECUTOR"] = prev
+            else:
+                os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
+
+    def test_resume_recovers_pure_executor_without_flag(self) -> None:
+        # Codex P1: a pure run resumed WITHOUT restating the flag/env must recover pure, not
+        # silently revert to legacy (which would switch execution + write-authority model).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_pure0001"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md", until_phase="Generate",
+                mode="dev", backend="claude", invocation={"generate_executor": "pure"})
+            self.assertEqual(self._resume_and_capture_executor(repo_root, oid, []), "pure")
+
+    def test_resume_conflicting_explicit_executor_rejected(self) -> None:
+        # Codex P1 (round 2): the executor is a per-run choice recorded in the immutable invocation
+        # block (not rewritten on resume). An explicit override that DIFFERS from the recovered
+        # value must be REJECTED fail-closed — honoring it non-durably would let a later implicit
+        # resume silently revert, flipping the execution + write-authority model mid-run.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_pure0002"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md", until_phase="Generate",
+                mode="dev", backend="claude", invocation={"generate_executor": "pure"})
+            prev = os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
+            try:
+                code, out, _ = self._run_main_with_fake_runtime(
+                    ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm",
+                     "--generate-executor", "legacy"])
+                self.assertEqual(code, 2, out)
+                self.assertEqual(out["reason"], "generate_executor_immutable_on_resume")
+            finally:
+                if prev is not None:
+                    os.environ["METDSL_GENERATE_EXECUTOR"] = prev
+                else:
+                    os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
+
+    def test_resume_ignores_invalid_ambient_env_executor(self) -> None:
+        # Codex P2: on resume the ambient env is IGNORED (recovered wins), so an invalid ambient
+        # METDSL_GENERATE_EXECUTOR (a shell typo) must NOT block resume with
+        # generate_executor_invalid — the persisted executor is recovered instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_pure0004"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md", until_phase="Generate",
+                mode="dev", backend="claude", invocation={"generate_executor": "pure"})
+            prev = os.environ.get("METDSL_GENERATE_EXECUTOR")
+            os.environ["METDSL_GENERATE_EXECUTOR"] = "pur"  # invalid typo in the ambient shell
+            try:
+                code, out, _ = self._run_main_with_fake_runtime(
+                    ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"])
+                self.assertEqual(code, 0, out)
+                self.assertEqual(os.environ.get("METDSL_GENERATE_EXECUTOR"), "pure")
+            finally:
+                if prev is not None:
+                    os.environ["METDSL_GENERATE_EXECUTOR"] = prev
+                else:
+                    os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
+
+    def test_resume_restating_same_executor_allowed(self) -> None:
+        # Restating the SAME executor on resume is fine (no change), so an operator re-passing the
+        # flag they always use is not spuriously rejected.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_pure0003"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md", until_phase="Generate",
+                mode="dev", backend="claude", invocation={"generate_executor": "pure"})
+            self.assertEqual(
+                self._resume_and_capture_executor(
+                    repo_root, oid, ["--generate-executor", "pure"]), "pure")
+
+    def test_resume_legacy_orchestration_stays_legacy(self) -> None:
+        # An orchestration predating the field recovers None -> stays legacy (it was legacy).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            oid = "orch_20260101T000000Z_legacy01"
+            self._seed_resumable_orchestration(
+                repo_root, oid, spec_ref="spec/problem/test.md", until_phase="Generate",
+                mode="dev", backend="claude", invocation={})
+            self.assertEqual(self._resume_and_capture_executor(repo_root, oid, []), "legacy")
+
     def test_index_closure_orchestrations_latest_wins_and_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
