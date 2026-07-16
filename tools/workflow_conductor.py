@@ -2817,7 +2817,15 @@ clean:
 
             reply = (f"status: {status}\nleaf rc={proc.returncode}\n"
                      f"category: {category or 'none'}")
-            result_summary = (f"pure_generate_fail: {category}" if status != "pass" else None)
+            # A pure row carries EMPTY output_refs, so `result_summary` is the ONLY thing that can
+            # speak for it: `_validate_agent_summary_text` requires a terminal row with no
+            # output_refs to explain itself (a rule written for fail rows, but a pure PASS is
+            # equally output-less and must satisfy it). Leaving this None on pass makes
+            # finalize-child reject every passing pure leaf — the executor cannot complete.
+            result_summary = (
+                f"pure_generate_fail: {category}" if status != "pass"
+                else f"pure_generate_pass: bundle accepted (attempts={attempt + 1})"
+            )
             # Finalize the attempt FIRST (close the child FS-diff window) — the pure terminal row
             # carries an EMPTY output_refs (the host has written nothing yet). ONLY AFTER this may
             # the host write the bundle artifacts.
@@ -3115,8 +3123,15 @@ clean:
                 verify_status = accepted_verdict["verification_status"]
                 reply = (f"verify verdict: {verify_status}\nleaf rc={proc.returncode}\n"
                          f"severity: {accepted_verdict['issue_severity']}")
-                result_summary = (None if verify_status == "pass"
-                                  else f"pure_verify_fail: {accepted_verdict['last_fail_reason']}"[:400])
+                # Non-None on BOTH outcomes: the pure row's output_refs is empty, so this is the
+                # only field that can satisfy `_validate_agent_summary_text`'s "a terminal row with
+                # no output_refs must explain itself" rule. See the producer's mirror above.
+                result_summary = (
+                    f"pure_verify_pass: verdict {verify_status} "
+                    f"(severity={accepted_verdict['issue_severity']}, attempts={attempt + 1})"[:400]
+                    if verify_status == "pass"
+                    else f"pure_verify_fail: {accepted_verdict['last_fail_reason']}"[:400]
+                )
                 # Finalize FIRST (close the child FS-diff window); the pure row carries EMPTY
                 # output_refs. ONLY AFTER this may the host author source_meta.json / verdict_meta.
                 self.finalize_child(
@@ -3646,10 +3661,16 @@ clean:
                 payload["agent_model"] = resolved
         if status == "pass":
             payload["output_refs"] = output_refs
-        elif result_summary and result_summary.strip():
-            # A failed substep carries no output_refs, so _validate_agent_summary_text
-            # requires a summary/reason token; surface the leaf failure reason here so
-            # finalize-child produces a valid agent.summary.txt instead of crashing.
+        # `_validate_agent_summary_text` requires a summary/reason token on any terminal row
+        # that publishes no output_refs — such a row has nothing else to speak for it. Two
+        # kinds qualify, and the condition must name both:
+        #   - a FAIL row (the original case): it sets no output_refs at all.
+        #   - since Z2, a pure leaf's PASS row: its output_refs is EMPTY by contract (the host
+        #     writes the deliverables only after the child window closes).
+        # Keying this on `status != "pass"` alone — the former `elif` — silently dropped the
+        # summary from every passing pure leaf, so finalize-child rejected it and the pure
+        # executor could never complete a real run (found by the first billed E2E).
+        if (status != "pass" or not output_refs) and result_summary and result_summary.strip():
             payload["result_summary"] = result_summary.strip()
         return payload
 

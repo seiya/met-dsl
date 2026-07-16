@@ -82,6 +82,28 @@ class PureVerifySubstepTests(unittest.TestCase):
         if hasattr(self, "_tmp"):
             self._tmp.cleanup()
 
+    def test_pure_pass_finalize_payload_satisfies_the_real_summary_validator(self) -> None:
+        """Mirror of the producer's regression pin (billed E2E, 2026-07-16).
+
+        A pure row's `output_refs` is empty by contract, so `_validate_agent_summary_text`
+        requires `result_summary` to explain the row. The reviewer, like the producer,
+        passed None on pass — which `finalize-child` rejects. These tests stub
+        `runtime()`, so the only way to catch it is to run the conductor's ACTUAL
+        captured payload through the REAL validators.
+        """
+        from tools.orchestration_runtime import (
+            _extract_agent_summary_text, _validate_agent_summary_text,
+        )
+
+        c, refs, oc = self._run([_envelope(_verdict("pass"))])
+        self.assertEqual(oc.status, "pass")
+        payloads = [cap["--agent-run-json"] for sub, cap in c.calls
+                    if sub == "finalize-child" and "--agent-run-json" in cap]
+        self.assertTrue(payloads, "finalize-child must have been called with a payload")
+        for payload in payloads:
+            self.assertEqual(payload["output_refs"], [])  # the pure contract
+            _validate_agent_summary_text(payload, _extract_agent_summary_text(payload))
+
     def test_pass_verdict_writes_source_meta_and_empty_output_refs(self) -> None:
         c, refs, oc = self._run([_envelope(_verdict("pass"))])
         self.assertEqual(oc.status, "pass")

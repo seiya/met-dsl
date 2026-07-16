@@ -273,6 +273,37 @@ class PureProducerSubstepTests(unittest.TestCase):
         self.assertEqual(meta["prompt_contract_version"], PURE_PROMPT_CONTRACT_VERSION)
         self.assertEqual(meta["per_attempt"][0]["model"], "claude-opus-4-8")
 
+    def test_pure_pass_finalize_payload_satisfies_the_real_summary_validator(self) -> None:
+        """The finalize payload a passing pure leaf produces must survive the REAL
+        runtime validators.
+
+        REGRESSION (billed E2E, 2026-07-16): every passing pure leaf was rejected by
+        `finalize-child` with "agent.summary.txt must include summary or failure
+        reason" — the pure executor could never complete a real run. A pure row carries
+        an EMPTY `output_refs` by contract, so `_validate_agent_summary_text` falls to
+        its "a terminal row with no output_refs must explain itself" branch; the
+        conductor passed `result_summary=None` on pass, leaving nothing to satisfy it.
+
+        The whole suite missed it because these tests stub `runtime()`. So drive the
+        conductor's ACTUAL captured payload through the REAL validators rather than
+        re-asserting the stub. Same anti-mock-green shape as the meta writer↔reader
+        contract test.
+        """
+        from tools.orchestration_runtime import (
+            _extract_agent_summary_text, _validate_agent_summary_text,
+        )
+
+        c, refs, oc = self._run([_envelope(_valid_bundle())])
+        self.assertEqual(oc.status, "pass")
+        payloads = [cap["--agent-run-json"] for sub, cap in c.calls
+                    if sub == "finalize-child" and "--agent-run-json" in cap]
+        self.assertTrue(payloads, "finalize-child must have been called with a payload")
+        for payload in payloads:
+            self.assertEqual(payload["status"], "pass")
+            self.assertEqual(payload["output_refs"], [])  # the pure contract
+            # The real generator + the real validator — no stub in this path.
+            _validate_agent_summary_text(payload, _extract_agent_summary_text(payload))
+
     def test_finalize_before_write_ordering(self) -> None:
         # The finalize-child call MUST precede the host artifact writes (empty write_roots make
         # an in-window write unauthorized). Pin the ORDERING directly: capture, at the instant
