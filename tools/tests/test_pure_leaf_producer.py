@@ -557,6 +557,98 @@ class PureTerminalCarveOutTests(unittest.TestCase):
 
 
 # ======================================================================================
+# Exemplar attachment on the pure launch (defect B)
+# ======================================================================================
+class _RenderingFakeConductor(_PureFakeConductor):
+    """`_PureFakeConductor` whose record-launch runs the REAL prompt pipeline.
+
+    The base stub returns a literal "PROMPT", so every prompt-content regression is invisible to
+    it — exactly how defect B (`exemplar=` never passed to `build_launch_request`) survived a
+    green suite. Here record-launch drives the real `prepare_launch_request_payload` +
+    `_validate_launch_prompt_text` over the conductor's ACTUAL request, so a request the
+    validators would reject fails the test too. Same anti-mock-green shape as the
+    finalize-payload test above.
+    """
+
+    exemplar_value: dict | None = None
+
+    def _resolve_exemplar(self, refs):  # type: ignore[override]
+        # Canned: the real selector needs a certified sibling on disk, which this fixture has no
+        # reason to build — the wiring under test is whether the resolved value reaches the render.
+        return self.exemplar_value
+
+    def runtime(self, args):  # type: ignore[override]
+        out = super().runtime(args)
+        if args[0] != "record-launch":
+            return out
+        request = json.loads(args[args.index("--request-json") + 1])
+        self.requests = getattr(self, "requests", [])
+        self.requests.append(request)
+        prepared = ort.prepare_launch_request_payload(dict(request))
+        prompt = prepared["launch_prompt_full"]
+        ort._validate_launch_prompt_text(prepared, prompt)
+        return {"launch_prompt_text": prompt}
+
+    def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+        self.prompts = getattr(self, "prompts", [])
+        self.prompts.append(prompt_text)
+        return super().spawn_leaf(prompt_text, child_env, **kwargs)
+
+
+class PureProducerExemplarTests(unittest.TestCase):
+    """R5 exemplar injection on the pure `generate.generate` launch.
+
+    REGRESSION (billed E2E, 2026-07-16 — defect B): every other strand of the pure exemplar
+    wiring was in place (the template's `<exemplar>` slot, `_build_exemplar`, the
+    `build_launch_request` attach condition, the scan carve-out) but `_run_pure_generate_substep`
+    never passed `exemplar=`, so the pure producer authored with strictly less information than
+    the legacy leaf it was being A/B'd against.
+    """
+
+    _EXEMPLAR = {
+        "node_key": "component/sibling@1.0.0",
+        "sources": [{"filename": "sibling_model.f90",
+                     "text": "module sibling_model\n  ! prior art body\nend module sibling_model\n"}],
+    }
+
+    def _run(self, envelopes):
+        self._tmp = tempfile.TemporaryDirectory()
+        repo = Path(self._tmp.name)
+        refs = _write_node(repo)
+        (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
+        c = _RenderingFakeConductor(
+            repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
+            backend="claude", env={}, generate_executor="pure")
+        c.exemplar_value = self._EXEMPLAR
+        c.envelopes = envelopes
+        oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+        return c, oc
+
+    def tearDown(self) -> None:
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
+
+    def test_cold_pure_launch_renders_exemplar_in_prompt(self) -> None:
+        c, oc = self._run([_envelope(_valid_bundle())])
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(c.requests[0]["exemplar"], self._EXEMPLAR)
+        # ...and it survives the real render + the real launch validator (no fail-close).
+        self.assertIn("Certified exemplar (conductor-injected PRIOR ART", c.prompts[0])
+        self.assertIn("! prior art body", c.prompts[0])
+
+    def test_warm_repair_attempt_does_not_attach_exemplar(self) -> None:
+        # The repair template has no `<exemplar>` slot, so attaching it to a repair turn would
+        # ship payload bytes nothing renders.
+        bad = _valid_bundle()
+        del bad["capability_requirements"]
+        c, oc = self._run([_envelope(bad), _envelope(_valid_bundle())])
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(oc.attempts, 2)
+        self.assertNotIn("exemplar", c.requests[1])
+        self.assertNotIn("Certified exemplar", c.prompts[1])
+
+
+# ======================================================================================
 # Cold-repair prompt contract (M-C 修正4)
 # ======================================================================================
 class PureColdRepairPromptTests(unittest.TestCase):
@@ -612,6 +704,36 @@ class PureColdRepairPromptTests(unittest.TestCase):
         text = ort._pure_output_contract_text(self._req())
         self.assertTrue(text.startswith("Output contract"))
         self.assertIn("diagnose it", text)  # the closing clause of the generate.generate contract
+
+    def test_cold_repair_includes_authoring_rules_and_output_contract(self) -> None:
+        # A cold fallback re-authors the whole bundle with no prior turn, so it needs the
+        # deterministic-gate rules for the same reason it needs the schema (M-C cold-repair
+        # contract, extended for defect C).
+        text = ort._render_pure_repair_prompt(self._req())
+        self.assertIn("Output contract", text)
+        self.assertIn("Authoring rules", text)
+        self.assertIn("! allow(C003)", text)
+
+    def test_warm_repair_omits_authoring_rules(self) -> None:
+        # The resumed session already holds the launch prompt's static prefix.
+        text = ort._render_pure_repair_prompt(self._req(warm_resume=True))
+        self.assertNotIn("Authoring rules", text)
+        self.assertNotIn("! allow(C003)", text)
+
+    def test_authoring_rules_lift_is_the_whole_paragraph(self) -> None:
+        # Mirrors the output-contract lift pin: an interior blank line introduced by a template
+        # edit would make `split("\n\n")` drop everything after it, shipping a cold repair with
+        # only the first rule group. Pin the heading (start) AND the last group's closing clause.
+        text = ort._pure_authoring_rules_text(self._req())
+        self.assertTrue(text.startswith("Authoring rules"))
+        self.assertIn("no branching on its result.", text)  # closing clause of the last group
+
+    def test_authoring_rules_lift_empty_for_verify(self) -> None:
+        # The verify template has no authoring-rules paragraph; the lift returns '' and the
+        # renderer must leave no unfilled `<authoring_rules>` token behind.
+        req = self._req(substep="verify")
+        self.assertEqual(ort._pure_authoring_rules_text(req), "")
+        self.assertNotIn("<authoring_rules>", ort._render_pure_repair_prompt(req))
 
 
 # ======================================================================================

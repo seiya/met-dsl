@@ -2687,6 +2687,12 @@ clean:
                 seed = str(repair.get("repair_findings", "")).strip() or None
                 last_excerpt = (seed.encode("utf-8", "backslashreplace").decode("utf-8")
                                 if seed is not None else None)
+        # R5: resolve the certified sibling exemplar ONCE, above the loop — it is
+        # attempt-invariant (the selector never raises; a failure just omits it), mirroring the
+        # agentic path. It is attached per-attempt only when that attempt renders the LAUNCH
+        # template: the repair template (`pure_bundle_repair.txt`) has no `<exemplar>` slot, so
+        # attaching it to a repair turn would ship the payload with nothing rendering it.
+        exemplar = self._resolve_exemplar(refs)
         attempt = 0
         while True:
             child_arid = self.new_agent_run_id()
@@ -2706,6 +2712,14 @@ clean:
                 }
                 if last_excerpt:
                     repair_payload["repair_findings"] = last_excerpt
+            # Same predicate the render dispatch uses to choose the launch vs repair template
+            # (`_render_launch_prompt_template`): a repair payload WITHOUT findings still renders
+            # the full launch prompt. True for a cold first attempt and for an outer reopen seeded
+            # with no findings excerpt (which also re-sends pure_context) — both want the
+            # exemplar; every inner repair turn carries findings and does not.
+            renders_launch_prompt = (
+                repair_payload is None
+                or not str(repair_payload.get("repair_findings", "")).strip())
             request = build_launch_request(
                 refs, step=phase, substep=substep,
                 orchestration_id=self.orchestration_id,
@@ -2715,6 +2729,7 @@ clean:
                 makefile_host_authored=True, runner_host_authored=True,
                 repair=repair_payload,
                 resolved_dependencies=resolved_dependencies,
+                exemplar=(exemplar if renders_launch_prompt else None),
                 warm_resume=warm,
                 pure_leaf=True,
                 # On a warm reuse repair the resumed session already holds the context, so it is

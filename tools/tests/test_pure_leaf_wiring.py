@@ -162,7 +162,10 @@ class PurePayloadValidationTests(unittest.TestCase):
             ort._validate_pure_launch_request_payload(bad)
 
     def test_validate_payload_pure_requires_exact_contract_version(self) -> None:
-        for version in ("pure-2", "", None):
+        # Any version other than the CURRENT constant is rejected — including the immediately
+        # preceding one. (The stand-in must not be a version that a later bump makes valid; keep
+        # it a value the contract will never take.)
+        for version in ("pure-OBSOLETE", "pure-1", "", None):
             bad = _pure_request(prompt_contract_version=version)
             with self.assertRaises(ValueError):
                 ort._validate_pure_launch_request_payload(bad)
@@ -316,6 +319,44 @@ class PureRenderTests(unittest.TestCase):
         ort._validate_launch_prompt_text(prepared, prompt)  # must not fail-close
         scanned = ort._gate_allowlist_scan_text(prepared, prompt)
         self.assertNotIn("validate_pipeline_semantics", scanned)
+
+    def test_pure_launch_prompt_carries_authoring_rules_tokens(self) -> None:
+        # Defect C (billed E2E, 2026-07-16): the pure template stated NO authoring rules, so the
+        # producer met the deterministic gates blind and oscillated between the two wrong
+        # `implicit none` forms until its retry budget ran out. Pin the load-bearing literals of
+        # each rule group — a rewrite that drops one fails here rather than in a billed run.
+        prepared = ort.prepare_launch_request_payload(_pure_request("generate"))
+        prompt = prepared["launch_prompt_full"]
+        for token in (
+            "! allow(C003)",          # the C003 <-> f2008 escape, verbatim
+            "-std=f2008",             # ... and why the F2018 spec-list is not the fix
+            "use, intrinsic ::",      # fortitude C122
+            "case default",           # fortitude C011
+            "associate (unused_<name> => <name>)",  # the unused-dummy bind form
+            "intent(out)",            # Generate.static dataflow
+            "INERT",                  # the inert dependency-call rule
+        ):
+            self.assertIn(token, prompt)
+        # `<name>` is not a substitution key, so the single-pass renderer must leave the
+        # `associate` form intact — the assertion above is also this pin.
+        # Static prefix first (byte-stable order): rules precede the variable documents.
+        self.assertLess(prompt.index("Authoring rules"), prompt.index("Harness capabilities"))
+
+    def test_pure_launch_prompt_renders_exemplar_block(self) -> None:
+        # Complements the fence/scan test below with the CONTENT assertion: an injected exemplar
+        # must actually reach the rendered prompt (heading + source body), which is what defect B
+        # silently lost by never passing `exemplar=` on the pure launch request.
+        exemplar = {
+            "node_key": "component/sibling@1.0.0",
+            "sources": [{"filename": "sibling_model.f90",
+                         "text": "module sibling_model\nend module sibling_model\n"}],
+        }
+        prepared = ort.prepare_launch_request_payload(_pure_request("generate", exemplar=exemplar))
+        prompt = prepared["launch_prompt_full"]
+        self.assertIn("Certified exemplar (conductor-injected PRIOR ART", prompt)
+        self.assertIn("component/sibling@1.0.0", prompt)
+        self.assertIn("module sibling_model", prompt)
+        ort._validate_launch_prompt_text(prepared, prompt)
 
     def test_pure_doc_placeholder_token_not_corrupted(self) -> None:
         # Fix C: a literal `<step>` / `<ir_document>` token INSIDE an inlined document must

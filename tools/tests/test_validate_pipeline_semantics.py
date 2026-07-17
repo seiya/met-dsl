@@ -14302,9 +14302,14 @@ class PureLaunchRecordSweepTest(unittest.TestCase):
             req["prompt_contract_version"] = "pure-OBSOLETE"
             req_path.write_text(json.dumps(req), encoding="utf-8")
             prompt_path = root / "launches" / f"{self._ARID}.prompt.txt"
+            # Reference the constant, not a `pure-1` literal: a version bump would turn a literal
+            # into a no-op replace, leaving the prompt line at the CURRENT version — the assertion
+            # below would then pass on the request-json violation alone and the prompt-line check
+            # would be silently dead.
+            from tools.pure_leaf import PURE_PROMPT_CONTRACT_VERSION
             prompt_path.write_text(
                 prompt_path.read_text(encoding="utf-8").replace(
-                    "prompt_contract_version: pure-1",
+                    f"prompt_contract_version: {PURE_PROMPT_CONTRACT_VERSION}",
                     "prompt_contract_version: pure-OBSOLETE"),
                 encoding="utf-8")
             self.assertTrue(

@@ -10068,23 +10068,44 @@ def _render_pure_launch_prompt(request_payload: dict[str, Any]) -> str:
     return _substitute_pure_placeholders(template, subs)
 
 
-def _pure_output_contract_text(request_payload: dict[str, Any]) -> str:
-    """The static output-contract paragraph of the pure launch template for this (step, substep).
+def _pure_template_paragraph(request_payload: dict[str, Any], prefix: str) -> str:
+    """The static paragraph beginning `prefix` in the pure launch template for this
+    (step, substep), lifted VERBATIM.
 
-    A cold repair fallback has no prior turn that carried the schema, so it must re-state it. The
-    paragraph is lifted VERBATIM from the launch template (`pure_{step}_{substep}.txt`) — the one
-    beginning `Output contract` — so the repair and the cold launch describe the same contract
-    from a single source rather than a hand-copied duplicate that could drift. Returns '' when no
-    launch template matches (defensive: the caller then omits the section)."""
+    A cold repair fallback has no prior turn that carried the launch template's static prefix, so
+    it must re-state the parts the producer needs. Lifting from the launch template
+    (`pure_{step}_{substep}.txt`) keeps the repair and the cold launch describing the same rules
+    from a single source rather than a hand-copied duplicate that could drift. A paragraph is a
+    `\\n\\n`-delimited block, so a template paragraph must carry no interior blank line or the lift
+    silently truncates it (pinned by a test). Returns '' when no launch template matches
+    (defensive) or when this template has no such paragraph (e.g. the verify template has no
+    authoring rules) — the caller then omits the section."""
     try:
         templates = _load_launch_prompt_templates()
         template = templates[_pure_launch_template_name(request_payload)]
     except (KeyError, OSError):
         return ""
     for block in template.split("\n\n"):
-        if block.lstrip().startswith("Output contract"):
+        if block.lstrip().startswith(prefix):
             return block.strip()
     return ""
+
+
+def _pure_output_contract_text(request_payload: dict[str, Any]) -> str:
+    """The static output-contract paragraph (the CodegenBundle schema) of the pure launch
+    template for this (step, substep)."""
+    return _pure_template_paragraph(request_payload, "Output contract")
+
+
+def _pure_authoring_rules_text(request_payload: dict[str, Any]) -> str:
+    """The static authoring-rules paragraph (the deterministic-gate closure the producer must
+    satisfy) of the pure launch template for this (step, substep).
+
+    A cold-fallback repair re-states it for the same reason it re-states the output contract: the
+    producer is re-authoring the whole document with no prior turn to carry the rules, and a
+    bundle repaired into schema conformance still has to clear `Generate.lint` / `Generate.syntax`
+    / `Generate.static` afterwards."""
+    return _pure_template_paragraph(request_payload, "Authoring rules")
 
 
 def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:
@@ -10092,11 +10113,13 @@ def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:
 
     The findings excerpt is wrapped in the same data-only fence as an inlined document so the
     single scan carve-out covers it. On a WARM repair the resumed session already holds the
-    output-contract schema, the prior document under repair, and the full context, so
-    `<output_contract>`, `<prior_document>`, and `<pure_context>` are all empty. On the COLD
-    fallback (`_claude_session_resumable` returned false — no `warm_resume`) the session has no
-    prior turn, so the repair re-states the output-contract SCHEMA (lifted from the launch
-    template), re-inlines the model's PRIOR document under repair (`prior_document`, threaded by
+    output-contract schema, the authoring rules, the prior document under repair, and the full
+    context, so `<output_contract>`, `<authoring_rules>`, `<prior_document>`, and
+    `<pure_context>` are all empty. On the COLD fallback (`_claude_session_resumable` returned
+    false — no `warm_resume`) the session has no prior turn, so the repair re-states the
+    output-contract SCHEMA and the AUTHORING RULES (both lifted from the launch template — a
+    re-authored bundle still has to clear the deterministic gates), re-inlines the model's PRIOR
+    document under repair (`prior_document`, threaded by
     the producer repair loop — the parsed bundle re-serialized, or the raw unparseable reply
     text), re-inlines the input context documents (`pure_context`), AND re-inlines the
     host-resolved `dependency_facts` (the published-operation interfaces of the node's component
@@ -10117,6 +10140,7 @@ def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:
     }
     if not request_payload.get("warm_resume"):
         subs["output_contract"] = _pure_output_contract_text(request_payload)
+        subs["authoring_rules"] = _pure_authoring_rules_text(request_payload)
         prior = str(request_payload.get("prior_document", "")).strip()
         subs["prior_document"] = (
             "**Your prior document under repair (correct it — do not restart from scratch):**\n"
@@ -10136,6 +10160,7 @@ def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:
         subs["pure_context"] = "\n".join(context_blocks)
     else:
         subs["output_contract"] = ""
+        subs["authoring_rules"] = ""
         subs["prior_document"] = ""
         subs["dependency_facts"] = ""
         subs["pure_context"] = ""
