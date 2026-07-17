@@ -2598,7 +2598,7 @@ layout a conductor-spawned leaf actually produces, and keep the `subagents/` sca
 in-process substeps (`Compile.static`, `Generate.{lint,syntax,static}`, `Build`, `Validate.{pre_judge,execute,post_judge}`)
 spawn no leaf and legitimately have no transcript; they must stay `unavailable` rather than be reported as zero-cost.
 
-## Z2 first billed A/B E2E — the pure executor had never run: one fixed defect, two open information gaps (FILED 2026-07-16)
+## Z2 first billed A/B E2E — the pure executor had never run: one fixed defect, two information gaps (FILED 2026-07-16; defects FIXED 2026-07-17 — P-arm re-run pending)
 
 `Z2` above is recorded `LANDED`, and its unit suite is green, but the `pure` `generate-executor` had never executed
 against the real runtime. The first billed A/B E2E ran it and it failed twice, for three distinct reasons. `LANDED`
@@ -2623,7 +2623,7 @@ three times on the same migration. All three were invisible to the unit suite fo
 same anti-mock-green shape as the bundle-meta writer↔reader contract test. Any further pure wiring should be pinned
 this way rather than against a stub.
 
-**Defect B — the certified exemplar is never injected into a pure `generate.generate` (OPEN).**
+**Defect B — the certified exemplar is never injected into a pure `generate.generate` (FIXED, `2bb508d`).**
 The M-B payload contract requires the pure request to reuse the existing `exemplar` key for `generate.generate`. Every
 part of the path exists except the last one: the template carries an `<exemplar>` placeholder, the pure renderer
 substitutes `_build_exemplar(request_payload)`, and `build_launch_request` attaches the key when given a value — but
@@ -2633,7 +2633,18 @@ no exemplar, and the request payload's keys are `leaf_mode` / `pure_context` / `
 **Required:** resolve and pass the exemplar on a cold pure launch, mirroring the legacy condition
 (`generate.generate` ∧ not deterministic ∧ not `warm_resume` — a resumed session already holds it).
 
-**Defect C — the pure prompt carries no authoring rules (OPEN, needs a scope decision).**
+**Resolution.** `_run_pure_generate_substep` now resolves the exemplar ONCE above the attempt loop (attempt-invariant,
+and the selector never raises — the legacy path's shape) and attaches it per-attempt under the predicate
+`repair_payload is None or not repair_payload["repair_findings"].strip()` — the **same** predicate
+`_render_launch_prompt_template` dispatches on, so the exemplar is attached exactly when the LAUNCH template (the only
+one with an `<exemplar>` slot) is what renders. The attach condition is deliberately **not** the legacy
+`not warm_resume`: the two disagree on one case, an outer reopen seeded with no findings excerpt, which under the pure
+executor renders a full launch prompt and re-sends `pure_context` — so it wants the exemplar, and `not warm_resume`
+would wrongly withhold it. Known cosmetic residual (R6): `_build_exemplar`'s heading tells the leaf to author from
+`controlled_spec.md` / `tests.md`, which a pure M3c leaf never reads (it gets an IR + tests document inline). Harmless
+orientation drift, left as-is rather than forking the shared renderer.
+
+**Defect C — the pure prompt carries no authoring rules (FIXED, `2bb508d`).**
 A `pure-function leaf` reads no `SKILL` and no contract doc by design; the host is supposed to inline everything it
 needs. The static section of `pure_generate_generate.txt` distills the **output contract** only — the `CodegenBundle`
 schema — because that is all the Z2 design specified to distil. It carries none of the authoring rules the agentic leaf
@@ -2662,5 +2673,40 @@ static prefix is byte-stable and precedes the variable context). Candidates: the
 `Generate.syntax` legality rules including the `associate (unused_<name> => <name>)` binding, the JSON descriptor rules,
 and the inert-dependency-call rule. Defect B may reduce how much is required — a certified sibling exemplar exhibits
 the correct forms as prior art — but an exemplar is **prior art, not a gate** (R5), so it is not a substitute for
-stating a rule the leaf must follow. Both defects must be closed and the P arm re-run before the A/B can be evaluated;
-the L arm baseline is unaffected (its generate path is `legacy`) and remains comparable.
+stating a rule the leaf must follow.
+
+**Resolution — the scope adopted is the DETERMINISTIC-GATE CLOSURE**: exactly the rules a gate will fail the bundle on,
+stated where the producer can act on them and nowhere else. Four groups, in the `Authoring rules` paragraph of
+`pure_generate_generate.txt` (immediately after the output contract, still inside the byte-stable static prefix and
+ahead of the variable context):
+
+1. **fortitude idioms** (`Generate.lint`): `S001` line length, `C121` `use ... only:`, `C122` `use, intrinsic ::`,
+   `PORT011` named integer kinds (with its cascade into `C122`), `C011` `case default`.
+2. **The `C003` ↔ `-std=f2008` trap**, stated at verbatim strength as the ONE correct form (`! allow(C003)` on its own
+   line above a plain `implicit none`) plus BOTH wrong forms named as wrong and an explicit "do not oscillate between
+   these two" — the measured failure was not ignorance of the rule but a two-attractor loop.
+3. **`Generate.syntax` legality** (a real `gfortran -fsyntax-only -std=f2008` front-end, so `! allow(...)` suppresses
+   nothing): 63-char identifiers, constant-only `stop` / `error stop` codes, the `associate (unused_<name> => <name>)`
+   bind for `-Werror=unused-dummy-argument`, case-insensitive identifier collisions.
+4. **`intent(out)` dataflow** (`Generate.static`) and the **inert dependency-call rule** (sink-in-IR ⇒ load-bearing;
+   no sink ⇒ inert, and no inventing a purpose for it).
+
+**Excluded, deliberately.** The JSON descriptor rules: `pure` is M3c-only and an M3c runner is host-rendered, so the
+producer never authors a descriptor and the rules are unreachable. Naming rules and the checks ABI: already carried by
+the inlined IR and `harness_capabilities` respectively — restating them would duplicate a live source with a static one
+that can drift from it.
+
+The rules are lifted into the **cold-fallback repair** too (`_pure_authoring_rules_text` → the repair template's
+`<authoring_rules>` slot), symmetric with the M-C cold-repair output-contract lift and for the same reason: a cold
+fallback re-authors the whole bundle with no prior turn, and a bundle repaired into schema conformance still has to
+clear the gates. A warm repair omits them (the resumed session holds the launch prefix). Both lifts now share one
+`_pure_template_paragraph(request_payload, prefix)` helper; because a "paragraph" is a `\n\n`-delimited block, an
+interior blank line would silently truncate the lift, so both are pinned by a test asserting the paragraph's **closing**
+clause, not just its heading.
+
+`PURE_PROMPT_CONTRACT_VERSION` is bumped `pure-1` → `pure-2` (the templates changed in a way that affects producer
+behavior). The bump is transport-wide by design: the verify substep's `verdict_meta` is stamped `pure-2` as well even
+though only the generate template changed, so an A/B summary shows both substeps at one contract version.
+
+The P arm must be re-run before the A/B can be evaluated; the L arm baseline is unaffected (its generate path is
+`legacy`) and remains comparable.
