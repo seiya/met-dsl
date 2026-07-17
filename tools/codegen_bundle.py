@@ -1432,16 +1432,104 @@ def m3c_literal_name_violation(doc: Mapping[str, Any], spec_id: str) -> str | No
         if not candidates:
             return (f"the host-rendered runner requires a {role}-role file named "
                     f"{want_path!r} declaring module {want_module!r}; the bundle has none")
+        # EXACT, not casefold: `logical_path` becomes a filename, and the gate that ultimately
+        # demands it opens `src_dir / f"{spec_id}_checks.f90"` on a case-sensitive filesystem
+        # (`_validate_checks_source_files`). Casefolding here accepted `Shallow_Water2d_Checks.f90`
+        # — which lints and compiles fine, since Fortran resolves `use` by module name and never
+        # by filename — and then `Generate.static` rejected it on the name, reopening the phase.
+        # The module comparison below stays casefolded for the mirror-image reason: a Fortran
+        # identifier IS case-insensitive.
         match = next((e for e in candidates
-                      if str(e.get("logical_path", "")).casefold() == want_path.casefold()), None)
+                      if str(e.get("logical_path", "")) == want_path), None)
         if match is None:
-            return (f"the {role}-role file must be named {want_path!r} (the host-rendered "
-                    f"runner `use`s module {want_module!r} by fixed name); got "
+            return (f"the {role}-role file must be named {want_path!r} exactly (the host-rendered "
+                    f"runner `use`s module {want_module!r} by fixed name, and the deterministic "
+                    f"gate opens that filename verbatim); got "
                     f"{[e.get('logical_path') for e in candidates]}")
         modules = {str(m).casefold() for m in (match.get("modules") or []) if isinstance(m, str)}
         if want_module.casefold() not in modules:
             return (f"{want_path} must declare module {want_module!r} (the host-rendered "
                     f"runner `use`s it); its modules are {sorted(match.get('modules') or [])}")
+    return None
+
+
+def m3c_checks_abi_violation(doc: Mapping[str, Any], spec_id: str) -> str | None:
+    """The fixed-ABI constraint on the bundle's checks module, or None.
+
+    An M3c node's `<spec_id>_checks` module must publish the SAME fixed set of names for every
+    node — `runner_renderer.CHECKS_PUBLIC_NAMES`, the authority — each as a SUBROUTINE, because
+    the host-rendered runner `call`s them (runner_renderer:690-738). Two later gates enforce
+    halves of that and this layer pre-empts both, turning what were phase reopens into one
+    bounded in-conversation repair (Z2 defect D: sw2d burned its whole retry budget re-guessing
+    an ABI it had never been shown):
+
+    - `Generate.static` (`_validate_checks_source_files`) requires all of the names to be
+      PUBLISHED. It does not distinguish a subroutine from a function.
+    - `Generate.syntax` rejects a name the runner imports but the module does not define
+      (`Symbol '<name>' not found in module`) or defines as a FUNCTION (`'<name>' ... has a type,
+      which is not consistent with the CALL`).
+
+    The required set is the FULL fixed ABI, never the subset the node's own runner happens to
+    import: the runner's import list IS dynamic in the IR (`get_r<rank>` per declared rank,
+    `metric_compute` only with metrics), but `Generate.static` requires all ten regardless, so
+    requiring only the imported subset would accept a bundle that gate then rejects — which is
+    what it did until a review caught it.
+
+    Conservative NECESSARY condition: every ABI name is published — defined in this module, or
+    named in one of its `public ::` statements — and none is defined HERE as a function. It does
+    not check dummy-argument agreement; `Generate.syntax` stages the runner with the source and
+    owns call resolution.
+
+    "Published" is `Generate.static`'s own notion, deliberately, not a better one. Fortran has
+    ways to export a callable name that neither gate models — a whole-module `use` re-export with
+    no `public ::`, a generic `interface`, an interface-only module implemented by a submodule —
+    and all of them compile and `call` fine while both gates report the ABI unpublished. That is a
+    shared false positive, and it stays shared ON PURPOSE: this layer exists to pre-empt
+    `Generate.static`, so being more permissive than it would just move the rejection later and
+    recreate the disagreement this defect is about, in the other direction. The certified idiom
+    (a bare `private` plus an explicit `public ::` list, which authoring rule 1 mandates and all
+    16 certified modules use) is well inside what both accept. The parse is delegated to `validate_pipeline_semantics.checks_module_abi_facts` —
+    the SAME parser `Generate.static` uses, so the two gates cannot disagree about what a given
+    source publishes. (A second implementation is exactly how this layer came to accept output
+    `Generate.static` rejected.)"""
+    from tools.runner_renderer import CHECKS_PUBLIC_NAMES
+    from tools.validate_pipeline_semantics import checks_module_abi_facts
+    # `m3c_literal_name_violation` runs first and guarantees this file exists and declares this
+    # module. Scope to it: a bundle may legally carry OTHER checks-role files, and reading their
+    # text too would let a sibling module vouch for a name `use <spec_id>_checks` cannot resolve.
+    want_path = f"{spec_id}_checks.f90"
+    match = next((e for e in (doc.get("files") or [])
+                  if isinstance(e, dict) and e.get("role") == "checks"
+                  and str(e.get("logical_path", "")) == want_path), None)
+    if match is None:  # unreachable via the ordered contract; fail-closed if ever called alone
+        return f"the bundle carries no checks-role file named {want_path!r}"
+    published, subroutines, defined = checks_module_abi_facts(
+        str(match.get("content") or ""), spec_id)
+    unpublished = [n for n in CHECKS_PUBLIC_NAMES if n not in published]
+    # Only POSITIVE evidence of the wrong kind rejects: the name is defined right here and is not
+    # a subroutine, so it is a function. A published name with NO local definition is not proof of
+    # anything — it can be `use`-associated, declared via an `interface`/generic block, or
+    # implemented in a submodule, all of which compile, link, and `call` fine. Rejecting those
+    # would fail a LEGAL module with findings telling the producer to write the subroutine it had
+    # already written: an unexitable repair loop, which is this defect's own failure mode.
+    # `Generate.syntax` stages the runner with the source and is the authority on call resolution.
+    wrong_kind = [n for n in CHECKS_PUBLIC_NAMES
+                  if n not in unpublished and n in defined and n not in subroutines]
+    if unpublished or wrong_kind:
+        parts = []
+        if unpublished:
+            parts.append(
+                f"not published by module {spec_id}_checks: {', '.join(unpublished)} (define it "
+                f"there and, under a bare `private` default, name it in a `public ::` statement)")
+        if wrong_kind:
+            parts.append(
+                f"defined here as a FUNCTION: {', '.join(wrong_kind)} (every ABI name is a "
+                f"subroutine by contract, and the runner reaches the ones it imports with a "
+                f"`call`, so a function of that name cannot satisfy it)")
+        return (f"module {spec_id}_checks must define and publish the fixed checks ABI as "
+                f"subroutines — " + "; ".join(parts)
+                + f". The full required set is {', '.join(CHECKS_PUBLIC_NAMES)} for EVERY M3c "
+                f"node, whatever subset this node's runner imports.")
     return None
 
 
@@ -1466,9 +1554,10 @@ def pure_bundle_contract_violation(
     report AND a later layer never runs on a doc an earlier one already rejected): schema
     (`validate_bundle`) -> single-node unit shape -> harness capability negotiation (the manifest
     MUST exist — an undeclared harness satisfies nothing) -> state_variable ∈ IR
-    algorithm.state_variables -> the M3c literal name the host-rendered runner `use`s ->
-    `build_graph(doc)` (the caller's assembly derivation, which raises RuntimeError on a
-    cross-origin object/module collision or a straddle).
+    algorithm.state_variables -> the M3c literal name the host-rendered runner `use`s -> the
+    fixed checks-module ABI -> `build_graph(doc)` (the caller's assembly
+    derivation, which raises RuntimeError on a cross-origin object/module collision or a
+    straddle).
 
     `harness_provided` is the caller-resolved harness capability set (`None` = undeclared harness
     = nothing provided, fail-closed); `harness_label` only names it in the findings text.
@@ -1511,6 +1600,9 @@ def pure_bundle_contract_violation(
     name_violation = m3c_literal_name_violation(doc, spec_id)
     if name_violation is not None:
         return ("bundle_assembly_collision", name_violation)
+    abi_violation = m3c_checks_abi_violation(doc, spec_id)
+    if abi_violation is not None:
+        return ("bundle_checks_abi_violation", abi_violation)
     try:
         build_graph(doc)
     except RuntimeError as exc:

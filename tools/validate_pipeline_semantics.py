@@ -3854,14 +3854,11 @@ _FORTRAN_NAME_LIMIT = 63
 
 
 # R1/M3c-β: the fixed public ABI of a physics node's `<spec_id>_checks.f90`
-# (see docs/workflow/CHECKS_MODULE_CONTRACT.md). Non-prefixed names — module scope
-# makes them collision-free (the harness is `harness_fortran_cpu__*`, the model is
-# `<spec_id>__*`), and they keep every identifier under the f2008 63-char limit.
-_CHECKS_PUBLIC_NAMES = (
-    "case_setup", "case_run", "get_time",
-    "get_scalar", "get_r1", "get_r2", "get_r3", "get_r4",
-    "checks_compute", "metric_compute",
-)
+# (see docs/workflow/CHECKS_MODULE_CONTRACT.md). Imported, NOT restated: `runner_renderer` owns
+# this set — it renders the runner that consumes it, and selects the per-node subset it imports
+# FROM it. A second copy here would be a second authority for one fact, which is exactly how the
+# Z2 bundle gate came to require the imported subset while this gate required all ten.
+from tools.runner_renderer import CHECKS_PUBLIC_NAMES as _CHECKS_PUBLIC_NAMES  # noqa: E402
 
 
 def _infra_direct_dep_node_keys(ir: dict[str, Any]) -> list[str]:
@@ -3944,9 +3941,61 @@ def _validate_checks_source_files(
         violations.append(
             f"{checks_path}: must declare `module {spec_id}_checks` (the fixed ABI module)")
 
+    published, _, _ = checks_module_abi_facts(text, spec_id)
+    missing = [n for n in _CHECKS_PUBLIC_NAMES if n not in published]
+    if missing:
+        violations.append(
+            f"{checks_path}: checks module must publish the fixed ABI names "
+            f"{list(_CHECKS_PUBLIC_NAMES)}; missing {missing}")
+
+    _validate_checks_source_harness_isolation(execution, src_dir, model_files, violations)
+
+
+def _fortran_statements(text: str) -> list[str]:
+    """Fortran source as one STATEMENT per entry: comments stripped, `&` continuations joined,
+    and `;`-joined statements split apart.
+
+    Every rule written against "a line" is really written against a statement, so this is what
+    such a rule must iterate. `_fortran_logical_lines` alone does only the first two steps, and
+    the omission is invisible until someone writes `use a; use b` — at which point an anchored
+    `^\\s*use\\b` rule silently sees one statement and misses the other. Both halves of the M3c
+    checks gate go through here so they cannot drift apart on that."""
+    return [stmt for line in _fortran_logical_lines(text)
+            for stmt in _split_fortran_statements(line)]
+
+
+def checks_module_abi_facts(text: str, spec_id: str) -> tuple[set[str], set[str], set[str]]:
+    """`(published, defined_subroutines, defined_procs)` for `module <spec_id>_checks` in `text`,
+    lowercased.
+
+    THE single parser for the checks-module ABI surface, shared by the deterministic
+    `Generate.static` gate (`_validate_checks_source_files`, which reads the staged file) and the
+    Z2 bundle acceptance gate (`codegen_bundle.m3c_checks_abi_violation`, which reads the
+    producer's in-memory bundle before anything is written). They MUST agree: a second
+    implementation is how the bundle gate came to accept output that `Generate.static` then
+    rejected, reopening the phase — the drift this function exists to make impossible.
+
+    `published` is what `use <spec_id>_checks, only:` can resolve: Fortran's module default is
+    PUBLIC, so a name is published iff it is defined and not `private ::`'d, unless a bare
+    `private` statement flips the default, in which case it must be `public ::`'d.
+
+    `defined_procs` are the module-level procedure definitions written HERE, and
+    `defined_subroutines` the subset of those spelled `subroutine`. Callers must read them as
+    positive evidence only, never as "everything callable": a name can be published and callable
+    without appearing in either — `use`-associated from another module, declared through an
+    `interface` / generic block, or implemented in a submodule. So `n in defined_procs and n not
+    in defined_subroutines` proves n is a FUNCTION here, while `n not in defined_procs` proves
+    nothing at all (and rejecting on it fails a legal module).
+
+    Iterates `_fortran_statements`, not raw lines: left unsplit, `public :: a; public :: b` read
+    as a single `public` statement whose list was `a; public :: b`, losing `a` (whose token was
+    `a;`) and inventing a name `public` — legal Fortran (gfortran rc=0) reported unpublished by
+    BOTH gates."""
+    logical = _fortran_statements(text)
     public_ids: set[str] = set()
     private_ids: set[str] = set()
     defined_procs: set[str] = set()
+    defined_subroutines: set[str] = set()
     module_default_private = False  # a bare module-level `private` flips the default
     type_depth = 0  # a bare `private` inside a derived-type def is a component attr, not the module default
     in_interface = False  # a subroutine/function header inside an interface block is a proto, not a def
@@ -3955,10 +4004,19 @@ def _validate_checks_source_files(
     target_module = f"{spec_id}_checks".lower()
     # A subroutine/function definition header. `function` may carry a type-spec prefix; the
     # `end <proc>` case is handled before this so the leading-token alternation can't match it.
+    # The type-spec `[^!]*` is greedy, so it is matched against a STRING-MASKED copy of the line
+    # (below): unmasked it ran from a declaration's type keyword into a string literal —
+    # `character(len=*), parameter :: note = 'run subroutine case_setup first'` registered a
+    # phantom definition and suppressed every later `public ::`. Masking rather than excluding
+    # quotes fixes that WITHOUT rejecting a legal quote inside the type-spec itself
+    # (`character(kind=kind('a')) function metric_compute()`), which the exclusion turned into a
+    # published-but-undefined function the gate then accepted — a fail-open both gate authors
+    # missed until a Codex review, since the runner `call`s it and Generate.syntax fails later.
     proc_start = re.compile(
         r"(?i)^\s*(?:(?:module|pure|impure|elemental|recursive|non_recursive)\s+)*"
-        r"(?:(?:integer|real|double\s+precision|complex|logical|character|type|class)\b[^!]*\s+)?"
-        r"(?:subroutine|function)\s+([A-Za-z]\w*)")
+        r"(?:(?:integer|real|double\s+precision|complex|logical|character|type|class)\b"
+        r"[^!]*\s+)?"
+        r"(subroutine|function)\s+([A-Za-z]\w*)")
     for ln in logical:
         s = ln.strip()
         # Enter/leave the TARGET checks module. A `module <name>` statement (not `module
@@ -4011,11 +4069,15 @@ def _validate_checks_source_files(
             continue
         # A subroutine/function definition. Only a MODULE-LEVEL (depth-0) definition INSIDE the
         # target checks module is a published entity the runner can `use ... only:`; a nested
-        # internal procedure, or one in another module / after `end module`, is not.
-        pm2 = proc_start.match(s)
+        # internal procedure, or one in another module / after `end module`, is not. Matched on a
+        # string-masked copy so the greedy type-spec neither crosses INTO a string literal nor is
+        # blocked by a legal quote WITHIN the type-spec.
+        pm2 = proc_start.match(_mask_fortran_string_contents(s))
         if pm2:
             if in_target_module and proc_depth == 0:
-                defined_procs.add(pm2.group(1).lower())
+                defined_procs.add(pm2.group(2).lower())
+                if pm2.group(1).lower() == "subroutine":
+                    defined_subroutines.add(pm2.group(2).lower())
             proc_depth += 1
             continue
         # `public` / `private` statements only publish/hide the target module's own entities,
@@ -4045,27 +4107,45 @@ def _validate_checks_source_files(
         published = public_ids - private_ids
     else:
         published = (public_ids | defined_procs) - private_ids
-    missing = [n for n in _CHECKS_PUBLIC_NAMES if n not in published]
-    if missing:
-        violations.append(
-            f"{checks_path}: checks module must publish the fixed ABI names "
-            f"{list(_CHECKS_PUBLIC_NAMES)}; missing {missing}")
+    return published, defined_subroutines, defined_procs
+
+
+def _validate_checks_source_harness_isolation(
+    execution: NodeExecution, src_dir: Path, model_files: list[Path], violations: list[str]
+) -> None:
+    """The rest of the M3c checks-source gate (see `_validate_checks_source_files`)."""
+    spec_id = _spec_id_from_node_key(execution.node_key)
+    if spec_id is None:
+        return
+    checks_path = src_dir / f"{spec_id}_checks.f90"
+    if not checks_path.is_file():
+        return
+    text = checks_path.read_text(encoding="utf-8", errors="ignore")
+    logical = _fortran_logical_lines(text)
 
     # Neither the checks nor the model source may `use` the harness module. Tolerate the
     # optional `, <attr>` (e.g. `, intrinsic`) and `::` forms — `use harness_x`,
-    # `use :: harness_x`, and `use, non_intrinsic :: harness_x` must all be caught.
+    # `use :: harness_x`, and `use, non_intrinsic :: harness_x` must all be caught. The scan is
+    # per STATEMENT, not per line: the regex is anchored, so a harness `use` written as the second
+    # statement of a `;`-joined line (`use, intrinsic :: iso_fortran_env, only: dp => real64;
+    # use harness_fortran_cpu_model, only: ...`, legal and rc=0) would otherwise be invisible —
+    # a fail-OPEN on the isolation invariant that nothing downstream catches, since the harness is
+    # staged for `Generate.syntax` and the bundle contract has no isolation layer.
     use_harness_re = re.compile(r"(?i)^\s*use\b\s*(?:,\s*\w+\s*)?(?:::\s*)?harness_")
     for f in [checks_path, *model_files]:
         ftext = f.read_text(encoding="utf-8", errors="ignore")
-        if any(use_harness_re.match(ln.strip())
-               for ln in _fortran_logical_lines(ftext)):
+        if any(use_harness_re.match(stmt.strip())
+               for stmt in _fortran_statements(ftext)):
             violations.append(
                 f"{f}: a physics source must not `use` the harness module — the physics "
                 "node never depends on the harness at the source level (the host-rendered "
                 "runner is the sole `use harness_*` site)")
 
-    # The checks module does no file I/O (emission is the harness/runner's exclusive job).
-    if any(re.search(r"(?i)\bopen\s*\(", ln) for ln in logical):
+    # The checks module does no file I/O (emission is the harness/runner's exclusive job). Scan
+    # string-masked statements: an `open(` call is code, so a quoted `'open('` in a message string
+    # is not one — matching it would fail-close a legal module. (The forbidden-filename scan below
+    # is deliberately the opposite: it inspects string CONTENT, so it runs on the raw text.)
+    if any(re.search(r"(?i)\bopen\s*\(", _mask_fortran_string_contents(ln)) for ln in logical):
         violations.append(
             f"{checks_path}: checks module must not do file I/O (`open(`) — emission is the "
             "harness's job; the checks module only computes state/checks/metrics")
@@ -4810,6 +4890,31 @@ _IFACE_TYPE_END = re.compile(r"^\s*end\s*type\b", re.IGNORECASE)
 def _strip_fenced_blocks(text: str) -> str:
     """Remove fenced code blocks (```...```) from Markdown text."""
     return _FENCED_BLOCK_RE.sub("", text)
+
+
+def _mask_fortran_string_contents(line: str) -> str:
+    """Replace the CONTENTS of every quoted string with spaces, keeping the quote delimiters and
+    every character's position.
+
+    For matching a statement's KEYWORD structure only: a string literal can hold text that looks
+    like Fortran (`'run subroutine x first'`), and a real type-spec can hold a quote inside its
+    parens (`character(kind=kind('a')) function f()`). Masking the contents removes the phantom
+    keyword without disturbing the parens/`::`/`,` a header match keys on. Do NOT feed a masked
+    line to a rule that inspects string CONTENT (the forbidden-filename scan deliberately catches
+    a quoted `verdict.json`)."""
+    out: list[str] = []
+    quote: str | None = None
+    for ch in line:
+        if quote is not None:
+            out.append(ch if ch == quote else " ")
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _strip_fortran_comment(line: str) -> str:
@@ -10552,10 +10657,11 @@ def _validate_post_generate_bundle(
     Fires ONLY when `codegen_bundle.json` exists (the legacy leaf-authored source tree has none),
     so it is inert on every legacy node. Re-runs the FULL host acceptance contract
     (`codegen_bundle.pure_bundle_contract_violation`: schema + single-node shape + harness
-    capability negotiation + IR state bindings + M3c model/checks names + assembly-graph
-    collisions) — the SAME layers the producer accepted, reconstructed from the IR + dependency
-    sidecar — so a post-write edit that stays schema-valid (e.g. swapping in an unsupported
-    `capability_requirements`) cannot slip past a validator that only re-ran `validate_bundle`.
+    capability negotiation + IR state bindings + M3c model/checks names + the fixed
+    checks-module ABI + assembly-graph collisions) — the SAME layers the producer
+    accepted, reconstructed from the IR + dependency sidecar — so a post-write edit that stays
+    schema-valid (e.g. swapping in an unsupported `capability_requirements`) cannot slip past a
+    validator that only re-ran `validate_bundle`.
     Then verifies every declared `files[]` entry exists on disk with byte-identical content (a
     post-write mutation is a violation), with no UNDECLARED `.f90` staged beyond the host glue
     (`<spec_id>_runner.f90`)."""

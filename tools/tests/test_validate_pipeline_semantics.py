@@ -13139,8 +13139,131 @@ end module bx_checks
 _MODEL_OK = "module bx_model\n! allow(C003)\nimplicit none\nend module bx_model\n"
 
 
+class ChecksAbiSingleAuthorityTests(unittest.TestCase):
+    """One fact, one authority. Two copies of the ABI name set is precisely how the Z2 bundle
+    gate came to require the runner-imported SUBSET while this gate required all ten, so a
+    prompt-conformant bundle passed one and failed the other."""
+
+    def test_static_gate_and_renderer_share_one_tuple(self) -> None:
+        from tools.runner_renderer import CHECKS_PUBLIC_NAMES
+        # `is`, not `==`: equal-but-separate tuples are the drift surface, and they would be
+        # equal right up to the commit that edits one of them.
+        self.assertIs(vps._CHECKS_PUBLIC_NAMES, CHECKS_PUBLIC_NAMES)
+
+    def test_bundle_gate_requires_exactly_that_set(self) -> None:
+        # The Z2 acceptance layer must key off the same authority, not a restatement.
+        import inspect
+        from tools.runner_renderer import CHECKS_PUBLIC_NAMES
+        import tools.codegen_bundle as _cb
+        src = inspect.getsource(_cb.m3c_checks_abi_violation)
+        self.assertIn("CHECKS_PUBLIC_NAMES", src)
+        for name in CHECKS_PUBLIC_NAMES:
+            self.assertNotIn(f'"{name}"', src, "the ABI names must not be restated here")
+
+
+class ChecksAbiFactsStatementSplitTests(unittest.TestCase):
+    """`checks_module_abi_facts` reads STATEMENTS, not lines. Every rule in it is written against
+    one statement, so a logical line carrying `;` separators must be split first — otherwise legal
+    Fortran (gfortran rc=0) is reported as unpublished by BOTH gates that share this parser."""
+
+    def test_semicolon_separated_public_statements(self) -> None:
+        src = ("module demo_checks\n  private\n  public :: case_setup; public :: case_run\n"
+               "contains\n  subroutine case_setup()\n  end subroutine case_setup\n"
+               "  subroutine case_run()\n  end subroutine case_run\nend module demo_checks\n")
+        published, _, _ = vps.checks_module_abi_facts(src, "demo")
+        self.assertIn("case_setup", published)  # was lost: its token was `case_setup;`
+        self.assertIn("case_run", published)
+        self.assertNotIn("public", published)  # was invented from the second statement's keyword
+
+    def test_semicolon_after_bare_private_still_flips_the_default(self) -> None:
+        # `private; public :: case_setup` => default private, and ONLY case_setup published.
+        src = ("module demo_checks\n  private; public :: case_setup\ncontains\n"
+               "  subroutine case_setup()\n  end subroutine case_setup\n"
+               "  subroutine case_run()\n  end subroutine case_run\nend module demo_checks\n")
+        published, _, _ = vps.checks_module_abi_facts(src, "demo")
+        self.assertEqual(published, {"case_setup"})
+
+    def test_string_literal_naming_subroutine_does_not_corrupt_the_parse(self) -> None:
+        # The type-spec prefix of `proc_start` is greedy enough to run from a declaration's type
+        # keyword into a string literal, registering a phantom definition AND incrementing
+        # proc_depth — which suppressed every later `public ::` and real definition, so both gates
+        # reported the whole ABI unpublished on a module gfortran accepts.
+        src = ("module demo_checks\n  private\n"
+               "  character(len=*), parameter :: note = 'run subroutine case_setup first'\n"
+               "  public :: case_setup, case_run\ncontains\n"
+               "  subroutine case_setup()\n  end subroutine case_setup\n"
+               "  subroutine case_run()\n  end subroutine case_run\nend module demo_checks\n")
+        published, subs, defined = vps.checks_module_abi_facts(src, "demo")
+        self.assertEqual(published, {"case_setup", "case_run"})
+        self.assertEqual(defined, {"case_setup", "case_run"})
+        self.assertEqual(subs, {"case_setup", "case_run"})
+
+    def test_quoted_type_spec_function_header_is_recognized(self) -> None:
+        # Codex review, the reverse of the string-literal case: a legal type-spec may hold a quote
+        # in its parens. Excluding quotes from the prefix made the header unmatchable, so the
+        # function went unrecorded — published but not in `defined_subroutines`, which let the
+        # bundle gate accept a FUNCTION for a name the runner `call`s. Masking the string CONTENT
+        # (not excluding quotes) recognizes it.
+        src = ("module demo_checks\n  public\ncontains\n"
+               "  character(kind=kind('a')) function metric_compute()\n"
+               "    metric_compute = 'x'\n  end function metric_compute\n"
+               "  subroutine case_setup()\n  end subroutine case_setup\nend module demo_checks\n")
+        published, subs, defined = vps.checks_module_abi_facts(src, "demo")
+        self.assertIn("metric_compute", defined)
+        self.assertNotIn("metric_compute", subs)  # it is a function, not a subroutine
+        self.assertIn("case_setup", subs)
+
+    def test_typed_function_statements_still_register(self) -> None:
+        # ...and excluding quotes from the prefix must not lose a real typed function header.
+        src = ("module demo_checks\n  public\ncontains\n"
+               "  real(kind(1d0)) function f(x)\n    real(kind(1d0)) :: x\n    f = x\n"
+               "  end function f\n  character(len=32) function name()\n    name = 'x'\n"
+               "  end function name\nend module demo_checks\n")
+        published, subs, defined = vps.checks_module_abi_facts(src, "demo")
+        self.assertEqual(defined, {"f", "name"})
+        self.assertEqual(subs, set())
+
+    def test_semicolon_inside_a_string_does_not_split(self) -> None:
+        src = ("module demo_checks\n  character(len=*), parameter :: s = 'a;b'\n  private\n"
+               "  public :: case_setup\ncontains\n  subroutine case_setup()\n"
+               "  end subroutine case_setup\nend module demo_checks\n")
+        published, _, _ = vps.checks_module_abi_facts(src, "demo")
+        self.assertEqual(published, {"case_setup"})
+
+
 class ChecksSourceGateTests(unittest.TestCase):
     """R1/M3c-β `_validate_checks_source_files`: the leaf-authored fixed-ABI checks module."""
+
+    def test_open_inside_a_string_literal_is_not_file_io(self) -> None:
+        # The `open(` scan reads code, so a quoted `'open('` in a message is not a call — matching
+        # it would fail-close a legal module. Masking strings for this scan (but NOT for the
+        # forbidden-filename scan, which inspects string content) draws the line correctly.
+        from tools.runner_renderer import CHECKS_PUBLIC_NAMES as TEN
+        body = ("".join(f"  public :: {n}\n" for n in TEN) + "contains\n"
+                + "".join(f"  subroutine {n}()\n  end subroutine {n}\n" for n in TEN))
+        legal = ("module bx_checks\n  private\n"
+                 "  character(len=8), parameter :: s = 'open('\n" + body + "end module\n")
+        self.assertEqual([v for v in self._run(legal) if "file I/O" in v], [])
+        real = ("module bx_checks\n  private\n" + body.replace(
+            "  subroutine case_setup()\n  end subroutine case_setup\n",
+            "  subroutine case_setup()\n    open(unit=10, file='x')\n  end subroutine case_setup\n")
+            + "end module\n")
+        self.assertTrue(any("file I/O" in v for v in self._run(real)))
+
+    def test_harness_use_as_a_second_statement_is_still_caught(self) -> None:
+        # Fail-OPEN guard. The harness-isolation scan is an anchored `^\s*use\b` regex, so a
+        # harness `use` written as the second statement of a `;`-joined line was invisible —
+        # legal Fortran (gfortran rc=0) that breaches the isolation invariant with nothing
+        # downstream to catch it: the harness IS staged for Generate.syntax, and the bundle
+        # contract has no isolation layer. Both halves of the gate now read STATEMENTS.
+        from tools.runner_renderer import CHECKS_PUBLIC_NAMES as TEN
+        body = ("".join(f"  public :: {n}\n" for n in TEN) + "contains\n"
+                + "".join(f"  subroutine {n}()\n  end subroutine {n}\n" for n in TEN))
+        src = ("module bx_checks\n"
+               "  use, intrinsic :: iso_fortran_env, only: dp => real64; "
+               "use harness_fortran_cpu_model, only: harness_fortran_cpu__box\n"
+               "  implicit none\n  private\n" + body + "end module\n")
+        self.assertTrue(any("harness" in v for v in self._run(src)), self._run(src))
 
     def _exec(self, tmp: Path) -> NodeExecution:
         return NodeExecution(node_key="component/bx@0.1.0", node_dir=tmp,
@@ -14188,7 +14311,8 @@ class PureLaunchRecordSweepTest(unittest.TestCase):
                 "prompt_contract_version": PURE_PROMPT_CONTRACT_VERSION,
                 "allowed_output_paths": [],
                 "pure_context": {"harness_capabilities": "{}", "target_profile": "t",
-                                 "ir_document": "i", "tests_document": "t"},
+                                 "ir_document": "i", "tests_document": "t",
+                                 "runner_document": "program r\nend program\n"},
             })
             prompt = render_launch_prompt_text(pure_render_req)
             (orch_root / "launches" / f"{self._ARID}.prompt.txt").write_text(

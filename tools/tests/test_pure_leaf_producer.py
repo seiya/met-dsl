@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", "1")
 
@@ -29,7 +31,64 @@ _NODE = "problem/shallow_water2d@0.3.0"
 _SAFE = wc.node_key_safe(_NODE)
 _SPEC_ID = "shallow_water2d"
 _HARNESS = "infrastructure/harness_fortran_cpu@0.3.0"
+_HARNESS_SPEC_ID = "harness_fortran_cpu"
 _SPEC_PATH = "spec/problem/ocean/shallow_water2d"
+
+def _runner_text() -> str:
+    from tools.runner_renderer import render_runner
+    return render_runner(_node_ir(), _SPEC_ID, _HARNESS_SPEC_ID)
+
+
+def cb_runner_imports(runner_text: str, spec_id: str) -> tuple[str, ...]:
+    """The names a rendered runner actually imports — a TEST-only read of the runner, kept here to
+    assert that the required ABI is deliberately WIDER than it (production must not key off this;
+    `Generate.static` requires all ten regardless)."""
+    out: list[str] = []
+    body, seen = "", False
+    for raw in runner_text.splitlines():
+        line = raw.split("!", 1)[0].strip()
+        if not seen:
+            m = re.match(rf"(?i)^use\s+{re.escape(spec_id)}_checks\s*,\s*only\s*:\s*(.*)$", line)
+            if not m:
+                continue
+            seen, line = True, m.group(1).strip()
+        else:
+            line = line.lstrip("&").strip()
+        cont = line.endswith("&")
+        body += line[:-1] if cont else line
+        if not cont:
+            break
+    for tok in body.split(","):
+        tok = tok.strip()
+        if re.fullmatch(r"[A-Za-z]\w*", tok):
+            out.append(tok)
+    return tuple(out)
+
+
+def _checks_symbols() -> tuple[str, ...]:
+    """The fixed checks ABI — required in FULL of every M3c node, not the subset this node's
+    runner imports (`Generate.static` checks all ten). Imported from the renderer, the ABI's
+    authority, rather than hand-typed here."""
+    from tools.runner_renderer import CHECKS_PUBLIC_NAMES
+    return CHECKS_PUBLIC_NAMES
+
+
+def _checks_content(*, omit: str = "", as_function: str = "", unexported: str = "") -> str:
+    """A checks module publishing the fixed ABI, in the certified idiom (a bare `private` default
+    plus an explicit `public ::` list — authoring rule 1). `omit` drops a name entirely,
+    `as_function` defines one as a FUNCTION (the two shapes the sw2d P-arm emitted), and
+    `unexported` defines one but leaves it off the export list."""
+    syms = [s for s in _checks_symbols() if s != omit]
+    body = [f"module {_SPEC_ID}_checks", "  private"]
+    body += [f"  public :: {s}" for s in syms if s != unexported]
+    body.append("contains")
+    for sym in syms:
+        if sym == as_function:
+            body += [f"  function {sym}() result(r)", f"  end function {sym}"]
+        else:
+            body += [f"  subroutine {sym}()", f"  end subroutine {sym}"]
+    body.append("end module")
+    return "\n".join(body) + "\n"
 
 
 def _valid_bundle() -> dict:
@@ -41,7 +100,7 @@ def _valid_bundle() -> dict:
              "member_node_key": _NODE, "content": f"module {_SPEC_ID}_model\nend module\n",
              "modules": [f"{_SPEC_ID}_model"]},
             {"logical_path": f"{_SPEC_ID}_checks.f90", "role": "checks", "language": "fortran",
-             "member_node_key": _NODE, "content": f"module {_SPEC_ID}_checks\nend module\n",
+             "member_node_key": _NODE, "content": _checks_content(),
              "modules": [f"{_SPEC_ID}_checks"]},
         ],
         "entrypoints": [
@@ -55,13 +114,12 @@ def _valid_bundle() -> dict:
     }
 
 
-def _write_node(repo: Path, *, ir_id="sw_20260715_001", source_id="src_20260715_001",
-                state_vars=("h", "u", "v")) -> wc.NodeRefs:
-    """Write a minimal M3c IR + dependency-graph sidecar + tests.md for the node."""
-    ir_dir = repo / "workspace" / "ir" / _SAFE / ir_id
-    ir_dir.mkdir(parents=True, exist_ok=True)
-    ir = {
-        "meta": {"spec_kind": "problem"},
+def _node_ir(state_vars=("h", "u", "v")) -> dict:
+    """A minimal M3c problem IR that `render_runner` accepts — so the fixture's runner can be
+    produced by the real renderer instead of hand-typed (a hand-typed runner would let the ABI
+    layer pass against a shape the renderer never emits)."""
+    return {
+        "meta": {"spec_id": _SPEC_ID, "spec_kind": "problem"},
         "impl_defaults": {
             "toolchain": {"language": "fortran", "standard": "f2008", "build_system": "make"},
             "target": {"backend": "cpu"},
@@ -71,7 +129,31 @@ def _write_node(repo: Path, *, ir_id="sw_20260715_001", source_id="src_20260715_
         "algorithm": {"state_variables": [{"name": v, "shape_expr": "[nx]"} for v in state_vars]},
         "dependency": {"direct_deps": [{"node_key": _HARNESS}]},
         "case": {"test_case_set": [{"case_id": "c1"}]},
+        "io_contract": {
+            "raw_requirements": {"required_evidence": [
+                {"artifact": "state_snapshots", "schema": {
+                    "variables": [{"name": "h", "shape_expr": "[4, 4]"}],
+                    "time_variable": "t"}},
+            ]},
+            "test_evidence_requirements": [{"test_id": "c1", "required_raw_variables": ["h"]}],
+            "diagnostics_contract": {
+                "checks": [{"id": "mass"}],
+                "metrics": ["error.l2"],
+                "verdict": {"required": True, "fields": ["overall", "failed_checks"]},
+            },
+            "test_predicates": [
+                {"test_id": "c1", "expected_outcome": "pass", "target_cases": ["c1"]}],
+        },
     }
+
+
+def _write_node(repo: Path, *, ir_id="sw_20260715_001", source_id="src_20260715_001",
+                state_vars=("h", "u", "v"), stage_runner=True) -> wc.NodeRefs:
+    """Write a minimal M3c IR + dependency-graph sidecar + tests.md for the node, and stage the
+    host-rendered runner the way `run_phase` does before any generate substep runs."""
+    ir_dir = repo / "workspace" / "ir" / _SAFE / ir_id
+    ir_dir.mkdir(parents=True, exist_ok=True)
+    ir = _node_ir(state_vars)
     import yaml
     (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(ir), encoding="utf-8")
     sidecar = {
@@ -84,8 +166,13 @@ def _write_node(repo: Path, *, ir_id="sw_20260715_001", source_id="src_20260715_
     spec_dir = repo / _SPEC_PATH
     spec_dir.mkdir(parents=True, exist_ok=True)
     (spec_dir / "tests.md").write_text("- test: conserves mass\n", encoding="utf-8")
-    return wc.NodeRefs(node_key=_NODE, spec_path=_SPEC_PATH, ir_id=ir_id,
+    refs = wc.NodeRefs(node_key=_NODE, spec_path=_SPEC_PATH, ir_id=ir_id,
                        pipeline_id="sw_20260715_001", source_id=source_id)
+    if stage_runner:
+        src_dir = repo / refs.source_dir() / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        (src_dir / f"{_SPEC_ID}_runner.f90").write_text(_runner_text(), encoding="utf-8")
+    return refs
 
 
 class _PureFakeConductor(wc.Conductor):
@@ -200,6 +287,34 @@ class PureBundleViolationsTests(unittest.TestCase):
             "module": f"{_SPEC_ID}_checks", "capture": "checks_getter", "capability": None}]
         self.assertIsNone(c._pure_bundle_violations(refs, ok))
 
+    def test_m3c_name_match_is_case_sensitive_like_the_filesystem(self) -> None:
+        # `logical_path` becomes a FILENAME, and Generate.static opens `<spec_id>_checks.f90`
+        # verbatim on a case-sensitive filesystem. Casefolding accepted `Shallow_Water2d_Checks.f90`
+        # — which lints and compiles fine (Fortran resolves `use` by module name, never by
+        # filename) — and then Generate.static rejected it on the name: accepted here, rejected
+        # there, i.e. a phase reopen, which is what this layer exists to prevent.
+        c, refs = self._c_refs()
+        for role, mixed in (("checks", "Shallow_Water2d_Checks.f90"),
+                            ("model", "Shallow_Water2d_Model.f90")):
+            bad = _valid_bundle()
+            entry = next(f for f in bad["files"] if f["role"] == role)
+            was = entry["logical_path"]
+            entry["logical_path"] = mixed
+            for e in bad["entrypoints"]:
+                if e["defined_in"] == was:
+                    e["defined_in"] = mixed
+            self.assertEqual(cb.validate_bundle(bad), [], "the shape must be schema-legal")
+            cat, _ = c._pure_bundle_violations(refs, bad)
+            self.assertEqual(cat, "bundle_assembly_collision", role)
+
+    def test_m3c_module_name_match_stays_case_insensitive(self) -> None:
+        # The mirror image: a Fortran identifier IS case-insensitive, so a module declared
+        # `Shallow_Water2D_Checks` resolves for the runner's `use` and must be accepted.
+        c, refs = self._c_refs()
+        ok = _valid_bundle()
+        ok["files"][1]["modules"] = [f"{_SPEC_ID}_CHECKS"]
+        self.assertIsNone(cb.m3c_literal_name_violation(ok, _SPEC_ID))
+
     def test_m3c_name_violation(self) -> None:
         c, refs = self._c_refs()
         bad = _valid_bundle()
@@ -207,6 +322,278 @@ class PureBundleViolationsTests(unittest.TestCase):
         bad["entrypoints"][0]["defined_in"] = "wrong_model.f90"
         cat, _ = c._pure_bundle_violations(refs, bad)
         self.assertEqual(cat, "bundle_assembly_collision")
+
+    def test_accepted_bundle_also_passes_the_real_generate_static_gate(self) -> None:
+        # Codex P1, the regression that matters: this layer accepting a bundle that
+        # `Generate.static` then rejects reopens the phase — the failure it exists to prevent.
+        # Drive the REAL gate, not a restatement of it: the ABI is fixed at ten for every node,
+        # and requiring only the subset THIS node's runner imports (6 of 10 here) was accepted
+        # here and rejected there.
+        import tempfile as _tf
+        c, refs = self._c_refs()
+        bundle = _valid_bundle()
+        self.assertIsNone(c._pure_bundle_violations(refs, bundle))
+        checks = next(f for f in bundle["files"] if f["role"] == "checks")
+        with _tf.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / checks["logical_path"]).write_text(checks["content"], encoding="utf-8")
+            execution = SimpleNamespace(node_key=_NODE)
+            v: list[str] = []
+            vps._validate_checks_source_files(execution, src, [], v)
+            self.assertEqual([s for s in v if "publish the fixed ABI" in s], [], v)
+
+    def test_runner_imported_subset_is_not_the_required_set(self) -> None:
+        # Pins the direction of the Codex P1 fix: the runner here imports 6 of the 10, and a
+        # bundle publishing only those 6 must be REJECTED (Generate.static wants all ten).
+        c, refs = self._c_refs()
+        from tools.runner_renderer import CHECKS_PUBLIC_NAMES
+        imported = cb_runner_imports(_runner_text(), _SPEC_ID)
+        self.assertTrue(set(imported) < set(CHECKS_PUBLIC_NAMES), imported)
+        bad = _valid_bundle()
+        syms = list(imported)
+        bad["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n  private\n"
+            + "".join(f"  public :: {s}\n" for s in syms)
+            + "contains\n"
+            + "".join(f"  subroutine {s}()\n  end subroutine {s}\n" for s in syms)
+            + "end module\n")
+        cat, findings = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+        for absent in set(CHECKS_PUBLIC_NAMES) - set(imported):
+            self.assertIn(absent, findings)
+
+    def test_checks_abi_missing_symbol(self) -> None:
+        # Z2 defect D, shape 1 (sw2d src_003): the checks module omits names the runner imports
+        # -> Generate.syntax "Symbol 'x' not found in module". Now a bounded in-loop repair.
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = _checks_content(omit="checks_compute")
+        cat, findings = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+        self.assertIn("checks_compute", findings)
+
+    def test_checks_abi_quoted_type_function_form_rejected(self) -> None:
+        # Codex review: a legal type-spec can hold a quote in its parens —
+        # `character(kind=kind('a')) function metric_compute()`. Excluding quotes from the
+        # proc-header prefix made that header unmatchable, so the function was published-but-not-
+        # defined and the gate ACCEPTED it; the runner then `call`s it and Generate.syntax fails —
+        # the phase reopen this gate exists to prevent. Matching a string-masked line catches it.
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        syms = _checks_symbols()
+        bad["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n  private\n"
+            + "".join(f"  public :: {s}\n" for s in syms) + "contains\n"
+            + "".join(f"  subroutine {s}()\n  end subroutine {s}\n"
+                      for s in syms if s != "metric_compute")
+            + "  character(kind=kind('a')) function metric_compute()\n"
+            "    metric_compute = 'x'\n  end function metric_compute\n"
+            "end module\n")
+        cat, findings = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+        self.assertIn("metric_compute", findings)
+        self.assertIn("FUNCTION", findings)
+
+    def test_checks_abi_function_form_rejected(self) -> None:
+        # Z2 defect D, shape 2 (sw2d src_004): the name EXISTS but is authored as a FUNCTION,
+        # while the runner `call`s it -> "has a type, which is not consistent with the CALL".
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = _checks_content(as_function="metric_compute")
+        cat, findings = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+        self.assertIn("metric_compute", findings)
+        self.assertIn("FUNCTION", findings)
+
+    def test_checks_abi_accepts_names_not_defined_locally(self) -> None:
+        # Review finding: a published ABI name need not be defined in this module's text to be
+        # callable — `use`-association, a generic `interface`, and a submodule all compile, LINK
+        # and `call` fine (verified with gfortran). Demanding a local `subroutine` header rejected
+        # those, with findings telling the producer to write what it had already written: a repair
+        # loop with no exit, i.e. this defect's own failure mode on a LEGAL bundle. Only positive
+        # evidence of the wrong kind (a local FUNCTION) may reject.
+        c, refs = self._c_refs()
+        syms = _checks_symbols()
+        pubs = "".join(f"  public :: {s}\n" for s in syms)
+        defs = "".join(f"  subroutine {s}()\n  end subroutine {s}\n"
+                       for s in syms if s != "case_setup")
+        ok = _valid_bundle()
+        ok["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks_impl\n  public\ncontains\n"
+            "  subroutine case_setup()\n  end subroutine case_setup\n"
+            f"end module {_SPEC_ID}_checks_impl\n"
+            f"module {_SPEC_ID}_checks\n"
+            f"  use {_SPEC_ID}_checks_impl, only: case_setup\n  private\n{pubs}contains\n{defs}"
+            "end module\n")
+        self.assertIsNone(c._pure_bundle_violations(refs, ok))
+
+    def test_checks_abi_defined_but_unexported_rejected(self) -> None:
+        # Review finding: the certified idiom is a bare `private` + explicit `public ::` list, so
+        # a name defined but left off that list is INVISIBLE to the runner and fails
+        # Generate.syntax with the same "Symbol not found in module" as an omitted one. Checking
+        # definition alone would fail open on half of the shape this layer exists to catch.
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = _checks_content(unexported="checks_compute")
+        cat, findings = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+        self.assertIn("checks_compute", findings)
+        self.assertIn("not published", findings)
+
+    def test_checks_abi_explicit_private_name_rejected(self) -> None:
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = _checks_content().replace(
+            "  private\n", "  private :: get_time\n", 1)
+        cat, findings = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+        self.assertIn("get_time", findings)
+
+    def test_checks_abi_accepts_default_public_module(self) -> None:
+        # No bare `private` => Fortran's own default is public => nothing to export explicitly.
+        # The export check must not invent a requirement the language does not impose.
+        c, refs = self._c_refs()
+        ok = _valid_bundle()
+        ok["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n"
+            + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in _checks_symbols())
+            + "end module\n")
+        self.assertIsNone(c._pure_bundle_violations(refs, ok))
+
+    def test_checks_abi_accepts_leading_ampersand_continuation(self) -> None:
+        # Free-form Fortran allows an OPTIONAL leading `&` on a continuation line (confirmed
+        # legal with `gfortran -fsyntax-only -std=f2008`). Fused onto the next name it would be
+        # dropped by the identifier filter and reject a module that DID export it — and the
+        # findings text would tell the leaf to do what it had already done, so the repair loop
+        # could only thrash. Latent today (every certified module wraps with a trailing `&`
+        # only), but the checks module is leaf-authored and continuation style varies.
+        c, refs = self._c_refs()
+        ok = _valid_bundle()
+        syms = _checks_symbols()
+        wrapped = "  public :: " + ", &\n       &  ".join(syms) + "\n"
+        ok["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n  private\n" + wrapped
+            + "contains\n"
+            + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in syms)
+            + "end module\n")
+        self.assertIsNone(c._pure_bundle_violations(refs, ok))
+
+    def test_checks_abi_derived_type_private_is_not_the_module_default(self) -> None:
+        # False-positive guard on a fail-closed gate: a bare `private` inside a derived type sets
+        # that TYPE's component accessibility. Reading it as the module default would demand a
+        # `public ::` list from a legal default-public module and reject it.
+        c, refs = self._c_refs()
+        ok = _valid_bundle()
+        ok["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n"
+            "  type :: bucket\n    private\n    integer :: n\n  end type bucket\n"
+            "contains\n"
+            + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in _checks_symbols())
+            + "end module\n")
+        self.assertIsNone(c._pure_bundle_violations(refs, ok))
+
+    def test_checks_abi_declaration_attribute_is_not_an_accessibility_statement(self) -> None:
+        # `integer, private :: n` is an attribute on a declaration, not a module default, and
+        # `private :: n` on an unrelated helper must not touch the ABI names.
+        c, refs = self._c_refs()
+        ok = _valid_bundle()
+        ok["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n"
+            "  integer, private :: n\n  private :: helper\n"
+            "contains\n"
+            + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in _checks_symbols())
+            + "end module\n")
+        self.assertIsNone(c._pure_bundle_violations(refs, ok))
+
+    def test_checks_abi_accepts_wrapped_export_list(self) -> None:
+        # The certified idiom wraps its `public ::` list with `&` continuations.
+        c, refs = self._c_refs()
+        ok = _valid_bundle()
+        syms = _checks_symbols()
+        wrapped = "  public :: " + ", &\n    ".join(syms) + "\n"
+        ok["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n  private\n" + wrapped
+            + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in syms)
+            + "end module\n")
+        self.assertIsNone(c._pure_bundle_violations(refs, ok))
+
+    def test_checks_abi_end_subroutine_and_comments_do_not_satisfy(self) -> None:
+        # Fail-open guard: every real module carries `end subroutine <name>` for each subroutine,
+        # so an unanchored `subroutine <name>` search would accept the FUNCTION form this layer
+        # exists to reject. A mention in a comment must not satisfy it either.
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n"
+            + "".join(f"subroutine {s}()\nend subroutine {s}\n"
+                      for s in _checks_symbols() if s != "metric_compute")
+            + "! the runner also calls subroutine metric_compute\n"
+            + "function metric_compute() result(r)\nend subroutine metric_compute\n"
+            + "end module\n")
+        cat, findings = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+        self.assertIn("metric_compute", findings)
+
+    def test_checks_abi_accepts_prefixed_subroutine_forms(self) -> None:
+        # ...while the anchoring must not reject a legal `pure subroutine foo()` definition.
+        c, refs = self._c_refs()
+        ok = _valid_bundle()
+        ok["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\n"
+            + "".join(f"  pure subroutine {s}()\n  end subroutine {s}\n"
+                      for s in _checks_symbols())
+            + "end module\n")
+        self.assertIsNone(c._pure_bundle_violations(refs, ok))
+
+    def test_checks_abi_ignores_a_decoy_sibling_checks_module(self) -> None:
+        # Codex review: a bundle may legally carry more than one checks-role file. Searching them
+        # all lets a sibling module's procedures vouch for names the runner — which imports
+        # <spec_id>_checks alone — can never see: accepted here, then dead at Generate.syntax.
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = f"module {_SPEC_ID}_checks\nend module\n"
+        bad["files"].append({
+            "logical_path": "decoy_checks.f90", "role": "checks", "language": "fortran",
+            "member_node_key": _NODE,
+            "content": _checks_content().replace(f"{_SPEC_ID}_checks", "decoy_checks"),
+            "modules": ["decoy_checks"]})
+        self.assertEqual(cb.validate_bundle(bad), [])  # the shape really is schema-legal
+        cat, _ = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+
+    def test_checks_abi_ignores_a_decoy_second_module_in_the_same_file(self) -> None:
+        # Same class, one level down: file scoping alone would still be fooled, so the check is
+        # scoped to the MODULE the runner imports.
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = (
+            f"module {_SPEC_ID}_checks\nend module\n"
+            + _checks_content().replace(f"{_SPEC_ID}_checks", "decoy_checks"))
+        bad["files"][1]["modules"] = [f"{_SPEC_ID}_checks", "decoy_checks"]
+        cat, _ = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+
+    def test_checks_abi_extra_checks_file_does_not_mask_a_real_violation(self) -> None:
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = _checks_content(omit="checks_compute")
+        bad["files"].append({
+            "logical_path": "helper_checks.f90", "role": "checks", "language": "fortran",
+            "member_node_key": _NODE,
+            "content": _checks_content().replace(f"{_SPEC_ID}_checks", "helper_checks"),
+            "modules": ["helper_checks"]})
+        cat, findings = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
+        self.assertIn("checks_compute", findings)
+
+    def test_checks_abi_fail_closed_when_declared_module_is_not_defined(self) -> None:
+        # `modules[]` is leaf-declared; if the content defines no such module the runner's import
+        # cannot resolve, so an unverifiable ABI must not be an accepted one.
+        c, refs = self._c_refs()
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = "! no module here\n"
+        cat, _ = c._pure_bundle_violations(refs, bad)
+        self.assertEqual(cat, "bundle_checks_abi_violation")
 
     def test_state_binding_fail_closed_when_ir_declares_no_state(self) -> None:
         # Review fix: an EMPTY declared state set must REJECT any binding (not accept all).
@@ -220,6 +607,45 @@ class PureBundleViolationsTests(unittest.TestCase):
             "module": f"{_SPEC_ID}_checks", "capture": "checks_getter", "capability": None}]
         cat, _ = c._pure_bundle_violations(refs, bad)
         self.assertEqual(cat, "bundle_state_binding_mismatch")
+
+
+class PureContextRunnerInjectionTests(unittest.TestCase):
+    """Z2 defect D: the tool-less leaf can reach the checks ABI ONLY through the injected
+    runner, so the injection itself is the fix and is pinned here."""
+
+    def test_runner_document_is_the_staged_file_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            ctx = _conductor(repo)._build_pure_context(refs)
+            staged = (repo / refs.source_dir() / "src"
+                      / f"{_SPEC_ID}_runner.f90").read_text(encoding="utf-8")
+            self.assertEqual(ctx["runner_document"], staged)
+            # The ABI the leaf must author against is actually reachable in what it is shown.
+            self.assertIn(f"use {_SPEC_ID}_checks, only:", ctx["runner_document"])
+
+    def test_non_utf8_runner_raises_the_named_contract_not_a_bare_decode_error(self) -> None:
+        # UnicodeDecodeError is a ValueError, not an OSError: catching OSError alone let it escape
+        # unnamed. The caller recovers any exception, so this is about the diagnosis an operator
+        # reads, not about containment.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            (repo / refs.source_dir() / "src" / f"{_SPEC_ID}_runner.f90").write_bytes(
+                b"program p\n  use x_checks, only: \xff\xfe bar\nend program\n")
+            with self.assertRaises(RuntimeError) as cm:
+                _conductor(repo)._build_pure_context(refs)
+            self.assertIn("pure_runner_document_missing", str(cm.exception))
+
+    def test_missing_runner_raises_rather_than_shipping_a_blank_abi(self) -> None:
+        # NOT the swallow-to-"" idiom ir/tests use: an empty string satisfies the renderer's
+        # presence check and would ship a prompt whose ABI section is blank — the very defect.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo, stage_runner=False)
+            with self.assertRaises(RuntimeError) as cm:
+                _conductor(repo)._build_pure_context(refs)
+            self.assertIn("pure_runner_document_missing", str(cm.exception))
 
 
 class PureHarnessManifestNarrowingTests(unittest.TestCase):
@@ -411,6 +837,42 @@ class PureProducerSubstepTests(unittest.TestCase):
         self.assertEqual(oc.status, "pass")
         self.assertEqual(oc.attempts, 2)
 
+    def test_checks_abi_violation_is_repaired_in_loop(self) -> None:
+        # The whole point of the layer: what cost the sw2d P-arm its retry budget (a phase reopen
+        # per guess) is now ONE bounded in-conversation repair.
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = _checks_content(as_function="metric_compute")
+        c, refs, oc = self._run([_envelope(bad), _envelope(_valid_bundle())])
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(oc.attempts, 2)
+
+    def test_exhausted_checks_abi_repair_routes_to_generate_reuse(self) -> None:
+        bad = _valid_bundle()
+        bad["files"][1]["content"] = _checks_content(omit="case_run")
+        c, refs, oc = self._run([_envelope(bad)])
+        self.assertEqual(oc.status, "fail")
+        meta = json.loads((c.repo_root / refs.source_dir() / "bundle_meta.json").read_text())
+        self.assertEqual(meta["failure_category"], "bundle_checks_abi_violation")
+        # The terminal category must carry an outer route, or the phase fails closed instead of
+        # reopening its own producer.
+        self.assertEqual(
+            wc.GENERATE_BUNDLE_FAILURE_ROUTING["bundle_checks_abi_violation"],
+            ("generate", "reuse"))
+
+    def test_missing_runner_fails_closed_before_any_leaf_spawn(self) -> None:
+        # A host artifact the conductor itself renders is not something a generate retry can fix:
+        # fail_closed (operator --resume), and no leaf is spawned to burn tokens on it.
+        self._tmp = tempfile.TemporaryDirectory()
+        repo = Path(self._tmp.name)
+        refs = _write_node(repo, stage_runner=False)
+        c = _conductor(repo)
+        c.envelopes = [_envelope(_valid_bundle())]
+        oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+        self.assertEqual(oc.status, "fail")
+        self.assertEqual(oc.leaf_returncode, 1)
+        self.assertEqual(oc.infra_error[0], "pure_context_assembly_failed")
+        self.assertEqual(getattr(c, "_spawn", 0), 0)
+
     def test_pass_after_repair_tombstones_orphan_attempts(self) -> None:
         # Review fix (HIGH): a repaired pass must tombstone the earlier (finalized, un-vouched)
         # attempt arids, or the completion gate rejects the otherwise-passing run.
@@ -580,7 +1042,8 @@ class PureLaunchRequestTests(unittest.TestCase):
                 agent_model="opus", workflow_mode="dev",
                 makefile_host_authored=True, runner_host_authored=True,
                 pure_leaf=True, pure_context={"harness_capabilities": "x", "target_profile": "y",
-                                              "ir_document": "z", "tests_document": "t"})
+                                              "ir_document": "z", "tests_document": "t",
+                                              "runner_document": "program r\nend program\n"})
             self.assertEqual(req["leaf_mode"], "pure")
             self.assertEqual(req["prompt_contract_version"], PURE_PROMPT_CONTRACT_VERSION)
             self.assertEqual(req["allowed_output_paths"], [])
@@ -748,7 +1211,8 @@ class PureColdRepairPromptTests(unittest.TestCase):
             "prompt_contract_version": PURE_PROMPT_CONTRACT_VERSION,
             "repair_findings": "capability_requirements missing",
             "pure_context": {"harness_capabilities": "hc", "target_profile": "tp",
-                             "ir_document": "ir", "tests_document": "tt"},
+                             "ir_document": "ir", "tests_document": "tt",
+                             "runner_document": "program r\nend program\n"},
             "prior_document": '{"bundle_schema_version": "1.0.0"}',
         }
         req.update(overrides)
@@ -803,6 +1267,37 @@ class PureColdRepairPromptTests(unittest.TestCase):
         self.assertIn("Authoring rules", text)
         self.assertIn("! allow(C003)", text)
 
+    def test_cold_repair_lifts_every_static_rule_paragraph(self) -> None:
+        # The ABI paragraph was added to the launch template and silently not lifted, so a cold
+        # repair handed the producer the runner source with no statement that it must publish all
+        # ten as subroutines — Z2 defect D reproduced in the RECOVERY path, which is reached
+        # exactly when recovery is happening. Assert against the template's own paragraphs, not a
+        # literal list, so a third static paragraph cannot be silently omitted the same way.
+        text = ort._render_pure_repair_prompt(self._req())
+        template = ort._load_launch_prompt_templates()["pure generate.generate"]
+        for prefix in ort.PURE_REPAIR_STATIC_PARAGRAPH_PREFIXES:
+            start = template.index(prefix)
+            end = template.index("\n\n", start)
+            for line in (ln.strip() for ln in template[start:end].splitlines()):
+                if line and not line.startswith("<"):  # the doc slot itself is filled elsewhere
+                    self.assertIn(line, text, f"cold repair dropped: {line[:60]}")
+
+    def test_placeholder_drop_keeps_rule_text_that_mentions_placeholders(self) -> None:
+        # The drop is `fullmatch` on the STRIPPED line, so only a line that is nothing but a
+        # document slot goes. Rule text quoting a `<...>` metavariable — `use <module>, only:
+        # <names>`, the `associate (unused_<name> => <name>)` binding — must survive; dropping it
+        # would silently delete a rule from every cold repair.
+        text = ort._render_pure_repair_prompt(self._req())
+        self.assertIn("use <module>, only: <names>", text)
+        self.assertIn("associate (unused_<name> => <name>); end associate", text)
+
+    def test_cold_repair_leaks_no_document_placeholder(self) -> None:
+        # A lifted paragraph ends with the `<doc>` slot its launch template fills; nothing
+        # substitutes it here, so it would ship as a literal token.
+        text = ort._render_pure_repair_prompt(self._req())
+        for slot in ("<runner_document>", "<ir_document>", "<tests_document>", "<exemplar>"):
+            self.assertNotIn(slot, text)
+
     def test_warm_repair_omits_authoring_rules(self) -> None:
         # The resumed session already holds the launch prompt's static prefix.
         text = ort._render_pure_repair_prompt(self._req(warm_resume=True))
@@ -848,8 +1343,9 @@ class PurePostGenerateBundleTests(unittest.TestCase):
         (gen / "codegen_bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
         for entry in bundle["files"]:
             (gen / "src" / entry["logical_path"]).write_text(entry["content"], encoding="utf-8")
-        (gen / "src" / f"{_SPEC_ID}_runner.f90").write_text("program p\nend program\n",
-                                                            encoding="utf-8")
+        # The real rendered runner, not a `program p` stub: it is the checks-ABI layer's
+        # authority, so a stub would make the gate unverifiable (fail-closed) here.
+        (gen / "src" / f"{_SPEC_ID}_runner.f90").write_text(_runner_text(), encoding="utf-8")
         return repo, gen, refs.ir_ref
 
     def test_clean_bundle_passes(self) -> None:
@@ -875,6 +1371,21 @@ class PurePostGenerateBundleTests(unittest.TestCase):
             v: list[str] = []
             vps._validate_post_generate_bundle(repo, gen, _NODE, ir_ref, v)
             self.assertTrue(any("tamper" in s for s in v), v)
+
+    def test_checks_abi_tamper_survives_byte_compare_but_is_caught(self) -> None:
+        # A CONSISTENT tamper (bundle content and the staged .f90 edited together) defeats the
+        # byte-compare mirror, so only the re-run acceptance contract can catch it. Drops a
+        # subroutine the runner calls.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, gen, ir_ref = self._gen_dir(tmp)
+            bundle = json.loads((gen / "codegen_bundle.json").read_text())
+            bundle["files"][1]["content"] = _checks_content(omit="checks_compute")
+            (gen / "codegen_bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
+            (gen / "src" / f"{_SPEC_ID}_checks.f90").write_text(
+                bundle["files"][1]["content"], encoding="utf-8")
+            v: list[str] = []
+            vps._validate_post_generate_bundle(repo, gen, _NODE, ir_ref, v)
+            self.assertTrue(any("bundle_checks_abi_violation" in s for s in v), v)
 
     def test_undeclared_f90_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

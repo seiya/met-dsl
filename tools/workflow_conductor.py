@@ -318,6 +318,7 @@ GENERATE_BUNDLE_FAILURE_CATEGORIES: tuple[str, ...] = (
     "bundle_capability_unsatisfied",
     "bundle_state_binding_mismatch",
     "bundle_assembly_collision",
+    "bundle_checks_abi_violation",
     "bundle_shape_unsupported",
 )
 GENERATE_BUNDLE_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
@@ -2427,9 +2428,16 @@ clean:
         """Assemble the closed context a pure `generate.generate` leaf sees, each value a plain
         string the renderer data-fences. All data is host-resolved from disk here (the leaf has
         no filesystem): the harness capability manifest (A6), the node's toolchain/target
-        defaults, the lowered IR, and the tests. Mirrors the must-read set the legacy
-        `generate.generate` leaf reads, minus controlled_spec.md (phase_02 §2-1 forbids it as a
-        generate input)."""
+        defaults, the lowered IR, the tests, and the host-rendered runner. Mirrors the must-read
+        set the legacy `generate.generate` leaf reads, minus controlled_spec.md (phase_02 §2-1
+        forbids it as a generate input).
+
+        The runner is injected VERBATIM (no interface extraction): it is the consumer of the
+        checks-module ABI the leaf must author against, and `docs/workflow/CHECKS_MODULE_CONTRACT.md`
+        — where the agentic leaf reads that ABI — is unreachable from a tool-less leaf. Injecting
+        the rendered artifact rather than a distilled restatement keeps the ABI's dynamic surface
+        (which names the runner actually imports) exact by construction. `run_phase` renders it
+        before any generate substep runs, so it is always on disk here."""
         from tools.codegen_bundle import harness_capability_manifest_document_for
         ir_text = ""
         ir_path = self.repo_root / refs.ir_ref / "spec.ir.yaml"
@@ -2444,6 +2452,19 @@ clean:
             tests_text = ""
         ir = _read_yaml(ir_path) or {}
         impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
+        # A missing runner RAISES rather than degrading to "" the way ir/tests do above: the
+        # empty string would satisfy the renderer's presence check and ship a prompt whose ABI
+        # section is blank, which is precisely the defect this injection fixes. The caller
+        # converts this into a fail_closed transport outcome (no leaf is spawned).
+        runner_path = self.repo_root / refs.source_dir() / "src" / f"{refs.spec_id}_runner.f90"
+        try:
+            runner_text = runner_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            # UnicodeError too: a corrupt/tampered runner raises UnicodeDecodeError, which is a
+            # ValueError — NOT an OSError — so catching OSError alone would let it escape as a
+            # bare decode error instead of this named, fail-closed contract.
+            raise RuntimeError(
+                f"pure_runner_document_missing: {runner_path}: {exc}") from exc
         return {
             "harness_capabilities": json.dumps(
                 harness_capability_manifest_document_for(self._pure_harness_node_key(ir)),
@@ -2451,6 +2472,7 @@ clean:
             "target_profile": json.dumps(impl, indent=2, ensure_ascii=False),
             "ir_document": ir_text,
             "tests_document": tests_text,
+            "runner_document": runner_text,
         }
 
     def _pure_bundle_violations(self, refs: NodeRefs,
@@ -2462,9 +2484,14 @@ clean:
         report): `validate_bundle` (schema + cross-field invariants) -> single-node unit shape
         -> harness capability negotiation (the manifest MUST exist — an undeclared harness
         satisfies nothing) -> state_variable ∈ IR algorithm.state_variables -> the M3c literal
-        name constraint the host-rendered runner glue `use`s -> `derive_build_graph` cross-origin
-        object/module collisions. The pure leaf has no tools, so a corrupted bundle can only
-        propagate as content here — these layers are what catch it before any file is written.
+        name constraint the host-rendered runner glue `use`s -> the fixed checks-module ABI ->
+        `derive_build_graph` cross-origin object/module collisions. The pure leaf has
+        no tools, so a corrupted bundle can only propagate as content here — these layers are what
+        catch it before any file is written.
+
+        The ABI layer makes a mis-authored checks module a BOUNDED in-conversation repair instead
+        of what it was before: a `Generate.syntax` failure that reopened the whole phase, and that
+        the producer could only answer by re-guessing an ABI it had never been shown.
 
         The layers themselves live in `codegen_bundle.pure_bundle_contract_violation` (the SINGLE
         source shared with the deterministic post-generate tamper gate, so the two cannot drift);
@@ -2676,7 +2703,21 @@ clean:
         from tools.pure_leaf import (
             parse_result_envelope, extract_json_document, MAX_BUNDLE_REPAIR_TURNS,
             RESPONSE_UNPARSEABLE, _MISSING)
-        pure_context = self._build_pure_context(refs)
+        # Assembling the context reads host-owned artifacts and RAISES on a missing one
+        # (`pure_runner_document_missing`). run_substep's callers must never see an exception —
+        # recover it as the same fail_closed transport outcome a failed `_write_runner` produces.
+        # A host artifact the conductor itself renders cannot be repaired by a generate retry, so
+        # fail_closed (operator --resume) is the correct terminus, not a reopen. No leaf has been
+        # spawned yet, so the arid here names no child window; it only labels the outcome row.
+        try:
+            pure_context = self._build_pure_context(refs)
+        except Exception as exc:  # noqa: BLE001 — any context-assembly failure must recover
+            self.emit("pure_context_assembly_failed", node_key=refs.node_key,
+                      detail=str(exc)[:200])
+            return SubstepOutcome(
+                self.new_agent_run_id(), "fail", [], 1,
+                ("pure_context_assembly_failed", f"{type(exc).__name__}: {exc}"),
+                time.time(), 1)
         per_attempt: list[dict[str, Any]] = []
         resume_session_id: str | None = None
         prior_document: str | None = None

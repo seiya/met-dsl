@@ -51,6 +51,8 @@ def _pure_generate_context() -> dict[str, str]:
         "target_profile": "language=fortran build_system=make",
         "ir_document": "algorithm:\n  state_variables: [h]\n",
         "tests_document": "- test: conserves mass",
+        "runner_document": ("program sw_runner\n  use sw_checks, only: &\n    case_run\n"
+                            "end program\n"),
     }
 
 
@@ -165,7 +167,7 @@ class PurePayloadValidationTests(unittest.TestCase):
         # Any version other than the CURRENT constant is rejected — including the immediately
         # preceding one. (The stand-in must not be a version that a later bump makes valid; keep
         # it a value the contract will never take.)
-        for version in ("pure-OBSOLETE", "pure-1", "", None):
+        for version in ("pure-OBSOLETE", "pure-1", "pure-3", "", None):
             bad = _pure_request(prompt_contract_version=version)
             with self.assertRaises(ValueError):
                 ort._validate_pure_launch_request_payload(bad)
@@ -241,8 +243,53 @@ class PureRenderTests(unittest.TestCase):
         # No `<placeholder>` token survives substitution.
         self.assertNotIn("<tests_document>", prompt)
         self.assertNotIn("<ir_document>", prompt)
+        self.assertNotIn("<runner_document>", prompt)
         # The identity block is the tail (variable ids last).
         self.assertGreater(prompt.index("Target node_key:"), prompt.index("Tests"))
+
+    def test_pure_launch_prompt_carries_the_runner_and_its_checks_abi(self) -> None:
+        # Z2 defect D: the tool-less leaf cannot read CHECKS_MODULE_CONTRACT.md or the runner
+        # from disk, so the ABI reaches it ONLY here. Pin the heading AND the runner body's
+        # `use ..._checks, only:` line — a heading alone would still pass with an empty runner.
+        prepared = ort.prepare_launch_request_payload(_pure_request("generate"))
+        prompt = prepared["launch_prompt_full"]
+        self.assertIn("Host-rendered runner", prompt)
+        self.assertIn("use sw_checks, only:", prompt)
+        self.assertIn("case_run", prompt)
+
+    def test_prompt_states_the_static_prohibitions_the_leaf_cannot_otherwise_know(self) -> None:
+        # `_validate_checks_source_files` rejects three things the acceptance gate does NOT
+        # pre-empt, so each is a phase reopen — the failure mode this whole change exists to
+        # remove. A tool-less leaf can only learn them here. The harness ban is the sharpest:
+        # the injected runner IS a `use harness_fortran_cpu_model` block the leaf must not copy.
+        tpl = ort._load_launch_prompt_templates()["pure generate.generate"]
+        for token in ("use harness_", "open(", "verdict.json", "aggregate_verdict.json",
+                      "summary.json", "trial_meta.json"):
+            self.assertIn(token, tpl, f"prompt must name the {token!r} prohibition")
+
+    def test_placeholder_drop_uses_the_renderer_definition_of_a_slot(self) -> None:
+        # One fact, one authority. A second pattern that disagreed would let a real slot survive
+        # the cold-repair lift and ship as a literal token — the leak the drop exists to prevent.
+        self.assertIs(ort._PURE_PLACEHOLDER_ONLY_RE, ort._PURE_PLACEHOLDER_RE)
+        for slot in ("<runner_document>", "<runner_document2>", "<Exemplar>"):
+            self.assertTrue(ort._PURE_PLACEHOLDER_ONLY_RE.fullmatch(slot), slot)
+
+    def test_prompt_forbidden_filenames_match_the_gate_exactly(self) -> None:
+        # Pin the two together: a name added to the gate's tuple and not to the prompt is a rule
+        # the producer is punished for breaking and never told about.
+        from tools.validate_pipeline_semantics import FORBIDDEN_RUNNER_OUTPUTS
+        tpl = ort._load_launch_prompt_templates()["pure generate.generate"]
+        for name in FORBIDDEN_RUNNER_OUTPUTS:
+            self.assertIn(name, tpl, f"the prompt must name {name!r}, which the gate rejects")
+
+    def test_cold_repair_reinlines_the_runner_document(self) -> None:
+        # A cold fallback re-authors the bundle with no prior turn, so the ABI must come back
+        # with the rest of the context (auto-inlined from pure_context).
+        req = ort.prepare_launch_request_payload(_pure_request(
+            "generate", repair_findings="fix the checks ABI", repair_strategy="reuse"))
+        text = ort._render_pure_repair_prompt(req)
+        self.assertIn("**runner_document:**", text)
+        self.assertIn("use sw_checks, only:", text)
 
     def test_render_pure_prompt_passes_launch_validator(self) -> None:
         prepared = ort.prepare_launch_request_payload(_pure_request("generate"))

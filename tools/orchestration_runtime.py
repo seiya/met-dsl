@@ -9975,7 +9975,7 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
 # (`_validate_launch_request_payload`); a missing context key on a cold launch is rejected too.
 PURE_CONTEXT_REQUIRED_KEYS: dict[tuple[str, str], tuple[str, ...]] = {
     ("generate", "generate"): ("harness_capabilities", "target_profile", "ir_document",
-                               "tests_document"),
+                               "tests_document", "runner_document"),
     ("generate", "verify"): ("controlled_spec_document", "tests_document", "ir_document",
                              "bundle_document"),
 }
@@ -10097,15 +10097,53 @@ def _pure_output_contract_text(request_payload: dict[str, Any]) -> str:
     return _pure_template_paragraph(request_payload, "Output contract")
 
 
-def _pure_authoring_rules_text(request_payload: dict[str, Any]) -> str:
-    """The static authoring-rules paragraph (the deterministic-gate closure the producer must
-    satisfy) of the pure launch template for this (step, substep).
+# Every static paragraph of a pure launch template that a COLD-FALLBACK repair must restate,
+# keyed by its opening prefix. The `Output contract` block has its own slot; these fill the
+# `<authoring_rules>` slot in template order.
+#
+# This is a LIST, not a pair of hand-written calls, because the omission it prevents already
+# happened: the ABI paragraph was added to the launch template and silently not lifted, so a cold
+# repair handed the producer the runner source with no statement that it must publish all ten
+# names as subroutines — Z2 defect D reproduced in the recovery path, which is reached exactly
+# when recovery is happening. A paragraph absent from a given template (the verify template has
+# no authoring rules) lifts to '' and is skipped, so one list serves both.
+PURE_REPAIR_STATIC_PARAGRAPH_PREFIXES: tuple[str, ...] = (
+    "Authoring rules",
+    "**Host-rendered runner",
+)
 
-    A cold-fallback repair re-states it for the same reason it re-states the output contract: the
-    producer is re-authoring the whole document with no prior turn to carry the rules, and a
+# A line that is nothing but a `<placeholder>` token — the launch template's document slots.
+# Reuses `_PURE_PLACEHOLDER_RE`, the renderer's own definition of a slot, rather than restating
+# it: a second pattern that disagreed (`<[a-z_]+>` misses `<runner_document2>`, `<Exemplar>`)
+# would let a real slot survive the lift and ship as a literal token to the producer — the same
+# leak this drop exists to prevent, and the same one-fact-two-authorities shape as the duplicated
+# ABI tuple. `fullmatch` on the stripped line keeps rule text that merely QUOTES a metavariable
+# (`use <module>, only: <names>`).
+_PURE_PLACEHOLDER_ONLY_RE = _PURE_PLACEHOLDER_RE
+
+
+def _pure_authoring_rules_text(request_payload: dict[str, Any]) -> str:
+    """The static rule paragraphs (the deterministic-gate closure the producer must satisfy) of
+    the pure launch template for this (step, substep), in template order.
+
+    A cold-fallback repair re-states them for the same reason it re-states the output contract:
+    the producer is re-authoring the whole document with no prior turn to carry the rules, and a
     bundle repaired into schema conformance still has to clear `Generate.lint` / `Generate.syntax`
     / `Generate.static` afterwards."""
-    return _pure_template_paragraph(request_payload, "Authoring rules")
+    blocks = []
+    for prefix in PURE_REPAIR_STATIC_PARAGRAPH_PREFIXES:
+        text = _pure_template_paragraph(request_payload, prefix)
+        if not text:
+            continue
+        # A lifted paragraph may end with the `<doc>` placeholder its launch-template slot fills
+        # (the ABI paragraph is followed by `<runner_document>`). Nothing substitutes it here —
+        # the repair template is what gets substituted, not this value — so it would ship as a
+        # literal `<runner_document>` in the prompt. Drop those lines: `<pure_context>` re-inlines
+        # every context document below anyway, so the text keeps its referent.
+        kept = [ln for ln in text.splitlines()
+                if not _PURE_PLACEHOLDER_ONLY_RE.fullmatch(ln.strip())]
+        blocks.append("\n".join(kept).rstrip())
+    return "\n\n".join(b for b in blocks if b)
 
 
 def _render_pure_repair_prompt(request_payload: dict[str, Any]) -> str:

@@ -10,6 +10,10 @@
 > `_write_makefile`) and are outside the leaf's `allowed_output_paths`. This is
 > not read by `Validate.judge`.
 >
+> Binds the **agentic** leaf. A `pure` leaf (`Z2`) cannot read this: it is told the ten names and
+> shown the rendered runner, gated by `codegen_bundle.m3c_checks_abi_violation`. All ten bind
+> every node. `tools/runner_renderer.py` owns the ABI — keep this in step with it.
+>
 > **§5 (Fortran legality and gate guards) is the one section with a wider
 > scope**: it binds **every** `Generate` leaf that authors Fortran — including a
 > non-M3c node (an `infrastructure` harness self-test, a legacy node with no

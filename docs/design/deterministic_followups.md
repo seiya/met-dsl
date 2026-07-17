@@ -2849,3 +2849,177 @@ shape; the narrowing is the leaf's projection of it.
 
 Regression coverage registers a SECOND harness manifest, since that is the only way to reach the branch, and asserts
 the leaf is shown its own harness alone; each test was confirmed to FAIL against the pre-fix context assembly.
+## Z2 pure `generate.generate` — the checks-module ABI was never shown to the producer (FIXED 2026-07-17)
+
+**Symptom.** The `shallow_water2d` P arm (`orch_20260717T061125Z_a508d4df`, commit `951c7ea` = `pure-3`) was
+terminated `retry_budget_exhausted` / `generate exceeded 3`. Every attempt died at `Generate.syntax` on the
+leaf-authored `shallow_water2d_checks.f90`, in two shapes: `src_20260717_003` omitted the names outright
+(`Symbol 'case_setup' referenced at (1) not found in module 'shallow_water2d_checks'`, and likewise for `case_run`,
+`get_time`, `get_r2`, `checks_compute`, `metric_compute`), and `src_20260717_004`, after a repair turn, defined
+`metric_compute` as a FUNCTION while the runner `call`s it
+(`'metric_compute' at (1) has a type, which is not consistent with the CALL at (2)`). The producer was guessing an
+interface, and each guess cost a whole phase reopen.
+
+**Cause.** On an M3c node the leaf authors `<spec_id>_checks.f90` against a fixed ABI owned by the host-rendered
+runner. All three channels that could have carried that ABI to a PURE leaf were empty:
+
+- `docs/workflow/CHECKS_MODULE_CONTRACT.md` is where the agentic leaf reads it — the L-arm baseline
+  (`orch_20260717T044138Z_d899b6df`) has it in its `generate.generate` read manifest. A pure leaf has no tools.
+- The authoring rules of `pure_generate_generate.txt` never distilled it. The 76,551-byte prompt the producer
+  actually received contains the string `checks_compute` zero times.
+- The R5 exemplar resolves to a certified SIBLING of the same `(spec_kind, family)`; the only certified `problem`
+  node is `advdiff1d_linear`, a different family. The prompt carried no `BEGIN EXEMPLAR` fence at all.
+
+The flux A/B established the pure executor on an M3c node too, and its producer authored all ten names correctly on
+the first attempt — because the third channel was OPEN there. Its cold prompt carries two `BEGIN EXEMPLAR` fences, the
+second being a certified sibling's `..._checks.f90` with the `public :: case_setup, case_run, get_time` /
+`get_scalar, get_r1, ... get_r4` / `checks_compute, metric_compute` block intact: the leaf was shown the ABI as prior
+art, not told it. `shallow_water2d` has no certified same-family sibling, so `_resolve_exemplar_source` returned None,
+its prompt carries zero exemplar fences and zero mentions of any ABI name, and it could not have passed at any retry
+budget. The distinction that mattered was never `component` vs `problem` (flux is M3c and does author a checks module —
+an earlier draft of this entry claimed otherwise and was wrong); it is that an exemplar is a CACHE of the contract,
+which is exactly as reliable as a certified sibling existing.
+
+**Resolution.** Two parts, injection and gate.
+
+The host now inlines the rendered runner VERBATIM as a fifth `pure_context` document
+(`runner_document`), fenced like the others. Verbatim, not an extracted or distilled interface: the runner's `call`
+sites are the authority for each callback's dummy arguments, which is what the producer was guessing when it authored
+`metric_compute` as a function. `run_phase` renders the runner before any generate substep, so it is always on disk at
+context-assembly time. A missing runner RAISES `pure_runner_document_missing` rather than degrading to `""` the way
+`ir_document` / `tests_document` do — an empty string satisfies the renderer's presence check and would ship a prompt
+whose ABI section is blank, which is the defect itself. The caller converts that into a `pure_context_assembly_failed`
+fail_closed transport outcome BEFORE any leaf is spawned: a host artifact the conductor renders is not something a
+generate retry can fix.
+
+`m3c_checks_abi_violation` (`codegen_bundle.py`, in `pure_bundle_contract_violation` between the M3c literal-name layer
+and `build_graph`) makes a mis-authored ABI a BOUNDED in-conversation repair instead of a phase reopen per guess. It
+requires every name in `runner_renderer.CHECKS_PUBLIC_NAMES` to be published by `module <spec_id>_checks` AND defined
+there as a SUBROUTINE. That is a conservative necessary condition which pre-empts BOTH downstream gates:
+`Generate.static` (`_validate_checks_source_files`) requires all ten published but cannot tell a subroutine from a
+function, and `Generate.syntax` rejects both an undefined name and a function-form one. Dummy-argument agreement stays
+with `Generate.syntax`, which stages the runner with the source and owns it. The check is scoped to the ONE module the
+runner imports: a bundle may legally carry other `checks`-role files, and reading their text too would let a sibling
+module vouch for a name `use <spec_id>_checks` cannot resolve. The category `bundle_checks_abi_violation` joins
+`GENERATE_BUNDLE_FAILURE_CATEGORIES`, which derives its `("generate", "reuse")` route and the in-loop repair predicate
+automatically.
+
+**The required set is the FIXED TEN, never the subset this node's runner imports** — and getting that wrong was the
+most expensive mistake in this entry. The runner's import list IS dynamic in the IR (`get_r<rank>` per declared rank,
+`metric_compute` only with metrics), so the first fix keyed the gate AND the prompt off the rendered runner's
+`use ... only:` list, reasoning that a hard-coded ten "would demand names this node's runner never imports". That
+demand is real and already enforced: `_validate_checks_source_files` requires all ten of every M3c node. The rank-2
+`shallow_water2d` runner imports six, so the prompt was instructing the producer to author exactly what
+`Generate.static` rejects — reproducing this very defect (prompt disagrees with a gate) inside its own fix. The
+authority for "which names" was never the renderer's IMPORT list; it is `CHECKS_PUBLIC_NAMES`, which the renderer
+selects a subset FROM. Checking the renderer and not the other gate is how a distillation looks verified and is not
+([[project-prompt-distillation-correctness-surface]] states the rule; this violated it while citing it).
+
+Only POSITIVE evidence of the wrong kind rejects: the name is defined in this module and is not a subroutine, so it is
+a function. A published name with NO local definition proves nothing — `use`-association, a generic `interface`, and a
+submodule all compile, LINK and `call` fine (each verified by compiling and running one). Requiring a local
+`subroutine` header rejected all three, with findings telling the producer to write the subroutine it had already
+written: an unexitable repair loop on a LEGAL bundle. A layer that is STRICTER than the gate it pre-empts converts a
+clean pass into a terminal thrash, which is worse than not pre-empting at all — the residual (a name published but
+defined nowhere) stays with `Generate.syntax`, which reports it precisely.
+
+Sharing the parser also surfaced two FALSE POSITIVES that predate this work and had been sitting in `Generate.static`
+alone (both confirmed legal with `gfortran -fsyntax-only -std=f2008`, both now fixed in the shared function, so both
+gates improve at once): a logical line was never split at its `;` statement separators, so `public :: a; public :: b`
+lost `a` (its token was `a;`) and invented a name `public` — the repo's existing string- and paren-aware
+`_split_fortran_statements` now runs first; and `proc_start`'s type-spec prefix was greedy enough to run from a
+declaration's type keyword into a string literal, so
+`character(len=*), parameter :: note = 'run subroutine case_setup first'` registered a phantom definition AND
+incremented `proc_depth`, suppressing every later `public ::` and real definition — the whole ABI reported unpublished
+on a module gfortran accepts. Excluding quotes from the prefix fixes it; a real function statement's type-spec never
+contains one. Extraction did not cause these, but it did widen their blast radius from one deterministic gate to the
+producer's repair loop, which is reason enough to fix them here.
+
+The parse is delegated to `validate_pipeline_semantics.checks_module_abi_facts` — the SAME parser `Generate.static`
+uses, extracted so both gates share it. `_CHECKS_PUBLIC_NAMES` is now an import of `runner_renderer`'s tuple rather
+than a second copy, pinned with `is`: two equal tuples are equal right up to the commit that edits one, and one fact
+with two authorities is what this entry is about. The first implementation was a second hand-rolled Fortran parser, and every
+review round found another spelling it mishandled that the existing one already handled: a leading `&` continuation,
+a comment-only line between continuations, `!` inside a string literal, `interface` bodies, nested procedures, a bare
+`end`, and finally `private; public :: x` (Codex), where the semicolon left the module default unset so an unexported
+callback read as exported. Those are not seven bugs; they are one: **a second implementation of an existing parser**.
+
+Review then found the recovery path reproducing the defect verbatim. A COLD-FALLBACK repair (reached exactly when
+recovery is happening — the session has been GC'd, or an outer reopen seeds one) lifts the launch template's static
+paragraphs by prefix, and the ABI paragraph was added to the template and silently not lifted: the producer was handed
+the runner source with no statement that it must publish all ten as subroutines, and none of the `Generate.static`
+prohibitions either. The lift is now driven by `PURE_REPAIR_STATIC_PARAGRAPH_PREFIXES`, a LIST, so a third static
+paragraph cannot be omitted the same way, and a test asserts the repair against the TEMPLATE'S OWN paragraph text
+rather than a literal copy. (Lifting also had to drop the `<doc>` placeholder line each paragraph ends with — nothing
+substitutes it on that path, so it shipped as a literal `<runner_document>`.) Same class as
+`project_slim_prompt_marker_parity`: a second rendering of the prompt that quietly drops a branch.
+
+Three prohibitions `_validate_checks_source_files` enforces were also missing from the prompt entirely, so each was a
+phase reopen the acceptance layer did not pre-empt — and the first is AGGRAVATED by this change: the injected runner is
+the leaf's only ABI model and it contains a `use harness_fortran_cpu_model, only:` block plus 27 `harness_fortran_cpu__*`
+references, while the paragraph tells the leaf to shape its stubs after it. The prompt now states all three (no
+harness `use` in checks or model; no `open(`; no judge-artifact filename ANYWHERE including comments — the scan is a
+substring match over lowered text, and the inlined tests document names `verdict.json` three times, so the prompt
+supplies the phrase the gate punishes). A test pins the prompt against `FORBIDDEN_RUNNER_OUTPUTS` so a name added to
+the gate cannot stay unstated.
+
+A third round found the isolation half of the same gate still reading LINES. `checks_module_abi_facts` was routed
+through the statement splitter and its docstring says why; `_validate_checks_source_harness_isolation`, split out of
+the SAME function eleven lines away, was not — so a harness `use` written as the second statement of a `;`-joined line
+(legal, gfortran rc=0) was invisible to an anchored `^\s*use\b` regex. That one is fail-OPEN and nothing downstream
+catches it: the harness IS staged for `Generate.syntax`, and the bundle contract has no isolation layer. Both halves
+now go through `_fortran_statements`, one helper, for the same reason the ABI tuple is one import.
+
+The same round found a SECOND definition of "is this line a placeholder" — the repair lift's `<[a-z_]+>` next to the
+renderer's `<(\w+)>`. A slot with a digit or a capital is a real slot the renderer fills and the lift would not drop,
+so it would ship to the producer as a literal token: the leak the drop exists to prevent, re-created by the same
+one-fact-two-authorities shape as the duplicated ABI tuple. The lift now reuses the renderer's pattern, pinned with
+`is`.
+
+A fourth round found the two gates disagreeing about WHICH FILE, rather than about its contents.
+`m3c_literal_name_violation` matched `logical_path` case-INSENSITIVELY (it predates this work), while
+`_validate_checks_source_files` opens `<spec_id>_checks.f90` verbatim on a case-sensitive filesystem. A bundle naming
+its file `Shallow_Water2d_Checks.f90` was therefore accepted here, staged, passed `Generate.lint` and
+`Generate.syntax` — Fortran resolves `use` by MODULE name and never by filename, so the mixed case is invisible to the
+compiler — and was then rejected by `Generate.static` on the name: a phase reopen, from the layer whose whole job is to
+not be more permissive than the gate it pre-empts. The comparison is now exact, and its mirror image is preserved and
+documented: the MODULE name stays casefolded, because a Fortran identifier genuinely is case-insensitive. Two
+comparisons, two different authorities — the filesystem and the language — and the bug was using one rule for both.
+
+A fifth review (Codex) found the reverse of the string-literal fix. Excluding quotes from the proc-header prefix
+(`[^!'"]*`) stopped it crossing into a string literal, but it ALSO blocked a legal quote inside a real type-spec —
+`character(kind=kind('a')) function metric_compute()` — so that header went unmatched, the function was
+published-but-not-`defined`, and the bundle gate ACCEPTED a function for a name the runner `call`s: the phase reopen
+this gate prevents, on legal Fortran. The distinction was never "has a quote"; it is "inside a string literal or not".
+The prefix is back to greedy `[^!]*`, matched against a STRING-MASKED copy of the statement (`_mask_fortran_string_contents`),
+which removes the phantom keyword without rejecting the legal type-spec. The same mask now guards the `open(` file-I/O
+scan, where a quoted `'open('` in a message was a pre-existing fail-close — but NOT the forbidden-filename scan, which
+inspects string CONTENT and must keep seeing a quoted `verdict.json`.
+
+**Verification.** Beyond the unit suite, the gate was swept over EVERY real `(checks, runner)` pair in the workspace —
+25 of them — rather than reviewed as prose (the blind spot this repository keeps hitting). All 16 pairs belonging to a
+CERTIFIED pipeline are accepted: zero false positives, and each of those modules does publish all ten while its runner
+imports fewer, which is the on-disk proof that ten is the contract. All 8 rejected pairs belong to pipelines that never
+passed Generate, and each is a genuine ABI guess: the failed sw2d P arm's four attempts, plus four flux attempts from
+the defect-B/C era that authored the prefixed `<spec_id>__checks` instead of `checks_compute`. A regression test drives
+the REAL `Generate.static` gate with a bundle this layer accepts, so the two agreeing is pinned rather than asserted.
+
+**Known gap (accepted).** `Generate.syntax` owns dummy-argument agreement: nothing before it checks that an imported
+callback's dummies match the runner's `call` sites. The runner is inlined so the producer can read them off.
+
+An earlier draft filed a second "gap" here — that nothing enforces the stub bodies of the ABI names a runner does not
+import — on the rationale that "nothing downstream can see it either". That rationale was FALSE, and a review caught
+it: `Generate.syntax` compiles `<spec_id>_checks.f90` itself, so it sees every stub body whether or not the runner
+imports the name. The prompt's stub recipe was therefore load-bearing and incomplete — transcribed verbatim it earned
+`Unused dummy argument 'name'` and `Dummy argument 'val' ... declared INTENT(OUT) but was not set` under the real gate
+argv, on 4 of 10 names of every node. It now spells out the rule-3 `associate` binding and the `intent(out)`
+assignment. The lesson generalizes past this line: **"no gate can see it" is a claim to verify, not to assume** — it
+is what turns a documented gap into an unnoticed defect.
+
+**Filed, not fixed: the `-p` body is one `argv` element.** The launch prompt is passed as a single `argv` element
+(`workflow_conductor.py`, `leaf_command`), and Linux caps one element at `MAX_ARG_STRLEN` = 131,072 bytes. The
+`shallow_water2d` runner is 30,879 bytes, so its cold launch prompt goes from 76,551 bytes to ~108,000 — headroom of
+roughly 23 KB. A COLD-FALLBACK repair re-inlines the whole `pure_context` PLUS `prior_document`, and can exceed it
+(`E2BIG`). It does not block this fix (a cold fallback happens only when the session has been GC'd; every repair
+observed so far has been warm), but the transport should move the `-p` body to stdin before a node with a larger runner
+or a longer spec_id lands.
