@@ -19,6 +19,7 @@ from pathlib import Path
 
 os.environ.setdefault("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", "1")
 
+import tools.codegen_bundle as cb
 import tools.orchestration_runtime as ort
 import tools.workflow_conductor as wc
 import tools.validate_pipeline_semantics as vps
@@ -219,6 +220,75 @@ class PureBundleViolationsTests(unittest.TestCase):
             "module": f"{_SPEC_ID}_checks", "capture": "checks_getter", "capability": None}]
         cat, _ = c._pure_bundle_violations(refs, bad)
         self.assertEqual(cat, "bundle_state_binding_mismatch")
+
+
+class PureHarnessManifestNarrowingTests(unittest.TestCase):
+    """The manifest a pure leaf is SHOWN must be the one it is JUDGED against (Codex review).
+
+    `_build_pure_context` used to inline the FULL `HARNESS_CAPABILITY_MANIFESTS` table while
+    `_pure_bundle_violations` negotiated only against the node's own infra dependency. With one
+    registered harness the two coincide, so the defect is latent; these tests register a SECOND
+    harness to make it live, which is the only way to reach the branch.
+    """
+
+    def setUp(self) -> None:
+        self._saved = dict(cb.HARNESS_CAPABILITY_MANIFESTS)
+        # A second harness providing what the node's own harness does not.
+        cb.HARNESS_CAPABILITY_MANIFESTS["infrastructure/harness_gpu_next@0.1.0"] = frozenset(
+            {"async_device_resident@1", "state_registration@1"})
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        self.refs = _write_node(self.repo, state_vars=("h",))
+        self.c = _conductor(self.repo)
+
+    def tearDown(self) -> None:
+        cb.HARNESS_CAPABILITY_MANIFESTS.clear()
+        cb.HARNESS_CAPABILITY_MANIFESTS.update(self._saved)
+        self._tmp.cleanup()
+
+    def test_context_shows_only_the_nodes_own_harness(self) -> None:
+        shown = json.loads(self.c._build_pure_context(self.refs)["harness_capabilities"])
+        self.assertEqual([m["node_key"] for m in shown["manifests"]], [_HARNESS])
+
+    def test_context_hides_another_harnesss_capabilities(self) -> None:
+        # The live consequence: the prompt licenses `harness_registration` when the manifest it is
+        # shown lists `state_registration@N`. Leaking another harness's token would license a
+        # requirement `_pure_bundle_violations` then rejects as `bundle_capability_unsatisfied` —
+        # a repair burn on a bundle the leaf could not know was unsatisfiable.
+        shown = json.loads(self.c._build_pure_context(self.refs)["harness_capabilities"])
+        provided = {t for m in shown["manifests"] for t in m["provides"]}
+        self.assertNotIn("state_registration@1", provided)
+        self.assertNotIn("async_device_resident@1", provided)
+        self.assertEqual(provided, {"sync_single_case@1"})
+
+    def test_context_and_gate_resolve_the_same_harness(self) -> None:
+        # The invariant the fix rests on: one resolution, so the two cannot drift.
+        ir = {"dependency": {"direct_deps": [{"node_key": _HARNESS}]}}
+        self.assertEqual(self.c._pure_harness_node_key(ir), _HARNESS)
+        shown = json.loads(self.c._build_pure_context(self.refs)["harness_capabilities"])
+        from_ir = self.c._pure_harness_node_key(
+            wc._read_yaml(self.repo / self.refs.ir_ref / "spec.ir.yaml") or {})
+        self.assertEqual([m["node_key"] for m in shown["manifests"]], [from_ir])
+
+    def test_narrowing_is_fail_closed_for_an_unresolvable_harness(self) -> None:
+        # None / unregistered => EMPTY manifests, mirroring `harness_provided_capabilities`'s
+        # fail-closed None. Never "show the whole table because we could not pick one".
+        for key in (None, "infrastructure/not_registered@9.9.9"):
+            self.assertEqual(
+                cb.harness_capability_manifest_document_for(key)["manifests"], [],
+                f"narrowing must be empty for {key!r}")
+
+    def test_zero_or_multiple_infra_deps_resolve_to_none(self) -> None:
+        self.assertIsNone(self.c._pure_harness_node_key({"dependency": {"direct_deps": []}}))
+        self.assertIsNone(self.c._pure_harness_node_key({"dependency": {"direct_deps": [
+            {"node_key": _HARNESS}, {"node_key": "infrastructure/harness_gpu_next@0.1.0"}]}}))
+
+    def test_full_document_still_carries_every_manifest(self) -> None:
+        # The unnarrowed document is the canonical Z6 shape; narrowing is the leaf's projection
+        # of it, not a replacement.
+        full = [m["node_key"] for m in cb.harness_capability_manifest_document()["manifests"]]
+        self.assertIn(_HARNESS, full)
+        self.assertIn("infrastructure/harness_gpu_next@0.1.0", full)
 
 
 # ======================================================================================

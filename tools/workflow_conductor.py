@@ -2410,6 +2410,19 @@ clean:
     # and the bundle-derived Makefile. Gated by `_pure_leaf_substep`; unreachable on the legacy
     # path (existing suite green proves legacy is byte-for-byte unchanged).
 
+    def _pure_harness_node_key(self, ir: dict[str, Any]) -> str | None:
+        """The ONE harness a pure leaf negotiates against: its node's single `infrastructure`
+        direct dependency, or None when there is not exactly one.
+
+        The SINGLE resolution shared by the context assembly (`_build_pure_context`, which shows
+        the leaf that harness's manifest) and the acceptance layer (`_pure_bundle_violations`,
+        which negotiates `capability_requirements` against it). One source, so the capabilities
+        the leaf is shown are by construction the capabilities it is judged against. A pure node
+        is M3c by `_pure_leaf_substep`, so it has exactly one infra dep; None is the fail-closed
+        answer for anything else (nothing provided, every requirement unsatisfied)."""
+        infra = self._infra_direct_deps(ir)
+        return infra[0] if len(infra) == 1 else None
+
     def _build_pure_context(self, refs: NodeRefs) -> dict[str, str]:
         """Assemble the closed context a pure `generate.generate` leaf sees, each value a plain
         string the renderer data-fences. All data is host-resolved from disk here (the leaf has
@@ -2417,7 +2430,7 @@ clean:
         defaults, the lowered IR, and the tests. Mirrors the must-read set the legacy
         `generate.generate` leaf reads, minus controlled_spec.md (phase_02 §2-1 forbids it as a
         generate input)."""
-        from tools.codegen_bundle import harness_capability_manifest_document
+        from tools.codegen_bundle import harness_capability_manifest_document_for
         ir_text = ""
         ir_path = self.repo_root / refs.ir_ref / "spec.ir.yaml"
         try:
@@ -2433,7 +2446,8 @@ clean:
         impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
         return {
             "harness_capabilities": json.dumps(
-                harness_capability_manifest_document(), indent=2, ensure_ascii=False),
+                harness_capability_manifest_document_for(self._pure_harness_node_key(ir)),
+                indent=2, ensure_ascii=False),
             "target_profile": json.dumps(impl, indent=2, ensure_ascii=False),
             "ir_document": ir_text,
             "tests_document": tests_text,
@@ -2459,11 +2473,11 @@ clean:
         from tools.codegen_bundle import (
             pure_bundle_contract_violation, harness_provided_capabilities)
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
-        # Capability negotiation against the SINGLE infrastructure (harness) dependency. A pure
-        # node is M3c by `_pure_leaf_substep`, so it has exactly one infra dep; its manifest MUST
-        # be declared (None => nothing provided => every requirement unsatisfied, fail-closed).
-        infra = self._infra_direct_deps(ir)
-        harness_nk = infra[0] if len(infra) == 1 else None
+        # Capability negotiation against the SINGLE infrastructure (harness) dependency, resolved
+        # by the same `_pure_harness_node_key` that narrows the manifest the leaf is SHOWN — so a
+        # capability the context advertises is always one this layer accepts. Its manifest MUST be
+        # declared (None => nothing provided => every requirement unsatisfied, fail-closed).
+        harness_nk = self._pure_harness_node_key(ir)
         provided = harness_provided_capabilities(harness_nk) if harness_nk else None
         algorithm = (ir.get("algorithm") or {}) if isinstance(ir, dict) else {}
         return pure_bundle_contract_violation(

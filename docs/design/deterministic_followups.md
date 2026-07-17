@@ -2598,7 +2598,7 @@ layout a conductor-spawned leaf actually produces, and keep the `subagents/` sca
 in-process substeps (`Compile.static`, `Generate.{lint,syntax,static}`, `Build`, `Validate.{pre_judge,execute,post_judge}`)
 spawn no leaf and legitimately have no transcript; they must stay `unavailable` rather than be reported as zero-cost.
 
-## Z2 first billed A/B E2E — the pure executor had never run: one fixed defect, two information gaps (FILED 2026-07-16; defects FIXED 2026-07-17 — P-arm re-run pending)
+## Z2 first billed A/B E2E — the pure executor had never run: one fixed defect, two information gaps (FILED 2026-07-16; defects FIXED 2026-07-17 — flux A/B established, `shallow_water2d` arms pending)
 
 `Z2` above is recorded `LANDED`, and its unit suite is green, but the `pure` `generate-executor` had never executed
 against the real runtime. The first billed A/B E2E ran it and it failed twice, for three distinct reasons. `LANDED`
@@ -2744,3 +2744,108 @@ though only the generate template changed, so an A/B summary shows both substeps
 
 The P arm must be re-run before the A/B can be evaluated; the L arm baseline is unaffected (its generate path is
 `legacy`) and remains comparable.
+
+**P-arm outcome (`orch_20260717T031645Z_1214d925`, `b915f91`).** The re-run cleared the A/B for
+`dynamics_advdiff_flux_1d_upwind_center2`: `aggregate_verdict=pass` on both arms, the two replaced substeps at
+`186,612` tokens against the L arm's `4,461,022` (−95.8%, `cache_read` −97.8%), and `Generate.lint` / `Generate.syntax`
+/ `Generate.static` all passed on the first attempt — the `C003` oscillation of defect C did not recur. One residual
+information gap surfaced within the run and is recorded below.
+
+## Z2 pure `generate.generate` — `state_bindings` on an IR that declares no state (FIXED 2026-07-17)
+
+**Symptom.** In the flux P arm the first pipeline (`src_20260717_001`) was terminated with
+`bundle_state_binding_mismatch` after exhausting its repair budget:
+`state_bindings[0].state_variable 'u' is not an IR algorithm.state_variable (declared: [])`. A cold restart accepted on
+its first attempt. The gate behaved correctly; the producer was not told the rule it broke.
+
+**Cause.** `state_bindings` is optional, and the output contract of `pure_generate_generate.txt` described it only as
+"tying a `state_variable` to its `storage_symbol`/`module`/`capture`". It stated no constraint on where the
+`state_variable` name comes from. `pure_bundle_contract_violation` (`codegen_bundle.py:1479-1487`) accepts a binding
+only for a name declared in the IR's `algorithm.state_variables`, and is fail-closed on an EMPTY declaration — a
+stateless IR accepts NO binding rather than every binding. The flux IR declares none, so the producer bound `u`, a name
+it had taken from the inlined tests and the algorithm steps, where `u` does appear.
+
+The criterion is the IR ALONE, never `spec_kind`: `advdiff1d_linear` is one `problem` node whose IRs both declare `u`
+(`advdiff1d-linear_20260712_001/002`) and declare nothing (`.../20260713_001`, `.../20260716_001`). A rule keyed on the
+node's kind would be wrong on that node in both directions.
+
+**Resolution.** The output-contract paragraph now states the sourcing rule with the gate's own criterion: bind ONLY a
+`state_variable` the inlined IR declares in `algorithm.state_variables`; when the IR declares none, OMIT
+`state_bindings` entirely.
+
+Three adjacent rules are stated with it, because naming a field without its constraint is what produced this defect in
+the first place — the previous text named `module` / `capture` and left every one of them unconstrained:
+
+- **The closed key set** (`node_key`, `state_variable`, `storage_symbol`, `module`, `capture`, `capability`;
+  `codegen_bundle.py:658-666`). The previous text named four of the six, leaving `node_key` and `capability` unnamed —
+  itself a schema-violation source for a producer that cannot consult the schema. `node_key` must be the unit member
+  (`:938-940`), and `(node_key, state_variable)` must be unique (`:941-948`); both are stated, since "one binding per
+  rank getter" is an available misreading of the gate's own rank-dispatch comment (`:975-978`).
+- **`module` ownership** (`:955-963`): it must be defined by a `checks`-role file OWNED BY THIS MEMBER, since it is what
+  publishes `storage_symbol` and the host renders `use <module>, only: <storage_symbol>` from it. The template names
+  `<spec_id>_model` three times and, before this change, `<spec_id>_checks` zero times — it asked for a field while
+  priming the one value that is rejected.
+- **`capture` / `capability`, in BOTH directions** (`:964-1006`): `harness_registration` requires a
+  `state_registration@N` capability both declared in `capability_requirements` and PROVIDED by the harness manifest;
+  and, in reverse (`:1001-1006`), every declared `state_registration@N` must be captured by a binding that uses it.
+  Stating only the forward direction leaves a bundle that declares an available token with no binding — or with only
+  `checks_getter` bindings — compliant with the prompt and rejected by the host. The rule is therefore written as a
+  biconditional, with the reason the producer can act on: `capability_requirements` states what the code USES, not what
+  the harness offers. `HARNESS_CAPABILITY_MANIFESTS` gives
+  `harness_fortran_cpu@0.3.0` only `sync_single_case@1` (`state_registration` is Z6-reserved), so on today's certified
+  harness every `harness_registration` binding is rejected by the capability layer and `checks_getter` with a null
+  `capability` is the only accepted form. The rule is keyed to the INLINED MANIFEST rather than hard-coding that fact:
+  `checks_getter` is mandated UNLESS the manifest lists `state_registration@N`, and the token may be declared only as
+  part of the binding that captures through it. A hard-coded mandate would go wrong in a specific way when Z6 adds the
+  capability — the token would become declarable while every binding stayed forced onto `checks_getter`, and the reverse
+  coupling at `:1001-1006` rejects a declared token no binding captures.
+
+The rule belongs to the **output contract**, not the `Authoring rules` paragraph: it constrains the returned document,
+which the host validates before any file is written, whereas the authoring rules carry the closure of the gates the
+host runs on the emitted SOURCE afterwards. Placing it in the output contract also lifts it into the cold-fallback
+repair through the existing `Output contract` paragraph lift.
+
+Per the distillation rule recorded above, every claim was diffed against the gate implementation rather than its prose
+and exercised against `Conductor._pure_bundle_violations` on BOTH branches — a stateless IR and the state-declaring
+`shallow_water2d` shape the pending arm runs. Each form the sentence permits is ACCEPTED (omission on either branch, a
+binding on a declared name, bindings on every declared name) and each form it forbids is REJECTED, the invented binding
+reproducing the P arm's message verbatim. The Z6 clause is exercised against a manifest patched to list
+`state_registration@1`, since no fixture can otherwise reach it.
+
+Four review rounds against the gate code were required, and every one found a real defect in the sentence: (1) it named
+`module` / `capture` / `capability` while constraining none of them and presented `harness_registration` as a co-equal
+option; (2) `node_key` and binding uniqueness were still unstated, and the `capture` mandate was hard-coded while this
+record claimed it was manifest-relative; (3) the manifest the leaf was SHOWN was not the manifest it is JUDGED against
+(above); (4) the `capture` coupling was stated forward-only, so a bundle declaring an available token with no capturing
+binding was prompt-compliant and host-rejected.
+
+Two lessons generalize past this entry. First, in a pure prompt, naming a field without its constraint is a defect, not
+an omission — the producer cannot look the constraint up. Second, an **inverted or half-stated implication is the
+recurring failure mode of this work specifically**: round 2 and round 4 are the same defect class found twice, once in
+each direction of the same coupling. A rule of the form "X requires Y" must be checked for whether the gate also
+enforces "Y requires X", because the producer will read the stated half as the whole rule.
+
+`PURE_PROMPT_CONTRACT_VERSION` is bumped `pure-2` → `pure-3`. The flux A/B result stands: the defect cost one pipeline
+within the P arm and is included in the measured `−95.8%`, so the fix does not invalidate the comparison.
+
+**A latent defect the same review surfaced: the leaf was shown capabilities it is not judged against.** The new
+`capture` rule is keyed to the inlined harness manifest, which made it load-bearing that the manifest shown is the
+manifest negotiated against — and it was not. `_build_pure_context` inlined
+`harness_capability_manifest_document()`, the FULL `HARNESS_CAPABILITY_MANIFESTS` table as a `manifests[]` array,
+while `_pure_bundle_violations` negotiated only against the node's single `infrastructure` direct dependency. With one
+harness registered the two coincide, so nothing was reachable; on the second registered manifest — or a second version
+of the same harness — a producer could read `state_registration@N` off an entry belonging to a harness it does not
+depend on, declare the requirement the rule licenses, and be rejected by the acceptance layer with
+`bundle_capability_unsatisfied`: a repair-budget burn on a bundle it had no way to know was unsatisfiable.
+
+`Conductor._pure_harness_node_key(ir)` is now the SINGLE resolution of that harness, shared by the context assembly and
+the acceptance layer, and `harness_capability_manifest_document_for(node_key)` narrows the document to that one entry
+(EMPTY for an unresolvable harness, mirroring `harness_provided_capabilities`'s fail-closed `None` — never "show the
+whole table because one could not be picked"). The context and the negotiation therefore cannot disagree by
+construction. The alternative — instructing the leaf to select the entry whose `node_key` matches its IR's harness
+dependency — was rejected: it adds another rule the producer must apply correctly to a prompt whose last such rule cost
+a pipeline, when the host can simply not show it the wrong thing. The unnarrowed document remains the canonical Z6
+shape; the narrowing is the leaf's projection of it.
+
+Regression coverage registers a SECOND harness manifest, since that is the only way to reach the branch, and asserts
+the leaf is shown its own harness alone; each test was confirmed to FAIL against the pre-fix context assembly.

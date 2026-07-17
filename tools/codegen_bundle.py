@@ -335,6 +335,29 @@ def harness_capability_manifest_document() -> dict[str, Any]:
     }
 
 
+def harness_capability_manifest_document_for(node_key: str | None) -> dict[str, Any]:
+    """The manifest document narrowed to ONE harness's entry — the projection a pure leaf sees.
+
+    A pure producer negotiates against exactly one harness: its node's single `infrastructure`
+    direct dependency (`Conductor._pure_harness_node_key`, which `_pure_bundle_violations` also
+    resolves the acceptance layer from). Handing it the FULL table instead would show it
+    capabilities that another harness provides and its own does not, licensing a
+    `capability_requirements` token the acceptance layer then rejects as
+    `bundle_capability_unsatisfied` — a repair-budget burn on a bundle the leaf had no way to know
+    was unsatisfiable. Narrowing here means the context and the negotiation cannot disagree,
+    rather than asking the leaf to filter the table by node_key correctly.
+
+    `None`, or a node_key no manifest declares, yields an EMPTY `manifests` list. That mirrors
+    `harness_provided_capabilities`'s fail-closed `None`: a leaf whose harness cannot be resolved
+    must be shown nothing, never another harness's capabilities."""
+    provides = HARNESS_CAPABILITY_MANIFESTS.get(node_key) if node_key is not None else None
+    return {
+        "harness_capability_abi_version": HARNESS_CAPABILITY_ABI_VERSION,
+        "manifests": ([{"node_key": node_key, "provides": sorted(provides)}]
+                      if provides is not None else []),
+    }
+
+
 # --------------------------------------------------------------------------------------
 # Field grammar
 # --------------------------------------------------------------------------------------
