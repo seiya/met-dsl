@@ -2635,7 +2635,7 @@ no exemplar, and the request payload's keys are `leaf_mode` / `pure_context` / `
 
 **Resolution.** `_run_pure_generate_substep` now resolves the exemplar ONCE above the attempt loop (attempt-invariant,
 and the selector never raises — the legacy path's shape) and attaches it per-attempt under the predicate
-`repair_payload is None or not repair_payload["repair_findings"].strip()` — the **same** predicate
+`repair_payload is None or not str(repair_payload.get("repair_findings", "")).strip()` — the **same** predicate
 `_render_launch_prompt_template` dispatches on, so the exemplar is attached exactly when the LAUNCH template (the only
 one with an `<exemplar>` slot) is what renders. The attach condition is deliberately **not** the legacy
 `not warm_resume`: the two disagree on one case, an outer reopen seeded with no findings excerpt, which under the pure
@@ -2680,29 +2680,63 @@ stated where the producer can act on them and nowhere else. Four groups, in the 
 `pure_generate_generate.txt` (immediately after the output contract, still inside the byte-stable static prefix and
 ahead of the variable context):
 
-1. **fortitude idioms** (`Generate.lint`): `S001` line length, `C121` `use ... only:`, `C122` `use, intrinsic ::`,
-   `PORT011` named integer kinds (with its cascade into `C122`), `C011` `case default`.
+1. **fortitude idioms** (`Generate.lint`): `S001` line length (stated as **under** 100 — `S001` compares `>=`, so a
+   line of exactly 100 fails; `phase_02_generate.md` §71's `≤ 100` was wrong and is corrected here too),
+   `C121` `use ... only:`, `C122` `use, intrinsic ::`, `PORT011` named kinds on reals *and* integers (with its
+   cascade into `C122`), `C131` default accessibility — paired with the `public :: <spec_id>__<op>` lines, since a
+   bare `private` alone publishes nothing and trades the lint failure for a `Generate.syntax` one (the consumer
+   staged alongside it cannot resolve the symbol; no static check reads the MODEL module's published set) — and
+   `C011` `case default`.
 2. **The `C003` ↔ `-std=f2008` trap**, stated at verbatim strength as the ONE correct form (`! allow(C003)` on its own
    line above a plain `implicit none`) plus BOTH wrong forms named as wrong and an explicit "do not oscillate between
    these two" — the measured failure was not ignorance of the rule but a two-attractor loop.
 3. **`Generate.syntax` legality** (a real `gfortran -fsyntax-only -std=f2008` front-end, so `! allow(...)` suppresses
-   nothing): 63-char identifiers, constant-only `stop` / `error stop` codes, the `associate (unused_<name> => <name>)`
-   bind for `-Werror=unused-dummy-argument`, case-insensitive identifier collisions.
-4. **`intent(out)` dataflow** (`Generate.static`) and the **inert dependency-call rule** (sink-in-IR ⇒ load-bearing;
-   no sink ⇒ inert, and no inventing a purpose for it).
+   nothing): 63-char identifiers *and* the "do not abbreviate an overlong `<spec_id>_model` — it is a spec-level
+   problem" prohibition (§55), constant-only `stop` / `error stop` codes, the EMPTY `associate (unused_<name> =>
+   <name>); end associate` bind for `-Werror=unused-dummy-argument`, the unset-`intent(out)` error that belongs to this
+   gate, case-insensitive identifier collisions.
+4. **The dependency-dataflow gate** (`Generate.static`, §79) and the **inert dependency-call rule** (§60): sink-in-IR ⇒
+   load-bearing, *uncertain correspondence ⇒ load-bearing too*; no sink ⇒ inert, with no invented purpose.
+
+**Distillation is a correctness surface, not editing.** The first cut of the paragraph was reviewed against the gate
+CODE (not against its own prose) and three of its five compressed rules were wrong (the bullets below number against the TEMPLATE's `(1)`-`(5)`, not the four groups above) in ways that would have re-run the
+defect-C failure under a new name — the compression, not the research, was the defect:
+
+- Rule 4 described a check `Generate.static` **does not perform** while omitting the one it does. "Every `intent(out)`
+  must be assigned or the gate fails" is false: `_validate_problem_model_dependency_dataflow` `continue`s when the
+  subroutine has no dependency-call results (`validate_pipeline_semantics.py:864`), and an unset `intent(out)` is in
+  fact the *syntax* gate's `-Werror=unused-dummy-argument` error. The real criterion (`:879`) is that the values a
+  load-bearing `call <dep>__<op>(...)` RETURNS reach an `intent(out)` by an assignment chain — so a producer could
+  satisfy the rule as written, assigning every `intent(out)` from local computation, and still fail the gate with a
+  message the prompt gave it no way to anticipate.
+- Rule 3 said to wrap `associate (unused_<name> => <name>)` "around a statement". Every canonical source shows the
+  EMPTY block, and the binding is licensed *because* it computes nothing — the wording invited the model to invent
+  work inside it and earn a `Generate.verify` fail for an additional operation.
+- Rule 5 dropped "an uncertain correspondence is treated as **load-bearing**" (§60 / `SKILL.md:39`). Since IR variable
+  names carry no provenance marker, uncertainty is the EXPECTED state, not an edge case; without the tiebreak a model
+  under pressure can fall to inert, and an inert-authored load-bearing call is a `Generate.verify` fail.
+
+The general rule this yields: a rule distilled into a pure prompt must be diffed against the **gate implementation**,
+because the pure leaf cannot consult the canonical doc to recover from a lossy paraphrase — the paraphrase IS its
+world. Reviewing the paragraph against the canonical *prose* would have passed all three.
 
 **Excluded, deliberately.** The JSON descriptor rules: `pure` is M3c-only and an M3c runner is host-rendered, so the
-producer never authors a descriptor and the rules are unreachable. Naming rules and the checks ABI: already carried by
-the inlined IR and `harness_capabilities` respectively — restating them would duplicate a live source with a static one
-that can drift from it.
+producer never authors a descriptor and the rules are unreachable. The literal `<spec_id>_model` / `<spec_id>__<op>`
+naming CONVENTION and the checks ABI: already carried by the inlined IR and `harness_capabilities` respectively —
+restating them would duplicate a live source with a static one that can drift from it. (The §55 overlong-name
+prohibition in group 3 is deliberately NOT excluded by that reasoning: no IR carries it, and the producer's natural
+repair — abbreviating — is exactly the forbidden move.)
 
 The rules are lifted into the **cold-fallback repair** too (`_pure_authoring_rules_text` → the repair template's
 `<authoring_rules>` slot), symmetric with the M-C cold-repair output-contract lift and for the same reason: a cold
 fallback re-authors the whole bundle with no prior turn, and a bundle repaired into schema conformance still has to
 clear the gates. A warm repair omits them (the resumed session holds the launch prefix). Both lifts now share one
 `_pure_template_paragraph(request_payload, prefix)` helper; because a "paragraph" is a `\n\n`-delimited block, an
-interior blank line would silently truncate the lift, so both are pinned by a test asserting the paragraph's **closing**
-clause, not just its heading.
+interior blank line would silently truncate the lift, so both lifts are pinned — the output contract by its heading
+plus its **closing** clause, and the authoring rules **structurally** (every non-blank template line between the
+heading and `**Harness capabilities` must survive the lift). The structural form is the stronger one: a literal anchor
+catches truncation of today's text but not an APPEND, where a rule group added after a blank line vanishes from the
+cold repair with the pin still green.
 
 `PURE_PROMPT_CONTRACT_VERSION` is bumped `pure-1` → `pure-2` (the templates changed in a way that affects producer
 behavior). The bump is transport-wide by design: the verify substep's `verdict_meta` is stamped `pure-2` as well even

@@ -331,6 +331,7 @@ class PureRenderTests(unittest.TestCase):
             "! allow(C003)",          # the C003 <-> f2008 escape, verbatim
             "-std=f2008",             # ... and why the F2018 spec-list is not the fix
             "use, intrinsic ::",      # fortitude C122
+            "public :: <spec_id>__<op>",  # fortitude C131 + its Generate.static counterpart
             "case default",           # fortitude C011
             "associate (unused_<name> => <name>)",  # the unused-dummy bind form
             "intent(out)",            # Generate.static dataflow

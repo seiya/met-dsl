@@ -611,7 +611,7 @@ class PureProducerExemplarTests(unittest.TestCase):
                      "text": "module sibling_model\n  ! prior art body\nend module sibling_model\n"}],
     }
 
-    def _run(self, envelopes):
+    def _run(self, envelopes, repair=None):
         self._tmp = tempfile.TemporaryDirectory()
         repo = Path(self._tmp.name)
         refs = _write_node(repo)
@@ -621,7 +621,7 @@ class PureProducerExemplarTests(unittest.TestCase):
             backend="claude", env={}, generate_executor="pure")
         c.exemplar_value = self._EXEMPLAR
         c.envelopes = envelopes
-        oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+        oc = c._run_pure_generate_substep(refs, "generate", "generate", repair, ())
         return c, oc
 
     def tearDown(self) -> None:
@@ -646,6 +646,25 @@ class PureProducerExemplarTests(unittest.TestCase):
         self.assertEqual(oc.attempts, 2)
         self.assertNotIn("exemplar", c.requests[1])
         self.assertNotIn("Certified exemplar", c.prompts[1])
+
+    def test_outer_reopen_without_findings_renders_launch_prompt_with_exemplar(self) -> None:
+        """The ONE case where the attach predicate differs from the legacy `not warm_resume`.
+
+        An outer reopen seeded with NO findings excerpt is warm (a session to resume) yet still
+        renders the full LAUNCH template — so it wants the exemplar, and the legacy condition
+        would have wrongly withheld it. This drives the conductor's predicate and the renderer's
+        dispatch against each other through the real renderer on the exact case where they could
+        disagree; every other test covers a case where the two happen to agree.
+        """
+        c, oc = self._run(
+            [_envelope(_valid_bundle())],
+            repair={"repair_strategy": "reuse", "repair_target_agent_run_id": "prior-arid"})
+        self.assertEqual(oc.status, "pass")
+        # The launch template rendered (not the repair template) ...
+        self.assertIn("Authoring rules", c.prompts[0])
+        # ... and the exemplar rode along with it.
+        self.assertEqual(c.requests[0]["exemplar"], self._EXEMPLAR)
+        self.assertIn("Certified exemplar (conductor-injected PRIOR ART", c.prompts[0])
 
 
 # ======================================================================================
@@ -721,12 +740,20 @@ class PureColdRepairPromptTests(unittest.TestCase):
         self.assertNotIn("! allow(C003)", text)
 
     def test_authoring_rules_lift_is_the_whole_paragraph(self) -> None:
-        # Mirrors the output-contract lift pin: an interior blank line introduced by a template
-        # edit would make `split("\n\n")` drop everything after it, shipping a cold repair with
-        # only the first rule group. Pin the heading (start) AND the last group's closing clause.
+        # An interior blank line introduced by a template edit would make `split("\n\n")` drop
+        # everything after it, shipping a cold repair with only the first rule groups. Assert
+        # STRUCTURALLY (not just heading + current closing clause): everything the template holds
+        # between the heading and the next section must survive the lift. A literal-anchored pin
+        # catches truncation of today's text but NOT an append — a rule (6) added after a blank
+        # line would vanish from the cold repair with the test still green.
         text = ort._pure_authoring_rules_text(self._req())
         self.assertTrue(text.startswith("Authoring rules"))
-        self.assertIn("no branching on its result.", text)  # closing clause of the last group
+        template = ort._load_launch_prompt_templates()["pure generate.generate"]
+        start = template.index("Authoring rules")
+        end = template.index("**Harness capabilities")  # the next section of the static prefix
+        for line in (ln.strip() for ln in template[start:end].splitlines()):
+            if line:
+                self.assertIn(line, text)
 
     def test_authoring_rules_lift_empty_for_verify(self) -> None:
         # The verify template has no authoring-rules paragraph; the lift returns '' and the
