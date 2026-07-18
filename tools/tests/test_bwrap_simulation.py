@@ -234,8 +234,13 @@ class BwrapJudgePinSimulationTests(unittest.TestCase):
         (cap_dir / f"{arid}.json").write_text(
             json.dumps({"agent_run_id": arid, "write_roots": [self.PIN]}), encoding="utf-8")
         rm_dir = _read_manifests_dir(repo, orch); rm_dir.mkdir(parents=True, exist_ok=True)
+        # Model production: the judge's run-node dir (verdict.json / diagnostics.json / raw/ are
+        # read inputs) is an explicit read-root ro-bind. The semantic_review.json write pin lives
+        # INSIDE it, so the dir is ro-bound first and the file pin rw-binds OVER it — exercising the
+        # read-root-ro-then-pin-rw override ordering directly, not just the blanket repo ro-bind.
         (rm_dir / f"{arid}.json").write_text(
-            json.dumps({"agent_run_id": arid, "allowed_read_roots": []}), encoding="utf-8")
+            json.dumps({"agent_run_id": arid, "allowed_read_roots": [self.RUN_DIR]}),
+            encoding="utf-8")
 
     def test_pin_pretouched_empty_and_not_retouched(self) -> None:
         with tempfile.TemporaryDirectory() as t:
@@ -267,13 +272,19 @@ class BwrapJudgePinSimulationTests(unittest.TestCase):
                 from pathlib import Path
                 def report(tag, ok, e=""):
                     print(f"{{tag}}:{{'OK' if ok else 'FAIL'}}", e, flush=True)
-                # (1) rewrite own semantic_review.json in place -> OK (the file pin is writable)
+                # (1) rewrite own semantic_review.json in place -> OK: the file pin rw-bind must
+                # override the read-root ro-bind of the enclosing run dir (production ordering).
                 try:
                     Path("{self.PIN}").write_text('{{"decision":"pass"}}')
                     report("SEM_WRITE", True)
                 except Exception as e:
                     report("SEM_WRITE", False, repr(e))
-                # (2) overwrite the same-dir host-authored verdict.json -> BLOCKED (dir stays ro)
+                # (2) the same-dir host-authored verdict.json is a read input: READABLE (ro-bound)...
+                try:
+                    Path("{self.VERDICT}").read_text(); report("VERDICT_READ", True)
+                except Exception as e:
+                    report("VERDICT_READ", False, repr(e))
+                # ...but NOT writable (the run dir is ro; only the one pin file is rw).
                 try:
                     Path("{self.VERDICT}").write_text('{{"forged":true}}')
                     print("VERDICT_WRITE:ALLOWED", flush=True)  # bad: narrowing failed
@@ -292,6 +303,7 @@ class BwrapJudgePinSimulationTests(unittest.TestCase):
             cmd = render_bwrap_command(profile=profile, command_argv=["python3", "-c", script])
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
             self.assertIn("SEM_WRITE:OK", out, out)
+            self.assertIn("VERDICT_READ:OK", out, out)
             self.assertIn("VERDICT_WRITE:BLOCKED", out, out)
             self.assertIn("SIBLING_NEW:BLOCKED", out, out)
             # The host-side verdict.json must be byte-for-byte unchanged.
@@ -324,10 +336,13 @@ class BwrapGenerateVerifyPinSimulationTests(unittest.TestCase):
         (cap_dir / f"{arid}.json").write_text(
             json.dumps({"agent_run_id": arid, "write_roots": [self.PIN]}), encoding="utf-8")
         rm_dir = _read_manifests_dir(repo, orch); rm_dir.mkdir(parents=True, exist_ok=True)
-        # source_meta.json is BOTH a read input and the write pin; the source tree is readable
-        # (repo ro-bind) so the verifier can inspect the certified sources.
+        # Model production: the source dir (src/*.f90 + source_meta.json) is an explicit read-root
+        # ro-bind for the verifier. source_meta.json (the write pin) lives INSIDE it, so the dir is
+        # ro-bound first and the file pin rw-binds OVER it — exercising the read-root-ro-then-pin-rw
+        # override directly (not the blanket repo ro-bind), while the certified src/*.f90 stays ro.
         (rm_dir / f"{arid}.json").write_text(
-            json.dumps({"agent_run_id": arid, "allowed_read_roots": [self.PIN]}), encoding="utf-8")
+            json.dumps({"agent_run_id": arid, "allowed_read_roots": [self.SRC_DIR]}),
+            encoding="utf-8")
 
     def test_verify_rewrites_meta_but_cannot_rewrite_certified_source(self) -> None:
         with tempfile.TemporaryDirectory() as t:
