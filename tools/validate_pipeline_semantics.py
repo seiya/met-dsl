@@ -817,9 +817,26 @@ def _validate_problem_model_dependency_dataflow(
     model_file: Path,
     lowered: str,
     dep_spec_ids: list[str],
-    required_sources: set[str],
     violations: list[str],
 ) -> None:
+    """`Generate.static` reachability lint: a `problem` subroutine that calls a dependency
+    operation must let that operation's RESULT flow to an `intent(out)` dummy. The check is a
+    backward ASSIGNMENT closure from the intent(out) vars: an assignment `lhs = f(rhs...)` makes
+    every `rhs` a source of `lhs`, transitively; a dependency-call output not assigned (directly or
+    through the chain) into any intent(out) is flagged (the inert-call / discarded-result defect).
+
+    Scope note — this gate does NOT deterministically check the stronger
+    ``semantic_dependency.required_sources`` reachability. That property (each intent(out)'s
+    expression tree reaches the required physical inputs) is inherently flow-sensitive and
+    argument-intent-dependent: whether a value passed to a `call` is read or written, and which of
+    several writes to a reused scratch variable reaches a use, cannot be decided from this
+    regex-level, flow-insensitive view without the callee interfaces. Every flow-insensitive
+    approximation attempted here either false-rejected physically-correct code (a dependency result
+    reaching intent(out) through a call chain) or failed open (a required source merely co-passed to
+    an unrelated call, or fed to a call whose write is later overwritten). It is therefore left to
+    ``Generate.verify`` G5, which reads ``controlled_spec.md`` and IS the semantic authority for
+    "each intent(out) reaches the required_sources", backed by the runtime. Check 1 below (a
+    dependency RESULT reaching intent(out)) is assignment-only, sound, and kept."""
     if not execution.node_key.startswith("problem/"):
         return
     if not dep_spec_ids:
@@ -864,6 +881,10 @@ def _validate_problem_model_dependency_dataflow(
         if not dep_output_candidates:
             continue
 
+        # A dependency RESULT is consumed into output through ASSIGNMENTS (you assign the call's
+        # output argument into your state / an intent(out)). Backward-close over assignment RHS only:
+        # crossing calls here has no sound flow-insensitive form (see the function docstring), and
+        # the assignment closure is the origin/main behavior with no false-positive history.
         dependency_sources = set(out_vars)
         changed = True
         while changed:
@@ -880,12 +901,6 @@ def _validate_problem_model_dependency_dataflow(
             violations.append(
                 f"{model_file}: subroutine {sub_name} does not propagate dependency operation outputs "
                 f"to intent(out) dataflow (candidates={sorted(dep_output_candidates)})"
-            )
-
-        if required_sources and required_sources.isdisjoint(dependency_sources):
-            violations.append(
-                f"{model_file}: subroutine {sub_name} does not include required semantic sources "
-                f"in intent(out) dataflow (required={sorted(required_sources)})"
             )
 
 
@@ -3781,7 +3796,6 @@ def _validate_generate_outputs(
         return
 
     dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
-    required_sources = _semantic_required_sources(repo_root, execution)
 
     for model_file in model_files:
         text = model_file.read_text(encoding="utf-8", errors="ignore")
@@ -3820,7 +3834,6 @@ def _validate_generate_outputs(
             model_file=model_file,
             lowered=lowered,
             dep_spec_ids=dep_spec_ids,
-            required_sources=required_sources,
             violations=violations,
         )
         _validate_problem_metric_only_scalar_kernel(
@@ -4331,7 +4344,6 @@ def _validate_generate_outputs_for_generation(
         return
 
     dep_spec_ids = _component_dep_spec_ids(repo_root, execution)
-    required_sources = _semantic_required_sources(repo_root, execution)
 
     for model_file in model_files:
         text = model_file.read_text(encoding="utf-8", errors="ignore")
@@ -4370,7 +4382,6 @@ def _validate_generate_outputs_for_generation(
             model_file=model_file,
             lowered=lowered,
             dep_spec_ids=dep_spec_ids,
-            required_sources=required_sources,
             violations=violations,
         )
         _validate_problem_metric_only_scalar_kernel(
@@ -6335,44 +6346,6 @@ def _state_snapshot_required(repo_root: Path, execution: NodeExecution) -> bool:
     if isinstance(value, bool):
         return value
     return default_required
-
-
-def _semantic_required_sources(repo_root: Path, execution: NodeExecution) -> set[str]:
-    contract = _io_contract_for_execution(repo_root, execution)
-    if not isinstance(contract, dict):
-        return set()
-
-    required: set[str] = set()
-
-    semantic_dep = contract.get("semantic_dependency")
-    if isinstance(semantic_dep, dict):
-        raw_sources = semantic_dep.get("required_sources")
-        if isinstance(raw_sources, list):
-            for item in raw_sources:
-                token = None
-                if isinstance(item, str):
-                    token = item.strip().lower()
-                elif isinstance(item, dict):
-                    name = item.get("name")
-                    if isinstance(name, str):
-                        token = name.strip().lower()
-                if token and FORTRAN_IDENTIFIER_PATTERN.fullmatch(token):
-                    required.add(token)
-
-    io_contract = contract.get("io_contract")
-    if isinstance(io_contract, dict):
-        outputs = io_contract.get("outputs")
-        if isinstance(outputs, list):
-            for item in outputs:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("name")
-                if not isinstance(name, str):
-                    continue
-                token = name.strip().lower()
-                if FORTRAN_IDENTIFIER_PATTERN.fullmatch(token):
-                    required.add(token)
-    return required
 
 
 def _validate_io_contract_file(

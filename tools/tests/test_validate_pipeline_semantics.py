@@ -15,6 +15,7 @@ import tools.validate_pipeline_semantics as vps
 from tools.validate_pipeline_semantics import (
     _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
     NodeExecution,
+    _validate_problem_model_dependency_dataflow,
     _diagnostics_contract_check_ids,
     _diagnostics_contract_verdict_fields,
     _node_executions,
@@ -5121,6 +5122,117 @@ end program shallow_water2d_runner
             self.assertTrue(
                 any("does not propagate dependency operation outputs" in v for v in violations)
             )
+
+    def test_real_call_only_unext_source_passes_dependency_dataflow(self) -> None:
+        # Regression: the EXACT model source the pure leaf authored (orch_9a5fe93e), a physically
+        # correct shallow-water2d step whose updated state reaches intent(out) through
+        # `call dep__ssprk2(..., unext, ...)` then `h_out = unext(1,:,:)`. Check 1 (dep result
+        # reaches intent(out), assignment-only) must be silent: `unext` is a dep-call output and it
+        # IS assigned into `h_out`. (The required-sources reachability that origin/main rejected here
+        # for Fail #2/#3 is no longer gated deterministically — it is a Generate.verify G5
+        # responsibility; see the function docstring.)
+        source = (Path(__file__).parent / "data" / "sw2d_call_only_unext_model.f90").read_text()
+        execution = NodeExecution(
+            node_key="problem/shallow_water2d@0.4.0",
+            node_dir=Path("/nonexistent/node"),
+            exec_dir=Path("/nonexistent/exec"),
+            pipeline_dir=Path("/nonexistent/pipeline"),
+        )
+        violations: list[str] = []
+        _validate_problem_model_dependency_dataflow(
+            execution=execution,
+            model_file=Path("shallow_water2d_model.f90"),
+            lowered=source.lower(),
+            dep_spec_ids=[
+                "dynamics_shallow_water_boundary_2d_periodic_copy",
+                "dynamics_shallow_water_flux_2d_rusanov_p0",
+                "dynamics_shallow_water_time_update_2d_ssprk2",
+            ],
+            violations=violations,
+        )
+        self.assertEqual(violations, [])
+
+    def test_dependency_result_reaching_no_intent_out_via_call_still_flags(self) -> None:
+        # Check 1 must flag a dependency result that reaches no intent(out): `dep_out` is produced by
+        # a dep call but never assigned into `flag` (nor into any local the flag assignment reads).
+        source = """module shallow_water2d_model
+use dynamics_shallow_water_flux_2d_rusanov_p0_model
+implicit none
+contains
+subroutine solve(scale, flag)
+  real(dp), intent(in) :: scale
+  logical, intent(out) :: flag
+  real(dp) :: local_in, dep_out
+  local_in = 1.0_dp
+  call dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux(local_in, dep_out)
+  flag = scale > 0.0_dp
+end subroutine solve
+end module shallow_water2d_model
+"""
+        execution = NodeExecution(
+            node_key="problem/shallow_water2d@0.4.0",
+            node_dir=Path("/nonexistent/node"),
+            exec_dir=Path("/nonexistent/exec"),
+            pipeline_dir=Path("/nonexistent/pipeline"),
+        )
+        violations: list[str] = []
+        _validate_problem_model_dependency_dataflow(
+            execution=execution,
+            model_file=Path("shallow_water2d_model.f90"),
+            lowered=source.lower(),
+            dep_spec_ids=["dynamics_shallow_water_flux_2d_rusanov_p0"],
+            violations=violations,
+        )
+        self.assertTrue(
+            any("does not propagate dependency operation outputs" in v for v in violations),
+            violations,
+        )
+
+    def test_discarded_dep_result_flagged_even_when_call_shares_an_input(self) -> None:
+        # Check 1 must flag a discarded dependency result even when the dep call shares an input
+        # (dt/dx) with the intent(out) formula: `unext` is produced by the ssprk2 call but never
+        # assigned into `h_out` (which is computed from an inline formula). Assignment-only closure
+        # correctly does not reach `unext`.
+        source = """module shallow_water2d_model
+use dynamics_shallow_water_time_update_2d_ssprk2_model
+implicit none
+contains
+subroutine advance(h, dt, dx, h_out)
+  real(dp), intent(in) :: h, dt, dx
+  real(dp), intent(out) :: h_out
+  real(dp) :: un, unext, gtime
+  un = h
+  call dynamics_shallow_water_time_update_2d_ssprk2__advance(un, dt, dx, unext, gtime)
+  h_out = h - dt/dx * h
+end subroutine advance
+end module shallow_water2d_model
+"""
+        execution = NodeExecution(
+            node_key="problem/shallow_water2d@0.4.0",
+            node_dir=Path("/nonexistent/node"),
+            exec_dir=Path("/nonexistent/exec"),
+            pipeline_dir=Path("/nonexistent/pipeline"),
+        )
+        violations: list[str] = []
+        _validate_problem_model_dependency_dataflow(
+            execution=execution,
+            model_file=Path("shallow_water2d_model.f90"),
+            lowered=source.lower(),
+            dep_spec_ids=["dynamics_shallow_water_time_update_2d_ssprk2"],
+            violations=violations,
+        )
+        self.assertTrue(
+            any("does not propagate dependency operation outputs" in v for v in violations),
+            violations,
+        )
+
+    # NOTE: the required-semantic-sources reachability check was removed from this gate. Every
+    # flow-insensitive approximation of it either false-rejected physically-correct code (a required
+    # source reaching intent(out) through a dependency-call chain) or failed open (a source co-passed
+    # to an unrelated call, or fed to a call whose write a later call overwrites). The property is a
+    # Generate.verify G5 semantic responsibility (it reads controlled_spec.md), backed by the
+    # runtime — see the _validate_problem_model_dependency_dataflow docstring. Only check 1 (a
+    # dependency RESULT reaching intent(out), assignment-only and sound) remains, exercised above.
 
     def test_state_snapshots_can_be_optional_by_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
