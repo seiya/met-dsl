@@ -26322,7 +26322,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # object/dict — the compile-verify mirror of the generate-verify note (same E2E #4
         # root cause). The prior ceiling left 21 bytes of headroom after the edit, which is
         # not a budget, so it is raised to the new footprint.
-        "skills/workflow-compile-verify/SKILL.md": 14100,
+        # Bumped 14100->14900: the IR self-sufficiency checklist item (a non-dependency operation_ref
+        # lowered as a name only, with the math solely in controlled_spec.md, is a major remand) —
+        # the semantic counterpart to the compile-generate lowering rule; not deterministically
+        # gatable, so it is a verify-leaf checklist item.
+        "skills/workflow-compile-verify/SKILL.md": 14900,
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
         # generate.generate no longer force-reads) to avoid a lint/build round-trip.
