@@ -1112,11 +1112,16 @@ def build_launch_request(
                 f"{spec}/tests.md",
                 f"{refs.pipeline_ref}/lineage.json",
             ]
+            # Verify's SOLE write is source_meta.json (verification_status): it inspects the
+            # producer sources (model / runner|checks / Makefile) but never rewrites them — a
+            # fail requests regeneration under a NEW source_id (SKILL workflow-generate-verify
+            # Scope + Rule 3), never an in-place edit. Those sources were certified by the
+            # deterministic lint / syntax / static gates that run BEFORE verify and never re-run,
+            # so listing them (or the Makefile / command_log) here would let a verify turn smuggle
+            # an uncertified source into Build. Narrowed to source_meta.json on ALL turns; the
+            # runtime pins verify's write_root to the same file (a structural second layer under
+            # the pattern-based file-tool guard).
             req["allowed_output_paths"] = [
-                f"{src}/src/{refs.spec_id}_model.f90",
-                runner_or_checks,
-                *make_entry,
-                f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
             ]
     elif step == "build":
@@ -1224,27 +1229,19 @@ def build_launch_request(
     if exemplar and step == "generate" and substep == "generate":
         req["exemplar"] = exemplar
     req.update(rep)
-    # A verify_meta_schema repair re-authors the phase's stage meta and NOTHING else, so its
-    # allowed_output_paths is narrowed to exactly that file. This is the structural statement of
-    # "re-author only the meta": the narrowed list is what the leaf's TRUSTED prompt shows as its
-    # deliverables, and it is what `allowed_file_tool_paths` (hence the output_manifest_write_guard
-    # hook, which rejects an Edit/Write/apply_patch to any unlisted path) holds the leaf to.
-    # What does NOT narrow with it: the bwrap `write_roots` and the terminal FS-diff are both keyed
-    # on (role, step), so the whole `source/` tree stays RW-bound and a source rewrite there would
-    # be write-root-contained (authorized). The file-tool guard is the enforcing layer, and its
-    # Bash-write detector is pattern-based, so this is one layer, not defence in depth — the same
-    # posture that already keeps compile.verify off the certified spec.ir.yaml.
-    # Load-bearing for generate.verify, whose normal allowed_output_paths also lists the producer
-    # sources (model/runner/checks .f90): those are certified by lint / syntax / static, which run
-    # BEFORE verify and are never re-run, so a source rewritten on a verify turn would reach Build
-    # uncertified. The constraint cannot live in the findings text instead — the slim renderer
-    # fences that as untrusted data the leaf is explicitly told not to obey.
-    if (substep == "verify" and rep.get("repair_reason") == VERIFY_META_SCHEMA_REPAIR_REASON
-            and step in ("compile", "generate")):
-        req["allowed_output_paths"] = [
-            f"{refs.ir_ref}/ir_meta.json" if step == "compile"
-            else f"{refs.source_dir()}/source_meta.json"
-        ]
+    # A verify substep's allowed_output_paths is already narrowed to exactly its stage-meta file
+    # on ALL turns (compile.verify -> ir_meta.json, generate.verify -> source_meta.json, above),
+    # so a verify_meta_schema repair turn — which re-authors ONLY that meta — needs no special-case
+    # narrowing here: the normal list already IS the meta. All three write-authorization layers are
+    # now substep-granular, giving real defence in depth: (1) allowed_file_tool_paths -> the
+    # output_manifest_write_guard hook (rejects an Edit/Write/apply_patch to any unlisted path),
+    # (2) the bwrap `write_roots` (the runtime pins verify's write_root to that same stage-meta
+    # file, so the rest of the source/ (resp. ir/) tree is not even RW-bound), and (3) the terminal
+    # FS-diff (which reads the narrowed write_roots). Because (2)/(3) are structural and independent
+    # of the pattern-based Bash-write detector, a source rewritten on a verify turn — which would
+    # reach Build uncertified, the lint/syntax/static gates having already run and never re-running
+    # — is refused by the sandbox itself, not merely by the hook. The constraint therefore does not
+    # rely on the findings text (which the slim renderer fences as untrusted data anyway).
     # Slim warm-resume repair turn: when the conductor has decided the producer session is
     # resumable (warm_resume) AND this is a reuse repair carrying findings, mark the request
     # so the runtime renders the findings-only slim prompt and empty the must-read (the

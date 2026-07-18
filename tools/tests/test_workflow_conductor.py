@@ -5011,15 +5011,23 @@ class WriteRunnerTest(unittest.TestCase):
 
     def test_build_launch_request_swaps_runner_for_checks(self) -> None:
         refs = self._refs()
-        for substep in ("generate", "verify"):
-            built = wc.build_launch_request(
-                refs, step="generate", substep=substep, orchestration_id="o",
-                orchestration_agent_run_id="ORCH", child_agent_run_id="c",
-                agent_model="m", workflow_mode="prod", runner_host_authored=True)
-            outs = built["allowed_output_paths"]
-            self.assertIn(f"{refs.source_dir()}/src/{self.SID}_checks.f90", outs)
-            self.assertNotIn(f"{refs.source_dir()}/src/{self.SID}_runner.f90", outs)
-            self.assertIn(f"{refs.source_dir()}/src/{self.SID}_model.f90", outs)
+        # generate.generate authors the sources: on an M3c (runner_host_authored) node the leaf
+        # writes <spec_id>_checks.f90 instead of <spec_id>_runner.f90.
+        built = wc.build_launch_request(
+            refs, step="generate", substep="generate", orchestration_id="o",
+            orchestration_agent_run_id="ORCH", child_agent_run_id="c",
+            agent_model="m", workflow_mode="prod", runner_host_authored=True)
+        outs = built["allowed_output_paths"]
+        self.assertIn(f"{refs.source_dir()}/src/{self.SID}_checks.f90", outs)
+        self.assertNotIn(f"{refs.source_dir()}/src/{self.SID}_runner.f90", outs)
+        self.assertIn(f"{refs.source_dir()}/src/{self.SID}_model.f90", outs)
+        # generate.verify writes ONLY source_meta.json — it inspects the sources, never rewrites
+        # them — so no runner / checks / model appears in its output set at all.
+        ver = wc.build_launch_request(
+            refs, step="generate", substep="verify", orchestration_id="o",
+            orchestration_agent_run_id="ORCH", child_agent_run_id="c",
+            agent_model="m", workflow_mode="prod", runner_host_authored=True)
+        self.assertEqual(ver["allowed_output_paths"], [f"{refs.source_dir()}/source_meta.json"])
         # default (legacy) keeps the runner
         legacy = wc.build_launch_request(
             refs, step="generate", substep="generate", orchestration_id="o",
@@ -5134,9 +5142,13 @@ class GenerateLeafAuthorizationTest(unittest.TestCase):
     def test_dependency_generate_launch_keeps_makefile(self) -> None:
         refs = self._refs()
         mk = f"{refs.source_dir()}/src/Makefile"
-        for substep in ("generate", "verify"):
-            req = self._launch(refs, substep, host_authored=False)
-            self.assertIn(mk, req["allowed_output_paths"], f"{substep} should keep Makefile")
+        # generate.generate (leaf-authored Makefile for a c/cpp/mixed dependency node) keeps it.
+        req = self._launch(refs, "generate", host_authored=False)
+        self.assertIn(mk, req["allowed_output_paths"], "generate should keep Makefile")
+        # generate.verify writes ONLY source_meta.json — it inspects the Makefile, never rewrites
+        # it — so the Makefile is absent from its output set regardless of authorship.
+        ver = self._launch(refs, "verify", host_authored=False)
+        self.assertEqual(ver["allowed_output_paths"], [f"{refs.source_dir()}/source_meta.json"])
 
     def test_phase_required_outputs_leaf_omits_makefile(self) -> None:
         refs = self._refs()
@@ -8368,8 +8380,8 @@ class VerifyMetaSchemaWarmResumeTests(unittest.TestCase):
             agent_model="m", workflow_mode="dev", repair=repair, warm_resume=True)
         self.assertTrue(req.get("warm_resume"))
         self.assertEqual(req["skill_must_read_refs"], "")
-        # Narrowed to the meta: the producer sources a normal generate.verify may write are NOT
-        # writable on a meta-schema repair turn.
+        # generate.verify's output set is source_meta.json on ALL turns (it never rewrites the
+        # producer sources), so the meta-schema repair turn is no different — no special case.
         self.assertEqual(req["allowed_output_paths"],
                          [f"{refs.source_dir()}/source_meta.json"])
 
@@ -8404,16 +8416,18 @@ class VerifyMetaSchemaWarmResumeTests(unittest.TestCase):
             codex._claude_session_resumable = lambda arid: True  # type: ignore[assignment]
             self.assertFalse(codex._verify_session_resumable("live-arid"))
 
-    def test_build_launch_request_does_not_narrow_a_normal_verify_launch(self) -> None:
-        # The narrowing is keyed on the meta-schema repair reason ONLY; an ordinary
-        # generate.verify launch keeps its full contract paths.
+    def test_build_launch_request_narrows_a_normal_verify_launch_too(self) -> None:
+        # generate.verify's output set is source_meta.json on EVERY turn (not just a meta-schema
+        # repair turn): it inspects the producer sources but never rewrites them. So an ordinary
+        # verify launch carries exactly the meta and nothing under src/.
         refs = self._refs()
         req = wc.build_launch_request(
             refs, step="generate", substep="verify", orchestration_id="orch_x",
             orchestration_agent_run_id="parent", child_agent_run_id="child-2",
             agent_model="m", workflow_mode="dev")
-        self.assertIn(f"{refs.source_dir()}/source_meta.json", req["allowed_output_paths"])
-        self.assertTrue([p for p in req["allowed_output_paths"] if p.endswith("_model.f90")])
+        self.assertEqual(req["allowed_output_paths"],
+                         [f"{refs.source_dir()}/source_meta.json"])
+        self.assertFalse([p for p in req["allowed_output_paths"] if p.endswith("_model.f90")])
 
 
 if __name__ == "__main__":  # pragma: no cover
