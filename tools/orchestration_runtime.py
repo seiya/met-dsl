@@ -9974,7 +9974,8 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
 # host inlines for each. A pure request outside this map is rejected at validation
 # (`_validate_launch_request_payload`); a missing context key on a cold launch is rejected too.
 PURE_CONTEXT_REQUIRED_KEYS: dict[tuple[str, str], tuple[str, ...]] = {
-    ("generate", "generate"): ("harness_capabilities", "target_profile", "ir_document",
+    ("generate", "generate"): ("harness_capabilities", "target_profile",
+                               "controlled_spec_document", "ir_document",
                                "tests_document", "runner_document"),
     ("generate", "verify"): ("controlled_spec_document", "tests_document", "ir_document",
                              "bundle_document"),

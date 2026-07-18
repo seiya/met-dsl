@@ -14311,6 +14311,7 @@ class PureLaunchRecordSweepTest(unittest.TestCase):
                 "prompt_contract_version": PURE_PROMPT_CONTRACT_VERSION,
                 "allowed_output_paths": [],
                 "pure_context": {"harness_capabilities": "{}", "target_profile": "t",
+                                 "controlled_spec_document": "cs",
                                  "ir_document": "i", "tests_document": "t",
                                  "runner_document": "program r\nend program\n"},
             })

@@ -166,6 +166,9 @@ def _write_node(repo: Path, *, ir_id="sw_20260715_001", source_id="src_20260715_
     spec_dir = repo / _SPEC_PATH
     spec_dir.mkdir(parents=True, exist_ok=True)
     (spec_dir / "tests.md").write_text("- test: conserves mass\n", encoding="utf-8")
+    (spec_dir / "controlled_spec.md").write_text(
+        "## 5 Algorithm\nhydrostatic reconstruction: h_star = max(0, eta - z_b)\n",
+        encoding="utf-8")
     refs = wc.NodeRefs(node_key=_NODE, spec_path=_SPEC_PATH, ir_id=ir_id,
                        pipeline_id="sw_20260715_001", source_id=source_id)
     if stage_runner:
@@ -624,6 +627,17 @@ class PureContextRunnerInjectionTests(unittest.TestCase):
             # The ABI the leaf must author against is actually reachable in what it is shown.
             self.assertIn(f"use {_SPEC_ID}_checks, only:", ctx["runner_document"])
 
+    def test_controlled_spec_is_inlined_from_the_spec_dir(self) -> None:
+        # pure-5 interim carve-out: the producer context now carries controlled_spec.md verbatim
+        # (the verify reviewer already did), so producer and checker see the same authority.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            ctx = _conductor(repo)._build_pure_context(refs)
+            staged = (repo / _SPEC_PATH / "controlled_spec.md").read_text(encoding="utf-8")
+            self.assertEqual(ctx["controlled_spec_document"], staged)
+            self.assertIn("h_star = max(0, eta - z_b)", ctx["controlled_spec_document"])
+
     def test_non_utf8_runner_raises_the_named_contract_not_a_bare_decode_error(self) -> None:
         # UnicodeDecodeError is a ValueError, not an OSError: catching OSError alone let it escape
         # unnamed. The caller recovers any exception, so this is about the diagnosis an operator
@@ -1042,6 +1056,7 @@ class PureLaunchRequestTests(unittest.TestCase):
                 agent_model="opus", workflow_mode="dev",
                 makefile_host_authored=True, runner_host_authored=True,
                 pure_leaf=True, pure_context={"harness_capabilities": "x", "target_profile": "y",
+                                              "controlled_spec_document": "cs",
                                               "ir_document": "z", "tests_document": "t",
                                               "runner_document": "program r\nend program\n"})
             self.assertEqual(req["leaf_mode"], "pure")
@@ -1211,6 +1226,7 @@ class PureColdRepairPromptTests(unittest.TestCase):
             "prompt_contract_version": PURE_PROMPT_CONTRACT_VERSION,
             "repair_findings": "capability_requirements missing",
             "pure_context": {"harness_capabilities": "hc", "target_profile": "tp",
+                             "controlled_spec_document": "cs",
                              "ir_document": "ir", "tests_document": "tt",
                              "runner_document": "program r\nend program\n"},
             "prior_document": '{"bundle_schema_version": "1.0.0"}',
