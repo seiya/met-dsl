@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import types
 import uuid
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
@@ -3881,15 +3882,28 @@ def _parse_iso_z_expiry(raw: str) -> datetime | None:
 # compile.static, validate.pre_judge / post_judge) which never import a build-runtime handler —
 # falls through to the fail-closed `[]` default. This is strictly per-substep least-privilege:
 # a read-only reviewer leaf holds no build-tool grant.
-_MCP_TOOL_GRANTS_BY_SUBSTEP: dict[tuple[str, str], tuple[str, ...]] = {
-    ("build", ""): ("compile_project",),
-    ("generate", "lint"): ("run_linter",),
-    ("generate", "syntax"): ("run_syntax_check",),
-    ("validate", "execute"): ("run_program", "run_quality_checks"),
-}
+#
+# A drift guard (test_mcp_grant_table_matches_conductor_call_sites) introspects the four
+# conductor bodies above and fails CI if a body's gated tool set stops matching this table —
+# so a new/renamed gated call cannot silently fail-closed at the runtime authz gate.
+#
+# Read-only mapping proxy: the grant table is security-sensitive, so freeze it against
+# accidental in-process mutation (a stray test or import doing `.clear()` / key reassignment
+# would otherwise flip grants for the rest of the process). Values are already immutable tuples.
+_MCP_TOOL_GRANTS_BY_SUBSTEP: types.MappingProxyType[tuple[str, str], tuple[str, ...]] = (
+    types.MappingProxyType({
+        ("build", ""): ("compile_project",),
+        ("generate", "lint"): ("run_linter",),
+        ("generate", "syntax"): ("run_syntax_check",),
+        ("validate", "execute"): ("run_program", "run_quality_checks"),
+    })
+)
 
 
 def _mcp_permissions_for_launch(role: str, step: str, *, substep: str = "") -> list[str]:
+    # `role` is a defense-in-depth guard ONLY (non-leaf roles get nothing); the actual grant
+    # is a pure `(step, substep)` lookup — the same (step, substep) yields the same grant for
+    # role "step" and "substep". Do not "fix" this into a role-dependent branch.
     r = role.strip().lower()
     if r not in {"step", "substep"}:
         return []
@@ -5024,9 +5038,14 @@ def validate_mcp_build_tool_invocation(
     perms = cap.get("mcp_permissions")
     allowed = [str(x) for x in perms] if isinstance(perms, list) else []
     if tool_name not in allowed:
+        # Surface the resolving (step, substep) so an empty `allowed` is self-diagnosing:
+        # a correctly fail-closed leaf (e.g. generate.verify) reads the same as a genuinely
+        # missing _MCP_TOOL_GRANTS_BY_SUBSTEP entry without this context.
+        cap_step = str(cap.get("step", "")).strip().lower()
+        cap_substep = str(cap.get("substep", "")).strip().lower()
         raise RuntimeError(
             f"MCP phase gate: tool {tool_name!r} not permitted by capability "
-            f"(allowed={allowed!r})"
+            f"(step={cap_step!r}, substep={cap_substep!r}, allowed={allowed!r})"
         )
 
     node_raw = cap.get("node_key")

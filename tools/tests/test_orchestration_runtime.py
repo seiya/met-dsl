@@ -7948,6 +7948,59 @@ shell_tool                       stable             true
         self.assertEqual(_mcp_permissions_for_launch("orchestration", "build"), [])
         self.assertEqual(_mcp_permissions_for_launch("substep", "build", substep="lint"), [])
 
+    def test_mcp_grant_table_matches_conductor_call_sites(self) -> None:
+        """Drift guard: `_MCP_TOOL_GRANTS_BY_SUBSTEP` is a hand-maintained mirror of which
+        conductor in-process body calls which gated build-runtime tool. If a body gains,
+        loses, or renames a gated `tool_*` call and the table is not updated in lockstep,
+        the runtime authz gate would silently fail-closed (deny a needed tool) or over-grant
+        in production, with the existing per-substep tests still green. Introspect the four
+        bodies' source and assert the derived (step, substep) -> tools mapping IS the table."""
+        import inspect
+        import re
+        import tools.workflow_conductor as wc
+        from tools.orchestration_runtime import _MCP_TOOL_GRANTS_BY_SUBSTEP
+
+        # (step, substep) -> the Conductor in-process method that runs it.
+        bodies = {
+            ("build", ""): wc.Conductor._build_inproc,
+            ("generate", "lint"): wc.Conductor._lint_inproc,
+            ("generate", "syntax"): wc.Conductor._syntax_inproc,
+            ("validate", "execute"): wc.Conductor._execute_inproc,
+        }
+        # Gated build-runtime handler name -> the MCP tool id it enforces.
+        handler_to_tool = {
+            "tool_compile_project": "compile_project",
+            "tool_run_linter": "run_linter",
+            "tool_run_syntax_check": "run_syntax_check",
+            "tool_run_program": "run_program",
+            "tool_run_quality_checks": "run_quality_checks",
+        }
+
+        derived: dict[tuple[str, str], tuple[str, ...]] = {}
+        for key, fn in bodies.items():
+            src = inspect.getsource(fn)
+            tools_called = tuple(sorted(
+                tool for handler, tool in handler_to_tool.items()
+                if re.search(rf"\b{handler}\b", src)
+            ))
+            derived[key] = tools_called
+
+        # The table must grant EXACTLY the tools each body calls (order-insensitive), and
+        # cover exactly these four keys — no stale entry, no missing body.
+        self.assertEqual(
+            {k: tuple(sorted(v)) for k, v in _MCP_TOOL_GRANTS_BY_SUBSTEP.items()},
+            derived,
+            "grant table drifted from the conductor in-process call sites — update "
+            "_MCP_TOOL_GRANTS_BY_SUBSTEP (and this test's `bodies` map) together",
+        )
+
+    def test_mcp_grant_table_is_immutable(self) -> None:
+        """The grant table is frozen (MappingProxyType) so a stray mutation cannot flip a
+        security-sensitive grant for the rest of the process."""
+        from tools.orchestration_runtime import _MCP_TOOL_GRANTS_BY_SUBSTEP
+        with self.assertRaises(TypeError):
+            _MCP_TOOL_GRANTS_BY_SUBSTEP[("generate", "verify")] = ("run_linter",)  # type: ignore[index]
+
     def test_allowed_output_paths_for_launch_promote_accepts_release_artifact_and_catalog(self) -> None:
         """Regression: promote step must pass phase contract validation for
         canonical write paths (release tree + spec_catalog.yaml). Without this
@@ -14207,16 +14260,45 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
             )
 
     @staticmethod
-    def _perm_test_refs():
+    def _perm_test_refs(**extra):
         import tools.workflow_conductor as wc
-        # ir_ref / pipeline_ref derive to _FIX_IR_REF / _FIX_PIPE_REF.
+        # ir_ref / pipeline_ref derive to _FIX_IR_REF / _FIX_PIPE_REF. `extra` supplies the
+        # producer ids a given step needs (binary_id for build, run_id/source_binary_id for
+        # validate.execute) so each test builds a real launch request via build_launch_request.
         return wc.NodeRefs(
             node_key="problem/shallow_water2d@0.3.0",
             spec_path="spec/problem/shallow_water/shallow_water2d",
             ir_id="shallow-water2d_20260415_001",
             pipeline_id="shallow-water2d_20260415_001",
             source_id="src_20260415_001",
+            **extra,
         )
+
+    @staticmethod
+    def _perm_test_plant_lineage(repo_root: Path, *, source_id: str = "src_20260415_001",
+                                 binary_id: str | None = None) -> None:
+        """Plant the upstream generate/build artifacts a build / validate.execute launch's
+        cross-phase authorization requires on disk (source_meta.json, and binary_meta.json
+        bound to source_source_id). In a real workflow those phases run before these launch."""
+        gen_dir = repo_root / f"{_FIX_PIPE_REF}/source/{source_id}"
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        (gen_dir / "source_meta.json").write_text(
+            '{"verification_status": "pass"}\n', encoding="utf-8"
+        )
+        if binary_id is not None:
+            bdir = repo_root / f"{_FIX_PIPE_REF}/binary/{binary_id}"
+            (bdir / "bin").mkdir(parents=True, exist_ok=True)
+            (bdir / "bin/simulate").write_text("binary\n", encoding="utf-8")
+            (bdir / "binary_meta.json").write_text(
+                json.dumps({
+                    "build_system": "make",
+                    "compiler": "gfortran",
+                    "build_log_ref": "...",
+                    "status": "pass",
+                    "source_source_id": source_id,
+                }) + "\n",
+                encoding="utf-8",
+            )
 
     @staticmethod
     def _perm_test_preflight(repo_root: Path, orchestration_id: str) -> None:
@@ -14323,6 +14405,124 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                     agent_run_id="gen_lint_child",
                     capability_token=str(cap["capability_token"]),
                     tool_name="run_syntax_check",
+                )
+            self.assertIn("not permitted by capability", str(ctx.exception))
+
+    def test_validate_mcp_build_grant_accepts_compile_project(self) -> None:
+        """The build step's grant is exercised through the REAL authz gate (not just the
+        table-lookup unit test): a build launch's capability token authorizes compile_project
+        and refuses a sibling gated tool."""
+        import tools.workflow_conductor as wc
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._perm_test_preflight(repo_root, "vperm3")
+            self._perm_test_plant_lineage(repo_root)
+            req = wc.build_launch_request(
+                self._perm_test_refs(binary_id="bin_20260415_001"),
+                step="build", substep=None,
+                orchestration_id="vperm3",
+                orchestration_agent_run_id="orch_vperm3",
+                child_agent_run_id="build_child",
+                agent_model="claude-opus-4-8",
+                workflow_mode="dev",
+                exe_name="simulate",
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="vperm3",
+                parent_agent_run_id="orch_vperm3",
+                child_agent_run_id="build_child",
+                request_payload=req,
+                response_payload=_spawn_response_payload("sess_build_child"),
+            )
+            cap = json.loads(
+                (repo_root / "workspace/orchestrations/vperm3/capabilities/build_child.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(cap["mcp_permissions"], ["compile_project"])
+            validate_mcp_build_tool_invocation(
+                repo_root,
+                orchestration_id="vperm3",
+                agent_run_id="build_child",
+                capability_token=str(cap["capability_token"]),
+                tool_name="compile_project",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                validate_mcp_build_tool_invocation(
+                    repo_root,
+                    orchestration_id="vperm3",
+                    agent_run_id="build_child",
+                    capability_token=str(cap["capability_token"]),
+                    tool_name="run_program",
+                )
+            self.assertIn("not permitted by capability", str(ctx.exception))
+
+    def test_validate_mcp_execute_grant_accepts_program_and_quality_checks(self) -> None:
+        """The validate.execute grant is exercised through the REAL authz gate: its capability
+        token authorizes BOTH run_program and run_quality_checks and refuses an unrelated
+        gated tool (run_linter, a different substep's grant)."""
+        import tools.workflow_conductor as wc
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._perm_test_preflight(repo_root, "vperm4")
+            self._perm_test_plant_lineage(repo_root, binary_id="bin_20260415_001")
+            req = wc.build_launch_request(
+                self._perm_test_refs(
+                    binary_id="bin_20260415_001",
+                    source_binary_id="bin_20260415_001",
+                    run_id="run_20260415_001",
+                ),
+                step="validate", substep="execute",
+                orchestration_id="vperm4",
+                orchestration_agent_run_id="orch_vperm4",
+                child_agent_run_id="exec_child",
+                agent_model="claude-opus-4-8",
+                workflow_mode="dev",
+                case_ids=("case_a",),
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="vperm4",
+                parent_agent_run_id="orch_vperm4",
+                child_agent_run_id="exec_child",
+                request_payload=req,
+                response_payload=_spawn_response_payload("sess_exec_child"),
+            )
+            cap = json.loads(
+                (repo_root / "workspace/orchestrations/vperm4/capabilities/exec_child.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(cap["mcp_permissions"], ["run_program", "run_quality_checks"])
+            # run_quality_checks passes the grant gate cleanly (no spec.ir.yaml planted, so the
+            # make-preset contract check is skipped) — a full clean pass through the real gate.
+            validate_mcp_build_tool_invocation(
+                repo_root,
+                orchestration_id="vperm4",
+                agent_run_id="exec_child",
+                capability_token=str(cap["capability_token"]),
+                tool_name="run_quality_checks",
+            )
+            # run_program is ALSO granted: it gets PAST the perms gate and only then trips its
+            # own command-array contract (which is out of scope here). Asserting it fails on the
+            # command contract — NOT "not permitted by capability" — proves the grant authorizes it.
+            with self.assertRaises(RuntimeError) as ctx_prog:
+                validate_mcp_build_tool_invocation(
+                    repo_root,
+                    orchestration_id="vperm4",
+                    agent_run_id="exec_child",
+                    capability_token=str(cap["capability_token"]),
+                    tool_name="run_program",
+                )
+            self.assertNotIn("not permitted by capability", str(ctx_prog.exception))
+            self.assertIn("run_program requires", str(ctx_prog.exception))
+            # An unrelated gated tool (a different substep's grant) IS refused at the perms gate.
+            with self.assertRaises(RuntimeError) as ctx:
+                validate_mcp_build_tool_invocation(
+                    repo_root,
+                    orchestration_id="vperm4",
+                    agent_run_id="exec_child",
+                    capability_token=str(cap["capability_token"]),
+                    tool_name="run_linter",
                 )
             self.assertIn("not permitted by capability", str(ctx.exception))
 
