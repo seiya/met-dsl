@@ -325,11 +325,9 @@ def _checks(ir: dict[str, Any]) -> list[str]:
         cid = _dget(c, "id")
         if isinstance(cid, str) and cid.strip():
             sid = cid.strip()
-            # The per-id ABI emits each id as a literal `'<id>', cstatus)` continuation actual.
-            # The old buffered ABI implied a de-facto 32-char id ceiling (chk_ids width); with
-            # that gone, an unbounded id would breach the 100-col lint guard the runner is
-            # host-authored under. Bound it here (symmetric with the CASE_ID_LEN case-id cap):
-            # 6 (indent) + quotes + 64 + "', cstatus)" == 82 < 100.
+            # The old buffered ABI implied a de-facto 32-char id ceiling (chk_ids width). With that
+            # gone, bound the raw id at CASE_ID_LEN (symmetric with the case-id cap) as a first
+            # gate. This alone is NOT sufficient — see the escaped-width check below.
             if len(sid) > CASE_ID_LEN:
                 raise RenderError(
                     f"check id {sid!r} is {len(sid)} chars (>{CASE_ID_LEN}); the per-id "
@@ -337,6 +335,22 @@ def _checks(ir: dict[str, Any]) -> list[str]:
             ids.append(sid)
     if not ids:
         raise RenderError("IR diagnostics_contract declares no checks")
+    # The width-binding rendered line per id is the assignment `    case_checks(<k>)%id = '<lit>'`,
+    # whose columns are 25 + digits(k) + len(_flit(id)) — `_flit` DOUBLES embedded apostrophes, so a
+    # raw-<=64 id can still expand past the limit. A line of EXACTLY MAX_RENDERED_LINE slips past
+    # `render_runner`'s `> 100` backstop yet fails the S001 lint (which fires AT 100) on a line the
+    # host authors and the Generate leaf cannot repair — an unrepairable fail_closed. Fail closed
+    # HERE instead, keeping the widest such line strictly under the limit. (The `checks_compute`
+    # continuation `      '<lit>', cstatus)` is 18 + len(_flit(id)) — always narrower than the
+    # assignment, so bounding the assignment bounds both.)
+    for k, sid in enumerate(ids, start=1):
+        width = 25 + len(str(k)) + len(_flit(sid))
+        if width >= MAX_RENDERED_LINE:
+            raise RenderError(
+                f"check id {sid!r} renders a {width}-column `case_checks(...)%id` assignment "
+                f"(>= the {MAX_RENDERED_LINE}-column S001 lint limit) after Fortran apostrophe "
+                "escaping; the host-authored runner line would fail Generate.lint unrepairably. "
+                "Declare a shorter check id (or one with fewer apostrophes).")
     return ids
 
 

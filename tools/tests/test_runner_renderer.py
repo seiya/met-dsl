@@ -1116,6 +1116,21 @@ class LineWidthTest(unittest.TestCase):
         with self.assertRaises(RenderError):
             render_runner(ir, BOUNDARY_SID, HARNESS)
 
+    def test_apostrophe_check_id_escaping_to_the_lint_bound_is_render_error(self) -> None:
+        # A raw-<=64 id whose Fortran apostrophe-doubling expands the `case_checks(k)%id = '<lit>'`
+        # assignment to EXACTLY 100 cols passes render_runner's `>100` backstop but fails the S001
+        # lint (=100) on a host-authored line the leaf cannot repair. `_checks()` must fail-close on
+        # the ESCAPED width, not just the raw length. (54 'a' + 10 "'" == 64 raw -> 74 escaped ->
+        # 25 + 1 + 74 == 100.)
+        ir = _boundary_ir()
+        ir["io_contract"]["diagnostics_contract"]["checks"] = [{"id": "a" * 54 + "'" * 10}]
+        with self.assertRaises(RenderError):
+            render_runner(ir, BOUNDARY_SID, HARNESS)
+        # One fewer apostrophe (98 cols) renders cleanly and stays within the limit.
+        ir["io_contract"]["diagnostics_contract"]["checks"] = [{"id": "a" * 54 + "'" * 9}]
+        txt = render_runner(ir, BOUNDARY_SID, HARNESS)
+        self.assertLessEqual(self._maxw(txt), 99)
+
 
 class FortranLiteralEscapingTest(unittest.TestCase):
     """R1/M3c-β (Codex review): IR-sourced names are only required non-empty, so a name with a
