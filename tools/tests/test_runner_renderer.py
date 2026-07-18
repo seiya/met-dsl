@@ -21,6 +21,7 @@ from pathlib import Path
 
 from tools.runner_renderer import (
     CASE_ID_LEN,
+    CHECK_STATUS_WIDTH,
     EXPECTED_HARNESS_SPEC_ID,
     _HARNESS_V3_PARAMETERS,
     MAX_SPEC_ID_LEN,
@@ -247,14 +248,14 @@ _RANK_CHECKS_STUB = textwrap.dedent(f"""\
         allocate(arr(2, 2, 2, 2))
         arr = a4
       end subroutine get_r4
-      subroutine checks_compute(case_id, ncheck, check_ids, status)
+      subroutine checks_compute(case_id, check_id, status)
         character(len=*), intent(in) :: case_id
-        integer, intent(out) :: ncheck
-        character(len=32), intent(out) :: check_ids(:)
-        character(len=4), intent(out) :: status(:)
-        ncheck = 1
-        check_ids(1) = 'c1'
-        status(1) = 'pass'
+        character(len=*), intent(in) :: check_id
+        character(len=4), intent(out) :: status
+        select case (trim(check_id))
+        case default
+          status = 'pass'
+        end select
         if (len_trim(case_id) < 0) continue
       end subroutine checks_compute
       subroutine metric_compute(case_id, name, val, is_na, reason_na, found)
@@ -609,27 +610,17 @@ _CHECKS_STUB = textwrap.dedent("""\
         found = .false.
         if (len_trim(name) < 0) continue
       end subroutine get_r4
-      subroutine checks_compute(case_id, ncheck, check_ids, status)
+      subroutine checks_compute(case_id, check_id, status)
         character(len=*), intent(in) :: case_id
-        integer, intent(out) :: ncheck
-        character(len=32), intent(out) :: check_ids(:)
-        character(len=4), intent(out) :: status(:)
-        select case (trim(case_id))
-        case ('l0_periodic_x_wrap_pass')
-          ncheck = 1
-          check_ids(1) = 'x_wrap'
-          status(1) = 'pass'
-        case ('l0_periodic_y_wrap_pass')
-          ncheck = 1
-          check_ids(1) = 'y_wrap'
-          status(1) = 'pass'
-        case ('l0_invalid_ny_xfail')
-          ncheck = 1
-          check_ids(1) = 'input_guard'
-          status(1) = 'fail'
+        character(len=*), intent(in) :: check_id
+        character(len=4), intent(out) :: status
+        select case (trim(check_id))
+        case ('input_guard')
+          status = 'fail'
         case default
-          ncheck = 0
+          status = 'pass'
         end select
+        if (len_trim(case_id) < 0) continue
       end subroutine checks_compute
       subroutine metric_compute(case_id, name, val, is_na, reason_na, found)
         character(len=*), intent(in) :: case_id
@@ -664,10 +655,26 @@ class RenderShapeTest(unittest.TestCase):
         self.assertNotIn("get_r1", self.txt)
 
     def test_calls_checks_abi(self) -> None:
-        for name in ("case_setup", "case_run", "get_time", "checks_compute"):
+        for name in ("case_setup", "case_run", "get_time"):
             self.assertIn(f"call {name}(", self.txt)
         self.assertIn("call get_r2('field_ghost', r2buf, gfound)", self.txt)
         self.assertIn("call get_scalar('max_abs_deviation', sval, gfound)", self.txt)
+
+    def test_per_id_checks_abi(self) -> None:
+        # Per-id ABI: the runner sizes case_checks to the declared count and calls checks_compute
+        # once per IR-declared id, supplying the id as a literal `intent(in)` actual (id on the
+        # continuation line). The module authors only the status.
+        self.assertIn("    allocate(case_checks(3))", self.txt)
+        self.assertIn(
+            "    call checks_compute(trim(case_ids(ci)), &\n      'x_wrap', cstatus)", self.txt)
+        self.assertIn("    case_checks(1)%id = 'x_wrap'", self.txt)
+        self.assertIn("    case_checks(1)%status = cstatus", self.txt)
+        self.assertIn("      'input_guard', cstatus)", self.txt)
+        self.assertIn("    case_checks(3)%id = 'input_guard'", self.txt)
+        self.assertIn(f"character(len={CHECK_STATUS_WIDTH}) :: cstatus", self.txt)
+        # the old buffered ABI (module-authored ids) is gone in every form
+        for gone in ("ncheck_out", "ncheck_max", "chk_ids", "chk_status"):
+            self.assertNotIn(gone, self.txt)
 
     def test_xfail_flag(self) -> None:
         self.assertIn(
@@ -1090,6 +1097,24 @@ class LineWidthTest(unittest.TestCase):
         ir["io_contract"]["test_predicates"][0]["target_cases"] = [long_id]
         txt = render_runner(ir, BOUNDARY_SID, HARNESS)
         self.assertLessEqual(self._maxw(txt), 100)
+
+    def test_max_length_check_id_wraps_within_limit(self) -> None:
+        # A 64-char check id (the `_checks()` fail-closed ceiling) still renders within 100 cols:
+        # the id rides the continuation line, so `      '<64>', cstatus)` is 82 columns.
+        ir = _boundary_ir()
+        long_check = "c" * CASE_ID_LEN  # 64
+        ir["io_contract"]["diagnostics_contract"]["checks"] = [{"id": long_check}]
+        txt = render_runner(ir, BOUNDARY_SID, HARNESS)
+        self.assertLessEqual(self._maxw(txt), 100)
+        self.assertIn(f"      '{long_check}', cstatus)", txt)
+
+    def test_overlong_check_id_is_render_error(self) -> None:
+        # With the old buffered ABI's de-facto 32-char id width gone, `_checks()` fail-closes on an
+        # id longer than CASE_ID_LEN rather than emit a per-id call that breaches the column guard.
+        ir = _boundary_ir()
+        ir["io_contract"]["diagnostics_contract"]["checks"] = [{"id": "c" * (CASE_ID_LEN + 1)}]
+        with self.assertRaises(RenderError):
+            render_runner(ir, BOUNDARY_SID, HARNESS)
 
 
 class FortranLiteralEscapingTest(unittest.TestCase):

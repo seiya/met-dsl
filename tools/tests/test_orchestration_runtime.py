@@ -26200,8 +26200,9 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # and the delete-don't-bind rule for a dummy no interface fixes (binding one in the
         # leaf's own private helper would freeze dead surface).
         # Bumped 13700->14000: the pure-leaf note block records that §2/§3 is distilled into
-        # `pure_generate_generate.txt` and check-id presence is the `m3c_checks_ids_violation`
-        # acceptance gate (Z2 defect E), plus the keep-in-step / TODO removal-trigger pointer.
+        # `pure_generate_generate.txt`. (The former check-id literal-presence acceptance gate is
+        # gone as of pure-8: the runner-driven per-id checks ABI supplies each id as a literal, so
+        # a dropped id is structurally impossible; `post_execute` stays the status backstop.)
         "docs/workflow/CHECKS_MODULE_CONTRACT.md": 14000,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).

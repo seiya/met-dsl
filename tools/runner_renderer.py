@@ -50,9 +50,10 @@ CHECKS_PUBLIC_NAMES = (
 # Harness-owned snapshot keys a physics snapshot variable must not shadow.
 HARNESS_RESERVED_SNAPSHOT_KEYS = frozenset({"t", "case_id", "step"})
 
-# Fixed character widths the checks ABI pins (assumed-length intent(out) is
-# disallowed, so both sides declare these exact widths).
-CHECK_ID_WIDTH = 32
+# Fixed character width the checks ABI pins for a check status: assumed-length
+# intent(out) is disallowed, so both sides declare this exact width. The check
+# *id* is no longer a pinned width — the runner supplies each declared id as a
+# literal `intent(in)` actual (per-id ABI), so the module never buffers ids.
 CHECK_STATUS_WIDTH = 4
 
 # The fixed width of a parsed case id. The rendered runner declares its `case_ids(:)` buffer
@@ -323,7 +324,17 @@ def _checks(ir: dict[str, Any]) -> list[str]:
     for c in _dget(dc, "checks", []) or []:
         cid = _dget(c, "id")
         if isinstance(cid, str) and cid.strip():
-            ids.append(cid.strip())
+            sid = cid.strip()
+            # The per-id ABI emits each id as a literal `'<id>', cstatus)` continuation actual.
+            # The old buffered ABI implied a de-facto 32-char id ceiling (chk_ids width); with
+            # that gone, an unbounded id would breach the 100-col lint guard the runner is
+            # host-authored under. Bound it here (symmetric with the CASE_ID_LEN case-id cap):
+            # 6 (indent) + quotes + 64 + "', cstatus)" == 82 < 100.
+            if len(sid) > CASE_ID_LEN:
+                raise RenderError(
+                    f"check id {sid!r} is {len(sid)} chars (>{CASE_ID_LEN}); the per-id "
+                    "checks_compute call would breach the 100-column runner lint guard")
+            ids.append(sid)
     if not ids:
         raise RenderError("IR diagnostics_contract declares no checks")
     return ids
@@ -629,9 +640,8 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     a("")
     a("  integer, parameter :: dp = real64")
     a(f"  integer, parameter :: case_id_len = {CASE_ID_LEN}")
-    a(f"  integer, parameter :: ncheck_max = {len(checks)}")
     a("")
-    a("  integer :: nargs, i, ci, ic, ln, ncases")
+    a("  integer :: nargs, i, ci, ln, ncases")
     a("  logical :: ok, setup_ok, run_ok")
     a("  character(len=512), allocatable :: tokens(:)")
     a("  character(len=case_id_len), allocatable :: case_ids(:)")
@@ -648,9 +658,7 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     if metrics:  # case_metrics is only referenced under the per-case metric block
         a(f"  type({H('h_metric')}), allocatable :: case_metrics(:)")
     a("")
-    a("  integer :: ncheck_out")
-    a(f"  character(len={CHECK_ID_WIDTH}) :: chk_ids(ncheck_max)")
-    a(f"  character(len={CHECK_STATUS_WIDTH}) :: chk_status(ncheck_max)")
+    a(f"  character(len={CHECK_STATUS_WIDTH}) :: cstatus")
     if has_scalar:
         a("  real(dp) :: sval")
     for r in array_ranks:
@@ -718,13 +726,18 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     a("    snap_cache(ci)%values = vals")
     a("    deallocate(vals)")
     a("")
-    a("    ! --- honest per-case check results (xfail adjustment is the harness fold) ---")
-    a("    call checks_compute(trim(case_ids(ci)), ncheck_out, chk_ids, chk_status)")
-    a("    allocate(case_checks(ncheck_out))")
-    a("    do ic = 1, ncheck_out")
-    a("      case_checks(ic)%id = trim(chk_ids(ic))")
-    a("      case_checks(ic)%status = chk_status(ic)")
-    a("    end do")
+    a("    ! --- honest per-case checks (runner-driven ids; xfail fold is the harness's) ---")
+    a(f"    allocate(case_checks({len(checks)}))")
+    for k, cid in enumerate(checks, start=1):
+        clit = _flit(cid)
+        # Per-id ABI (metric_compute's twin): the runner passes each IR-declared check id as a
+        # literal `intent(in)` actual, so the module authors only the status — a dropped/renamed
+        # id is structurally impossible. The id rides the continuation line (not the header) so a
+        # 64-char id stays within the 100-col lint bound.
+        a("    call checks_compute(trim(case_ids(ci)), &")
+        a(f"      '{clit}', cstatus)")
+        a(f"    case_checks({k})%id = '{clit}'")
+        a(f"    case_checks({k})%status = cstatus")
     a("")
     if metrics:
         a("    ! --- per-case metric leaves (dotted addresses; NA carried honestly) ---")

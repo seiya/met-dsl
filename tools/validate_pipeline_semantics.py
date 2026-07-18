@@ -3977,155 +3977,6 @@ def _fortran_statements(text: str) -> list[str]:
             for stmt in _split_fortran_statements(line)]
 
 
-def _read_fortran_string_literal(stmt: str, i: int) -> "tuple[str, int]":
-    """Read one `'...'`/`"..."` literal starting at the opening quote `stmt[i]`; return its
-    (unescaped contents, index just past the closing quote). Fortran escapes an embedded delimiter
-    by DOUBLING it (`'it''s'` -> `it's`); an unterminated literal contributes what it has."""
-    quote = stmt[i]
-    i += 1
-    buf: list[str] = []
-    n = len(stmt)
-    while i < n:
-        c = stmt[i]
-        if c == quote:
-            if i + 1 < n and stmt[i + 1] == quote:  # doubled delimiter = escaped quote
-                buf.append(quote)
-                i += 2
-                continue
-            i += 1  # closing delimiter
-            break
-        buf.append(c)
-        i += 1
-    return "".join(buf), i
-
-
-_IDENT_AT_RE = re.compile(r"[A-Za-z]\w*")
-# A `character ... parameter :: <entities>` declaration. `[^:]*` cannot cross a `::`, so the
-# capture is the entity list; the head is re-checked for the `parameter` attribute separately.
-_CHAR_PARAM_DECL_RE = re.compile(r"(?i)^\s*character\b[^:]*::\s*(.+)$")
-# The FIRST entity of that list: `NAME [*len | (len-spec)] = <rhs>`. Only the first is resolved
-# (the fold below naturally stops the rhs at a top-level comma), which is conservative — a later
-# comma-separated entity stays unresolved rather than mis-valued.
-_CHAR_PARAM_ENTITY_RE = re.compile(
-    r"(?i)^\s*([A-Za-z]\w*)\s*(?:\*\s*\d+|\([^)]*\))?\s*=\s*(.+?)\s*$")
-
-
-def _read_string_operand(
-    stmt: str, i: int, params: "dict[str, str]"
-) -> "tuple[str | None, int]":
-    """Read one operand of a `//` string-concatenation chain at `stmt[i]`: a string literal, or a
-    character-`parameter` identifier resolved through `params`. Returns `(value, index_after)`;
-    `value` is None (with the index advanced PAST the whole token) when `stmt[i]` begins neither a
-    literal nor a resolvable parameter. Advancing past the whole identifier is what keeps the
-    caller from ever re-entering it mid-token, so `params` lookups only fire at a word boundary
-    (an identifier `myprefix` never matches a parameter `prefix`)."""
-    ch = stmt[i]
-    if ch in ("'", '"'):
-        return _read_fortran_string_literal(stmt, i)
-    m = _IDENT_AT_RE.match(stmt, i)
-    if m:
-        return params.get(m.group(0).lower()), m.end()
-    return None, i + 1
-
-
-def _fold_concat_run(stmt: str, start: int, params: "dict[str, str]") -> "tuple[str | None, int]":
-    """Fold the maximal `//`-joined run of string operands beginning at `stmt[start]`. Returns
-    `(value, index_after_run)`, or `(None, index_after_first_token)` when `stmt[start]` does not
-    begin a string operand. The run ends at the first `//` continuation whose operand is not a
-    literal/resolvable-parameter (that trailing runtime term is the necessary-only residual)."""
-    first, nxt = _read_string_operand(stmt, start, params)
-    if first is None:
-        return None, nxt
-    run, i, n = first, nxt, len(stmt)
-    while True:
-        k = i
-        while k < n and stmt[k] in " \t":
-            k += 1
-        if stmt[k:k + 2] != "//":
-            break
-        k += 2
-        while k < n and stmt[k] in " \t":
-            k += 1
-        if k >= n:
-            break
-        val, nxt = _read_string_operand(stmt, k, params)
-        if val is None:
-            break
-        run += val
-        i = nxt
-    return run, i
-
-
-def _char_parameter_values(stmts: "list[str]") -> "dict[str, str]":
-    """Map a `character(...), parameter :: NAME = <const string>` name (lowercased — Fortran is
-    case-insensitive) to its constant value, for parameters whose RHS is a pure literal /
-    parameter `//` chain. Conservative: a declaration whose RHS carries a runtime term, or that the
-    narrow regexes do not match, is skipped (its name stays unresolved) — so this can only REDUCE
-    false positives in the caller, never invent a value (no fail-open). Iterated so a parameter
-    defined from an earlier parameter resolves."""
-    decls: list[tuple[str, str]] = []
-    for stmt in stmts:
-        m = _CHAR_PARAM_DECL_RE.match(stmt)
-        if not m or not re.search(r"(?i)\bparameter\b", stmt[:m.start(1)]):
-            continue
-        em = _CHAR_PARAM_ENTITY_RE.match(m.group(1))
-        if em:
-            decls.append((em.group(1).lower(), em.group(2)))
-    params: dict[str, str] = {}
-    for _ in range(len(decls) + 1):  # enough passes to chase parameter-from-parameter nesting
-        progressed = False
-        for name, rhs in decls:
-            if name in params:
-                continue
-            value, end = _fold_concat_run(rhs, 0, params)
-            # Accept only when the whole RHS is that constant chain (a trailing non-constant term
-            # leaves `rest`, meaning the parameter is not a pure string constant we can resolve).
-            if value is not None:
-                rest = rhs[end:].lstrip()
-                if rest == "" or rest.startswith(","):
-                    params[name] = value
-                    progressed = True
-        if not progressed:
-            break
-    return params
-
-
-def fortran_string_literal_values(text: str) -> set[str]:
-    """The set of compile-time string VALUES appearing in Fortran `text`, folding `//` concatenation
-    of adjacent string literals AND character-`parameter` constants into the value they produce.
-
-    THE single string-value extractor, so a rule that needs "can this exact string appear" cannot
-    grow a second hand-rolled quote scanner (the R5 lesson — a bespoke parser's bugs are what a
-    review keeps re-finding). Iterates `_fortran_statements`, the SAME statement stream the
-    checks-ABI parser (`checks_module_abi_facts`) walks, so it inherits comment stripping and `&`
-    continuation joining: a value that appears ONLY in a `!` comment is not counted (comments are
-    gone), and a literal split across a continuation reads as one.
-
-    FOLDING: a run of operands joined by `//` (`'analytic_' // 'agreement'`, or `prefix //
-    'agreement'` where `character(*), parameter :: prefix = 'analytic_'`) yields the single
-    concatenated value (`analytic_agreement`) — the string the code actually produces — NOT the
-    component pieces. A bare literal is a run of length one. A parameter is resolved via
-    `_char_parameter_values`. The fold stops at the first operand that is neither a literal nor a
-    resolvable parameter (`'cfl' // trim(x)` yields `cfl`, `p // fn()` yields `p`'s value): a value
-    assembled from a RUNTIME term is deliberately NOT reconstructed here — that residual is the
-    necessary-only acceptance layer's documented weakness, backstopped by `post_execute`, and is
-    where this static class of string-value analysis bottoms out. Two literals separated by a comma
-    or other token stay distinct values."""
-    stmts = _fortran_statements(text)
-    params = _char_parameter_values(stmts)
-    values: set[str] = set()
-    for stmt in stmts:
-        i, n = 0, len(stmt)
-        while i < n:
-            value, nxt = _fold_concat_run(stmt, i, params)
-            if value is None:
-                i = nxt if nxt > i else i + 1
-                continue
-            values.add(value)
-            i = nxt if nxt > i else i + 1
-    return values
-
-
 def checks_module_abi_facts(text: str, spec_id: str) -> tuple[set[str], set[str], set[str]]:
     """`(published, defined_subroutines, defined_procs)` for `module <spec_id>_checks` in `text`,
     lowercased.
@@ -10831,7 +10682,6 @@ def _validate_post_generate_bundle(
     harness_nk = infra[0] if len(infra) == 1 else None
     provided = harness_provided_capabilities(harness_nk) if harness_nk else None
     algorithm = (ir.get("algorithm") or {}) if isinstance(ir, dict) else {}
-    check_ids = _diagnostics_contract_check_ids(ir)
     toolchain, closure, edges = _pure_gate_build_graph_inputs(repo_root, ir_ref, ir, node_key)
 
     def _build_graph(d: Any) -> Any:
@@ -10843,8 +10693,7 @@ def _validate_post_generate_bundle(
     contract = pure_bundle_contract_violation(
         doc, node_key=node_key, spec_id=spec_id,
         ir_state_variables=(algorithm.get("state_variables") or []),
-        harness_provided=provided, harness_label=harness_nk, build_graph=_build_graph,
-        diagnostics_check_ids=check_ids)
+        harness_provided=provided, harness_label=harness_nk, build_graph=_build_graph)
     if contract is not None:
         violations.append(
             f"{bundle_path}: host acceptance contract re-check failed ({contract[0]}): "

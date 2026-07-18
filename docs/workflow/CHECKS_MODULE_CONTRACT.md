@@ -12,10 +12,10 @@
 >
 > Binds the **agentic** leaf. A `pure` leaf (`Z2`) cannot read this: it is told the ten names and
 > shown the rendered runner, gated by `m3c_checks_abi_violation`; the §2/§3 behavioral contract is
-> distilled into `pure_generate_generate.txt` and check-id presence is the
-> `m3c_checks_ids_violation` gate. All ten bind every node. `tools/runner_renderer.py` owns the ABI
-> — keep it, this doc, the distilled paragraph, and that gate in step (runner-driven-ABI TODO's
-> removal trigger).
+> distilled into `pure_generate_generate.txt`. (pure-8's runner-driven per-id `checks_compute`
+> takes each id as a literal actual, so a dropped id is impossible — the former
+> `m3c_checks_ids_violation` gate is gone.) All ten bind every node. `tools/runner_renderer.py`
+> owns the ABI — keep it, this doc, and the distilled paragraph in step.
 >
 > **§5 (Fortran legality and gate guards) is the one section with a wider
 > scope**: it binds **every** `Generate` leaf that authors Fortran — including a
@@ -83,16 +83,15 @@ end subroutine get_r1
 ! get_r2(name, arr(:,:), found), get_r3(name, arr(:,:,:), found),
 ! get_r4(name, arr(:,:,:,:), found) — identical apart from the array rank.
 
-! The honest per-case check results. Fill `check_ids(1:ncheck)` /
-! `status(1:ncheck)` for the checks THIS case evaluates. `status` is one of
-! 'pass' / 'fail' / 'na  ' (right-padded to width 4). Report the honest result —
-! an xfail case whose guard fired reports its check as 'fail'; the xfail
-! adjustment is the harness fold's job, NOT this module's.
-subroutine checks_compute(case_id, ncheck, check_ids, status)
+! The honest per-case result for ONE check. The runner calls this once per
+! (case, check id), supplying `check_id` (a literal from the IR's
+! diagnostics_contract.checks[].id); you author no id and set `status` (one of
+! 'pass'/'fail'/'na  ', width 4) on EVERY `check_id` branch, `case default`
+! included. An xfail case's failing guard still reports 'fail' (the harness folds).
+subroutine checks_compute(case_id, check_id, status)
   character(len=*), intent(in) :: case_id
-  integer, intent(out) :: ncheck
-  character(len=32), intent(out) :: check_ids(:)
-  character(len=4), intent(out) :: status(:)
+  character(len=*), intent(in) :: check_id
+  character(len=4), intent(out) :: status
 end subroutine checks_compute
 
 ! One diagnostics_contract.metrics leaf (dotted address, e.g. 'error.l2') for
@@ -108,9 +107,9 @@ subroutine metric_compute(case_id, name, val, is_na, reason_na, found)
 end subroutine metric_compute
 ```
 
-Pinned widths (the rendered runner declares matching actuals, so they must
-match): `check_ids` is `character(len=32)`, `status` is `character(len=4)`.
-`reason_na` is a deferred-length allocatable (`character(len=:), allocatable`).
+Pinned width: `status` is `character(len=4)` (the rendered runner declares a
+matching actual). The check id is a runner-supplied `intent(in)` actual, so no
+width is pinned for it. `reason_na` is a deferred-length allocatable.
 
 The ten names must be published from `module <spec_id>_checks` **itself**. The
 `Generate.static` gate (`_validate_checks_source_files`) resolves the published set
@@ -131,8 +130,8 @@ in a submodule / a second module / after `end module` does not count as defined.
   shape-valid array/scalar for every snapshot variable that case requires (the
   runner always emits the case's snapshot). Return a defined placeholder (e.g.
   zeros of the right shape), never leave the array unallocated.
-- **`checks_compute` is honest, never judgmental.** Report `'fail'` when a check
-  fails, even for an xfail case. The harness `__write_diagnostics` computes the
+- **`checks_compute` is honest, never judgmental.** The runner calls it once per
+  (case, IR check id). Report `'fail'` when a check fails, even for an xfail case. The harness `__write_diagnostics` computes the
   per-case verdict (`overall == 'fail'` iff any of that case's checks is
   `'fail'`), the top-level fold, and the **xfail exclusion** (a failing case
   whose `expected_xfail` is true — supplied by the runner from the IR predicates
@@ -197,7 +196,7 @@ value (`found=.true.`), and `found=.false.` for the earlier cases.
 This section applies to every leaf-authored Fortran source of any `Generate` node
 (the model, this checks module, and a hand-authored runner on a non-M3c node).
 
-- **`intent(out)` character dummies** must be fixed-length (`character(len=32)`)
+- **`intent(out)` character dummies** must be fixed-length (`character(len=4)`)
   or a deferred-length allocatable (`character(len=:), allocatable`) — an
   assumed-length `intent(out)` (`character(len=*)`) is illegal, matching the
   harness's own rule.

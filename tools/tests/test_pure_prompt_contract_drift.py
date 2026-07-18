@@ -25,26 +25,25 @@ templates distill verbatim (`CHECKS_PUBLIC_NAMES` and the two character widths).
 STABLE, behavior-defining input (not a churny one); do NOT grow it beyond that bar.
 
 Every pinned member is either a production constant IMPORTED from its authority
-(`CHECKS_PUBLIC_NAMES`, the widths, the prefixes, `PURE_SYSTEM_PROMPT`) or the template file bytes
-themselves — never a test-local COPY of a production value, which would drift silently from its
+(`CHECKS_PUBLIC_NAMES`, the status width, the prefixes, `PURE_SYSTEM_PROMPT`) or the template file
+bytes themselves — never a test-local COPY of a production value, which would drift silently from its
 source and pin nothing. In particular the checks-status vocabulary (`'pass'`/`'fail'`/`'na  '`) is
 NOT pinned as a separate literal: it has no production enum constant (it lives only as prose in the
-templates and one `'na  '` mention in a `codegen_bundle.m3c_checks_ids_violation` message), and the
-template prose is already covered by hashing the template bytes above, so a copy here would be
-redundant and self-referential.
+templates), and the template prose is already covered by hashing the template bytes above, so a copy
+here would be redundant and self-referential.
 
-DELIBERATELY OUT OF SCOPE — host-side acceptance-gate IMPLEMENTATIONS (e.g.
-`codegen_bundle.m3c_checks_ids_violation`, whose behavioral contract clause (A) of the producer
-prompt distills). `PURE_PROMPT_CONTRACT_VERSION` tracks the pure leaf's INPUT contract (the prompt
-templates, `PURE_SYSTEM_PROMPT`, the transport request shape — see `pure_leaf.py`), NOT host-side
-checks that run AFTER the leaf returns. Hashing a gate's source into this tuple would (a) force a
-spurious version bump on every transparent gate change — a refactor, a comment, or a false-positive
-FIX (the `//`-concatenation / character-`parameter` folding fixes were exactly such transparent
-corrections) — making the very churn magnet this pin set is scoped to avoid, and (b) miscategorize
-a host-side change as a leaf-input-contract change. The gate's behavior is instead guarded by its
-own behavioral tests (`test_pure_leaf_producer.py`), and a gate change is captured for A/B
-comparability by the run's recorded repo revision (`preflight` / `orchestration_meta.json#invocation`),
-not by this version. The prose the gate and prompt share IS pinned — as the template bytes.
+DELIBERATELY OUT OF SCOPE — host-side acceptance-gate / backstop IMPLEMENTATIONS (e.g.
+`validate_pipeline_semantics._validate_diagnostics_contract_output`, the post_execute backstop for
+the diagnostics contract that the producer prompt's clause (A) is written against).
+`PURE_PROMPT_CONTRACT_VERSION` tracks the pure leaf's INPUT contract (the prompt templates,
+`PURE_SYSTEM_PROMPT`, the transport request shape — see `pure_leaf.py`), NOT host-side checks that
+run AFTER the leaf returns. Hashing such a gate's source into this tuple would (a) force a spurious
+version bump on every transparent gate change — a refactor, a comment, or a false-positive FIX —
+making the very churn magnet this pin set is scoped to avoid, and (b) miscategorize a host-side
+change as a leaf-input-contract change. The gate's behavior is instead guarded by its own
+behavioral tests, and a gate change is captured for A/B comparability by the run's recorded repo
+revision (`preflight` / `orchestration_meta.json#invocation`), not by this version. The prose the
+gate and prompt share IS pinned — as the template bytes.
 """
 from __future__ import annotations
 
@@ -72,13 +71,20 @@ _TEMPLATE_FILES = (
 #
 # `pure-6` is the pre-guard BASELINE: it predates this guard (the guard was introduced at pure-7), so
 # it never had a live pin; its digest is the pure-6 template bytes (origin/main) hashed under the
-# CURRENT tuple schema, seeded here so a future version that reverts the generate template to the
-# pure-6 contract (e.g. dropping the C072 clause while doing the carve-out / runner-driven-ABI TODOs
-# that touch this template) is caught as a duplicate. Only pure_generate_generate.txt differs between
+# pure-6/pure-7 tuple schema, seeded here so a future version that reverts the generate template to
+# the pure-6 contract is caught as a duplicate. Only pure_generate_generate.txt differs between
 # pure-6 and pure-7; every other pinned member is identical across the two.
+#
+# NOTE — the contract-tuple SCHEMA changed at pure-8: `check_id_width` was dropped from
+# `_contract_tuple` when the runner-driven per-id checks ABI removed the pinned check-id width
+# (`runner_renderer.CHECK_ID_WIDTH` no longer exists). The pure-6 / pure-7 digests below are FROZEN
+# literals computed under the OLD (wider) schema; they are NOT recomputed from the current tuple and
+# exist ONLY as opaque values for the uniqueness (empty-bump / revert) check. Only the CURRENT
+# version's pin (pure-8, below) is a live equality target for `_digest()`.
 PINNED: dict[str, str] = {
     "pure-6": "b614072bcaad7ffe61f48d54256305b89982457d2ef6c3b5126e09598e5e7067",
     "pure-7": "14c7db85579eeb5f0dd21af2a7321edfcc9bcd647bcb735f511e0d3f80aa2eda",
+    "pure-8": "1b1a9575930504226c6d6acebf7cf3ee4b64247e4146f978ee84bbe505b1e4c2",
 }
 
 
@@ -91,7 +97,6 @@ def _contract_tuple() -> dict[str, object]:
         "system_prompt": PURE_SYSTEM_PROMPT,
         "repair_static_prefixes": list(ort.PURE_REPAIR_STATIC_PARAGRAPH_PREFIXES),
         "checks_public_names": list(rr.CHECKS_PUBLIC_NAMES),
-        "check_id_width": rr.CHECK_ID_WIDTH,
         "check_status_width": rr.CHECK_STATUS_WIDTH,
     }
 

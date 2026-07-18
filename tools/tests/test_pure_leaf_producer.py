@@ -73,17 +73,14 @@ def _checks_symbols() -> tuple[str, ...]:
     return CHECKS_PUBLIC_NAMES
 
 
-def _checks_content(*, omit: str = "", as_function: str = "", unexported: str = "",
-                    check_ids: tuple[str, ...] = ("mass",)) -> str:
+def _checks_content(*, omit: str = "", as_function: str = "", unexported: str = "") -> str:
     """A checks module publishing the fixed ABI, in the certified idiom (a bare `private` default
     plus an explicit `public ::` list — authoring rule 1). `omit` drops a name entirely,
     `as_function` defines one as a FUNCTION (the two shapes the sw2d P-arm emitted), and
     `unexported` defines one but leaves it off the export list.
 
-    `check_ids` are emitted as string literals inside `checks_compute` so the module satisfies the
-    defect-E acceptance layer (`m3c_checks_ids_violation`) — the default matches the fixture IR's
-    single declared check id (`mass`). Passing `check_ids=()` produces a module that publishes the
-    ABI but names NO id, the shape that layer rejects (used by its negative test)."""
+    Since the per-id checks ABI (pure-8), the module authors no check id — the runner supplies each
+    id as a literal actual — so there is no id-literal-presence layer to satisfy here."""
     syms = [s for s in _checks_symbols() if s != omit]
     body = [f"module {_SPEC_ID}_checks", "  private"]
     body += [f"  public :: {s}" for s in syms if s != unexported]
@@ -91,22 +88,10 @@ def _checks_content(*, omit: str = "", as_function: str = "", unexported: str = 
     for sym in syms:
         if sym == as_function:
             body += [f"  function {sym}() result(r)", f"  end function {sym}"]
-        elif sym == "checks_compute" and check_ids:
-            body.append(f"  subroutine {sym}()")
-            body += [f"    chk_ids(n) = '{cid}'" for cid in check_ids]
-            body.append(f"  end subroutine {sym}")
         else:
             body += [f"  subroutine {sym}()", f"  end subroutine {sym}"]
     body.append("end module")
     return "\n".join(body) + "\n"
-
-
-# A module-level statement naming the fixture IR's single check id (`mass`) as a literal, so an
-# ABI-parsing test that hand-builds its own checks module (not via `_checks_content`) still clears
-# the defect-E acceptance layer (`m3c_checks_ids_violation`), which runs AFTER the ABI layer. Inert
-# to the ABI parser (not a public/private/proc header) and to the id extractor it just contributes
-# the `'mass'` literal.
-_IDS_SATISFY = "  cid0 = 'mass'\n"
 
 
 def _valid_bundle() -> dict:
@@ -445,7 +430,7 @@ class PureBundleViolationsTests(unittest.TestCase):
             f"end module {_SPEC_ID}_checks_impl\n"
             f"module {_SPEC_ID}_checks\n"
             f"  use {_SPEC_ID}_checks_impl, only: case_setup\n  private\n{pubs}contains\n"
-            + _IDS_SATISFY + defs
+            + defs
             + "end module\n")
         self.assertIsNone(c._pure_bundle_violations(refs, ok))
 
@@ -477,7 +462,7 @@ class PureBundleViolationsTests(unittest.TestCase):
         c, refs = self._c_refs()
         ok = _valid_bundle()
         ok["files"][1]["content"] = (
-            f"module {_SPEC_ID}_checks\n" + _IDS_SATISFY
+            f"module {_SPEC_ID}_checks\n"
             + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in _checks_symbols())
             + "end module\n")
         self.assertIsNone(c._pure_bundle_violations(refs, ok))
@@ -495,7 +480,7 @@ class PureBundleViolationsTests(unittest.TestCase):
         wrapped = "  public :: " + ", &\n       &  ".join(syms) + "\n"
         ok["files"][1]["content"] = (
             f"module {_SPEC_ID}_checks\n  private\n" + wrapped
-            + "contains\n" + _IDS_SATISFY
+            + "contains\n"
             + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in syms)
             + "end module\n")
         self.assertIsNone(c._pure_bundle_violations(refs, ok))
@@ -509,7 +494,7 @@ class PureBundleViolationsTests(unittest.TestCase):
         ok["files"][1]["content"] = (
             f"module {_SPEC_ID}_checks\n"
             "  type :: bucket\n    private\n    integer :: n\n  end type bucket\n"
-            "contains\n" + _IDS_SATISFY
+            "contains\n"
             + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in _checks_symbols())
             + "end module\n")
         self.assertIsNone(c._pure_bundle_violations(refs, ok))
@@ -522,7 +507,7 @@ class PureBundleViolationsTests(unittest.TestCase):
         ok["files"][1]["content"] = (
             f"module {_SPEC_ID}_checks\n"
             "  integer, private :: n\n  private :: helper\n"
-            "contains\n" + _IDS_SATISFY
+            "contains\n"
             + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in _checks_symbols())
             + "end module\n")
         self.assertIsNone(c._pure_bundle_violations(refs, ok))
@@ -534,7 +519,7 @@ class PureBundleViolationsTests(unittest.TestCase):
         syms = _checks_symbols()
         wrapped = "  public :: " + ", &\n    ".join(syms) + "\n"
         ok["files"][1]["content"] = (
-            f"module {_SPEC_ID}_checks\n  private\n" + wrapped + _IDS_SATISFY
+            f"module {_SPEC_ID}_checks\n  private\n" + wrapped
             + "".join(f"  subroutine {s}()\n  end subroutine\n" for s in syms)
             + "end module\n")
         self.assertIsNone(c._pure_bundle_violations(refs, ok))
@@ -561,7 +546,7 @@ class PureBundleViolationsTests(unittest.TestCase):
         c, refs = self._c_refs()
         ok = _valid_bundle()
         ok["files"][1]["content"] = (
-            f"module {_SPEC_ID}_checks\n" + _IDS_SATISFY
+            f"module {_SPEC_ID}_checks\n"
             + "".join(f"  pure subroutine {s}()\n  end subroutine {s}\n"
                       for s in _checks_symbols())
             + "end module\n")
@@ -1379,17 +1364,18 @@ class PureColdRepairPromptTests(unittest.TestCase):
         self.assertNotIn("<authoring_rules>", ort._render_pure_repair_prompt(req))
 
     def test_style_lint_distills_c072_character_dummy_widths(self) -> None:
-        # Fail #1 (orch_9a5fe93e): the pure leaf authored `character(len=*), intent(out) ::
-        # chk_ids(:)` and burned a retry on fortitude C072. The doc-blind producer learns the rule
-        # only if the launch template states it, and the widths must MATCH the one authority the
-        # runner renders against (runner_renderer), not a hand-copied number that could drift.
-        from tools.runner_renderer import CHECK_ID_WIDTH, CHECK_STATUS_WIDTH
+        # Fail #1 (orch_9a5fe93e): the pure leaf authored `character(len=*), intent(out)` and
+        # burned a retry on fortitude C072. The doc-blind producer learns the rule only if the
+        # launch template states it. Under the per-id ABI (pure-8) the sole `intent(out)` character
+        # dummy is `status`, whose width MUST match the one authority the runner renders against
+        # (runner_renderer.CHECK_STATUS_WIDTH), not a hand-copied number that could drift.
+        from tools.runner_renderer import CHECK_STATUS_WIDTH
         template = ort._load_launch_prompt_templates()["pure generate.generate"]
         start = template.index("(1) Style lint")
         end = template.index("\n(2)", start)
         style = template[start:end]
         self.assertIn("C072", style)
-        self.assertIn(f"character(len={CHECK_ID_WIDTH})", style)
+        self.assertIn("checks_compute(case_id, check_id, status)", style)
         self.assertIn(f"character(len={CHECK_STATUS_WIDTH})", style)
 
 
@@ -1451,21 +1437,6 @@ class PurePostGenerateBundleTests(unittest.TestCase):
             v: list[str] = []
             vps._validate_post_generate_bundle(repo, gen, _NODE, ir_ref, v)
             self.assertTrue(any("bundle_checks_abi_violation" in s for s in v), v)
-
-    def test_checks_ids_tamper_survives_byte_compare_but_is_caught(self) -> None:
-        # A consistent tamper (bundle + staged .f90 edited together) that drops the check-id
-        # literal keeps the ABI intact, so only the re-run acceptance contract's ids layer catches
-        # it — the same shared single implementation the producer gate uses (defect E).
-        with tempfile.TemporaryDirectory() as tmp:
-            repo, gen, ir_ref = self._gen_dir(tmp)
-            bundle = json.loads((gen / "codegen_bundle.json").read_text())
-            bundle["files"][1]["content"] = _checks_content(check_ids=())
-            (gen / "codegen_bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
-            (gen / "src" / f"{_SPEC_ID}_checks.f90").write_text(
-                bundle["files"][1]["content"], encoding="utf-8")
-            v: list[str] = []
-            vps._validate_post_generate_bundle(repo, gen, _NODE, ir_ref, v)
-            self.assertTrue(any("bundle_checks_ids_violation" in s for s in v), v)
 
     def test_undeclared_f90_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1545,287 +1516,6 @@ class GenerateExecutorFlagTests(unittest.TestCase):
             else:
                 os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
 
-
-# ======================================================================================
-# m3c_checks_ids_violation: the defect-E acceptance layer (check-id literal presence)
-# ======================================================================================
-class PureChecksIdsGateTests(unittest.TestCase):
-    """Fixture-driven coverage of the check-id literal-presence layer. The fixture IR
-    (`_node_ir`) declares one check id, `mass`; the valid `_checks_content` names it."""
-
-    def _c_refs(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        repo = Path(self._tmp.name)
-        refs = _write_node(repo)
-        return _conductor(repo), refs
-
-    def tearDown(self) -> None:
-        if hasattr(self, "_tmp"):
-            self._tmp.cleanup()
-
-    def test_missing_check_id_literal_rejected_after_abi_passes(self) -> None:
-        # The module publishes all ten ABI subroutines (so the ABI layer passes) but names NO
-        # check id — the defect-E shape. The ids layer, which runs AFTER the ABI layer, rejects it.
-        c, refs = self._c_refs()
-        bad = _valid_bundle()
-        bad["files"][1]["content"] = _checks_content(check_ids=())
-        cat, findings = c._pure_bundle_violations(refs, bad)
-        self.assertEqual(cat, "bundle_checks_ids_violation")
-        self.assertIn("mass", findings)
-
-    def test_present_check_id_literal_accepted(self) -> None:
-        c, refs = self._c_refs()
-        self.assertIsNone(c._pure_bundle_violations(refs, _valid_bundle()))
-
-    def test_ids_gate_direct_names_only_the_absent_ids(self) -> None:
-        # Drive the gate directly with a multi-id contract: only the literally-absent ids are named.
-        doc = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-                          "content": f"module {_SPEC_ID}_checks\n  a = 'cfl'\n"
-                                     "  b = 'positivity'\nend module\n"}]}
-        v = cb.m3c_checks_ids_violation(doc, _SPEC_ID, ["cfl", "positivity", "symmetry", "lake"])
-        self.assertIsNotNone(v)
-        self.assertIn("symmetry", v)
-        self.assertIn("lake", v)
-        self.assertNotIn("'cfl'", v)  # a present id is not named as missing
-        self.assertIsNone(
-            cb.m3c_checks_ids_violation(doc, _SPEC_ID, ["cfl", "positivity"]))
-
-    def test_ids_gate_ignores_id_that_appears_only_in_a_comment(self) -> None:
-        # Comments are stripped by `_fortran_statements`, so an id present ONLY in a comment does
-        # not satisfy the gate — the runtime `checks_compute` cannot emit a commented-out id.
-        doc = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-                          "content": f"module {_SPEC_ID}_checks\n"
-                                     "  ! emits 'cfl' for each case\nend module\n"}]}
-        v = cb.m3c_checks_ids_violation(doc, _SPEC_ID, ["cfl"])
-        self.assertIsNotNone(v)
-        self.assertIn("cfl", v)
-
-    def test_empty_check_ids_skips(self) -> None:
-        # A node with no diagnostics contract (no declared ids) passes through untouched, even with
-        # a checks module that names nothing.
-        doc = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-                          "content": f"module {_SPEC_ID}_checks\nend module\n"}]}
-        self.assertIsNone(cb.m3c_checks_ids_violation(doc, _SPEC_ID, []))
-
-    def test_non_m3c_bundle_without_checks_file_skips(self) -> None:
-        # A flux-shaped (non-M3c) bundle with no `<spec_id>_checks.f90` passes through even when the
-        # IR declares ids — the ABI/name layers own that shape, not this one.
-        doc = {"files": [{"role": "model", "logical_path": f"{_SPEC_ID}_model.f90",
-                          "content": f"module {_SPEC_ID}_model\nend module\n"}]}
-        self.assertIsNone(cb.m3c_checks_ids_violation(doc, _SPEC_ID, ["cfl", "positivity"]))
-
-    def test_ids_literal_in_a_reexport_impl_sibling_file_is_accepted(self) -> None:
-        # Review finding: a legal `use`-reexport puts `checks_compute`'s body — and its id literals
-        # — in a SEPARATE `<spec_id>_checks_impl.f90` file, while `<spec_id>_checks.f90` is a thin
-        # shell. The runner's `use <spec_id>_checks` still resolves `checks_compute` to the impl
-        # body, so the bundle works; scanning only the shell would false-reject it (the
-        # unexitable-repair-loop class). The value layer scans the union of all checks-role files.
-        c, refs = self._c_refs()
-        ok = _valid_bundle()
-        syms = _checks_symbols()
-        # Shell: publishes the ABI via a whole-module re-export; names NO id literal itself.
-        ok["files"][1]["content"] = (
-            f"module {_SPEC_ID}_checks\n"
-            f"  use {_SPEC_ID}_checks_impl\n  private\n"
-            + "".join(f"  public :: {s}\n" for s in syms)
-            + "end module\n")
-        ok["files"][1]["modules"] = [f"{_SPEC_ID}_checks"]
-        # Impl sibling: defines the ABI subroutines AND carries the `'mass'` literal.
-        ok["files"].append({
-            "logical_path": f"{_SPEC_ID}_checks_impl.f90", "role": "checks", "language": "fortran",
-            "member_node_key": _NODE,
-            "content": _checks_content().replace(f"{_SPEC_ID}_checks", f"{_SPEC_ID}_checks_impl"),
-            "modules": [f"{_SPEC_ID}_checks_impl"]})
-        self.assertEqual(cb.validate_bundle(ok), [])  # schema-legal
-        # Only the ids layer is the subject here; drive it directly with the union of both files.
-        self.assertIsNone(
-            cb.m3c_checks_ids_violation(ok, _SPEC_ID, ["mass"]))
-
-    def test_ids_gate_reads_trailing_padded_literals(self) -> None:
-        # `checks_compute` fills `character(len=32)` slots, so a real source often TRAILING-pads the
-        # literal (`'cfl'` vs `'cfl                '`); the runner keys diagnostics by `trim(...)`
-        # (trailing-only), so the gate rstrips before comparing and accepts this.
-        doc = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-                          "content": f"module {_SPEC_ID}_checks\n"
-                                     "  ids(1) = 'cfl                 '\nend module\n"}]}
-        self.assertIsNone(cb.m3c_checks_ids_violation(doc, _SPEC_ID, ["cfl"]))
-
-    def test_ids_gate_accepts_id_built_by_literal_concatenation(self) -> None:
-        # Codex finding: a legal checks module may build an exact check id from a `//`-concatenation
-        # of adjacent literals (`'analytic_' // 'agreement'`); the runner emits `analytic_agreement`
-        # and the diagnostics contract passes, so the gate must NOT false-reject it into a repair
-        # loop. The extractor folds `//` runs.
-        doc = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-                          "content": f"module {_SPEC_ID}_checks\n"
-                                     "  chk_ids(1) = 'analytic_' // 'agreement'\n"
-                                     "  chk_ids(2) = 'cfl'\nend module\n"}]}
-        self.assertIsNone(
-            cb.m3c_checks_ids_violation(doc, _SPEC_ID, ["analytic_agreement", "cfl"]))
-        # ...but a concatenation that spells a DIFFERENT id is still rejected (no fail-open).
-        bad = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-                          "content": f"module {_SPEC_ID}_checks\n"
-                                     "  chk_ids(1) = 'analytic_' // 'wrong'\nend module\n"}]}
-        v = cb.m3c_checks_ids_violation(bad, _SPEC_ID, ["analytic_agreement"])
-        self.assertIsNotNone(v)
-        self.assertIn("analytic_agreement", v)
-
-    def test_ids_gate_accepts_id_built_via_named_parameter(self) -> None:
-        # Codex finding (round 3): a legal module may factor a common prefix into a character
-        # `parameter` and concatenate it (`prefix // 'agreement'`); the runner emits the exact
-        # `analytic_agreement` key. The extractor resolves character parameters, so this is accepted
-        # — while a mid-identifier lookalike (`myprefix`) must NOT resolve to the parameter, and a
-        # dropped id stays rejected (no fail-open).
-        ok = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-              "content": f"module {_SPEC_ID}_checks\n"
-                         "  character(len=*), parameter :: prefix = 'analytic_'\n"
-                         "  chk_ids(1) = prefix // 'agreement'\n  chk_ids(2) = 'cfl'\nend module\n"}]}
-        self.assertIsNone(
-            cb.m3c_checks_ids_violation(ok, _SPEC_ID, ["analytic_agreement", "cfl"]))
-        # A mid-identifier lookalike does not resolve to the parameter -> still rejected.
-        bad = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-               "content": f"module {_SPEC_ID}_checks\n"
-                          "  character(len=*), parameter :: prefix = 'analytic_'\n"
-                          "  chk_ids(1) = myprefix // 'agreement'\nend module\n"}]}
-        v = cb.m3c_checks_ids_violation(bad, _SPEC_ID, ["analytic_agreement"])
-        self.assertIsNotNone(v)
-        self.assertIn("analytic_agreement", v)
-
-    def test_ids_gate_leading_padded_literal_is_rejected(self) -> None:
-        # Codex finding: the runner keys diagnostics.json by Fortran `trim(chk_ids(ic))`, which
-        # removes only TRAILING blanks. A leading-padded literal (`' cfl'`) therefore reaches
-        # diagnostics.json as the key `' cfl'` and fails post_execute — so the gate must NOT strip
-        # the leading space (that would fail OPEN, accepting an id emitted under a different key).
-        doc = {"files": [{"role": "checks", "logical_path": f"{_SPEC_ID}_checks.f90",
-                          "content": f"module {_SPEC_ID}_checks\n"
-                                     "  ids(1) = ' cfl'\nend module\n"}]}
-        v = cb.m3c_checks_ids_violation(doc, _SPEC_ID, ["cfl"])
-        self.assertIsNotNone(v)
-        self.assertIn("cfl", v)
-
-
-def _test_repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent.parent
-
-
-def _strip_f_comment(line: str) -> str:
-    """Test-local, quote-aware `!`-comment strip — deliberately NOT the production helper, so the
-    real-artifact oracle below is independent of the gate's own comment handling."""
-    q = None
-    for i, ch in enumerate(line):
-        if q is not None:
-            if ch == q:
-                q = None
-        elif ch in ("'", '"'):
-            q = ch
-        elif ch == "!":
-            return line[:i]
-    return line
-
-
-def _oracle_present_ids(text: str, ids: list[str]) -> set[str]:
-    """Independent value scan (test-owned, not `fortran_string_literal_values`): the `rstrip`ped
-    contents of every quoted token on a comment-stripped line, intersected with `ids`. Mirrors the
-    runtime `trim(chk_ids(ic))` (trailing-only) exactly as the production gate does — leading
-    padding is significant, so `' cfl'` does not count as present for id `cfl`. (Real check ids are
-    bare single-line literals, so this simple scan agrees with the production `//`-folding extractor
-    on every real source the sweep covers.)"""
-    present: set[str] = set()
-    for raw in text.splitlines():
-        for m in re.finditer(r"'([^']*)'|\"([^\"]*)\"", _strip_f_comment(raw)):
-            tok = (m.group(1) if m.group(1) is not None else m.group(2)).rstrip()
-            if tok in ids:
-                present.add(tok)
-    return present
-
-
-class PureChecksIdsGateRealArtifactTests(unittest.TestCase):
-    """Drive the gate against the REAL workspace checks sources ([[fixture-fiction]] lesson: do not
-    hand-build the artifact shape). Skipped when `workspace/pipelines` is absent (it is gitignored,
-    so CI runs with an empty workspace); it exercises the true defect-E source and every certified
-    M3c checks module the local workspace holds."""
-
-    _PIPES = _test_repo_root() / "workspace" / "pipelines"
-
-    @staticmethod
-    def _ir_check_ids(ir_dir: Path) -> list[str]:
-        import yaml
-        ir = yaml.safe_load((ir_dir / "spec.ir.yaml").read_text(encoding="utf-8"))
-        return vps._diagnostics_contract_check_ids(ir) if isinstance(ir, dict) else []
-
-    def _pairs(self):
-        """(spec_id, checks_text, ir_check_ids) for every real checks source whose pipeline
-        lineage resolves an IR carrying declared check ids."""
-        root = _test_repo_root()
-        out = []
-        for checks in sorted(self._PIPES.rglob("*_checks.f90")):
-            spec_id = checks.name[: -len("_checks.f90")]
-            # source/<sid>/src/<spec>_checks.f90 -> pipeline dir is checks.parents[3]
-            lineage = checks.parents[3] / "lineage.json"
-            if not lineage.exists():
-                continue
-            ir_ref = json.loads(lineage.read_text(encoding="utf-8")).get("ir_ref")
-            if not ir_ref:
-                continue
-            ir_dir = root / ir_ref
-            if not (ir_dir / "spec.ir.yaml").exists():
-                continue
-            ids = self._ir_check_ids(ir_dir)
-            if ids:
-                out.append((spec_id, checks.read_text(encoding="utf-8"), ids))
-        return out
-
-    def setUp(self) -> None:
-        if not self._PIPES.is_dir():
-            self.skipTest("workspace/pipelines not present (gitignored; local-only verification)")
-
-    def test_defect_e_source_is_rejected_naming_the_absent_ids(self) -> None:
-        # The exact defect-E artifact: run 43172c0e's checks source + its IR (8 ids). Three ids
-        # never appear as literals; the gate names them.
-        base = self._PIPES / "problem__shallow_water2d__0.4.0"
-        checks = (base / "shallow-water2d_20260718_001" / "source" / "src_20260718_002"
-                  / "src" / "shallow_water2d_checks.f90")
-        ir_dir = (_test_repo_root() / "workspace" / "ir"
-                  / "problem__shallow_water2d__0.4.0" / "shallow-water2d_20260718_002")
-        if not (checks.exists() and (ir_dir / "spec.ir.yaml").exists()):
-            self.skipTest("defect-E artifact not present in this workspace")
-        ids = self._ir_check_ids(ir_dir)
-        doc = {"files": [{"role": "checks", "logical_path": "shallow_water2d_checks.f90",
-                          "content": checks.read_text(encoding="utf-8")}]}
-        v = cb.m3c_checks_ids_violation(doc, "shallow_water2d", ids)
-        self.assertIsNotNone(v)
-        for absent in ("analytic_agreement", "convergence_order", "symmetry"):
-            self.assertIn(absent, v)
-
-    def test_l_arm_certified_source_is_accepted(self) -> None:
-        base = self._PIPES / "problem__shallow_water2d__0.4.0"
-        checks = (base / "shallow-water2d_20260717_001" / "source" / "src_20260717_001"
-                  / "src" / "shallow_water2d_checks.f90")
-        ir_dir = (_test_repo_root() / "workspace" / "ir"
-                  / "problem__shallow_water2d__0.4.0" / "shallow-water2d_20260717_001")
-        if not (checks.exists() and (ir_dir / "spec.ir.yaml").exists()):
-            self.skipTest("L-arm certified artifact not present in this workspace")
-        ids = self._ir_check_ids(ir_dir)
-        doc = {"files": [{"role": "checks", "logical_path": "shallow_water2d_checks.f90",
-                          "content": checks.read_text(encoding="utf-8")}]}
-        self.assertIsNone(cb.m3c_checks_ids_violation(doc, "shallow_water2d", ids))
-
-    def test_sweep_gate_matches_independent_oracle_zero_false_positives(self) -> None:
-        # Every real (checks source, its pipeline IR) pair: the gate's missing set must equal the
-        # ids an independent literal scan finds absent. This pins BOTH directions — no certified
-        # source (all ids present) is rejected, and a defective one is rejected naming exactly the
-        # absent ids — across every M3c node the workspace holds.
-        pairs = self._pairs()
-        self.assertGreater(len(pairs), 0, "expected at least one real checks/IR pair")
-        for spec_id, text, ids in pairs:
-            expected_missing = sorted(set(ids) - _oracle_present_ids(text, ids))
-            doc = {"files": [{"role": "checks", "logical_path": f"{spec_id}_checks.f90",
-                              "content": text}]}
-            v = cb.m3c_checks_ids_violation(doc, spec_id, ids)
-            with self.subTest(spec_id=spec_id):
-                self.assertEqual(v is None, expected_missing == [],
-                                 f"{spec_id}: gate={v!r} oracle_missing={expected_missing}")
-                for mid in expected_missing:
-                    self.assertIn(mid, v)
 
 
 if __name__ == "__main__":
