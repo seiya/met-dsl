@@ -3926,14 +3926,15 @@ def _write_roots_for_launch(
     orch_root = _with_trailing_slash(_normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}"))
     ir_norm = _with_trailing_slash(_normalize_rel_posix(ir_ref))
     pipe_norm = _with_trailing_slash(_normalize_rel_posix(pipeline_ref))
-    # Slash-stripped bases reused by the per-subtree branches below (avoids repeating
-    # `.rstrip('/')` inline at every f-string and drifting if a new step is added).
-    ir_base = ir_ref.rstrip("/")
-    pipe_base = pipeline_ref.rstrip("/")
     if r == "orchestration":
         return [orch_root]
     if r not in {"step", "substep"}:
         return []
+    # Slash-stripped bases reused by the per-subtree branches below (avoids repeating
+    # `.rstrip('/')` inline at every f-string and drifting if a new step is added). Computed
+    # after the early returns since only the step/substep subtree branches use them.
+    ir_base = ir_ref.rstrip("/")
+    pipe_base = pipeline_ref.rstrip("/")
     if st == "compile":
         # Compile.verify authors ONLY ir_meta.json (verification_status): the certified
         # spec.ir.yaml (and every other file under <ir_ref>/) must stay non-writable to the
