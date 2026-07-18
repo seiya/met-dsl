@@ -1023,6 +1023,7 @@ class RunWorkflowTests(unittest.TestCase):
             workflow_mode="dev",
             agent_model="opus",
             with_deps=False,
+            generate_executor="pure",
         )
         self.assertEqual(rec["argv"], ["spec/problem/a", "validate"])
         self.assertIn("python3 tools/run_workflow.py", rec["command"])
@@ -1042,6 +1043,7 @@ class RunWorkflowTests(unittest.TestCase):
             workflow_mode="dev",
             agent_model=None,
             with_deps=True,
+            generate_executor="pure",
             closure_id="orch_target",
             closure_target_spec_ref="spec/problem/a",
             closure_until_phase="Validate",
@@ -1096,12 +1098,13 @@ class RunWorkflowTests(unittest.TestCase):
             workflow_mode="dev", agent_model=None, with_deps=False,
             generate_executor="pure")
         self.assertEqual(rec["generate_executor"], "pure")
-        # Defaults to legacy when omitted (older cold runs are legacy).
-        rec2 = run_workflow._build_invocation_record(
-            argv=["spec/problem/a", "generate"], spec_ref="spec/problem/a",
-            until_phase="Generate", llm="claude", llm_command="claude",
-            workflow_mode="dev", agent_model=None, with_deps=False)
-        self.assertEqual(rec2["generate_executor"], "legacy")
+        # The executor is a REQUIRED keyword (adoption commit): a call site that forgets to
+        # thread the resolved value must fail loudly, not silently record a wrong default.
+        with self.assertRaises(TypeError):
+            run_workflow._build_invocation_record(
+                argv=["spec/problem/a", "generate"], spec_ref="spec/problem/a",
+                until_phase="Generate", llm="claude", llm_command="claude",
+                workflow_mode="dev", agent_model=None, with_deps=False)
 
     def test_load_resume_params_recovers_generate_executor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

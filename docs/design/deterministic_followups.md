@@ -2436,8 +2436,8 @@ would deterministically fail on `.f90`; the compiler/linker is now validated aga
 
 `zero_base_architecture.md` Z2. The Z0-pinned `CodegenBundle` contract now has a producer: the dominant-cost Generate
 leaves run as **pure-function leaves** (`claude -p` with tools disabled, the host inlining a fully closed context, the
-model returning exactly one JSON document) under an opt-in `generate-executor` selection. The default remains `legacy`;
-the billed A/B adoption commit flips it. What landed:
+model returning exactly one JSON document) under an opt-in `generate-executor` selection. The default remained `legacy`
+until the billed A/B passed; the adoption commit (2026-07-18, see "Z2 adoption" below) flipped it to `pure`. What landed:
 
 - `tools/pure_leaf.py` — the stage-independent transport module (`pure_leaf_flags` with `--safe-mode` + a fixed system
   prompt to block CLAUDE.md/hooks/skills/MCP, `parse_result_envelope` with the `_MISSING` sentinel, `extract_json_document`
@@ -2496,8 +2496,9 @@ authority for `resume_node_refs`), then globs `<pipeline_ref>/source/*`. Neither
 would measure nothing on a `generate`-only run (the A/B command) and nothing for a terminally-failed generate. The glob
 (rather than `output_refs`) is what keeps a failed generate and every cold-restart-rotated source dir measured.
 The billed A/B E2E (L-arm `legacy` vs P-arm `pure` over a single kernel and a dependency-bearing
-multi-module node) and the adoption commit that flips the default to `pure` are operator-run and gated on
-`aggregate_verdict=pass` at equal-or-better certified-outcome accuracy.
+multi-module node) and the adoption commit that flips the default to `pure` were operator-run and gated on
+`aggregate_verdict=pass` at equal-or-better certified-outcome accuracy — both satisfied 2026-07-18 ("Z2 adoption"
+below).
 
 **Residuals.** Multi-node optimization units are validator-unit-only (a live pure node fails closed on a non-single
 member with `bundle_shape_unsupported`); non-`M3c` and `codex` nodes stay `legacy` even under `--generate-executor pure`
@@ -2598,7 +2599,7 @@ layout a conductor-spawned leaf actually produces, and keep the `subagents/` sca
 in-process substeps (`Compile.static`, `Generate.{lint,syntax,static}`, `Build`, `Validate.{pre_judge,execute,post_judge}`)
 spawn no leaf and legitimately have no transcript; they must stay `unavailable` rather than be reported as zero-cost.
 
-## Z2 first billed A/B E2E — the pure executor had never run: one fixed defect, two information gaps (FILED 2026-07-16; defects FIXED 2026-07-17 — flux A/B established, `shallow_water2d` arms pending)
+## Z2 first billed A/B E2E — the pure executor had never run: one fixed defect, two information gaps (FILED 2026-07-16; defects FIXED 2026-07-17 — flux A/B established 2026-07-17, `shallow_water2d` P arm passed 2026-07-18; see "Z2 adoption" below)
 
 `Z2` above is recorded `LANDED`, and its unit suite is green, but the `pure` `generate-executor` had never executed
 against the real runtime. The first billed A/B E2E ran it and it failed twice, for three distinct reasons. `LANDED`
@@ -3023,3 +3024,34 @@ roughly 23 KB. A COLD-FALLBACK repair re-inlines the whole `pure_context` PLUS `
 (`E2BIG`). It does not block this fix (a cold fallback happens only when the session has been GC'd; every repair
 observed so far has been warm), but the transport should move the `-p` body to stdin before a node with a larger runner
 or a longer spec_id lands.
+
+## Z2 adoption — the billed A/B passed on both target nodes; `pure` is the default `generate-executor` (ADOPTED 2026-07-18)
+
+The acceptance gate the `Z2` section set — an operator-run billed A/B (L arm `legacy` vs P arm `pure`) over a single
+kernel and a dependency-bearing multi-module node, adopted only at `aggregate_verdict=pass` with equal-or-better
+certified-outcome accuracy — is satisfied, and the adoption commit flips the default executor to `pure`.
+
+**Evidence (rolled up by `tools/audit_orchestration.py`'s pure-leaf A/B section).**
+- **Kernel node** (`dynamics_advdiff_flux_1d_upwind_center2`, 2026-07-17): P arm `orch_20260717T031645Z_1214d925`
+  (repo `b915f91`) — `aggregate_verdict=pass` at equal accuracy; the two migrated substeps' tokens fell **−95.8%**
+  (4.46M → 187k) with cache_read −97.8%; every deterministic gate passed on the first attempt; node-total tokens
+  ~−36%; net wall roughly equal (the leaf went 9.7 → 7.8 min; run-to-run `compile.generate` variance offset it).
+- **Multi-module `M3c` node** (`shallow_water2d`, 2026-07-18): L arm `orch_20260717T044138Z_d899b6df` (pass, wall
+  66.7 min; the two migrated substeps = 6.87M tokens / 404k output = 25.6 min, 38% of wall). P arm
+  `orch_20260718T042000Z_9a5fe93e` (repo `b6bcec3`, contract `pure-6`) — `workflow_status=pass`, ~62 min, with
+  `validate.execute` clean (field confirmation that defect E stayed closed). **Accuracy is byte-equivalent**: all 7
+  per-test verdicts identical across the arms (6 pass + 1 xfail), identical `aggregate_verdict` / `semantic_review` /
+  `quality_check`, identical dependency set. The migrated substeps' tokens fell **−96% total / −92% output** counting
+  the adopted attempt (−88% / −62% summing all four dev-mode attempts — the retried pipelines' failures were
+  `compile`-phase authoring variance, which is executor-independent; see the TODO items). Wall was roughly equal:
+  the P arm's leaf savings were offset by those dev-mode retries, the known residual.
+
+**What the adoption commit changes.** `run_workflow.py`'s cold-run resolution (`--generate-executor` /
+`METDSL_GENERATE_EXECUTOR` / default) now defaults to `pure`, as does `run_conductor`'s env fallback (reached only
+without run_workflow's stamp); `_build_invocation_record` takes the executor as a required keyword so no call site can
+silently record a wrong provenance. Everything else is unchanged: `legacy` remains explicitly selectable until M-F
+removes it, the recorded executor stays immutable across `--resume`, an orchestration whose invocation predates the
+field still resumes as `legacy` (it was), and the `claude`+`M3c` narrowing still applies — a non-matching node runs
+`legacy` under the `pure` default exactly as it did under `--generate-executor pure`. Next step: M-F (legacy-path
+removal), plus the filed residuals (the `controlled_spec` interim inline's removal trigger, the runner-driven checks
+ABI, `compile.generate` authoring variance).

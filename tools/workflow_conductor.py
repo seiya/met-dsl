@@ -1552,10 +1552,14 @@ class Conductor:
     # --llm-command); empty falls back to the bare backend name.
     llm_command: str = ""
     # Z2 generate-phase executor: "legacy" (the agentic `generate.generate` leaf) or "pure"
-    # (the host-mediated CodegenBundle producer). Defaults to legacy; run_workflow flips it via
-    # `--generate-executor` / `METDSL_GENERATE_EXECUTOR`. `_pure_leaf_substep` gates the pure
-    # path on this AND backend==claude AND the node's M3c shape, so an unmigrated (non-M3c /
-    # codex) node stays legacy even under executor=pure.
+    # (the host-mediated CodegenBundle producer). The operator-facing DEFAULT is pure since the
+    # billed A/B adoption (2026-07-18): run_workflow resolves `--generate-executor` /
+    # `METDSL_GENERATE_EXECUTOR` (cold) or the persisted invocation (resume) and ALWAYS threads
+    # the resolved value here via run_conductor, so this field default is reached only by direct
+    # construction (unit fixtures). It stays "legacy" so the legacy-path fixtures keep exercising
+    # the legacy branch until M-F deletes it — it is NOT the project default. `_pure_leaf_substep`
+    # gates the pure path on this AND backend==claude AND the node's M3c shape, so an unmigrated
+    # (non-M3c / codex) node stays legacy even under executor=pure.
     generate_executor: str = "legacy"
 
     def emit(self, event: str, **fields: Any) -> None:
@@ -7110,10 +7114,11 @@ def run_conductor(*, repo_root: Path | str, orchestration_id: str,
     # pinned version: the exact version is resolved post-run from the leaf transcript.
     from tools.orchestration_runtime import default_agent_model_for_backend
     resolved_agent_model = agent_model or default_agent_model_for_backend(backend)
-    # Z2 generate-executor: threaded via env (METDSL_GENERATE_EXECUTOR), restored on resume with
-    # the rest of the environment. run_workflow blocks `pure` selection until M-D (verify
-    # migration), so in M-C this is always "legacy" in production; tests set it directly.
-    generate_executor = str(env.get("METDSL_GENERATE_EXECUTOR", "legacy")).strip().lower() or "legacy"
+    # Z2 generate-executor: threaded via env (METDSL_GENERATE_EXECUTOR). run_workflow always
+    # stamps the resolved value (cold: flag/env/default; resume: the persisted invocation), so
+    # the fallback here is reached only when run_conductor is driven without that stamp — it
+    # mirrors the project default, pure since the billed A/B adoption (2026-07-18).
+    generate_executor = str(env.get("METDSL_GENERATE_EXECUTOR", "pure")).strip().lower() or "pure"
     conductor = Conductor(
         repo_root=root, orchestration_id=orchestration_id,
         orchestration_agent_run_id=orchestration_agent_run_id,

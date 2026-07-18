@@ -123,7 +123,9 @@ def _build_invocation_record(
     workflow_mode: str,
     agent_model: str | None,
     with_deps: bool,
-    generate_executor: str = "legacy",
+    # Keyword-required (no default): every call site must thread the RESOLVED executor, so a
+    # forgotten site cannot silently record the wrong provenance for the run.
+    generate_executor: str,
     closure_id: str | None = None,
     closure_target_spec_ref: str | None = None,
     closure_until_phase: str | None = None,
@@ -830,8 +832,9 @@ def _load_resume_params(repo_root: Path, orchestration_id: str) -> dict[str, str
         "closure_id": _clean(invocation.get("closure_id")),
         "closure_target_spec_ref": _clean(invocation.get("closure_target_spec_ref")),
         "closure_until_phase": _clean(invocation.get("closure_until_phase")),
-        # Z2 executor (M-D). Older orchestrations predating the field → None → the caller keeps
-        # the default legacy (correct: those runs were legacy).
+        # Z2 executor (M-D). Older orchestrations predating the field → None → the caller treats
+        # them as legacy (correct: those runs were legacy — the pre-adoption executor, NOT the
+        # current cold-run default, which is pure since 2026-07-18).
         "generate_executor": _clean(invocation.get("generate_executor")),
     }
 
@@ -879,8 +882,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=(
             "Z2 generate-phase executor: 'legacy' (the agentic generate.generate + verify "
             "leaves) or 'pure' (the host-mediated CodegenBundle producer + verdict reviewer). "
-            "Defaults to legacy (or METDSL_GENERATE_EXECUTOR). 'pure' applies to a claude M3c "
-            "node; a non-matching node stays legacy under executor=pure."
+            "Defaults to pure (or METDSL_GENERATE_EXECUTOR) since the billed A/B adoption "
+            "(2026-07-18). 'pure' applies to a claude M3c node; a non-matching node stays "
+            "legacy under executor=pure."
         ),
     )
     parser.add_argument(
@@ -980,8 +984,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Z2 generate-executor selection. Threaded to the conductor via env (METDSL_GENERATE_EXECUTOR).
     # As of M-D both generate LLM substeps (the CodegenBundle producer and the verdict reviewer)
-    # are pure, so `pure` is a fully selectable executor: `_pure_leaf_substep` still narrows it to a
+    # are pure; since the billed A/B adoption (2026-07-18, flux + shallow_water2d P arms pass at
+    # byte-equal accuracy) `pure` is the DEFAULT: `_pure_leaf_substep` still narrows it to a
     # claude M3c node, and a non-matching (codex / non-M3c) node stays legacy under executor=pure.
+    # `legacy` remains explicitly selectable until M-F removes it.
     #
     # COLD run: resolve from the flag or the ambient env, validate, and stamp the env. RESUME: the
     # ambient env is IGNORED — the executor is recovered from the persisted invocation in the resume
@@ -992,8 +998,8 @@ def main(argv: list[str] | None = None) -> int:
     generate_executor = "legacy"
     if not resume_mode:
         generate_executor = (
-            args.generate_executor or os.environ.get("METDSL_GENERATE_EXECUTOR") or "legacy"
-        ).strip().lower() or "legacy"
+            args.generate_executor or os.environ.get("METDSL_GENERATE_EXECUTOR") or "pure"
+        ).strip().lower() or "pure"
         # argparse's `choices` guards only the flag; a value from METDSL_GENERATE_EXECUTOR bypasses
         # it. Validate the resolved value against the SAME set so a typo (e.g. `pur`) fails loudly
         # rather than falling through to legacy — `_pure_leaf_substep` matches only the exact literal
@@ -2365,7 +2371,7 @@ def _run_with_dependency_closure(
             workflow_mode=workflow_mode,
             agent_model=agent_model,
             with_deps=True,
-            generate_executor=base_env.get("METDSL_GENERATE_EXECUTOR", "legacy"),
+            generate_executor=base_env.get("METDSL_GENERATE_EXECUTOR", "pure"),
             closure_id=target_orchestration_id,
             closure_target_spec_ref=target_spec_ref,
             closure_until_phase=until_phase,
@@ -2478,7 +2484,7 @@ def _run_with_dependency_closure(
         workflow_mode=workflow_mode,
         agent_model=agent_model,
         with_deps=True,
-        generate_executor=base_env.get("METDSL_GENERATE_EXECUTOR", "legacy"),
+        generate_executor=base_env.get("METDSL_GENERATE_EXECUTOR", "pure"),
         closure_id=target_orchestration_id,
         closure_target_spec_ref=target_spec_ref,
         closure_until_phase=until_phase,

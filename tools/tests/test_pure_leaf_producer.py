@@ -1496,6 +1496,28 @@ class GenerateExecutorFlagTests(unittest.TestCase):
             else:
                 os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
 
+    def test_cold_default_executor_is_pure(self) -> None:
+        # Adoption commit (2026-07-18): a cold run with NO flag and NO env resolves the executor
+        # to pure and stamps it into the env for the conductor. The run then proceeds to normal
+        # startup resolution (failing here on the bogus spec, not on the executor block).
+        import io
+        from contextlib import redirect_stdout
+        import tools.run_workflow as rw
+        buf = io.StringIO()
+        prev = os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
+        try:
+            with redirect_stdout(buf):
+                rc = rw.main(["spec/nonexistent_xyz", "generate"])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid_startup_input", buf.getvalue())
+            self.assertNotIn("generate_executor_invalid", buf.getvalue())
+            self.assertEqual(os.environ.get("METDSL_GENERATE_EXECUTOR"), "pure")
+        finally:
+            if prev is not None:
+                os.environ["METDSL_GENERATE_EXECUTOR"] = prev
+            else:
+                os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
+
     def test_invalid_env_executor_rejected(self) -> None:
         # Codex P2 (finding 3): a typo in METDSL_GENERATE_EXECUTOR bypasses argparse's `choices`;
         # the resolved value must be validated so it cannot silently fall through to legacy.
