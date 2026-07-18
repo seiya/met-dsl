@@ -73,7 +73,7 @@ class PureVerifySubstepTests(unittest.TestCase):
         refs = _verify_node(repo)
         (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
         c = cls(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-                backend="claude", env={}, generate_executor="pure")
+                backend="claude", env={})
         c.envelopes = envelopes
         oc = c._run_pure_verify_substep(refs, "generate", "verify", ())
         return c, refs, oc
@@ -217,7 +217,7 @@ class PureVerifySubstepTests(unittest.TestCase):
 
         (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
         c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-               backend="claude", env={}, generate_executor="pure")
+               backend="claude", env={})
         c.envelopes = [_envelope(_verdict("pass"))]
         oc = c._run_pure_verify_substep(refs, "generate", "verify", ())
         self.assertEqual(oc.status, "pass")
@@ -241,7 +241,7 @@ class PureVerifySubstepTests(unittest.TestCase):
 
         (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
         c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-               backend="claude", env={}, generate_executor="pure")
+               backend="claude", env={})
         c.envelopes = [_envelope(_verdict("pass"))]
         oc = c._run_pure_verify_substep(refs, "generate", "verify", ())
         self.assertTrue(finalized.get("did"))
@@ -342,7 +342,7 @@ class PureVerifyColdFallbackSurrogateTests(unittest.TestCase):
             refs = _verify_node(repo)
             (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
             c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-                   backend="claude", env={}, generate_executor="pure")
+                   backend="claude", env={})
             c.envelopes = [_envelope(bad)]
             oc = c._run_pure_verify_substep(refs, "generate", "verify", ())  # must not raise
             self.assertEqual(oc.status, "fail")
@@ -364,7 +364,7 @@ class PureVerifyColdFallbackSurrogateTests(unittest.TestCase):
             refs = _verify_node(repo)
             (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
             c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-                   backend="claude", env={}, generate_executor="pure")
+                   backend="claude", env={})
             c.envelopes = [_envelope({"verification_status": "pass"})]  # schema-invalid -> repair
             with mock.patch.object(pl, "verify_verdict_violations",
                                    return_value=["bad field value \ud800 here"]):
@@ -448,8 +448,8 @@ class PureStepResultValidationTests(unittest.TestCase):
     The pure producer AND the pure verify reviewer both finalize with output_refs==[] (the host
     authors model/checks/source_meta after the child windows close). Without the pure carve-out
     the per-step-result validator raises — `substep must publish non-empty output_refs` and
-    `required_outputs must be satisfied by substep output_refs` — so `--generate-executor pure`
-    could never certify a node. This exercises the real validator end-to-end (the unit loops stub
+    `required_outputs must be satisfied by substep output_refs` — so a pure-leaf node
+    could never certify. This exercises the real validator end-to-end (the unit loops stub
     the runtime, so they miss this)."""
 
     def _setup(self, tmp: str):

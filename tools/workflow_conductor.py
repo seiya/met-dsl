@@ -332,7 +332,7 @@ GENERATE_BUNDLE_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
 # bounded in-conversation warm-resume loop (MAX_BUNDLE_REPAIR_TURNS, `tools/pure_leaf`). A
 # schema-VALID verdict (pass OR fail) is the reviewer's answer and is NEVER repaired here — a
 # `fail` verdict projects onto source_meta.json and routes through the normal verify-severity gate
-# (classify_verify_severity), exactly like the legacy verify leaf. Only a persistently MALFORMED
+# (classify_verify_severity), exactly like the agentic verify leaf. Only a persistently MALFORMED
 # verdict (unparseable / truncated / schema-invalid past the repair budget) reaches this table:
 # that is a verify-LEAF behavior defect, not a bundle defect, and the reviewer's own broken output
 # gives the host nothing to hand a producer. So the route is a COLD generate restart (a fresh
@@ -1045,7 +1045,7 @@ def build_launch_request(
         make_entry = [] if makefile_host_authored else [f"{src}/src/Makefile"]
         # R1/M3c-β: on a harness-backed node the conductor host-renders the runner glue
         # (_write_runner), so the leaf authors <spec_id>_checks.f90 instead — swap it into the
-        # write set. The model is leaf-authored either way. c/cpp/mixed + legacy fortran nodes
+        # write set. The model is leaf-authored either way. c/cpp/mixed + non-M3c fortran nodes
         # keep the leaf-authored <spec_id>_runner.f90.
         runner_or_checks = (f"{src}/src/{refs.spec_id}_checks.f90" if runner_host_authored
                             else f"{src}/src/{refs.spec_id}_runner.f90")
@@ -1551,16 +1551,6 @@ class Conductor:
     # The resolved backend command (may be a wrapper with flags, e.g. from
     # --llm-command); empty falls back to the bare backend name.
     llm_command: str = ""
-    # Z2 generate-phase executor: "legacy" (the agentic `generate.generate` leaf) or "pure"
-    # (the host-mediated CodegenBundle producer). The operator-facing DEFAULT is pure since the
-    # billed A/B adoption (2026-07-18): run_workflow resolves `--generate-executor` /
-    # `METDSL_GENERATE_EXECUTOR` (cold) or the persisted invocation (resume) and ALWAYS threads
-    # the resolved value here via run_conductor, so this field default is reached only by direct
-    # construction (unit fixtures). It stays "legacy" so the legacy-path fixtures keep exercising
-    # the legacy branch until M-F deletes it — it is NOT the project default. `_pure_leaf_substep`
-    # gates the pure path on this AND backend==claude AND the node's M3c shape, so an unmigrated
-    # (non-M3c / codex) node stays legacy even under executor=pure.
-    generate_executor: str = "legacy"
 
     def emit(self, event: str, **fields: Any) -> None:
         """Write one JSONL info event to stdout (the conductor runs in-process
@@ -2022,20 +2012,25 @@ class Conductor:
     def _pure_leaf_substep(self, refs: NodeRefs, phase: str, substep: str | None) -> bool:
         """True when this substep runs as a Z2 host-mediated pure-function leaf.
 
-        Gated on the executor selection (`generate_executor == "pure"`), the claude backend
-        (the ONLY pure producer; codex fail-closes in `leaf_command`), and the node's M3c shape
-        (`_conductor_authors_makefile` ∧ `_conductor_authors_runner`) — the shape the
-        CodegenBundle v1 producer can express (the leaf authors model+checks; the host renders
-        the runner glue + the Makefile). A non-M3c node (harness self-test, c/cpp/mixed, a
-        physics node with no infra dep) has no bundle representation for its runner, so it stays
-        on the legacy agentic leaf even under executor=pure (a residual, per the plan).
+        Since M-F the generate-executor is no longer selectable (legacy execution removed; `pure`
+        is the only executor), so this dispatch is decided purely by the node shape: the claude
+        backend (the ONLY pure producer; codex fail-closes in `leaf_command`), the two generate LLM
+        substeps, and the node's M3c shape (`_conductor_authors_makefile` ∧
+        `_conductor_authors_runner`) — the shape the CodegenBundle v1 producer can express (the leaf
+        authors model+checks; the host renders the runner glue + the Makefile).
 
-        Both generate LLM substeps are pure under executor=pure: `(generate, generate)` (the
-        CodegenBundle producer, M-C) and `(generate, verify)` (the verdict reviewer, M-D). The
-        two are dispatched to their own loops in `run_substep`. Deterministic generate substeps
+        A non-M3c node (harness self-test, c/cpp/mixed, a physics node with no infra dep) has no
+        bundle representation for its runner, and a codex node has no pure producer, so those fall
+        through to the shared AGENTIC leaf loop in `run_substep`. That is a recorded RESIDUAL of the
+        migration scope, not a selectable executor: their invocation record still stamps
+        `generate_executor=pure` (a provenance stamp), and they are not rejected on resume.
+
+        Both generate LLM substeps go pure on an M3c claude node: `(generate, generate)` (the
+        CodegenBundle producer, M-C) and `(generate, verify)` (the verdict reviewer, M-D). The two
+        are dispatched to their own loops in `run_substep`. Deterministic generate substeps
         (lint/syntax/static) are never pure — they run in-process regardless — and compile.verify
-        stays legacy (Z2 migrates the generate phase only)."""
-        if self.generate_executor != "pure" or self.backend != "claude":
+        stays agentic (Z2 migrates the generate phase only)."""
+        if self.backend != "claude":
             return False
         if (phase, substep) not in (("generate", "generate"), ("generate", "verify")):
             return False
@@ -2413,8 +2408,8 @@ clean:
     # the derived Makefile. The leaf holds no write authority, so every artifact is host-written
     # AFTER the child window closes (finalize_child). The methods below are the host side of
     # that channel: context assembly, bundle validation + assembly preflight, artifact writes,
-    # and the bundle-derived Makefile. Gated by `_pure_leaf_substep`; unreachable on the legacy
-    # path (existing suite green proves legacy is byte-for-byte unchanged).
+    # and the bundle-derived Makefile. Gated by `_pure_leaf_substep`; unreachable on the agentic
+    # leaf path (existing suite green proves the agentic path is byte-for-byte unchanged).
 
     def _pure_harness_node_key(self, ir: dict[str, Any]) -> str | None:
         """The ONE harness a pure leaf negotiates against: its node's single `infrastructure`
@@ -2434,7 +2429,7 @@ clean:
         string the renderer data-fences. All data is host-resolved from disk here (the leaf has
         no filesystem): the harness capability manifest (A6), the node's toolchain/target
         defaults, the lowered IR, the tests, the host-rendered runner, and — as an INTERIM
-        carve-out (below) — controlled_spec.md. Mirrors the must-read set the legacy
+        carve-out (below) — controlled_spec.md. Mirrors the must-read set the agentic
         `generate.generate` leaf reads.
 
         The controlled_spec.md inline is an INTERIM measure (pure-5), not a repeal of phase_02
@@ -2587,10 +2582,11 @@ clean:
     def _render_pure_makefile_from_graph(self, refs: NodeRefs, graph: dict[str, Any]) -> str:
         """Render `src/Makefile` from a bundle's derived build graph (`derive_build_graph`).
 
-        Unlike the legacy IR-shaped `_write_makefile` (which assumes a fixed model/checks/runner
-        set), this compiles EXACTLY the graph's `compile_units` — so a bundle that declares a
-        helper / internal_module file is built too. The overridable FC/OBJDIR/BINDIR/RUNDIR/BIN/
-        SPEC/CASES surface and the test/clean targets match the legacy Makefile so Build
+        Unlike the IR-shaped `_write_makefile` (which assumes a fixed model/checks/runner set —
+        still the live Makefile author for Model B dependencies and non-M3c agentic leaves), this
+        compiles EXACTLY the graph's `compile_units` — so a bundle that declares a helper /
+        internal_module file is built too. The overridable FC/OBJDIR/BINDIR/RUNDIR/BIN/
+        SPEC/CASES surface and the test/clean targets match the IR-shaped Makefile so Build
         (`compile_project`) and Validate.execute (`run_quality_checks`) drive it identically.
         Source paths: a `staged:` dep is `$(OBJDIR)/<name>` (staged by `_stage_dependency_sources`
         before make), a `bundle:` / `glue:` source is a filename in the src/ cwd. Objects live
@@ -5966,9 +5962,9 @@ clean:
         # repair (bounded warm-resume of its own session inside `_run_pure_verify_substep`) and
         # the host authors source_meta.json from the returned verdict — there is no leaf-authored
         # meta to re-author here. A schema-exhausted pure verify is routed by classify_failure's
-        # verdict table (a cold generate restart), not by this legacy meta warm-resume loop. Only
-        # (generate, verify) is pure (compile.verify stays legacy), so this fires solely for the
-        # generate phase under executor=pure.
+        # verdict table (a cold generate restart), not by this agentic meta warm-resume loop. Only
+        # (generate, verify) is pure (compile.verify stays agentic), so this fires solely for the
+        # generate phase on a pure-leaf node.
         if self._pure_leaf_substep(refs, phase, "verify"):
             return outcomes
         failed = outcomes[-1]
@@ -6425,7 +6421,7 @@ clean:
                 #   (b) a schema-VALID `fail` verdict (the reviewer legitimately rejected the
                 #       source): verdict_meta.json has no routed category, source_meta.json WAS
                 #       written with the verdict projection -> fall through to the verify-severity
-                #       gate below (classify_verify_severity), identical to the legacy verify leaf.
+                #       gate below (classify_verify_severity), identical to the agentic verify leaf.
                 vmeta = _read_json(self.repo_root / refs.source_dir() / "verdict_meta.json") or {}
                 category = str(vmeta.get("failure_category") or "")
                 route = GENERATE_VERDICT_FAILURE_ROUTING.get(category)
@@ -7114,17 +7110,12 @@ def run_conductor(*, repo_root: Path | str, orchestration_id: str,
     # pinned version: the exact version is resolved post-run from the leaf transcript.
     from tools.orchestration_runtime import default_agent_model_for_backend
     resolved_agent_model = agent_model or default_agent_model_for_backend(backend)
-    # Z2 generate-executor: threaded via env (METDSL_GENERATE_EXECUTOR). run_workflow always
-    # stamps the resolved value (cold: flag/env/default; resume: the persisted invocation), so
-    # the fallback here is reached only when run_conductor is driven without that stamp — it
-    # mirrors the project default, pure since the billed A/B adoption (2026-07-18).
-    generate_executor = str(env.get("METDSL_GENERATE_EXECUTOR", "pure")).strip().lower() or "pure"
     conductor = Conductor(
         repo_root=root, orchestration_id=orchestration_id,
         orchestration_agent_run_id=orchestration_agent_run_id,
         backend=backend, env=env,
         agent_model=resolved_agent_model, workflow_mode=workflow_mode,
-        llm_command=llm_command, generate_executor=generate_executor,
+        llm_command=llm_command,
     )
     refs = (resume_node_refs(conductor, node_key, spec_path) if resume
             else prepare_node(conductor, node_key, spec_path))

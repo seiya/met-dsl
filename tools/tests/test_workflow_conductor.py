@@ -5038,6 +5038,77 @@ class WriteRunnerTest(unittest.TestCase):
         self.assertIn(f"{refs.source_dir()}/src/{self.SID}_runner.f90", legacy)
 
 
+class PureLeafSubstepPredicateTests(unittest.TestCase):
+    """M-F: `_pure_leaf_substep` dispatch is decided by node SHAPE alone (the generate-executor is
+    no longer selectable — legacy execution was removed, `pure` is the only executor). Direct unit
+    coverage of the predicate (previously exercised only indirectly). Reuses WriteRunnerTest's
+    `_write_consumer_ir` IR-shaping helper (self is ignored by it)."""
+
+    SID = "boundary_x"
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key=f"component/{self.SID}@0.1.0", spec_path=f"spec/component/{self.SID}",
+            ir_id="i1", pipeline_id="p1", source_id="s1", binary_id="b1")
+
+    def _conductor(self, repo: Path, backend: str) -> _FakeConductor:
+        return _FakeConductor(repo_root=repo, orchestration_id="o",
+                              orchestration_agent_run_id="ORCH", backend=backend, env={})
+
+    def test_claude_m3c_generate_substeps_are_pure(self) -> None:
+        # (a) claude + M3c: both generate LLM substeps are pure; other (phase, substep) pairs are
+        # not (deterministic generate substeps + compile.verify stay agentic).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            WriteRunnerTest._write_consumer_ir(self, repo, refs, infra=1)
+            c = self._conductor(repo, "claude")
+            self.assertTrue(c._pure_leaf_substep(refs, "generate", "generate"))
+            self.assertTrue(c._pure_leaf_substep(refs, "generate", "verify"))
+            self.assertFalse(c._pure_leaf_substep(refs, "generate", "static"))
+            self.assertFalse(c._pure_leaf_substep(refs, "compile", "verify"))
+
+    def test_codex_m3c_is_agentic_residual(self) -> None:
+        # (b) codex + M3c: no pure producer (codex fail-closes in leaf_command), so the node runs
+        # the shared agentic leaf loop as a recorded residual.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            WriteRunnerTest._write_consumer_ir(self, repo, refs, infra=1)
+            c = self._conductor(repo, "codex")
+            self.assertFalse(c._pure_leaf_substep(refs, "generate", "generate"))
+            self.assertFalse(c._pure_leaf_substep(refs, "generate", "verify"))
+
+    def test_claude_non_m3c_is_agentic_residual(self) -> None:
+        # (c) claude but non-M3c (0 or 2 infra deps): no bundle representation for the runner, so
+        # the node keeps the agentic leaf.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            c = self._conductor(repo, "claude")
+            WriteRunnerTest._write_consumer_ir(self, repo, refs, infra=0)
+            self.assertFalse(c._pure_leaf_substep(refs, "generate", "generate"))
+            WriteRunnerTest._write_consumer_ir(self, repo, refs, infra=2)
+            self.assertFalse(c._pure_leaf_substep(refs, "generate", "generate"))
+
+    def test_infrastructure_spec_kind_is_not_pure(self) -> None:
+        # (d) an infrastructure node authors its own self-test runner (not glue), so it is non-M3c
+        # even with exactly one infra dep.
+        from tools.tests.test_runner_renderer import _boundary_ir
+        import yaml as _yaml
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            ir = _boundary_ir()
+            ir["meta"]["spec_kind"] = "infrastructure"
+            ir["dependency"]["direct_deps"] = [
+                {"node_key": "infrastructure/harness_fortran_cpu@0.2.0"}]
+            (repo / refs.ir_ref).mkdir(parents=True, exist_ok=True)
+            (repo / refs.ir_ref / "spec.ir.yaml").write_text(_yaml.safe_dump(ir))
+            c = self._conductor(repo, "claude")
+            self.assertFalse(c._pure_leaf_substep(refs, "generate", "generate"))
+
+
 class GenerateLeafAuthorizationTest(unittest.TestCase):
     """For a leaf node, src/Makefile is conductor-authored, so it is dropped from the leaf's
     generate allowed_output_paths and required_outputs (it must not author it)."""

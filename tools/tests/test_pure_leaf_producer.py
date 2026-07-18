@@ -6,7 +6,7 @@ Covers the host side of the pure `generate.generate` channel added across
 bundle-derived Makefile, bundle_meta), `tools/orchestration_runtime.py` (the terminal-payload
 carve-out + the cold-repair prompt contract), `tools/validate_pipeline_semantics.py` (the
 post_generate bundle re-validation + the sweep output_refs mirror), and `tools/run_workflow.py`
-(the M-C `--generate-executor pure` block).
+(the generate-executor surface — since M-F the executor is hardcoded pure).
 """
 
 from __future__ import annotations
@@ -242,7 +242,7 @@ def _conductor(repo: Path) -> _PureFakeConductor:
     (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
     return _PureFakeConductor(
         repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-        backend="claude", env={}, generate_executor="pure")
+        backend="claude", env={})
 
 
 # ======================================================================================
@@ -854,7 +854,7 @@ class PureProducerSubstepTests(unittest.TestCase):
 
         (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
         c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-               backend="claude", env={}, generate_executor="pure")
+               backend="claude", env={})
         c.envelopes = [_envelope(_valid_bundle())]
         oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
         self.assertEqual(oc.status, "pass")
@@ -952,7 +952,7 @@ class PureProducerSubstepTests(unittest.TestCase):
 
         (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
         c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-               backend="claude", env={}, generate_executor="pure")
+               backend="claude", env={})
         c.envelopes = [_envelope(_valid_bundle())]
         oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
         self.assertTrue(finalized.get("did"))            # the window WAS closed (finalize ran)
@@ -994,7 +994,7 @@ class PureProducerSubstepTests(unittest.TestCase):
         refs = _write_node(repo)
         (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
         c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-               backend="claude", env={}, generate_executor="pure")
+               backend="claude", env={})
         bad = _valid_bundle()
         del bad["capability_requirements"]  # persistently schema-invalid -> exhaustion
         c.envelopes = [_envelope(bad)]
@@ -1028,7 +1028,7 @@ class PureProducerColdFallbackSurrogateTests(unittest.TestCase):
             refs = _write_node(repo)
             (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
             c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-                   backend="claude", env={}, generate_executor="pure")
+                   backend="claude", env={})
             c.envelopes = [_envelope(bad)]
             oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())  # must not raise
             self.assertEqual(oc.status, "fail")
@@ -1049,7 +1049,7 @@ class PureProducerColdFallbackSurrogateTests(unittest.TestCase):
             refs = _write_node(repo)
             (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
             c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-                   backend="claude", env={}, generate_executor="pure")
+                   backend="claude", env={})
             c.envelopes = [_envelope(_valid_bundle())]  # valid doc; validator forces the violation
             oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())  # must not raise
             self.assertEqual(oc.status, "fail")
@@ -1185,7 +1185,7 @@ class PureProducerExemplarTests(unittest.TestCase):
         (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
         c = _RenderingFakeConductor(
             repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
-            backend="claude", env={}, generate_executor="pure")
+            backend="claude", env={})
         c.exemplar_value = self._EXEMPLAR
         c.envelopes = envelopes
         oc = c._run_pure_generate_substep(refs, "generate", "generate", repair, ())
@@ -1469,37 +1469,14 @@ class PurePostGenerateBundleTests(unittest.TestCase):
 
 
 # ======================================================================================
-# run_workflow --generate-executor pure block (M-C inert)
+# run_workflow generate-executor surface (M-F: flag + env removed, pure is the only executor)
 # ======================================================================================
 class GenerateExecutorFlagTests(unittest.TestCase):
-    def test_pure_selection_accepted_after_md(self) -> None:
-        # M-D unlocks `--generate-executor pure`: the gate no longer errors, so a pure selection
-        # passes the executor block and proceeds to normal startup resolution (here failing on the
-        # bogus spec, NOT on `generate_executor_pure_unavailable`).
-        import io
-        from contextlib import redirect_stdout
-        import tools.run_workflow as rw
-        buf = io.StringIO()
-        prev = os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
-        try:
-            with redirect_stdout(buf):
-                rc = rw.main(["spec/nonexistent_xyz", "generate", "--generate-executor", "pure"])
-            self.assertNotIn("generate_executor_pure_unavailable", buf.getvalue())
-            self.assertIn("invalid_startup_input", buf.getvalue())
-            self.assertEqual(rc, 2)
-        finally:
-            # main() sets os.environ["METDSL_GENERATE_EXECUTOR"] to the resolved value, so restore
-            # the ORIGINAL state fully — including deleting it when it was absent before — or the
-            # leaked "pure" pollutes every later test's ambient env.
-            if prev is not None:
-                os.environ["METDSL_GENERATE_EXECUTOR"] = prev
-            else:
-                os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
-
-    def test_cold_default_executor_is_pure(self) -> None:
-        # Adoption commit (2026-07-18): a cold run with NO flag and NO env resolves the executor
-        # to pure and stamps it into the env for the conductor. The run then proceeds to normal
-        # startup resolution (failing here on the bogus spec, not on the executor block).
+    def test_cold_run_has_no_executor_gate(self) -> None:
+        # M-F: a cold run has NO executor gate — the executor is hardcoded pure. The run proceeds
+        # straight to normal startup resolution (failing here on the bogus spec, not on any
+        # executor block), and does NOT emit the retired generate_executor_invalid reason nor stamp
+        # the removed METDSL_GENERATE_EXECUTOR env.
         import io
         from contextlib import redirect_stdout
         import tools.run_workflow as rw
@@ -1511,16 +1488,15 @@ class GenerateExecutorFlagTests(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("invalid_startup_input", buf.getvalue())
             self.assertNotIn("generate_executor_invalid", buf.getvalue())
-            self.assertEqual(os.environ.get("METDSL_GENERATE_EXECUTOR"), "pure")
+            self.assertNotIn("METDSL_GENERATE_EXECUTOR", os.environ)
         finally:
             if prev is not None:
                 os.environ["METDSL_GENERATE_EXECUTOR"] = prev
-            else:
-                os.environ.pop("METDSL_GENERATE_EXECUTOR", None)
 
-    def test_invalid_env_executor_rejected(self) -> None:
-        # Codex P2 (finding 3): a typo in METDSL_GENERATE_EXECUTOR bypasses argparse's `choices`;
-        # the resolved value must be validated so it cannot silently fall through to legacy.
+    def test_ambient_env_executor_ignored(self) -> None:
+        # M-F: METDSL_GENERATE_EXECUTOR is fully inert. A stale ambient value (even an old typo)
+        # is neither read nor validated — no generate_executor_invalid, and the run proceeds to
+        # normal startup resolution.
         import io
         from contextlib import redirect_stdout
         import tools.run_workflow as rw
@@ -1529,9 +1505,10 @@ class GenerateExecutorFlagTests(unittest.TestCase):
         os.environ["METDSL_GENERATE_EXECUTOR"] = "pur"
         try:
             with redirect_stdout(buf):
-                rc = rw.main(["spec/x", "generate"])
+                rc = rw.main(["spec/nonexistent_xyz", "generate"])
             self.assertEqual(rc, 2)
-            self.assertIn("generate_executor_invalid", buf.getvalue())
+            self.assertIn("invalid_startup_input", buf.getvalue())
+            self.assertNotIn("generate_executor_invalid", buf.getvalue())
         finally:
             if prev is not None:
                 os.environ["METDSL_GENERATE_EXECUTOR"] = prev

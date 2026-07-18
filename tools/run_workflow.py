@@ -123,9 +123,6 @@ def _build_invocation_record(
     workflow_mode: str,
     agent_model: str | None,
     with_deps: bool,
-    # Keyword-required (no default): every call site must thread the RESOLVED executor, so a
-    # forgotten site cannot silently record the wrong provenance for the run.
-    generate_executor: str,
     closure_id: str | None = None,
     closure_target_spec_ref: str | None = None,
     closure_until_phase: str | None = None,
@@ -149,10 +146,12 @@ def _build_invocation_record(
         "llm_command": llm_command,
         "mode": workflow_mode,
         "with_deps": bool(with_deps),
-        # Z2 executor selection (M-D). Persisted so an implicit resume (no flag / env in the
-        # fresh process) recovers the ORIGINAL choice via _load_resume_params — otherwise a pure
-        # run would resume as legacy, silently switching the execution + write-authority model.
-        "generate_executor": generate_executor,
+        # Z2 executor provenance. Since M-F the generate-executor is always `pure` (legacy removed),
+        # so this is a hardcoded provenance stamp rather than a per-run choice. It is still the value
+        # read by the M-F resume fail-close gate in main(): a resume of an orchestration whose
+        # recorded executor is not `pure` (legacy, or the field absent = a pre-adoption run) is
+        # rejected with `generate_executor_legacy_removed`.
+        "generate_executor": "pure",
     }
     if agent_model:
         record["agent_model"] = agent_model
@@ -832,10 +831,51 @@ def _load_resume_params(repo_root: Path, orchestration_id: str) -> dict[str, str
         "closure_id": _clean(invocation.get("closure_id")),
         "closure_target_spec_ref": _clean(invocation.get("closure_target_spec_ref")),
         "closure_until_phase": _clean(invocation.get("closure_until_phase")),
-        # Z2 executor (M-D). Older orchestrations predating the field → None → the caller treats
-        # them as legacy (correct: those runs were legacy — the pre-adoption executor, NOT the
-        # current cold-run default, which is pure since 2026-07-18).
+        # Z2 executor. Since M-F the recovered value is used ONLY by the resume fail-close gate in
+        # main(): anything other than `pure` (a `legacy` record, or None from an orchestration
+        # predating the field) is rejected — legacy execution was removed, so those runs cannot be
+        # resumed and must be re-run cold.
         "generate_executor": _clean(invocation.get("generate_executor")),
+    }
+
+
+def _recorded_generate_executor(repo_root: Path, orchestration_id: str) -> str | None:
+    """The cleaned `invocation.generate_executor` recorded on `orchestration_id`, or None.
+
+    Same normalization as `_load_resume_params` (strip; non-string / empty → None), but reads
+    only `orchestration_meta.json` so the closure-member resume gate can validate every member
+    orchestration cheaply (no preflight / prompt parse)."""
+    meta = _read_json_if_exists(
+        repo_root / "workspace" / "orchestrations" / orchestration_id / "orchestration_meta.json"
+    ) or {}
+    invocation = meta.get("invocation")
+    invocation = invocation if isinstance(invocation, dict) else {}
+    value = invocation.get("generate_executor")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _generate_executor_resume_rejection(
+    orchestration_id: str, recorded_executor: str | None
+) -> dict[str, Any] | None:
+    """Fail-close envelope (M-F) when `recorded_executor` is not exactly `pure`, else None.
+
+    Legacy generate execution was removed, so any resume of an orchestration recorded `legacy`,
+    with the field absent (None → a pre-adoption legacy run), or carrying garbage must be rejected
+    rather than silently promoted to the pure-only shape-based dispatch. Shared by the entry gate
+    in `main()` and the per-member gate in `_run_with_dependency_closure` so a closure resume
+    validates EVERY member it warm-resumes, not just the entry orchestration."""
+    if recorded_executor == "pure":
+        return None
+    return {
+        "status": "fail",
+        "reason": "generate_executor_legacy_removed",
+        "detail": (
+            f"cannot resume orchestration {orchestration_id}: its recorded generate-executor is "
+            f"{recorded_executor!r} (None = a run predating the field, i.e. a legacy run), but "
+            f"legacy generate execution was removed at M-F. The run is NOT silently switched to "
+            f"pure and legacy is not run; start a fresh run instead."
+        ),
+        "orchestration_id": orchestration_id,
     }
 
 
@@ -875,18 +915,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--llm", default=None, choices=SUPPORTED_LLMS)
     parser.add_argument("--llm-command", help="Override backend command used by preflight and optional launch.")
-    parser.add_argument(
-        "--generate-executor",
-        choices=("legacy", "pure"),
-        default=None,
-        help=(
-            "Z2 generate-phase executor: 'legacy' (the agentic generate.generate + verify "
-            "leaves) or 'pure' (the host-mediated CodegenBundle producer + verdict reviewer). "
-            "Defaults to pure (or METDSL_GENERATE_EXECUTOR) since the billed A/B adoption "
-            "(2026-07-18). 'pure' applies to a claude M3c node; a non-matching node stays "
-            "legacy under executor=pure."
-        ),
-    )
+    # NOTE (M-F): the `--generate-executor` flag and the `METDSL_GENERATE_EXECUTOR` env var were
+    # removed when legacy generate execution was deleted — `pure` is the only executor. A cold run
+    # that still passes `--generate-executor …` therefore fails at argparse ("unrecognized
+    # arguments", SystemExit 2), not via a JSON envelope. The JSON fail-close (with reason
+    # `generate_executor_legacy_removed`) is implemented only on the resume path, where a
+    # legacy-recorded orchestration is the actual hazard.
     parser.add_argument(
         "--agent-model",
         default=None,
@@ -982,44 +1016,14 @@ def main(argv: list[str] | None = None) -> int:
 
     resume_mode = bool(args.resume)
 
-    # Z2 generate-executor selection. Threaded to the conductor via env (METDSL_GENERATE_EXECUTOR).
-    # As of M-D both generate LLM substeps (the CodegenBundle producer and the verdict reviewer)
-    # are pure; since the billed A/B adoption (2026-07-18, flux + shallow_water2d P arms pass at
-    # byte-equal accuracy) `pure` is the DEFAULT: `_pure_leaf_substep` still narrows it to a
-    # claude M3c node, and a non-matching (codex / non-M3c) node stays legacy under executor=pure.
-    # `legacy` remains explicitly selectable until M-F removes it.
-    #
-    # COLD run: resolve from the flag or the ambient env, validate, and stamp the env. RESUME: the
-    # ambient env is IGNORED — the executor is recovered from the persisted invocation in the resume
-    # branch below (recovered ALWAYS wins; a conflicting --generate-executor FLAG is rejected
-    # there). So DEFER the env resolution+validation for a resume entirely: an unrelated shell typo
-    # in METDSL_GENERATE_EXECUTOR must not block an otherwise-valid resume (the flag itself is
-    # already validated by argparse `choices`). The placeholder here is overwritten by recovery.
-    generate_executor = "legacy"
-    if not resume_mode:
-        generate_executor = (
-            args.generate_executor or os.environ.get("METDSL_GENERATE_EXECUTOR") or "pure"
-        ).strip().lower() or "pure"
-        # argparse's `choices` guards only the flag; a value from METDSL_GENERATE_EXECUTOR bypasses
-        # it. Validate the resolved value against the SAME set so a typo (e.g. `pur`) fails loudly
-        # rather than falling through to legacy — `_pure_leaf_substep` matches only the exact literal
-        # `pure`, so an unrecognized value would silently run an unintended executor.
-        if generate_executor not in {"legacy", "pure"}:
-            print(
-                json.dumps(
-                    {
-                        "status": "fail",
-                        "reason": "generate_executor_invalid",
-                        "detail": (
-                            f"generate-executor must be 'legacy' or 'pure'; got "
-                            f"{generate_executor!r} (from METDSL_GENERATE_EXECUTOR or --generate-executor)"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            return 2
-        os.environ["METDSL_GENERATE_EXECUTOR"] = generate_executor
+    # Z2 generate-executor (M-F). The executor is no longer selectable: legacy execution was
+    # removed, so `pure` is hardcoded. Both generate LLM substeps (the CodegenBundle producer and
+    # the verdict reviewer) go through the pure path when `_pure_leaf_substep` matches (claude
+    # backend ∧ M3c node); a non-M3c or codex node runs the shared agentic leaf loop as a recorded
+    # residual, NOT as a selectable executor. The `--generate-executor` flag and
+    # METDSL_GENERATE_EXECUTOR env were deleted; a cold run that still passes the flag fails at
+    # argparse. On RESUME the recorded executor is recovered below and a non-`pure` record is
+    # rejected fail-closed (`generate_executor_legacy_removed`) — legacy runs cannot be resumed.
 
     # Resolve effective startup inputs. With --resume, omitted spec_ref /
     # until_phase / --llm / --mode are recovered from the target orchestration's
@@ -1142,42 +1146,28 @@ def main(argv: list[str] | None = None) -> int:
         resume_recovered_dep_ref = recovered.get("source_dependency_ref")
         resume_recovered_llm = recovered.get("llm")
         resume_recovered_llm_command = recovered.get("llm_command")
-        # Z2 executor immutability on resume (Codex P1, two rounds). The generate-executor is a
-        # per-RUN choice recorded ONCE in the immutable invocation block (persisted on the cold
-        # init path only; a resume passes invocation=None and the runtime preserves the existing
-        # block). It therefore cannot change across a resume:
-        #   - Round 1: an IMPLICIT resume defaulted to legacy above, so a pure run resumed with
-        #     agentic leaves + expanded write authority. Fix: the recovered original ALWAYS wins.
-        #   - Round 2: an explicit override on resume would apply to THIS process but NOT persist
-        #     (the invocation is not rewritten), so a LATER implicit resume would silently revert
-        #     to the original — flipping the model mid-run. Fix: reject a conflicting explicit
-        #     FLAG (fail-closed) instead of honoring it non-durably.
-        # The conflict check keys on the deliberate CLI FLAG, NOT the env var: METDSL_GENERATE_
-        # EXECUTOR is the threading/default mechanism and may be ambiently set in the operator's
-        # shell (or by this process), so on resume the recovered value always takes precedence over
-        # it — only an explicit --generate-executor that disagrees is a deliberate, rejected change.
-        # Older orchestrations predating the field recover None → treated as legacy (they were).
-        recovered_executor = recovered.get("generate_executor")
-        recovered_executor = recovered_executor if recovered_executor in ("legacy", "pure") else "legacy"
-        flag_executor = (args.generate_executor or "").strip().lower() or None
-        if flag_executor and flag_executor != recovered_executor:
-            print(
-                json.dumps(
-                    {
-                        "status": "fail",
-                        "reason": "generate_executor_immutable_on_resume",
-                        "detail": (
-                            f"the resumed run was started with generate-executor "
-                            f"{recovered_executor!r}; it cannot be changed to {flag_executor!r} "
-                            f"on resume (start a fresh run to switch executors)"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-            )
+        # Z2 executor fail-close on resume (M-F). Legacy generate execution was removed: `pure` is
+        # the only executor. The recorded executor in the immutable invocation block is now used
+        # solely to REJECT a resume that would otherwise silently switch execution + write-authority
+        # models. Reject fail-closed unless the recovered value is exactly `pure`:
+        #   - `legacy`  → the run genuinely used the deleted legacy leaves; there is no legacy path
+        #     to resume onto, and silently promoting it to pure would change the execution model of
+        #     an in-flight run.
+        #   - None      → the orchestration predates the `generate_executor` field (a pre-adoption
+        #     legacy run); same hazard.
+        #   - garbage (e.g. "pur") → an unknown value must never be read as pure; fail loud.
+        # This gate validates the ENTRY orchestration. A closure resume additionally validates
+        # every warm-resumed member inside `_run_with_dependency_closure` (a mixed closure — e.g. a
+        # reused closure id pairing a `pure` entry with a `legacy` member — must not slip a legacy
+        # member past this entry check). A pure-recorded run resumes normally. A non-M3c/codex run
+        # is ALSO recorded `pure` (the executor is a provenance stamp, not the leaf-mode decision),
+        # so it is NOT rejected — it simply runs its agentic leaves as before.
+        entry_executor_rejection = _generate_executor_resume_rejection(
+            orchestration_id, recovered.get("generate_executor")
+        )
+        if entry_executor_rejection is not None:
+            print(json.dumps(entry_executor_rejection, ensure_ascii=False))
             return 2
-        generate_executor = recovered_executor
-        os.environ["METDSL_GENERATE_EXECUTOR"] = generate_executor
         missing = [
             name
             for name, value, ok in (
@@ -1391,7 +1381,6 @@ def main(argv: list[str] | None = None) -> int:
             workflow_mode=workflow_mode,
             agent_model=args.agent_model,
             with_deps=False,
-            generate_executor=generate_executor,
         )
     )
     return _run_node(
@@ -2329,6 +2318,26 @@ def _run_with_dependency_closure(
         prior_dep_orch_id = prior_orch_by_spec.get(spec_ref) if resume else None
         dep_orch_id = prior_dep_orch_id or _new_orchestration_id()
         dep_resume = prior_dep_orch_id is not None
+        # M-F executor fail-close, per warm-resumed member. The entry gate in main() only checked
+        # the entry orchestration; a mixed closure could otherwise resume a legacy-recorded
+        # dependency here under the pure-only dispatch. A cold (fresh) dep node records `pure` and
+        # is not gated.
+        if dep_resume:
+            dep_executor_rejection = _generate_executor_resume_rejection(
+                dep_orch_id, _recorded_generate_executor(repo_root, dep_orch_id)
+            )
+            if dep_executor_rejection is not None:
+                _emit_closure_event(
+                    {
+                        **dep_executor_rejection,
+                        "failed_dependency_node": node_label,
+                        "spec_ref": spec_ref,
+                        "dependency_runs": dependency_runs,
+                        "target_spec_ref": target_spec_ref,
+                    },
+                    stdout_format,
+                )
+                return 2
         try:
             dep_source_dependency_ref = _discover_source_dependency_ref(repo_root, spec_ref)
         except ValueError as exc:
@@ -2371,7 +2380,6 @@ def _run_with_dependency_closure(
             workflow_mode=workflow_mode,
             agent_model=agent_model,
             with_deps=True,
-            generate_executor=base_env.get("METDSL_GENERATE_EXECUTOR", "pure"),
             closure_id=target_orchestration_id,
             closure_target_spec_ref=target_spec_ref,
             closure_until_phase=until_phase,
@@ -2475,6 +2483,18 @@ def _run_with_dependency_closure(
         and isinstance(target_meta_invocation, dict)
         and target_meta_invocation.get("closure_id") == target_orchestration_id
     )
+    # M-F executor fail-close for the warm-resumed target (mirrors the per-dependency gate above);
+    # a cold target records `pure` and is not gated.
+    if target_resume:
+        target_executor_rejection = _generate_executor_resume_rejection(
+            target_orchestration_id, _recorded_generate_executor(repo_root, target_orchestration_id)
+        )
+        if target_executor_rejection is not None:
+            _emit_closure_event(
+                {**target_executor_rejection, "dependency_runs": dependency_runs},
+                stdout_format,
+            )
+            return 2
     target_invocation = None if target_resume else _build_invocation_record(
         argv=raw_argv,
         spec_ref=target_spec_ref,
@@ -2484,7 +2504,6 @@ def _run_with_dependency_closure(
         workflow_mode=workflow_mode,
         agent_model=agent_model,
         with_deps=True,
-        generate_executor=base_env.get("METDSL_GENERATE_EXECUTOR", "pure"),
         closure_id=target_orchestration_id,
         closure_target_spec_ref=target_spec_ref,
         closure_until_phase=until_phase,

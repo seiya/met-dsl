@@ -3,9 +3,11 @@
 > **Scope note.** Under `Z2` (`docs/design/zero_base_architecture.md`) the pure
 > `Generate.generate` leaf produces exactly one `CodegenBundle`; the host validates
 > it with `validate_bundle` (the post-generate gate), writes the declared files, and
-> assembles the build graph. When the `generate-executor` is `legacy`, no bundle is
-> produced — the agentic `Generate.generate` leaf writes two Fortran sources directly
-> with a host-rendered runner and Makefile, as described in
+> assembles the build graph. On a residual node that stays on the agentic leaf (a
+> `codex` backend, or a node whose runner/Makefile are not host-rendered — the pure
+> executor is the only executor since `M-F`, but such a node cannot be expressed as a
+> pure producer), no bundle is produced — the agentic `Generate.generate` leaf writes
+> the Fortran sources directly, as described in
 > `docs/workflow/phases/phase_02_generate.md` together with `CHECKS_MODULE_CONTRACT.md`.
 > This document is the canonical contract for the bundle document itself; the schema
 > (`spec/schema/generate/codegen_bundle.schema.json`) and the validator module
@@ -495,12 +497,14 @@ graph become a derivation input in `Z5`.
 
 **Parity.** For a bundle of the `M3c` shape (one member, `model` + `checks`, a
 dependency closure, host-rendered runner glue), the derived object order equals the
-object order of the Makefile the conductor renders on the `legacy` executor
-(dependency objects → model → checks → runner). That equality is what the parity test
-pins: it compares `derive_build_graph(...)["link"]["objects"]` against the object list
-parsed out of the `legacy`-authored Makefile. Under `Z2` the pure executor renders its
-Makefile from this derived graph (`_render_pure_makefile_from_graph`) while the
-`legacy` `_write_makefile` is unchanged, so the two renders are **not** byte-identical
+object order of the IR-shaped Makefile the conductor renders via `_write_makefile`
+(dependency objects → model → checks → runner). `_write_makefile` remains the live
+Makefile author for Model B dependency closures and for non-`M3c` agentic leaves, so it
+is not dead code. That equality is what the parity test pins: it compares
+`derive_build_graph(...)["link"]["objects"]` against the object list parsed out of the
+`_write_makefile`-authored Makefile. Under `Z2` a pure `M3c` node renders its Makefile
+from this derived graph (`_render_pure_makefile_from_graph`) while `_write_makefile` is
+unchanged, so the two renders are **not** byte-identical
 (they differ in header comments and in whether object paths are carried by
 `MODEL_SRC` / `MODEL_OBJ` variables or inlined per compile unit). What both must agree
 on is the derived build graph — the object set and its order — plus the overridable

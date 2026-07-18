@@ -507,10 +507,12 @@ def collect_token_cost_summary(
     return summary
 
 
-# The `generate-executor` vocabulary (canonical allowlist: `run_workflow.py`, which
-# validates it on cold init). Duplicated as a literal rather than imported so the
-# read-only audit does not pull in the workflow launcher; the render only uses it to
-# flag an out-of-vocabulary value, never to reject one.
+# The `generate-executor` vocabulary as HISTORICALLY RECORDED on `invocation.generate_executor`.
+# Since M-F, run_workflow no longer validates this value on cold init (legacy execution was removed
+# and the executor is not selectable — cold runs always record `pure`), but past orchestrations on
+# disk still carry `legacy`, so the audit keeps both to stay a faithful reader of historical
+# records. Duplicated as a literal rather than imported so the read-only audit does not pull in the
+# workflow launcher; the render only uses it to flag an out-of-vocabulary value, never to reject one.
 _KNOWN_GENERATE_EXECUTORS: tuple[str, ...] = ("legacy", "pure")
 
 
@@ -632,7 +634,7 @@ def collect_pure_leaf_ab_summary(
     # `codex --version` on a codex run. Carry the recorded `backend` so the renderer
     # can label it truthfully; naming it "claude" unconditionally would report false
     # provenance for every codex orchestration (which this section still renders,
-    # since a codex node stays legacy even under --generate-executor pure).
+    # since a codex node runs the agentic residual leaf, not the pure producer).
     backend = _clean_str(preflight.get("backend"))
     agent_cli_version = _clean_str(preflight.get("agent_version"))
 

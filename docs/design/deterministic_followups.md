@@ -3055,3 +3055,51 @@ field still resumes as `legacy` (it was), and the `claude`+`M3c` narrowing still
 `legacy` under the `pure` default exactly as it did under `--generate-executor pure`. Next step: M-F (legacy-path
 removal), plus the filed residuals (the `controlled_spec` interim inline's removal trigger, the runner-driven checks
 ABI, `compile.generate` authoring variance).
+
+## M-F — legacy generate-executor removal (LANDED 2026-07-18)
+
+The final `Z2` migration milestone: legacy generate execution is deleted so `pure` is the ONLY generate-executor. This
+is *migration-scope* removal only — the broad hook / preflight / contract-doc teardown remains `Z4`.
+
+**What was removed.**
+- The `--generate-executor {legacy,pure}` CLI flag and the `METDSL_GENERATE_EXECUTOR` env var (`run_workflow.py`).
+  The executor is no longer selectable or threaded through the environment.
+- The cold-run executor resolution + validation block (and its `generate_executor_invalid` reason), the conductor's
+  `generate_executor` dataclass field + its `run_conductor` env read, and the resume-time
+  `generate_executor_immutable_on_resume` conflict check.
+- `_build_invocation_record`'s `generate_executor` keyword — the record now hardcodes `"pure"` as provenance.
+- `_pure_leaf_substep`'s `generate_executor == "pure"` guard: dispatch is now decided by node SHAPE alone
+  (`backend == "claude"` ∧ the two generate substeps ∧ the `M3c` makefile/runner shape).
+
+**Fail-close semantics.** Legacy execution cannot be resumed onto. A resume of an orchestration whose recorded
+`invocation.generate_executor` is not exactly `"pure"` — a `legacy` record, the field absent (a pre-adoption run), or
+any garbage value — is rejected fail-closed with reason `generate_executor_legacy_removed`. The run is neither silently
+promoted to `pure` nor run as legacy; the operator starts a fresh run. A pure-recorded run resumes normally. The check
+is shared (`_generate_executor_resume_rejection`) and applied to **every** orchestration a resume warm-resumes, not only
+the entry one: a `--with-deps` closure resume re-validates each dependency member and the target inside
+`_run_with_dependency_closure` before resuming it, so a *mixed* closure (e.g. a reused closure id pairing a `pure` entry
+with a `legacy` member) cannot slip a legacy member past the entry gate.
+
+**Argparse-level (not JSON) rejection of the cold flag.** Per the operator decision, the flag was fully deleted rather
+than kept with `choices=("pure",)`. A cold run that still passes `--generate-executor …` therefore fails at argparse
+("unrecognized arguments", `SystemExit 2`), NOT via a JSON envelope. The JSON fail-close is implemented only on the
+resume path, where a legacy-recorded orchestration is the actual hazard.
+
+**What was retained as a recorded residual (deletion would be wrong).** The migration scope removed the *executor
+choice*, not the *agentic leaf loop*. A node the pure producer cannot express — a `codex` backend, or a node whose
+runner/Makefile are not host-rendered (harness self-test, c/cpp/mixed, a physics node with no infra dep) — runs the
+shared agentic leaf loop as before. Its invocation still stamps `generate_executor=pure` (a provenance stamp, since the
+leaf-mode is decided by node shape, not the executor), so it is NOT rejected on resume. Also retained: `_write_makefile`
+(the live Makefile author for Model B dependency closures and non-`M3c` leaves), the verify-meta warm-resume loop,
+`leaf_command(pure=True)`'s `codex` fail-close (defense-in-depth), the two `Generate` SKILLs (`skills/workflow-generate-
+generate|verify/`, consumed by the residual agentic leaves), and `audit_orchestration.py`'s
+`_KNOWN_GENERATE_EXECUTORS=("legacy","pure")` (so historical `legacy` records stay readable — the audit reports the
+recorded value, it does not validate it).
+
+**Z4 boundary.** The `--generate-executor` surface, the executor field, and the resume gate are gone; the broader
+agentic-leaf infrastructure (the shared `run_substep` loop, `compile.verify` / `validate.judge` agentic leaves) is out
+of scope and remains for `Z4`.
+
+**Confirmation E2E (operator-run, after the commit).** flux
+(`spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2`): _orch id + result pending._
+Acceptance = `workflow_status=pass` + the audit's Pure-leaf A/B section shows executor `pure` with bundle/verdict metas.
