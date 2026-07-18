@@ -1458,7 +1458,8 @@ def m3c_checks_abi_violation(doc: Mapping[str, Any], spec_id: str) -> str | None
 
     An M3c node's `<spec_id>_checks` module must publish the SAME fixed set of names for every
     node — `runner_renderer.CHECKS_PUBLIC_NAMES`, the authority — each as a SUBROUTINE, because
-    the host-rendered runner `call`s them (runner_renderer:690-738). Two later gates enforce
+    the host-rendered runner `call`s them (`runner_renderer.render_runner`'s `checks_syms` imports
+    and the per-case call sites). Two later gates enforce
     halves of that and this layer pre-empts both, turning what were phase reopens into one
     bounded in-conversation repair (Z2 defect D: sw2d burned its whole retry budget re-guessing
     an ABI it had never been shown):

@@ -71,15 +71,18 @@ _TEMPLATE_FILES = (
 #
 # `pure-6` is the pre-guard BASELINE: it predates this guard (the guard was introduced at pure-7), so
 # it never had a live pin; its digest is the pure-6 template bytes (origin/main) hashed under the
-# pure-6/pure-7 tuple schema, seeded here so a future version that reverts the generate template to
-# the pure-6 contract is caught as a duplicate. Only pure_generate_generate.txt differs between
-# pure-6 and pure-7; every other pinned member is identical across the two.
+# pure-6/pure-7 tuple schema. Only pure_generate_generate.txt differs between pure-6 and pure-7;
+# every other pinned member is identical across the two.
 #
 # NOTE — the contract-tuple SCHEMA changed at pure-8: `check_id_width` was dropped from
 # `_contract_tuple` when the runner-driven per-id checks ABI removed the pinned check-id width
 # (`runner_renderer.CHECK_ID_WIDTH` no longer exists). The pure-6 / pure-7 digests below are FROZEN
 # literals computed under the OLD (wider) schema; they are NOT recomputed from the current tuple and
-# exist ONLY as opaque values for the uniqueness (empty-bump / revert) check. Only the CURRENT
+# serve ONLY the uniqueness / no-empty-bump check (`test_no_empty_version_bump`). Because they were
+# hashed under a schema the current `_digest()` no longer produces, they can never collide with a
+# current-schema digest — so they do NOT detect a future REVERT of the template to the pre-pure-8
+# (pure-6/pure-7) contract. Revert detection holds only among versions sharing the CURRENT schema
+# (pure-8 onward); the empty-bump guard across all pinned versions is unaffected. Only the CURRENT
 # version's pin (pure-8, below) is a live equality target for `_digest()`.
 PINNED: dict[str, str] = {
     "pure-6": "b614072bcaad7ffe61f48d54256305b89982457d2ef6c3b5126e09598e5e7067",

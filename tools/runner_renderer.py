@@ -732,8 +732,10 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
         clit = _flit(cid)
         # Per-id ABI (metric_compute's twin): the runner passes each IR-declared check id as a
         # literal `intent(in)` actual, so the module authors only the status — a dropped/renamed
-        # id is structurally impossible. The id rides the continuation line (not the header) so a
-        # 64-char id stays within the 100-col lint bound.
+        # id is structurally impossible. The width-binding line is the `case_checks(k)%id = '<id>'`
+        # assignment (~90-91 cols for a 64-char id, 2-digit index); the wrapped `checks_compute`
+        # call keeps its id on the continuation line (~82 cols). `_checks()` bounds the id at
+        # CASE_ID_LEN (64) and a global >100-col backstop fail-closes any pathological escaped id.
         a("    call checks_compute(trim(case_ids(ci)), &")
         a(f"      '{clit}', cstatus)")
         a(f"    case_checks({k})%id = '{clit}'")
