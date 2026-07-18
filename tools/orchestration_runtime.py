@@ -3932,11 +3932,25 @@ def _write_roots_for_launch(
             return [_normalize_rel_posix(f"{ir_ref.rstrip('/')}/ir_meta.json")]
         return [ir_norm]
     if st == "generate":
+        # generate.verify's SOLE write is source_meta.json (verification_status): it inspects the
+        # producer sources (already certified by the deterministic lint/syntax/static gates that
+        # run before it and never re-run) but never rewrites them — a fail requests regeneration
+        # under a NEW source_id (SKILL workflow-generate-verify). Narrow its write_root to that
+        # single producer-authored file pin so an out-of-scope source rewrite is refused by the
+        # sandbox itself, not merely by the pattern-based file-tool hook. source_meta.json is both
+        # a read input and this write pin; render_bwrap_command skips the ro read-bind for a read
+        # input that coincides with a write_root, keeping it writable. A missing/malformed
+        # source_id yields [] -> capability_invalid_empty_write_roots at launch.
+        if ss == "verify":
+            sid = source_id.strip()
+            if not _is_safe_path_id(sid):
+                return []
+            return [_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/source/{sid}/source_meta.json")]
         # lineage.json is NOT a leaf write_root: it sits at the pipeline root, which must
         # stay non-writable to the sandboxed leaf (atomic temp-sibling+rename would need
         # the whole root writable). It is authored host-side by the conductor
-        # (workflow_conductor._write_lineage), matching docs/WORKSPACE_LAYOUT.md. The leaf
-        # writes only the source tree.
+        # (workflow_conductor._write_lineage), matching docs/WORKSPACE_LAYOUT.md. The
+        # source-generating substep writes only the source tree.
         return [
             _with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/source")),
         ]

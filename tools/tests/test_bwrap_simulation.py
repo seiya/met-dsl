@@ -303,6 +303,82 @@ class BwrapJudgePinSimulationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
+class BwrapGenerateVerifyPinSimulationTests(unittest.TestCase):
+    """Model Generate.verify's narrowed write_root: a single source_meta.json FILE pin (not the
+    whole source/ dir). Confirm the verifier can rewrite its own source_meta.json in place but
+    CANNOT rewrite a certified producer source (src/<id>_model.f90) nor add a sibling — so an
+    uncertified source can never reach Build via a verify turn."""
+
+    PIPE = "workspace/pipelines/n/p_001"
+    SRC_DIR = PIPE + "/source/src_001/"
+    PIN = SRC_DIR + "source_meta.json"
+    MODEL = SRC_DIR + "src/foo_model.f90"
+
+    def _setup(self, repo: Path, orch: str, arid: str) -> None:
+        _ensure_orchestration_audit_dirs(repo, orch)
+        (repo / self.SRC_DIR / "src").mkdir(parents=True, exist_ok=True)
+        # producer-authored source_meta.json + a certified source the verifier must not rewrite.
+        (repo / self.PIN).write_text('{"verification_status": "pending"}\n', encoding="utf-8")
+        (repo / self.MODEL).write_text("module foo\nend module\n", encoding="utf-8")
+        cap_dir = _capabilities_dir(repo, orch); cap_dir.mkdir(parents=True, exist_ok=True)
+        (cap_dir / f"{arid}.json").write_text(
+            json.dumps({"agent_run_id": arid, "write_roots": [self.PIN]}), encoding="utf-8")
+        rm_dir = _read_manifests_dir(repo, orch); rm_dir.mkdir(parents=True, exist_ok=True)
+        # source_meta.json is BOTH a read input and the write pin; the source tree is readable
+        # (repo ro-bind) so the verifier can inspect the certified sources.
+        (rm_dir / f"{arid}.json").write_text(
+            json.dumps({"agent_run_id": arid, "allowed_read_roots": [self.PIN]}), encoding="utf-8")
+
+    def test_verify_rewrites_meta_but_cannot_rewrite_certified_source(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo = Path(t).resolve()
+            orch, arid = "orch_gv", "arid_gv"
+            self._setup(repo, orch, arid)
+            _write_run_write_baseline(repo, orch, agent_run_id=arid)
+            script = textwrap.dedent(f"""
+                from pathlib import Path
+                def report(tag, ok, e=""):
+                    print(f"{{tag}}:{{'OK' if ok else 'FAIL'}}", e, flush=True)
+                # (1) read the certified source -> OK (repo ro-bind), then (2) rewrite own meta.
+                try:
+                    Path("{self.MODEL}").read_text(); report("READ_SRC", True)
+                except Exception as e:
+                    report("READ_SRC", False, repr(e))
+                try:
+                    Path("{self.PIN}").write_text('{{"verification_status":"pass"}}')
+                    report("META_WRITE", True)
+                except Exception as e:
+                    report("META_WRITE", False, repr(e))
+                # (3) rewrite the certified source in place -> BLOCKED (src/ stays ro)
+                try:
+                    Path("{self.MODEL}").write_text("module evil\\nend module\\n")
+                    print("SRC_REWRITE:ALLOWED", flush=True)  # bad: uncertified source to Build
+                except Exception:
+                    print("SRC_REWRITE:BLOCKED", flush=True)  # good
+                # (4) add a brand-new sibling source -> BLOCKED
+                try:
+                    Path("{self.SRC_DIR}src/evil_model.f90").write_text("x")
+                    print("SIBLING_SRC:ALLOWED", flush=True)  # bad
+                except Exception:
+                    print("SIBLING_SRC:BLOCKED", flush=True)  # good
+            """)
+            profile = build_bwrap_profile(
+                repo_root=repo, orchestration_id=orch, agent_run_id=arid,
+                backend_command="python3", backend_type="claude")
+            cmd = render_bwrap_command(profile=profile, command_argv=["python3", "-c", script])
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
+            self.assertIn("READ_SRC:OK", out, out)
+            self.assertIn("META_WRITE:OK", out, out)
+            self.assertIn("SRC_REWRITE:BLOCKED", out, out)
+            self.assertIn("SIBLING_SRC:BLOCKED", out, out)
+            # the certified source is byte-for-byte unchanged on the host
+            self.assertEqual((repo / self.MODEL).read_text(), "module foo\nend module\n")
+            changed = set(_actual_changed_paths_since_baseline(repo, orch, agent_run_id=arid))
+            self.assertIn(self.PIN, changed, changed)
+            self.assertNotIn(self.MODEL, changed, changed)
+
+
+@unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
 class BwrapBuildPathSimulationTests(unittest.TestCase):
     """Model the Build phase's filesystem writes under bwrap (the highest-risk path per
     docs/BWRAP_ENABLEMENT.md). A Make/Fortran build routes outputs via OBJDIR/BINDIR

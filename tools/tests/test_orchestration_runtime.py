@@ -7805,6 +7805,80 @@ shell_tool                       stable             true
             [f"{_FIX_PIPE_REF}/runs/run_20260415_001/problem__shallow_water2d__0.3.0/semantic_review.json"],
         )
 
+    def test_write_roots_for_launch_generate_verify_pins_source_meta(self) -> None:
+        """generate.verify's write_root is narrowed to the single producer-authored
+        source_meta.json file pin: it inspects the certified sources but never rewrites
+        them (a fail requests regeneration under a NEW source_id)."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="substep",
+                step="generate",
+                substep="verify",
+                orchestration_id="orch_001",
+                ir_ref=_FIX_IR_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+                node_key="problem/shallow_water2d@0.3.0",
+                source_id="src_20260415_001",
+            ),
+            [f"{_FIX_PIPE_REF}/source/src_20260415_001/source_meta.json"],
+        )
+
+    def test_write_roots_for_launch_generate_generate_keeps_source_dir(self) -> None:
+        """generate.generate authors the source tree and keeps the whole source/ dir
+        root; only the verifier is pinned (source_id is irrelevant to the author root)."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="substep",
+                step="generate",
+                substep="generate",
+                orchestration_id="orch_001",
+                ir_ref=_FIX_IR_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+                node_key="problem/shallow_water2d@0.3.0",
+                source_id="src_20260415_001",
+            ),
+            [f"{_FIX_PIPE_REF}/source/"],
+        )
+
+    def test_write_roots_for_launch_generate_verify_missing_source_id_returns_empty(self) -> None:
+        """Without a valid source_id the verify pin cannot be derived; return [] so the
+        capability_invalid_empty_write_roots fail-closed error fires at launch."""
+        for bad in ("", "src/../x", "..", "sr/c"):
+            self.assertEqual(
+                _write_roots_for_launch(
+                    role="substep",
+                    step="generate",
+                    substep="verify",
+                    orchestration_id="orch_001",
+                    ir_ref=_FIX_IR_REF,
+                    pipeline_ref=_FIX_PIPE_REF,
+                    node_key="problem/shallow_water2d@0.3.0",
+                    source_id=bad,
+                ),
+                [],
+                f"malformed source_id {bad!r} should yield []",
+            )
+
+    def test_build_capability_document_generate_verify_pins_source_meta(self) -> None:
+        from tools.orchestration_runtime import build_capability_document
+        cap = build_capability_document(
+            agent_run_id="substep_gv_001",
+            orchestration_id="orch_001",
+            request_payload={
+                "agent_role": "substep",
+                "step": "generate",
+                "substep": "verify",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "ir_ref": _FIX_IR_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "source_id": "src_20260415_001",
+            },
+        )
+        self.assertEqual(
+            cap["write_roots"],
+            [f"{_FIX_PIPE_REF}/source/src_20260415_001/source_meta.json"],
+        )
+
     def test_allowed_output_paths_for_launch_promote_accepts_release_artifact_and_catalog(self) -> None:
         """Regression: promote step must pass phase contract validation for
         canonical write paths (release tree + spec_catalog.yaml). Without this
