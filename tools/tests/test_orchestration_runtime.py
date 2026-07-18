@@ -7748,9 +7748,9 @@ shell_tool                       stable             true
         )
 
     def test_write_roots_for_launch_validate_judge_malformed_run_id_returns_empty(self) -> None:
-        """A separator / traversal-bearing run_id must not widen or escape the pin.
-        Fail closed with []."""
-        for bad in ("run_x/../../etc", "run/x", "..", "."):
+        """A run_id outside the [A-Za-z0-9_-] allowlist (separators, traversal, or any
+        shell/glob metacharacter) must not widen or escape the pin. Fail closed with []."""
+        for bad in ("run_x/../../etc", "run/x", "..", ".", "run *", "run~1", "run?x", "run.1", ""):
             self.assertEqual(
                 _write_roots_for_launch(
                     role="substep",

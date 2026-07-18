@@ -3887,15 +3887,25 @@ def _mcp_permissions_for_launch(role: str, step: str) -> list[str]:
     return []
 
 
+# A per-substep write_root file pin interpolates `run_id` / `source_id` directly into a
+# repo-relative path, so the id is constrained to an explicit allowlist rather than a denylist:
+# only `[A-Za-z0-9_-]` (the superset of the canonical `_RUN_ID_RE` / `_SOURCE_ID_RE` forms).
+# This rejects not just path separators / traversal (`/`, `\`, `.`, `..`) but every other
+# metacharacter (space, `~`, `*`, `?`, glob/shell chars) in one place — a fail-closed guard, not
+# a full format check (the canonical regexes above own the exact `<prefix>_<date>_<seq3>` shape).
+_SAFE_PATH_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _is_safe_path_id(tok: str) -> bool:
     """A path segment safe to interpolate into a per-substep write_root pin.
 
-    A file pin embeds the id directly in a repo-relative path; a separator or a
-    traversal component would either widen the pin (making a sibling dir writable)
-    or escape the intended subtree. Reject empty / separator-bearing / `.` / `..`
-    ids so the caller fails closed (`[]` -> capability_invalid_empty_write_roots).
+    A file pin embeds the id directly in a repo-relative path; anything but a plain
+    `[A-Za-z0-9_-]` token could widen the pin (a separator making a sibling dir writable),
+    escape the intended subtree (`.` / `..`), or introduce a shell/glob metacharacter. Reject
+    everything outside that allowlist so the caller fails closed (`[]` ->
+    capability_invalid_empty_write_roots).
     """
-    return bool(tok) and "/" not in tok and "\\" not in tok and tok not in (".", "..")
+    return bool(_SAFE_PATH_ID_RE.fullmatch(tok))
 
 
 def _write_roots_for_launch(
@@ -3916,6 +3926,10 @@ def _write_roots_for_launch(
     orch_root = _with_trailing_slash(_normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}"))
     ir_norm = _with_trailing_slash(_normalize_rel_posix(ir_ref))
     pipe_norm = _with_trailing_slash(_normalize_rel_posix(pipeline_ref))
+    # Slash-stripped bases reused by the per-subtree branches below (avoids repeating
+    # `.rstrip('/')` inline at every f-string and drifting if a new step is added).
+    ir_base = ir_ref.rstrip("/")
+    pipe_base = pipeline_ref.rstrip("/")
     if r == "orchestration":
         return [orch_root]
     if r not in {"step", "substep"}:
@@ -3929,7 +3943,7 @@ def _write_roots_for_launch(
         # compile substeps (generate authors the IR; static is deterministic/no-leaf) keep the
         # directory root.
         if ss == "verify":
-            return [_normalize_rel_posix(f"{ir_ref.rstrip('/')}/ir_meta.json")]
+            return [_normalize_rel_posix(f"{ir_base}/ir_meta.json")]
         return [ir_norm]
     if st == "generate":
         # generate.verify's SOLE write is source_meta.json (verification_status): it inspects the
@@ -3945,17 +3959,17 @@ def _write_roots_for_launch(
             sid = source_id.strip()
             if not _is_safe_path_id(sid):
                 return []
-            return [_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/source/{sid}/source_meta.json")]
+            return [_normalize_rel_posix(f"{pipe_base}/source/{sid}/source_meta.json")]
         # lineage.json is NOT a leaf write_root: it sits at the pipeline root, which must
         # stay non-writable to the sandboxed leaf (atomic temp-sibling+rename would need
         # the whole root writable). It is authored host-side by the conductor
         # (workflow_conductor._write_lineage), matching docs/WORKSPACE_LAYOUT.md. The
         # source-generating substep writes only the source tree.
         return [
-            _with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/source")),
+            _with_trailing_slash(_normalize_rel_posix(f"{pipe_base}/source")),
         ]
     if st == "build":
-        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/binary"))]
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipe_base}/binary"))]
     if st == "validate":
         # Validate.execute writes the whole runs/<run_id>/<node_key_safe>/ evidence tree
         # (command_log, diagnostics, verdict, raw/ snapshots, ...). The judge is a pure
@@ -3977,10 +3991,10 @@ def _write_roots_for_launch(
                 return []
             return [
                 _normalize_rel_posix(
-                    f"{pipeline_ref.rstrip('/')}/runs/{rid}/{node_safe}/semantic_review.json"
+                    f"{pipe_base}/runs/{rid}/{node_safe}/semantic_review.json"
                 )
             ]
-        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/runs"))]
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipe_base}/runs"))]
     # NOTE: `tune` / `promote` are out-of-scope for the core 5-phase workflow
     # (Spec -> Compile -> Generate -> Build -> Validate). They are retained
     # here as optional flows invoked via a separate entrypoint (Tune / Promote
@@ -3988,7 +4002,7 @@ def _write_roots_for_launch(
     # step tokens, so the branches below are reachable only from the optional
     # entrypoints; their tests assert the contract those entrypoints rely on.
     if st == "tune":
-        return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/tune"))]
+        return [_with_trailing_slash(_normalize_rel_posix(f"{pipe_base}/tune"))]
     if st == "promote":
         # Promote writes to two canonical locations outside the pipeline workspace:
         #   - releases/<spec_kind>/<domain>/<family>/<spec_id>/...
