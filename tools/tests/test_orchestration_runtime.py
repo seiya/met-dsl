@@ -7957,7 +7957,12 @@ shell_tool                       stable             true
         bodies' source and assert the derived (step, substep) -> tools mapping IS the table."""
         import inspect
         import re
+        import sys
         import tools.workflow_conductor as wc
+        # build_runtime_server is imported bare (`from build_runtime_server import ...`) by the
+        # conductor bodies, so put mcp_servers/ on the path the same way the conductor tests do.
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server as brs  # type: ignore
         from tools.orchestration_runtime import _MCP_TOOL_GRANTS_BY_SUBSTEP
 
         # (step, substep) -> the Conductor in-process method that runs it.
@@ -7976,12 +7981,32 @@ shell_tool                       stable             true
             "tool_run_quality_checks": "run_quality_checks",
         }
 
+        # Pin `handler_to_tool`'s universe to the ACTUAL gate-enforcing tools rather than a
+        # second hand-maintained list: a build-runtime `tool_*` handler is gated iff its body
+        # calls `_maybe_enforce_orchestration_mcp_gate`. If a NEW gated tool is added to
+        # build_runtime_server (or an existing one stops enforcing), this fails first —
+        # forcing handler_to_tool AND the grant table to be reconciled, so a brand-new gated
+        # call cannot enter production while silently absent from the table.
+        gate_enforcing = {
+            name for name, obj in vars(brs).items()
+            if name.startswith("tool_") and inspect.isfunction(obj)
+            and "_maybe_enforce_orchestration_mcp_gate" in inspect.getsource(obj)
+        }
+        self.assertEqual(
+            set(handler_to_tool), gate_enforcing,
+            "the set of gate-enforcing build-runtime tools changed — reconcile this test's "
+            "`handler_to_tool` and _MCP_TOOL_GRANTS_BY_SUBSTEP with build_runtime_server",
+        )
+
         derived: dict[tuple[str, str], tuple[str, ...]] = {}
         for key, fn in bodies.items():
             src = inspect.getsource(fn)
+            # Match the CALL shape `tool_x(` — not a bare name, which would also match the
+            # in-body `from build_runtime_server import tool_x` line and let a removed call
+            # with a retained import slip through as a false grant.
             tools_called = tuple(sorted(
                 tool for handler, tool in handler_to_tool.items()
-                if re.search(rf"\b{handler}\b", src)
+                if re.search(rf"\b{handler}\s*\(", src)
             ))
             derived[key] = tools_called
 

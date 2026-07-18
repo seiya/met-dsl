@@ -3884,8 +3884,11 @@ def _parse_iso_z_expiry(raw: str) -> datetime | None:
 # a read-only reviewer leaf holds no build-tool grant.
 #
 # A drift guard (test_mcp_grant_table_matches_conductor_call_sites) introspects the four
-# conductor bodies above and fails CI if a body's gated tool set stops matching this table —
-# so a new/renamed gated call cannot silently fail-closed at the runtime authz gate.
+# conductor bodies above (matching the CALL shape, not the import) and fails CI if a body's
+# gated tool set stops matching this table. It also pins its notion of "which tools are gated"
+# to build_runtime_server's actual gate-enforcing handlers (those calling
+# _maybe_enforce_orchestration_mcp_gate), so a newly-added gated tool cannot enter production
+# while silently absent from this table (it would fail-closed at the runtime authz gate).
 #
 # Read-only mapping proxy: the grant table is security-sensitive, so freeze it against
 # accidental in-process mutation (a stray test or import doing `.clear()` / key reassignment
