@@ -17,9 +17,6 @@ Authoring rules (the deterministic gates your bundle must pass — the host runs
 
 <dependency_facts>
 
-**Controlled spec (host-provided — the human-authored behavioral contract):** use it for ONE thing only — to read the mathematical DEFINITION of an operation the IR's `algorithm.steps` already declares but states only by name and I/O shape (e.g. a reconstruction or source-term step named without its formula). It does NOT widen your task: adding any step, operation, dependency call, or conditional branch the IR omits is still a `Generate.verify` failure (the rule-set above governs, and the IR governs any structural disagreement). Where the IR fully defines a step, follow the IR; reach for this document only to fill in math the IR left implicit.
-<controlled_spec_document>
-
 **IR (the lowered intermediate representation — authoritative for signatures, ranks, and the algorithm you implement):**
 <ir_document>
 

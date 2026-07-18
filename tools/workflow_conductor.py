@@ -2433,22 +2433,13 @@ clean:
         """Assemble the closed context a pure `generate.generate` leaf sees, each value a plain
         string the renderer data-fences. All data is host-resolved from disk here (the leaf has
         no filesystem): the harness capability manifest (A6), the node's toolchain/target
-        defaults, the lowered IR, the tests, the host-rendered runner, and — as an INTERIM
-        carve-out (below) — controlled_spec.md. Mirrors the must-read set the agentic
-        `generate.generate` leaf reads.
+        defaults, the lowered IR, the tests, and the host-rendered runner. Mirrors the must-read
+        set the agentic `generate.generate` leaf reads.
 
-        The controlled_spec.md inline is an INTERIM measure (pure-5), not a repeal of phase_02
-        §2-1. §2-1 makes `spec.ir.yaml` the sole carrier of the algorithm a generate leaf
-        implements, but a thin `compile` roll can lower a step's operation to a name + I/O shape
-        with NO mathematical definition (the Audusse hydrostatic reconstruction was declared but
-        undefined in a 564-line IR), and a tool-less pure leaf — which reads no `spec/` — then has
-        no path to that math, while the pure `generate.verify` reviewer IS shown controlled_spec.md
-        (`_build_pure_verify_context`): producer-blind / checker-sighted, structurally unwinnable.
-        The prompt scopes controlled_spec strictly to interpreting the math of operations the IR
-        ALREADY declares — it licenses no step/operation/branch the IR omits (still a
-        `Generate.verify` G4 fail). It is removed (a future contract version past pure-7) once the
-        `compile` side guarantees IR self-sufficiency (the TODO tracking that guarantee is this
-        carve-out's removal trigger) and a verification run passes with the slot gone.
+        Per phase_02 §2-1 the producer does NOT read controlled_spec.md — `spec.ir.yaml` is the
+        sole carrier of the algorithm a generate leaf implements (the pure-5 interim carve-out that
+        inlined controlled_spec.md into the producer context was removed at pure-8; the pure
+        `generate.verify` reviewer still reads it by design, `_build_pure_verify_context`).
 
         The runner is injected VERBATIM (no interface extraction): it is the consumer of the
         checks-module ABI the leaf must author against, and `docs/workflow/CHECKS_MODULE_CONTRACT.md`
@@ -2468,18 +2459,6 @@ clean:
             tests_text = (self.repo_root / refs.spec_path / "tests.md").read_text(encoding="utf-8")
         except OSError:
             tests_text = ""
-        # INTERIM (pure-5, see docstring): the pure verify reviewer reads controlled_spec.md the
-        # same way (`_build_pure_verify_context`); the producer now does too so the two are not
-        # asymmetrically informed. Degrades to "" on a read error exactly like tests above — the
-        # required-keys validation (`PURE_CONTEXT_REQUIRED_KEYS`) then fails the launch closed on
-        # an empty value, so a genuinely missing controlled_spec never ships a blank slot silently.
-        controlled_spec_text = ""
-        try:
-            controlled_spec_text = (
-                self.repo_root / refs.spec_path / "controlled_spec.md"
-            ).read_text(encoding="utf-8")
-        except OSError:
-            controlled_spec_text = ""
         ir = _read_yaml(ir_path) or {}
         impl = (ir.get("impl_defaults") or {}) if isinstance(ir, dict) else {}
         # A missing runner RAISES rather than degrading to "" the way ir/tests do above: the
@@ -2500,7 +2479,6 @@ clean:
                 harness_capability_manifest_document_for(self._pure_harness_node_key(ir)),
                 indent=2, ensure_ascii=False),
             "target_profile": json.dumps(impl, indent=2, ensure_ascii=False),
-            "controlled_spec_document": controlled_spec_text,
             "ir_document": ir_text,
             "tests_document": tests_text,
             "runner_document": runner_text,
