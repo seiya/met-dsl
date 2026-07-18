@@ -14342,6 +14342,22 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
             },
         )
 
+    @staticmethod
+    def _perm_record_and_cap(repo_root: Path, *, orchestration_id: str, parent: str,
+                             child: str, req: dict) -> dict:
+        """record_launch the request and return the persisted capability document. Centralizes
+        the capability-file path convention so the four perm-gate tests share one literal."""
+        record_launch(
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            parent_agent_run_id=parent,
+            child_agent_run_id=child,
+            request_payload=req,
+            response_payload=_spawn_response_payload(f"sess_{child}"),
+        )
+        cap_path = repo_root / f"workspace/orchestrations/{orchestration_id}/capabilities/{child}.json"
+        return json.loads(cap_path.read_text(encoding="utf-8"))
+
     def test_validate_mcp_rejects_build_tool_for_generate_verify_leaf(self) -> None:
         """A generate.verify launch (read-only reviewer leaf) holds NO MCP grant, so the real
         authz gate refuses a build-runtime tool call under its capability token. The perms
@@ -14359,17 +14375,9 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 agent_model="claude-opus-4-8",
                 workflow_mode="dev",
             )
-            record_launch(
-                repo_root=repo_root,
-                orchestration_id="vperm1",
-                parent_agent_run_id="orch_vperm1",
-                child_agent_run_id="gen_verify_child",
-                request_payload=req,
-                response_payload=_spawn_response_payload("sess_gen_verify_child"),
-            )
-            cap = json.loads(
-                (repo_root / "workspace/orchestrations/vperm1/capabilities/gen_verify_child.json")
-                .read_text(encoding="utf-8")
+            cap = self._perm_record_and_cap(
+                repo_root, orchestration_id="vperm1", parent="orch_vperm1",
+                child="gen_verify_child", req=req,
             )
             self.assertEqual(cap["mcp_permissions"], [])
             with self.assertRaises(RuntimeError) as ctx:
@@ -14400,17 +14408,9 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 workflow_mode="dev",
             )
             self.assertTrue(req.get("deterministic"))
-            record_launch(
-                repo_root=repo_root,
-                orchestration_id="vperm2",
-                parent_agent_run_id="orch_vperm2",
-                child_agent_run_id="gen_lint_child",
-                request_payload=req,
-                response_payload=_spawn_response_payload("sess_gen_lint_child"),
-            )
-            cap = json.loads(
-                (repo_root / "workspace/orchestrations/vperm2/capabilities/gen_lint_child.json")
-                .read_text(encoding="utf-8")
+            cap = self._perm_record_and_cap(
+                repo_root, orchestration_id="vperm2", parent="orch_vperm2",
+                child="gen_lint_child", req=req,
             )
             self.assertEqual(cap["mcp_permissions"], ["run_linter"])
             # run_linter is accepted.
@@ -14451,17 +14451,9 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 workflow_mode="dev",
                 exe_name="simulate",
             )
-            record_launch(
-                repo_root=repo_root,
-                orchestration_id="vperm3",
-                parent_agent_run_id="orch_vperm3",
-                child_agent_run_id="build_child",
-                request_payload=req,
-                response_payload=_spawn_response_payload("sess_build_child"),
-            )
-            cap = json.loads(
-                (repo_root / "workspace/orchestrations/vperm3/capabilities/build_child.json")
-                .read_text(encoding="utf-8")
+            cap = self._perm_record_and_cap(
+                repo_root, orchestration_id="vperm3", parent="orch_vperm3",
+                child="build_child", req=req,
             )
             self.assertEqual(cap["mcp_permissions"], ["compile_project"])
             validate_mcp_build_tool_invocation(
@@ -14504,17 +14496,9 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 workflow_mode="dev",
                 case_ids=("case_a",),
             )
-            record_launch(
-                repo_root=repo_root,
-                orchestration_id="vperm4",
-                parent_agent_run_id="orch_vperm4",
-                child_agent_run_id="exec_child",
-                request_payload=req,
-                response_payload=_spawn_response_payload("sess_exec_child"),
-            )
-            cap = json.loads(
-                (repo_root / "workspace/orchestrations/vperm4/capabilities/exec_child.json")
-                .read_text(encoding="utf-8")
+            cap = self._perm_record_and_cap(
+                repo_root, orchestration_id="vperm4", parent="orch_vperm4",
+                child="exec_child", req=req,
             )
             self.assertEqual(cap["mcp_permissions"], ["run_program", "run_quality_checks"])
             # run_quality_checks passes the grant gate cleanly (no spec.ir.yaml planted, so the
