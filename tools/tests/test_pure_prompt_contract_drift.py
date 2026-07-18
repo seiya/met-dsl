@@ -87,10 +87,7 @@ _TEMPLATE_FILES = (
 PINNED: dict[str, str] = {
     "pure-6": "b614072bcaad7ffe61f48d54256305b89982457d2ef6c3b5126e09598e5e7067",
     "pure-7": "14c7db85579eeb5f0dd21af2a7321edfcc9bcd647bcb735f511e0d3f80aa2eda",
-    # pure-8 spans two commits of one unpushed series: commit 1 (per-id checks ABI) and commit 2
-    # (controlled_spec producer carve-out removal). This digest is the final pure-8 state after
-    # both; commit 1's intermediate generate template never shipped on a billed run.
-    "pure-8": "13ca347efd8cd90a0d16254d625f480d4ddb092d8f17118de93943742c515d01",
+    "pure-8": "1b1a9575930504226c6d6acebf7cf3ee4b64247e4146f978ee84bbe505b1e4c2",
 }
 
 

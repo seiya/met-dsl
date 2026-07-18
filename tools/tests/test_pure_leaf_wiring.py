@@ -49,6 +49,7 @@ def _pure_generate_context() -> dict[str, str]:
     return {
         "harness_capabilities": '{"operations": []}',
         "target_profile": "language=fortran build_system=make",
+        "controlled_spec_document": "the model conserves mass; h* = max(0, eta - z_b)",
         "ir_document": "algorithm:\n  state_variables: [h]\n",
         "tests_document": "- test: conserves mass",
         "runner_document": ("program sw_runner\n  use sw_checks, only: &\n    case_run\n"
@@ -258,15 +259,23 @@ class PureRenderTests(unittest.TestCase):
         self.assertIn("use sw_checks, only:", prompt)
         self.assertIn("case_run", prompt)
 
-    def test_pure_launch_prompt_omits_controlled_spec_for_the_producer(self) -> None:
-        # The pure-5 producer carve-out was removed at pure-8 (phase_02 §2-1): the generate prompt
-        # carries NO controlled_spec section and no `<controlled_spec_document>` slot — the producer
-        # is spec-blind again. (The verify reviewer still gets controlled_spec by design — see
-        # test_pure_leaf_verify.py.)
-        prepared = ort.prepare_launch_request_payload(_pure_request("generate"))
+    def test_pure_launch_prompt_carries_controlled_spec_in_a_data_fence(self) -> None:
+        # pure-5 interim carve-out: the producer is now inlined controlled_spec.md so it is not
+        # producer-blind while the verify reviewer is checker-sighted. Pin (a) the heading that
+        # scopes it to interpreting IR-declared math, (b) the body inside the data-only fence,
+        # and (c) that the body sits before the IR document (its role is to gloss IR steps).
+        ctx = _pure_generate_context()
+        ctx["controlled_spec_document"] = "Audusse reconstruction: h_star = max(0, eta - z_b)"
+        prepared = ort.prepare_launch_request_payload(_pure_request("generate", pure_context=ctx))
         prompt = prepared["launch_prompt_full"]
         self.assertNotIn("<controlled_spec_document>", prompt)
-        self.assertNotIn("Controlled spec", prompt)
+        self.assertIn("Controlled spec", prompt)
+        self.assertIn("Audusse reconstruction: h_star = max(0, eta - z_b)", prompt)
+        self.assertLess(prompt.index("h_star = max(0, eta - z_b)"),
+                        prompt.index("state_variables: [h]"))
+        # The controlled_spec body is data-fenced like every other inlined document.
+        body_idx = prompt.index("Audusse reconstruction")
+        self.assertGreater(prompt.rfind(PURE_DOC_FENCE_BEGIN, 0, body_idx), -1)
 
     def test_prompt_states_the_static_prohibitions_the_leaf_cannot_otherwise_know(self) -> None:
         # `_validate_checks_source_files` rejects three things the acceptance gate does NOT
