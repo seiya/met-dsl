@@ -205,6 +205,12 @@ _EXECUTE_EXCERPT_MAX_LINES = 50
 _EXECUTE_EXCERPT_MAX_CHARS = 4000
 _EXECUTE_EXCERPT_TRUNCATION_MARK = "[... excerpt truncated to the last "
 
+# Per-attempt failure excerpt bound in bundle_meta.json / verdict_meta.json. These are OBSERVABILITY
+# fields (why each superseded pure attempt failed), rendered into no repair prompt — the terminal
+# top-level failure_excerpt is the repair carrier — so a short cap keeps the meta small while still
+# naming the failure class.
+_PURE_ATTEMPT_EXCERPT_MAX_CHARS = 400
+
 
 def _execute_failure_excerpt(text: str) -> str:
     """The bounded tail of an `[execute fail]` report, safe to render into a repair prompt."""
@@ -2844,7 +2850,9 @@ clean:
             envelope = parse_result_envelope(proc.stdout)
             model = None if envelope.model is _MISSING else envelope.model
             usage = None if envelope.usage is _MISSING else envelope.usage
-            per_attempt.append({"agent_run_id": child_arid, "model": model, "usage": usage})
+            attempt_record: dict[str, Any] = {
+                "agent_run_id": child_arid, "model": model, "usage": usage}
+            per_attempt.append(attempt_record)
 
             infra_error: tuple[str, str] | None = None
             category: str | None = None
@@ -2918,6 +2926,16 @@ clean:
                                 if findings is not None else None)
                 if prior_document is not None:
                     prior_document = prior_document.encode("utf-8", "backslashreplace").decode("utf-8")
+                # Record why THIS attempt failed on its own per_attempt row (observability only —
+                # ADDITIVE fields; the terminal top-level failure_excerpt stays the repair carrier
+                # `_read_repair_findings` reads). A superseded attempt is otherwise a bare
+                # arid/model/usage row that says nothing about the failure it burned a turn on.
+                attempt_record["failure_category"] = category
+                attempt_record["failure_excerpt"] = (
+                    last_excerpt[:_PURE_ATTEMPT_EXCERPT_MAX_CHARS] if last_excerpt else None)
+                self.emit("pure_bundle_attempt_failed", node_key=refs.node_key,
+                          substep=substep, attempt=attempt + 1, failure_category=category,
+                          detail=(last_excerpt or "")[:200])
 
             reply = (f"status: {status}\nleaf rc={proc.returncode}\n"
                      f"category: {category or 'none'}")
@@ -3169,7 +3187,9 @@ clean:
             envelope = parse_result_envelope(proc.stdout)
             model = None if envelope.model is _MISSING else envelope.model
             usage = None if envelope.usage is _MISSING else envelope.usage
-            per_attempt.append({"agent_run_id": child_arid, "model": model, "usage": usage})
+            attempt_record: dict[str, Any] = {
+                "agent_run_id": child_arid, "model": model, "usage": usage}
+            per_attempt.append(attempt_record)
 
             infra_error: tuple[str, str] | None = None
             category: str | None = None
@@ -3288,6 +3308,15 @@ clean:
                             if findings is not None else None)
             if prior_document is not None:
                 prior_document = prior_document.encode("utf-8", "backslashreplace").decode("utf-8")
+            # Record why THIS reviewer attempt failed on its own per_attempt row (observability only —
+            # ADDITIVE fields; mirrors the producer). A schema-VALID verdict returned above already,
+            # so this branch is only a malformed/transport reply, never a legitimate `fail` verdict.
+            attempt_record["failure_category"] = category
+            attempt_record["failure_excerpt"] = (
+                last_excerpt[:_PURE_ATTEMPT_EXCERPT_MAX_CHARS] if last_excerpt else None)
+            self.emit("pure_verdict_attempt_failed", node_key=refs.node_key,
+                      substep=substep, attempt=attempt + 1, failure_category=category,
+                      detail=(last_excerpt or "")[:200])
             reply = (f"verify verdict: none\nleaf rc={proc.returncode}\n"
                      f"category: {category or 'none'}")
             result_summary = f"pure_verify_fail: {category}"

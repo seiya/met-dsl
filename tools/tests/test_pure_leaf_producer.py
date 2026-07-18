@@ -870,6 +870,22 @@ class PureProducerSubstepTests(unittest.TestCase):
         self.assertEqual(oc.status, "pass")
         self.assertEqual(oc.attempts, 2)
 
+    def test_per_attempt_records_failure_of_a_superseded_attempt_only(self) -> None:
+        # Item 6 observability: the failed (superseded) attempt carries its failure_category and a
+        # bounded failure_excerpt; the passing attempt that supersedes it does not.
+        bad = _valid_bundle()
+        del bad["capability_requirements"]  # schema violation -> repair
+        c, refs, oc = self._run([_envelope(bad), _envelope(_valid_bundle())])
+        self.assertEqual(oc.status, "pass")
+        meta = json.loads((c.repo_root / refs.source_dir() / "bundle_meta.json").read_text())
+        pa = meta["per_attempt"]
+        self.assertEqual(len(pa), 2)
+        self.assertEqual(pa[0]["failure_category"], "bundle_schema_violation")
+        self.assertTrue(pa[0]["failure_excerpt"])
+        self.assertLessEqual(len(pa[0]["failure_excerpt"]), 400)
+        self.assertNotIn("failure_category", pa[1])
+        self.assertNotIn("failure_excerpt", pa[1])
+
     def test_checks_abi_violation_is_repaired_in_loop(self) -> None:
         # The whole point of the layer: what cost the sw2d P-arm its retry budget (a phase reopen
         # per guess) is now ONE bounded in-conversation repair.
