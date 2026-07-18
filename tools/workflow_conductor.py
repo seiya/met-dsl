@@ -319,6 +319,7 @@ GENERATE_BUNDLE_FAILURE_CATEGORIES: tuple[str, ...] = (
     "bundle_state_binding_mismatch",
     "bundle_assembly_collision",
     "bundle_checks_abi_violation",
+    "bundle_checks_ids_violation",
     "bundle_shape_unsupported",
 )
 GENERATE_BUNDLE_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
@@ -2525,6 +2526,7 @@ clean:
         capabilities, the build-graph derivation) and delegates."""
         from tools.codegen_bundle import (
             pure_bundle_contract_violation, harness_provided_capabilities)
+        from tools.validate_pipeline_semantics import _diagnostics_contract_check_ids
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         # Capability negotiation against the SINGLE infrastructure (harness) dependency, resolved
         # by the same `_pure_harness_node_key` that narrows the manifest the leaf is SHOWN — so a
@@ -2533,11 +2535,17 @@ clean:
         harness_nk = self._pure_harness_node_key(ir)
         provided = harness_provided_capabilities(harness_nk) if harness_nk else None
         algorithm = (ir.get("algorithm") or {}) if isinstance(ir, dict) else {}
+        # The IR's diagnostics-contract check ids (defect-E layer). `_diagnostics_contract_check_ids`
+        # reads `io_contract.diagnostics_contract.checks[].id` from the raw IR dict, the SAME source
+        # `_validate_diagnostics_contract_output` folds against at post_execute — so the acceptance
+        # gate and the runtime backstop key off one id list.
+        check_ids = _diagnostics_contract_check_ids(ir)
         return pure_bundle_contract_violation(
             doc, node_key=refs.node_key, spec_id=refs.spec_id,
             ir_state_variables=(algorithm.get("state_variables") or []),
             harness_provided=provided, harness_label=harness_nk,
-            build_graph=lambda d: self._build_pure_bundle_graph(refs, d))
+            build_graph=lambda d: self._build_pure_bundle_graph(refs, d),
+            diagnostics_check_ids=check_ids)
 
     def _build_pure_bundle_graph(self, refs: NodeRefs, doc: Any) -> dict[str, Any]:
         """The deterministic build graph of a bundle (`derive_build_graph`), with the closure,

@@ -26199,7 +26199,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # the unset-`intent(out)` case, which `-Werror=unused-dummy-argument` promotes too,
         # and the delete-don't-bind rule for a dummy no interface fixes (binding one in the
         # leaf's own private helper would freeze dead surface).
-        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 13700,
+        # Bumped 13700->14000: the pure-leaf note block records that §2/§3 is distilled into
+        # `pure_generate_generate.txt` and check-id presence is the `m3c_checks_ids_violation`
+        # acceptance gate (Z2 defect E), plus the keep-in-step / TODO removal-trigger pointer.
+        "docs/workflow/CHECKS_MODULE_CONTRACT.md": 14000,
         # Still force-read by compile.generate/verify (its IR schema is the contract
         # the compile SKILL defers to).
         # Bumped 17000->18200: documented the deterministic Compile.static substep (G2,

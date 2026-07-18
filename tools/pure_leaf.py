@@ -35,7 +35,7 @@ from typing import Any, NamedTuple
 # contract change is an observable event (A7). Bumped when the pure prompt templates, the
 # fixed `PURE_SYSTEM_PROMPT`, or the transport's request shape change in a way that affects
 # producer behavior.
-PURE_PROMPT_CONTRACT_VERSION = "pure-5"
+PURE_PROMPT_CONTRACT_VERSION = "pure-6"
 
 # The pure leaf's system prompt is REPLACED with this fixed string via `--system-prompt`. The
 # default Claude Code system prompt injects per-machine DYNAMIC sections (cwd, environment,

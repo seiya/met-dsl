@@ -11,8 +11,11 @@
 > not read by `Validate.judge`.
 >
 > Binds the **agentic** leaf. A `pure` leaf (`Z2`) cannot read this: it is told the ten names and
-> shown the rendered runner, gated by `codegen_bundle.m3c_checks_abi_violation`. All ten bind
-> every node. `tools/runner_renderer.py` owns the ABI — keep this in step with it.
+> shown the rendered runner, gated by `m3c_checks_abi_violation`; the §2/§3 behavioral contract is
+> distilled into `pure_generate_generate.txt` and check-id presence is the
+> `m3c_checks_ids_violation` gate. All ten bind every node. `tools/runner_renderer.py` owns the ABI
+> — keep it, this doc, the distilled paragraph, and that gate in step (runner-driven-ABI TODO's
+> removal trigger).
 >
 > **§5 (Fortran legality and gate guards) is the one section with a wider
 > scope**: it binds **every** `Generate` leaf that authors Fortran — including a

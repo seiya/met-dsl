@@ -1533,6 +1533,81 @@ def m3c_checks_abi_violation(doc: Mapping[str, Any], spec_id: str) -> str | None
     return None
 
 
+def m3c_checks_ids_violation(
+    doc: Mapping[str, Any], spec_id: str, check_ids: Iterable[str]
+) -> str | None:
+    """Every IR diagnostics-contract check id appears as a string LITERAL in the bundle's
+    `<spec_id>_checks` module, or None.
+
+    A NECESSARY-condition acceptance layer that pre-empts the phase-LATE `post_execute` failure
+    `_validate_diagnostics_contract_output` (Z2 defect E: a pure `checks_compute` emitted only a
+    subset of `io_contract.diagnostics_contract.checks[].id`, so `diagnostics.json` dropped three
+    ids and the run failed 53 minutes in, at Validate.execute). The runner call site is
+    `checks_compute(case_id, ncheck, chk_ids, chk_status)` — it passes NO ids, so the module is the
+    sole author of `chk_ids`/`status`; an id whose literal text never appears in the module can
+    never be emitted for any case. Flagging the literally-absent ids by name turns that late,
+    executor-visible failure into a bounded in-conversation repair (mirroring how the ABI layer
+    turns a `Generate.static` reopen into one).
+
+    Deliberately NECESSARY, not sufficient: it proves only that each id is REACHABLE as a string
+    the module can emit, never that `checks_compute` emits it for the right case, nor that the
+    case's slice carries it (a `per_case`/`case:` predicate reads `checks.<id>.status` inside a
+    target case — `verdict_evaluator`). `post_execute` stays the sufficient backstop; this layer
+    just moves the whole-id-absent class earlier and cheaper. The value extraction is delegated to
+    `validate_pipeline_semantics.fortran_string_literal_values` (the SAME `_fortran_statements`
+    stream the ABI parser uses, so an id in a comment does not satisfy it, and the two checks-module
+    gates cannot disagree about what the source contains). That extractor FOLDS `//` concatenation
+    of literals AND character `parameter` constants (`'analytic_' // 'agreement'`, or `prefix //
+    'agreement'` with `character(*), parameter :: prefix = 'analytic_'`, both count as the id
+    `analytic_agreement`), so a legal id assembled from constants is NOT false-rejected — only an id
+    whose text cannot be produced from the module's compile-time strings at all is flagged (an id
+    built from a RUNTIME term still slips to the `post_execute` backstop; that residual is where
+    this static necessary-only design bottoms out, and the runner-driven-checks-ABI TODO is its real
+    fix).
+
+    Guards mirror `m3c_checks_abi_violation`: it fires only when the bundle carries the
+    `<spec_id>_checks.f90` file (a non-M3c/flux bundle with no checks module passes through) AND the
+    IR declares at least one check id (a node with no diagnostics contract passes through). Unlike
+    the ABI NAME layer — which scopes to the one file `use <spec_id>_checks` resolves, because a
+    published name must come from THAT module — this VALUE layer scans the UNION of ALL `checks`-role
+    files. A legal `use`-reexport shell (`<spec_id>_checks.f90` re-exporting `checks_compute` from a
+    sibling `<spec_id>_checks_impl.f90`) puts the id literals in the impl file, and the runner's
+    `use <spec_id>_checks` still resolves `checks_compute` to that body; scanning only the shell
+    would false-reject a working bundle (the unexitable-repair-loop class this design guards against)
+    the ABI layer accepts. Widening to the union only relaxes a NECESSARY condition — `post_execute`
+    stays the sufficient backstop for an id that is present as text but not actually emitted."""
+    ids = [s for c in check_ids if (s := str(c).strip())]
+    if not ids:
+        return None
+    from tools.validate_pipeline_semantics import fortran_string_literal_values
+    want_path = f"{spec_id}_checks.f90"
+    checks_files = [e for e in (doc.get("files") or [])
+                    if isinstance(e, dict) and e.get("role") == "checks"]
+    if not any(str(e.get("logical_path", "")) == want_path for e in checks_files):
+        return None  # non-M3c / no checks module named for the runner's `use`: not this layer's
+    combined = "\n".join(str(e.get("content") or "") for e in checks_files)
+    # Normalize the value with rstrip, NOT strip: the rendered runner keys diagnostics.json by
+    # `trim(chk_ids(ic))` (runner_renderer.py), and Fortran `trim` removes only TRAILING blanks.
+    # A leading-padded value (`chk_ids(1) = ' cfl'`) therefore reaches diagnostics.json as the key
+    # `' cfl'` and fails post_execute — so stripping the leading space here would fail OPEN,
+    # accepting an id the runtime emits under a different key. The IR-id side stays `.strip()`
+    # (matching `_diagnostics_contract_check_ids`, which the post_execute backstop also uses; a
+    # schema-valid check id carries no surrounding space anyway).
+    values = {v.rstrip() for v in fortran_string_literal_values(combined)}
+    missing = [cid for cid in ids if cid not in values]
+    if missing:
+        return (f"module {spec_id}_checks names no string value matching diagnostics-contract "
+                f"check id(s): {', '.join(missing)}. `checks_compute(case_id, ncheck, chk_ids, "
+                f"chk_status)` authors chk_ids from io_contract.diagnostics_contract.checks[].id "
+                f"verbatim (the runner passes no ids); an id whose exact text the module never "
+                f"produces — as a bare literal or a `//`-concatenation of literals / character "
+                f"parameters — cannot reach diagnostics.json and fails Validate.execute's "
+                f"diagnostics contract. Emit EVERY "
+                f"declared id in every case, with status 'na  ' for a check this case does not "
+                f"evaluate; take the ids from the IR only, not the tests/spec prose.")
+    return None
+
+
 def pure_bundle_contract_violation(
     doc: Mapping[str, Any],
     *,
@@ -1542,6 +1617,7 @@ def pure_bundle_contract_violation(
     harness_provided: Iterable[str] | None,
     harness_label: str | None = None,
     build_graph: Callable[[Mapping[str, Any]], Any],
+    diagnostics_check_ids: Iterable[str],
 ) -> tuple[str, str] | None:
     """The full Z2 pure-CodegenBundle host acceptance contract as `(category, findings)`, or None.
 
@@ -1555,13 +1631,16 @@ def pure_bundle_contract_violation(
     (`validate_bundle`) -> single-node unit shape -> harness capability negotiation (the manifest
     MUST exist — an undeclared harness satisfies nothing) -> state_variable ∈ IR
     algorithm.state_variables -> the M3c literal name the host-rendered runner `use`s -> the
-    fixed checks-module ABI -> `build_graph(doc)` (the caller's assembly
-    derivation, which raises RuntimeError on a cross-origin object/module collision or a
-    straddle).
+    fixed checks-module ABI -> the diagnostics-contract check-id literal presence ->
+    `build_graph(doc)` (the caller's assembly derivation, which raises RuntimeError on a
+    cross-origin object/module collision or a straddle).
 
     `harness_provided` is the caller-resolved harness capability set (`None` = undeclared harness
     = nothing provided, fail-closed); `harness_label` only names it in the findings text.
-    `build_graph(doc)` performs the caller's `derive_build_graph` assembly."""
+    `build_graph(doc)` performs the caller's `derive_build_graph` assembly. `diagnostics_check_ids`
+    is the caller-resolved IR `io_contract.diagnostics_contract.checks[].id` list — keyword-only
+    with NO default so a caller cannot silently omit it and drop the defect-E layer (both call
+    sites resolve it from the same IR)."""
     violations = validate_bundle(doc)
     if violations:
         return ("bundle_schema_violation",
@@ -1603,6 +1682,9 @@ def pure_bundle_contract_violation(
     abi_violation = m3c_checks_abi_violation(doc, spec_id)
     if abi_violation is not None:
         return ("bundle_checks_abi_violation", abi_violation)
+    ids_violation = m3c_checks_ids_violation(doc, spec_id, diagnostics_check_ids)
+    if ids_violation is not None:
+        return ("bundle_checks_ids_violation", ids_violation)
     try:
         build_graph(doc)
     except RuntimeError as exc:

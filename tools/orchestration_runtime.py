@@ -10111,6 +10111,7 @@ def _pure_output_contract_text(request_payload: dict[str, Any]) -> str:
 PURE_REPAIR_STATIC_PARAGRAPH_PREFIXES: tuple[str, ...] = (
     "Authoring rules",
     "**Host-rendered runner",
+    "**Checks-module behavioral contract",
 )
 
 # A line that is nothing but a `<placeholder>` token — the launch template's document slots.
