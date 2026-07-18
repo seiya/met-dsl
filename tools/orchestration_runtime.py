@@ -3868,23 +3868,33 @@ def _parse_iso_z_expiry(raw: str) -> datetime | None:
         return None
 
 
-def _mcp_permissions_for_launch(role: str, step: str) -> list[str]:
+# Least-privilege MCP grants, keyed by the exact (step, substep) whose conductor
+# in-process body actually invokes a gated build-runtime tool. Only four bodies do:
+#   build            -> tool_compile_project      (_build_inproc)
+#   generate.lint    -> tool_run_linter           (_lint_inproc)
+#   generate.syntax  -> tool_run_syntax_check      (_syntax_inproc)
+#   validate.execute -> tool_run_program + tool_run_quality_checks (_execute_inproc)
+# `build` is the only substep-less phase (role "step", no substep key), so its key is
+# ("build", ""). Every other (step, substep) — all LLM leaves (compile/generate.generate,
+# compile/generate.verify, validate.judge, which are forbidden from calling any MCP tool by
+# their SKILLs) and all other deterministic in-process validators (generate.static,
+# compile.static, validate.pre_judge / post_judge) which never import a build-runtime handler —
+# falls through to the fail-closed `[]` default. This is strictly per-substep least-privilege:
+# a read-only reviewer leaf holds no build-tool grant.
+_MCP_TOOL_GRANTS_BY_SUBSTEP: dict[tuple[str, str], tuple[str, ...]] = {
+    ("build", ""): ("compile_project",),
+    ("generate", "lint"): ("run_linter",),
+    ("generate", "syntax"): ("run_syntax_check",),
+    ("validate", "execute"): ("run_program", "run_quality_checks"),
+}
+
+
+def _mcp_permissions_for_launch(role: str, step: str, *, substep: str = "") -> list[str]:
     r = role.strip().lower()
-    st = step.strip().lower()
-    if r == "orchestration":
-        return []
     if r not in {"step", "substep"}:
         return []
-    if st == "generate":
-        # run_linter for the deterministic generate.lint substep, run_syntax_check for the
-        # deterministic generate.syntax substep (both conductor in-process; no LLM leaf
-        # calls either — the capability is per-step, so both substeps share this grant).
-        return ["run_linter", "run_syntax_check"]
-    if st == "build":
-        return ["compile_project"]
-    if st == "validate":
-        return ["run_program", "run_quality_checks"]
-    return []
+    return list(_MCP_TOOL_GRANTS_BY_SUBSTEP.get(
+        (step.strip().lower(), substep.strip().lower()), ()))
 
 
 # A per-substep write_root file pin interpolates `run_id` / `source_id` directly into a
@@ -4108,7 +4118,7 @@ def build_capability_document(
             run_id=run_id_val,
             source_id=source_id_val,
         ),
-        "mcp_permissions": [] if pure else _mcp_permissions_for_launch(role, step),
+        "mcp_permissions": [] if pure else _mcp_permissions_for_launch(role, step, substep=substep_val or ""),
         "expires_at": _default_capability_expires_at_iso(),
     }
     if pure:

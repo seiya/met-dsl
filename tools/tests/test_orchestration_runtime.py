@@ -7879,6 +7879,75 @@ shell_tool                       stable             true
             [f"{_FIX_PIPE_REF}/source/src_20260415_001/source_meta.json"],
         )
 
+    def test_build_capability_document_mcp_permissions_per_substep(self) -> None:
+        """Least-privilege: `mcp_permissions` is granted per (step, substep) — ONLY the
+        four conductor in-process bodies that actually call a gated build-runtime tool get a
+        grant; every LLM leaf and every other deterministic in-process validator falls
+        through to the fail-closed `[]`. Asserted through build_capability_document (the
+        production path) so the wiring — not just the table lookup — is pinned."""
+        from tools.orchestration_runtime import build_capability_document
+
+        node = "problem/shallow_water2d@0.3.0"
+
+        def _cap(*, role: str, step: str, substep: str | None, extra: dict | None = None) -> list:
+            payload: dict[str, object] = {
+                "agent_role": role,
+                "step": step,
+                "node_key": node,
+                "ir_ref": _FIX_IR_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+            }
+            if substep is not None:
+                payload["substep"] = substep
+            if extra:
+                payload.update(extra)
+            cap = build_capability_document(
+                agent_run_id="substep_perm_001",
+                orchestration_id="orch_001",
+                request_payload=payload,
+            )
+            return cap["mcp_permissions"]
+
+        # The four gated bodies get exactly their tool(s).
+        self.assertEqual(_cap(role="step", step="build", substep=None), ["compile_project"])
+        self.assertEqual(_cap(role="substep", step="generate", substep="lint"), ["run_linter"])
+        self.assertEqual(_cap(role="substep", step="generate", substep="syntax"), ["run_syntax_check"])
+        self.assertEqual(
+            _cap(role="substep", step="validate", substep="execute"),
+            ["run_program", "run_quality_checks"],
+        )
+
+        # Every LLM leaf and every other deterministic validator: `[]` (fail-closed).
+        self.assertEqual(_cap(role="substep", step="generate", substep="generate"), [])
+        self.assertEqual(_cap(role="substep", step="generate", substep="static"), [])
+        self.assertEqual(
+            _cap(role="substep", step="generate", substep="verify",
+                 extra={"source_id": "src_20260415_001"}),
+            [],
+        )
+        self.assertEqual(_cap(role="substep", step="validate", substep="pre_judge"), [])
+        self.assertEqual(_cap(role="substep", step="validate", substep="post_judge"), [])
+        self.assertEqual(
+            _cap(role="substep", step="validate", substep="judge",
+                 extra={"run_id": "run_20260415_001"}),
+            [],
+        )
+        self.assertEqual(_cap(role="substep", step="compile", substep="generate"), [])
+        self.assertEqual(_cap(role="substep", step="compile", substep="static"), [])
+        self.assertEqual(_cap(role="substep", step="compile", substep="verify"), [])
+        # Substep-less generate payload (agent_role explicitly "substep"): the ("generate", "")
+        # key is not in the table, so fail-closed `[]` even though write_roots resolve.
+        self.assertEqual(_cap(role="substep", step="generate", substep=None), [])
+
+    def test_mcp_permissions_for_launch_unknown_pairs_are_fail_closed(self) -> None:
+        """Direct-call fail-closed coverage: an unknown (step, substep) and a non-leaf role
+        both yield `[]`."""
+        from tools.orchestration_runtime import _mcp_permissions_for_launch
+
+        self.assertEqual(_mcp_permissions_for_launch("substep", "generate", substep="bogus"), [])
+        self.assertEqual(_mcp_permissions_for_launch("orchestration", "build"), [])
+        self.assertEqual(_mcp_permissions_for_launch("substep", "build", substep="lint"), [])
+
     def test_allowed_output_paths_for_launch_promote_accepts_release_artifact_and_catalog(self) -> None:
         """Regression: promote step must pass phase contract validation for
         canonical write paths (release tree + spec_catalog.yaml). Without this
@@ -14136,6 +14205,126 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 capability_token=str(cap["capability_token"]),
                 tool_name="compile_project",
             )
+
+    @staticmethod
+    def _perm_test_refs():
+        import tools.workflow_conductor as wc
+        # ir_ref / pipeline_ref derive to _FIX_IR_REF / _FIX_PIPE_REF.
+        return wc.NodeRefs(
+            node_key="problem/shallow_water2d@0.3.0",
+            spec_path="spec/problem/shallow_water/shallow_water2d",
+            ir_id="shallow-water2d_20260415_001",
+            pipeline_id="shallow-water2d_20260415_001",
+            source_id="src_20260415_001",
+        )
+
+    @staticmethod
+    def _perm_test_preflight(repo_root: Path, orchestration_id: str) -> None:
+        init_orchestration(repo_root=repo_root, orchestration_id=orchestration_id)
+        _mark_dependencies_ready(repo_root, orchestration_id)
+        write_preflight(
+            repo_root=repo_root,
+            orchestration_id=orchestration_id,
+            payload={
+                "status": "pass",
+                "sandbox_runtime": "bwrap",
+                "sandbox_enforced": True,
+                "can_launch_step_agents": True,
+                "can_launch_substep_agents": True,
+                "feature_states": {"multi_agent": True, "hooks": True},
+                "checks": [{"name": "multi_agent_enabled", "pass": True}, {"name": "hooks_enabled", "pass": True}, {"name": "codex_home_writable", "pass": True}, {"name": "sandbox_bwrap_available", "pass": True}, {"name": "sandbox_bwrap_userns", "pass": True}],
+            },
+        )
+
+    def test_validate_mcp_rejects_build_tool_for_generate_verify_leaf(self) -> None:
+        """A generate.verify launch (read-only reviewer leaf) holds NO MCP grant, so the real
+        authz gate refuses a build-runtime tool call under its capability token. The perms
+        check fires before any node-state check, so no extra phase_state seed is needed."""
+        import tools.workflow_conductor as wc
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._perm_test_preflight(repo_root, "vperm1")
+            req = wc.build_launch_request(
+                self._perm_test_refs(),
+                step="generate", substep="verify",
+                orchestration_id="vperm1",
+                orchestration_agent_run_id="orch_vperm1",
+                child_agent_run_id="gen_verify_child",
+                agent_model="claude-opus-4-8",
+                workflow_mode="dev",
+            )
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="vperm1",
+                parent_agent_run_id="orch_vperm1",
+                child_agent_run_id="gen_verify_child",
+                request_payload=req,
+                response_payload=_spawn_response_payload("sess_gen_verify_child"),
+            )
+            cap = json.loads(
+                (repo_root / "workspace/orchestrations/vperm1/capabilities/gen_verify_child.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(cap["mcp_permissions"], [])
+            with self.assertRaises(RuntimeError) as ctx:
+                validate_mcp_build_tool_invocation(
+                    repo_root,
+                    orchestration_id="vperm1",
+                    agent_run_id="gen_verify_child",
+                    capability_token=str(cap["capability_token"]),
+                    tool_name="run_linter",
+                )
+            self.assertIn("not permitted by capability", str(ctx.exception))
+
+    def test_validate_mcp_generate_lint_grant_is_least_privilege(self) -> None:
+        """The deterministic generate.lint body gets exactly run_linter: the real authz gate
+        accepts run_linter under its capability token but refuses run_syntax_check on the same
+        child (cross-substep least-privilege — the sibling grant is not shared)."""
+        import tools.workflow_conductor as wc
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._perm_test_preflight(repo_root, "vperm2")
+            req = wc.build_launch_request(
+                self._perm_test_refs(),
+                step="generate", substep="lint",
+                orchestration_id="vperm2",
+                orchestration_agent_run_id="orch_vperm2",
+                child_agent_run_id="gen_lint_child",
+                agent_model="claude-opus-4-8",
+                workflow_mode="dev",
+            )
+            self.assertTrue(req.get("deterministic"))
+            record_launch(
+                repo_root=repo_root,
+                orchestration_id="vperm2",
+                parent_agent_run_id="orch_vperm2",
+                child_agent_run_id="gen_lint_child",
+                request_payload=req,
+                response_payload=_spawn_response_payload("sess_gen_lint_child"),
+            )
+            cap = json.loads(
+                (repo_root / "workspace/orchestrations/vperm2/capabilities/gen_lint_child.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(cap["mcp_permissions"], ["run_linter"])
+            # run_linter is accepted.
+            validate_mcp_build_tool_invocation(
+                repo_root,
+                orchestration_id="vperm2",
+                agent_run_id="gen_lint_child",
+                capability_token=str(cap["capability_token"]),
+                tool_name="run_linter",
+            )
+            # The sibling generate.syntax tool is refused on this lint child.
+            with self.assertRaises(RuntimeError) as ctx:
+                validate_mcp_build_tool_invocation(
+                    repo_root,
+                    orchestration_id="vperm2",
+                    agent_run_id="gen_lint_child",
+                    capability_token=str(cap["capability_token"]),
+                    tool_name="run_syntax_check",
+                )
+            self.assertIn("not permitted by capability", str(ctx.exception))
 
     def test_tool_compile_project_enforces_gate_when_orchestration_id_set(self) -> None:
         """L-FOURTH-1: exercise the REAL `validate_mcp_build_tool_invocation`
