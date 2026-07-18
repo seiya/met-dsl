@@ -2441,9 +2441,9 @@ clean:
         (`_build_pure_verify_context`): producer-blind / checker-sighted, structurally unwinnable.
         The prompt scopes controlled_spec strictly to interpreting the math of operations the IR
         ALREADY declares — it licenses no step/operation/branch the IR omits (still a
-        `Generate.verify` G4 fail). It is removed (pure-6) once the `compile` side guarantees IR
-        self-sufficiency (the TODO tracking that guarantee is this carve-out's removal trigger)
-        and a verification run passes with the slot gone.
+        `Generate.verify` G4 fail). It is removed (a future contract version past pure-7) once the
+        `compile` side guarantees IR self-sufficiency (the TODO tracking that guarantee is this
+        carve-out's removal trigger) and a verification run passes with the slot gone.
 
         The runner is injected VERBATIM (no interface extraction): it is the consumer of the
         checks-module ABI the leaf must author against, and `docs/workflow/CHECKS_MODULE_CONTRACT.md`

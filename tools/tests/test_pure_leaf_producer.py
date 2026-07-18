@@ -1362,6 +1362,20 @@ class PureColdRepairPromptTests(unittest.TestCase):
         self.assertEqual(ort._pure_authoring_rules_text(req), "")
         self.assertNotIn("<authoring_rules>", ort._render_pure_repair_prompt(req))
 
+    def test_style_lint_distills_c072_character_dummy_widths(self) -> None:
+        # Fail #1 (orch_9a5fe93e): the pure leaf authored `character(len=*), intent(out) ::
+        # chk_ids(:)` and burned a retry on fortitude C072. The doc-blind producer learns the rule
+        # only if the launch template states it, and the widths must MATCH the one authority the
+        # runner renders against (runner_renderer), not a hand-copied number that could drift.
+        from tools.runner_renderer import CHECK_ID_WIDTH, CHECK_STATUS_WIDTH
+        template = ort._load_launch_prompt_templates()["pure generate.generate"]
+        start = template.index("(1) Style lint")
+        end = template.index("\n(2)", start)
+        style = template[start:end]
+        self.assertIn("C072", style)
+        self.assertIn(f"character(len={CHECK_ID_WIDTH})", style)
+        self.assertIn(f"character(len={CHECK_STATUS_WIDTH})", style)
+
 
 # ======================================================================================
 # post_generate bundle re-validation
