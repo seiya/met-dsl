@@ -7833,8 +7833,13 @@ end program shallow_water2d_runner
         real wiring (`_plan_dependency_node_key` -> `_validate_algorithm_contract_file`)."""
         _seed_shape_expr_schema_into(repo_root)
         self._plant_tests_md(repo_root)
+        # A checks.<id> condition (beyond bare verdict.*) keeps this pass set non-degenerate so the
+        # degenerate-predicate gate does not fire — this fixture exercises the state-contract gate,
+        # not the predicate DSL.
         preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
-                  "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}]
+                  "pass_when": {"all": [
+                      {"ref": "verdict.overall", "op": "eq", "value": "pass"},
+                      {"ref": "checks.g.status", "op": "eq", "value": "pass"}]}}]
         _create_minimal_execution_tree(
             repo_root,
             dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
@@ -8139,6 +8144,37 @@ end program shallow_water2d_runner
                                              "value": 0.2, "per_case": True}]}}]
             v = self._compile_with_io_contract(Path(tmp), self._io_contract_with_predicates(preds))
             self.assertTrue(any("diagnostics_contract.metrics" in x for x in v), v)
+
+    def test_compile_predicate_gate_rejects_degenerate_verdict_only_pass_set(self) -> None:
+        # TODO Item 2 (orch_...154247Z_d82d283a class): a structurally-valid pass set that asserts
+        # only verdict.* collapses the per-test judgment to the runner's verdict.overall. It must be
+        # rejected THROUGH the full compile stage (routes to compile.generate as a
+        # compile_static_violation), not only by the unit-level gate.
+        with tempfile.TemporaryDirectory() as tmp:
+            preds = [{"test_id": "t1", "expected_outcome": "pass", "target_cases": ["c1"],
+                      "pass_when": {"all": [{"ref": "verdict.overall", "op": "eq", "value": "pass"}]}}]
+            v = self._compile_with_io_contract(Path(tmp), self._io_contract_with_predicates(preds))
+            self.assertTrue(any("degenerate pass-test set" in x for x in v), v)
+
+    def test_real_full_fidelity_predicate_set_is_not_degenerate(self) -> None:
+        # Calibration against the real full-fidelity IR (shallow-water2d_20260718_003): 6 pass blocks
+        # (per-case threshold maps, `case:`-scoped conditions, metric addresses) + 1 verdict-only
+        # xfail. The degenerate gate must NOT fire — the pass set carries real metric/checks
+        # conditions and the xfail is exempt. Driven through `_validate_test_predicates` on the exact
+        # on-disk IR so a false positive here is caught against production shape.
+        real_ir = (Path(__file__).resolve().parents[2]
+                   / "workspace/ir/problem__shallow_water2d__0.4.0"
+                   / "shallow-water2d_20260718_003/spec.ir.yaml")
+        if not real_ir.is_file():
+            self.skipTest("real IR artifact not present in this checkout")
+        with tempfile.TemporaryDirectory() as tmp:
+            ir_dir = Path(tmp) / "ir"
+            ir_dir.mkdir()
+            (ir_dir / "spec.ir.yaml").write_text(real_ir.read_text(encoding="utf-8"),
+                                                 encoding="utf-8")
+            violations: list[str] = []
+            vps._validate_test_predicates(Path(tmp), ir_dir, violations)
+            self.assertFalse(any("degenerate" in v for v in violations), violations)
 
     def test_validate_compile_stage_rejects_non_plans_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -134,6 +134,10 @@ io_contract:
             per_case: false                 # optional: resolve `ref` inside each target case's diagnostics slice
             case: "<case_id>"               # optional: resolve `ref` inside ONE target case's slice (excludes per_case)
             na_allowed: false               # optional: a null/absent lhs counts as satisfied (a "not applied" metric)
+  # NOT DEGENERATE (--stage compile, degenerate_predicate_violations): a pass set whose EVERY
+  #   expected_outcome=pass predicate asserts only verdict.* is rejected (it collapses the per-test
+  #   judgment back to the runner's verdict.overall). Each pass test carries its concrete conditions
+  #   (checks.<id> or a pinned metrics address). An xfail predicate is exempt.
   # test_predicates ref vocabulary (all resolvable at --stage compile):
   #   verdict.<field>   -> a diagnostics_contract.verdict.fields entry (overall/failed_checks)
   #   checks.<id>...    -> an id in diagnostics_contract.checks (the runner emits checks.<id>.pass|status)

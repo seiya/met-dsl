@@ -26255,7 +26255,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # update_semantics shadowing order). phase_01 is the canonical IR-schema doc and is
         # force-read by every compile leaf, so a gate that can fail Compile cannot live only
         # in the SKILLs.
-        "docs/workflow/phases/phase_01_compile.md": 34800,
+        # Bumped 34800->36100: V3 gains the deterministic anti-degenerate test_predicates gate (a
+        # pass set asserting only verdict.* collapses the per-test judgment to verdict.overall), and
+        # V2 gains the IR self-sufficiency obligation (a non-dependency operation_ref must lower its
+        # defining math — the removal trigger for the pure leaf's controlled_spec carve-out). Both
+        # are Compile-failing rules, so they must live in the force-read canonical schema doc.
+        "docs/workflow/phases/phase_01_compile.md": 36100,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -26297,7 +26302,12 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # (if it holds any of the 4 contract keys) -> the direct children. Either of the first
         # two SHADOWS correct direct children, which are then never read and fail as if absent
         # — the same doc<->validator drift class that produced E2E #4.
-        "skills/workflow-compile-generate/SKILL.md": 19800,
+        # Bumped 19800->21500: the R2 anti-degenerate clause (a pass set asserting only verdict.* is
+        # rejected at Compile.static) and the IR self-sufficiency rule (a non-dependency operation_ref
+        # must lower its defining math + forbidden forms — the pure-leaf controlled_spec carve-out
+        # removal trigger). This leaf authors the predicates and the algorithm section and does not
+        # read the validator, so both Compile-failing rules must be here.
+        "skills/workflow-compile-generate/SKILL.md": 21500,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity

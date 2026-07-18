@@ -541,6 +541,72 @@ def validate_predicate_schema(
     return v
 
 
+def degenerate_predicate_violations(predicates: Any) -> list[str]:
+    """Necessary-condition gate against a degenerate pass-test set (TODO Item 2). If EVERY
+    ``expected_outcome == "pass"`` predicate's ``pass_when.all`` conditions reference only
+    ``verdict.<field>`` — with NO ``checks.<id>`` condition and NO per-case metric-address condition
+    anywhere in the pass set — then the per-test pass judgment reduces to the runner's own
+    ``verdict.overall``, reintroducing the judge nondeterminism the R2 predicate DSL exists to
+    remove. Returns a single violation string in that case, else an empty list.
+
+    ``xfail`` predicates are EXEMPT (a guard-rejection test such as ``l0_cfl_guard_xfail``
+    legitimately asserts only ``verdict.*``), and a SINGLE ``checks``/metric condition anywhere in
+    the pass set clears the gate. Deliberately kept SEPARATE from ``validate_predicate_schema``
+    (which validates structure) so a malformed set fails there first; this inspects only well-formed
+    pass predicates and never raises on a malformed one (it skips it). The ref-head classification
+    mirrors ``_check_ref``: head ``verdict`` is a verdict field, ``checks`` a check status, anything
+    else a per-case metric address.
+
+    Deliberately SET-LEVEL, not per-predicate. It flags ONLY the fully-degenerate set (no pass test
+    anywhere pins a concrete condition), which is unambiguously wrong. It does NOT flag a single
+    verdict-only pass predicate sitting alongside concrete ones, because that is NOT unambiguously
+    degenerate: an individual pass test can legitimately assert an aggregate criterion — the
+    certified ``infrastructure/harness_fortran_cpu`` IR carries ``l0_multi_case_evidence_pass`` as a
+    verdict-only pass test beside five ``checks.*`` tests, and a per-predicate rule would false-reject
+    it. Whether a specific pass test that COULD carry a threshold instead dropped it to ``verdict.*``
+    is a per-test FIDELITY question — it needs ``tests.md`` (which this gate cannot read) to decide,
+    so it belongs to ``Compile.verify`` (the R2 fidelity checklist item: each predicate is a truthful
+    translation of its ``tests.md`` §6/§7 prose), not to this deterministic necessary-condition gate.
+    Keeping this gate sound (no false positive on legitimate aggregate tests) and delegating per-test
+    fidelity to the semantic verifier is the same division of labor the dependency-dataflow gate uses
+    for ``required_sources``."""
+    if not isinstance(predicates, list):
+        return []
+    saw_pass_predicate = False
+    heads: list[str] = []
+    for pred in predicates:
+        if not isinstance(pred, dict):
+            continue
+        if str(pred.get("expected_outcome") or "").strip().lower() != _KIND_PASS:
+            continue
+        pass_when = pred.get("pass_when")
+        conds = pass_when.get("all") if isinstance(pass_when, dict) else None
+        if not isinstance(conds, list) or not conds:
+            continue
+        saw_pass_predicate = True
+        for cond in conds:
+            if not isinstance(cond, dict):
+                continue
+            ref = cond.get("ref")
+            if not isinstance(ref, str) or not ref.strip():
+                continue
+            heads.append(ref.strip().split(".", 1)[0])
+    # No well-formed pass predicate (only xfail, or malformed handled by the schema gate), or no
+    # resolvable ref at all: nothing to judge degenerate.
+    if not saw_pass_predicate or not heads:
+        return []
+    if any(head != "verdict" for head in heads):
+        return []
+    return [
+        "io_contract.test_predicates: degenerate pass-test set — every expected_outcome=pass "
+        "predicate references only verdict.* fields, with no checks.<id> or per-case metric-address "
+        "condition anywhere in the pass set. The per-test pass judgment then reduces to the runner's "
+        "own verdict.overall, defeating the deterministic R2 predicate DSL. Give each pass test the "
+        "concrete threshold/reduction conditions it actually asserts (a checks.<id> status or a "
+        "pinned diagnostics_contract.metrics address)."
+    ]
+
+
 def _check_ref(loc: str, ref: str, check_ids: set[str], verdict_fields: set[str],
                metric_addrs: set[str]) -> list[str]:
     """Resolve a predicate ``ref`` head against the declared diagnostics vocabulary."""

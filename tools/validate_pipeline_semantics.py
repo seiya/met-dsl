@@ -10442,9 +10442,17 @@ def _validate_test_predicates(
     the TER gate is trusted to backstop). A degenerate IR carrying
     NEITHER (which fails the io_contract gate anyway) degrades to the predicate ids (a no-op).
 
+    A separate necessary-condition gate (``verdict_evaluator.degenerate_predicate_violations``)
+    additionally rejects a structurally-valid but DEGENERATE pass-test set — one where every
+    ``expected_outcome=pass`` predicate asserts only ``verdict.*``, so the per-test judgment
+    collapses back to the runner's own ``verdict.overall`` (the judge nondeterminism R2 removed).
+
     A violation routes (via ``classify_compile_static_failure``) back to ``compile.generate``
     to re-author the predicates."""
-    from tools.verdict_evaluator import validate_predicate_schema
+    from tools.verdict_evaluator import (
+        validate_predicate_schema,
+        degenerate_predicate_violations,
+    )
 
     derived_path = ir_dir / "spec.ir.yaml"
     if not derived_path.exists():
@@ -10536,6 +10544,13 @@ def _validate_test_predicates(
         verdict_fields=verdict_fields,
         metric_addrs=metric_addrs,
     ):
+        violations.append(f"{derived_path}:{msg}")
+
+    # A structurally-valid predicate set can still be DEGENERATE: if every pass test asserts only
+    # `verdict.*`, the deterministic per-test judgment collapses to the runner's own verdict.overall
+    # (the judge nondeterminism R2 removed). This is a separate necessary-condition gate from the
+    # schema check above; it routes back to compile.generate through the same compile_static_violation.
+    for msg in degenerate_predicate_violations(predicates):
         violations.append(f"{derived_path}:{msg}")
 
 

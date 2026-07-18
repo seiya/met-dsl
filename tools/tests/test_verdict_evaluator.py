@@ -12,6 +12,7 @@ import unittest
 
 from tools.verdict_evaluator import (
     PredicateError,
+    degenerate_predicate_violations,
     evaluate_predicate,
     evaluate_verdict,
     validate_predicate_schema,
@@ -243,6 +244,68 @@ class CaseResolutionTest(unittest.TestCase):
         # tighten n064 beyond tolerance -> physics fail
         diag["cases"][1]["metrics"][addr] = 0.13
         self.assertEqual(evaluate_predicate(pred, diag)[0], "fail")
+
+
+class DegeneratePredicateTest(unittest.TestCase):
+    @staticmethod
+    def _pred(test_id, outcome, refs):
+        return {
+            "test_id": test_id,
+            "expected_outcome": outcome,
+            "target_cases": ["c0"],
+            "pass_when": {"all": [{"ref": r, "op": "le", "value": 1.0} for r in refs]},
+        }
+
+    def test_all_verdict_only_pass_set_is_flagged(self) -> None:
+        preds = [
+            self._pred("t0", "pass", ["verdict.overall"]),
+            self._pred("t1", "pass", ["verdict.overall", "verdict.failed_checks"]),
+        ]
+        violations = degenerate_predicate_violations(preds)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("degenerate pass-test set", violations[0])
+
+    def test_one_metric_condition_clears_the_gate(self) -> None:
+        preds = [
+            self._pred("t0", "pass", ["verdict.overall"]),
+            self._pred("t1", "pass", ["cfl.max"]),  # a per-case metric address
+        ]
+        self.assertEqual(degenerate_predicate_violations(preds), [])
+
+    def test_verdict_only_pass_beside_a_concrete_one_is_deliberately_not_flagged(self) -> None:
+        # DELIBERATE set-level scope (do NOT change to per-predicate): a single verdict-only PASS
+        # predicate beside a concrete one must NOT be flagged. An individual pass test can legitimately
+        # assert an aggregate criterion — this is the shape of the CERTIFIED
+        # infrastructure/harness_fortran_cpu IR, whose `l0_multi_case_evidence_pass` is verdict-only
+        # beside five `checks.*` pass tests. A per-predicate rule would false-reject that certified IR.
+        # Whether a specific test dropped a threshold it should carry is a per-test FIDELITY question
+        # owned by Compile.verify (which reads tests.md), not this deterministic gate.
+        preds = [
+            self._pred("l0_numeric_roundtrip_pass", "pass", ["checks.numeric_roundtrip.status"]),
+            self._pred("l0_multi_case_evidence_pass", "pass", ["verdict.overall"]),
+        ]
+        self.assertEqual(degenerate_predicate_violations(preds), [])
+
+    def test_one_checks_condition_clears_the_gate(self) -> None:
+        preds = [self._pred("t0", "pass", ["verdict.overall", "checks.mass_guard.status"])]
+        self.assertEqual(degenerate_predicate_violations(preds), [])
+
+    def test_verdict_only_xfail_is_not_flagged(self) -> None:
+        # A guard-rejection xfail legitimately asserts only verdict.*; with no pass predicate at all
+        # there is no pass set to be degenerate.
+        preds = [self._pred("t0", "xfail", ["verdict.overall"])]
+        self.assertEqual(degenerate_predicate_violations(preds), [])
+
+    def test_xfail_verdict_only_alongside_a_real_pass_set_is_ignored(self) -> None:
+        preds = [
+            self._pred("t0", "pass", ["metrics.mass_drift_rel"]),
+            self._pred("t1", "xfail", ["verdict.overall"]),  # exempt
+        ]
+        self.assertEqual(degenerate_predicate_violations(preds), [])
+
+    def test_malformed_predicates_do_not_raise(self) -> None:
+        self.assertEqual(degenerate_predicate_violations("not a list"), [])
+        self.assertEqual(degenerate_predicate_violations([{"expected_outcome": "pass"}]), [])
 
 
 class VerdictReduceTest(unittest.TestCase):
