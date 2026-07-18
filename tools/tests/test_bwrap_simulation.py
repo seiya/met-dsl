@@ -213,6 +213,96 @@ class BwrapSimulationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
+class BwrapJudgePinSimulationTests(unittest.TestCase):
+    """Model Validate.judge's narrowed write_root: a single semantic_review.json FILE pin
+    (not the whole runs/<run_id>/<safe>/ dir). Confirm the judge can rewrite its own
+    semantic_review.json in place but CANNOT touch the same-dir host-authored verdict.json
+    (the R2 verdict) nor create a sibling file — the whole point of the narrowing."""
+
+    PIPE = "workspace/pipelines/n/p_001"
+    RUN_DIR = PIPE + "/runs/run_20260101_001/component__spec_x__0.1.0/"
+    PIN = RUN_DIR + "semantic_review.json"
+    VERDICT = RUN_DIR + "verdict.json"
+
+    def _setup(self, repo: Path, orch: str, arid: str) -> None:
+        _ensure_orchestration_audit_dirs(repo, orch)
+        (repo / self.RUN_DIR).mkdir(parents=True, exist_ok=True)
+        # execute authored verdict.json host-side; it shares the judge's run dir.
+        (repo / self.VERDICT).write_text('{"per_test": []}\n', encoding="utf-8")
+        cap_dir = _capabilities_dir(repo, orch); cap_dir.mkdir(parents=True, exist_ok=True)
+        # write_roots is the single semantic_review.json FILE pin.
+        (cap_dir / f"{arid}.json").write_text(
+            json.dumps({"agent_run_id": arid, "write_roots": [self.PIN]}), encoding="utf-8")
+        rm_dir = _read_manifests_dir(repo, orch); rm_dir.mkdir(parents=True, exist_ok=True)
+        (rm_dir / f"{arid}.json").write_text(
+            json.dumps({"agent_run_id": arid, "allowed_read_roots": []}), encoding="utf-8")
+
+    def test_pin_pretouched_empty_and_not_retouched(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo = Path(t).resolve()
+            orch, arid = "orch_judge_pt", "arid_judge_pt"
+            self._setup(repo, orch, arid)
+            build_bwrap_profile(
+                repo_root=repo, orchestration_id=orch, agent_run_id=arid,
+                backend_command="python3", backend_type="claude")
+            pin_abs = repo / self.PIN
+            # Pre-touch creates an empty regular file (all consumers fail-close on empty JSON).
+            self.assertTrue(pin_abs.is_file())
+            self.assertEqual(pin_abs.read_text(), "")
+            mtime = pin_abs.stat().st_mtime_ns
+            # A rebuild (retry) must NOT re-touch an existing pin: mtime preserved so the
+            # freshness / stale-guard machinery stays intact.
+            build_bwrap_profile(
+                repo_root=repo, orchestration_id=orch, agent_run_id=arid,
+                backend_command="python3", backend_type="claude")
+            self.assertEqual((repo / self.PIN).stat().st_mtime_ns, mtime)
+
+    def test_judge_writes_own_review_but_cannot_touch_sibling_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo = Path(t).resolve()
+            orch, arid = "orch_judge", "arid_judge"
+            self._setup(repo, orch, arid)
+            _write_run_write_baseline(repo, orch, agent_run_id=arid)
+            script = textwrap.dedent(f"""
+                from pathlib import Path
+                def report(tag, ok, e=""):
+                    print(f"{{tag}}:{{'OK' if ok else 'FAIL'}}", e, flush=True)
+                # (1) rewrite own semantic_review.json in place -> OK (the file pin is writable)
+                try:
+                    Path("{self.PIN}").write_text('{{"decision":"pass"}}')
+                    report("SEM_WRITE", True)
+                except Exception as e:
+                    report("SEM_WRITE", False, repr(e))
+                # (2) overwrite the same-dir host-authored verdict.json -> BLOCKED (dir stays ro)
+                try:
+                    Path("{self.VERDICT}").write_text('{{"forged":true}}')
+                    print("VERDICT_WRITE:ALLOWED", flush=True)  # bad: narrowing failed
+                except Exception:
+                    print("VERDICT_WRITE:BLOCKED", flush=True)  # good
+                # (3) create a brand-new sibling file in the run dir -> BLOCKED (dir stays ro)
+                try:
+                    Path("{self.RUN_DIR}evil.json").write_text("x")
+                    print("SIBLING_NEW:ALLOWED", flush=True)  # bad
+                except Exception:
+                    print("SIBLING_NEW:BLOCKED", flush=True)  # good
+            """)
+            profile = build_bwrap_profile(
+                repo_root=repo, orchestration_id=orch, agent_run_id=arid,
+                backend_command="python3", backend_type="claude")
+            cmd = render_bwrap_command(profile=profile, command_argv=["python3", "-c", script])
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
+            self.assertIn("SEM_WRITE:OK", out, out)
+            self.assertIn("VERDICT_WRITE:BLOCKED", out, out)
+            self.assertIn("SIBLING_NEW:BLOCKED", out, out)
+            # The host-side verdict.json must be byte-for-byte unchanged.
+            self.assertEqual((repo / self.VERDICT).read_text(), '{"per_test": []}\n')
+            # FS-diff attributes only the in-scope semantic_review.json write.
+            changed = set(_actual_changed_paths_since_baseline(repo, orch, agent_run_id=arid))
+            self.assertIn(self.PIN, changed, changed)
+            self.assertNotIn(self.VERDICT, changed, changed)
+
+
+@unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
 class BwrapBuildPathSimulationTests(unittest.TestCase):
     """Model the Build phase's filesystem writes under bwrap (the highest-risk path per
     docs/BWRAP_ENABLEMENT.md). A Make/Fortran build routes outputs via OBJDIR/BINDIR

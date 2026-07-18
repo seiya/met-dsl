@@ -3887,6 +3887,17 @@ def _mcp_permissions_for_launch(role: str, step: str) -> list[str]:
     return []
 
 
+def _is_safe_path_id(tok: str) -> bool:
+    """A path segment safe to interpolate into a per-substep write_root pin.
+
+    A file pin embeds the id directly in a repo-relative path; a separator or a
+    traversal component would either widen the pin (making a sibling dir writable)
+    or escape the intended subtree. Reject empty / separator-bearing / `.` / `..`
+    ids so the caller fails closed (`[]` -> capability_invalid_empty_write_roots).
+    """
+    return bool(tok) and "/" not in tok and "\\" not in tok and tok not in (".", "..")
+
+
 def _write_roots_for_launch(
     *,
     role: str,
@@ -3895,9 +3906,13 @@ def _write_roots_for_launch(
     ir_ref: str,
     pipeline_ref: str,
     node_key: str = "",
+    substep: str = "",
+    run_id: str = "",
+    source_id: str = "",
 ) -> list[str]:
     r = role.strip().lower()
     st = step.strip().lower()
+    ss = substep.strip().lower()
     orch_root = _with_trailing_slash(_normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}"))
     ir_norm = _with_trailing_slash(_normalize_rel_posix(ir_ref))
     pipe_norm = _with_trailing_slash(_normalize_rel_posix(pipeline_ref))
@@ -3906,6 +3921,15 @@ def _write_roots_for_launch(
     if r not in {"step", "substep"}:
         return []
     if st == "compile":
+        # Compile.verify authors ONLY ir_meta.json (verification_status): the certified
+        # spec.ir.yaml (and every other file under <ir_ref>/) must stay non-writable to the
+        # verifier so a post-gate mutation cannot bypass --stage compile. Narrow the verifier's
+        # write_root to that single conductor/generate-authored file pin instead of the whole
+        # <ir_ref>/ directory (a structural second layer under the file-tool guard). The other
+        # compile substeps (generate authors the IR; static is deterministic/no-leaf) keep the
+        # directory root.
+        if ss == "verify":
+            return [_normalize_rel_posix(f"{ir_ref.rstrip('/')}/ir_meta.json")]
         return [ir_norm]
     if st == "generate":
         # lineage.json is NOT a leaf write_root: it sits at the pipeline root, which must
@@ -3919,7 +3943,29 @@ def _write_roots_for_launch(
     if st == "build":
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/binary"))]
     if st == "validate":
-        # Validate substeps (execute / judge) write under runs/<run_id>/<node_key_safe>/.
+        # Validate.execute writes the whole runs/<run_id>/<node_key_safe>/ evidence tree
+        # (command_log, diagnostics, verdict, raw/ snapshots, ...). The judge is a pure
+        # semantic pass authoring ONLY semantic_review.json — verdict.json and the derived
+        # aggregate/summary/validate_meta are host/execute-authored — so narrow its write_root
+        # to that single file pin. This removes the same-dir host-authored verdict.json /
+        # diagnostics.json (the R2 verdict, the load-bearing evidence) from the judge leaf's RW
+        # surface. A missing/malformed run_id or node_key yields [] -> the launch-time
+        # capability_invalid_empty_write_roots fail-closed error.
+        if ss == "judge":
+            rid = run_id.strip()
+            if not _is_safe_path_id(rid):
+                return []
+            try:
+                node_safe = _node_key_to_safe(node_key.strip())
+            except ValueError:
+                return []
+            if not node_safe:
+                return []
+            return [
+                _normalize_rel_posix(
+                    f"{pipeline_ref.rstrip('/')}/runs/{rid}/{node_safe}/semantic_review.json"
+                )
+            ]
         return [_with_trailing_slash(_normalize_rel_posix(f"{pipeline_ref.rstrip('/')}/runs"))]
     # NOTE: `tune` / `promote` are out-of-scope for the core 5-phase workflow
     # (Spec -> Compile -> Generate -> Build -> Validate). They are retained
@@ -4002,6 +4048,11 @@ def build_capability_document(
     ss = request_payload.get("substep")
     if isinstance(ss, str) and ss.strip():
         substep_val = ss.strip().lower()
+    # run_id / source_id are already resolved into the request payload at launch
+    # (build_launch_request / record_launch); they are needed to narrow the
+    # per-substep write_root file pins (validate.judge / generate.verify).
+    run_id_val = str(request_payload.get("run_id") or "").strip()
+    source_id_val = str(request_payload.get("source_id") or "").strip()
 
     # A pure-function leaf holds NO write authority (no tools, host writes after the child
     # window closes) and invokes no gate/MCP: its capability is a truthful zero-authority
@@ -4024,6 +4075,9 @@ def build_capability_document(
             ir_ref=ir_ref,
             pipeline_ref=pipeline_ref,
             node_key=node_key,
+            substep=substep_val or "",
+            run_id=run_id_val,
+            source_id=source_id_val,
         ),
         "mcp_permissions": [] if pure else _mcp_permissions_for_launch(role, step),
         "expires_at": _default_capability_expires_at_iso(),

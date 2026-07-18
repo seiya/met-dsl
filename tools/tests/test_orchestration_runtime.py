@@ -3461,7 +3461,8 @@ shell_tool                       stable             true
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
-            write_roots=[f"{_FIX_PIPE_REF}/runs/"],
+            # Judge's production write_root is the narrowed semantic_review.json file pin.
+            write_roots=[f"{run_dir}/semantic_review.json"],
         )
         for p in out:
             self.assertFalse(
@@ -7659,6 +7660,149 @@ shell_tool                       stable             true
                 pipeline_ref=_FIX_PIPE_REF,
             ),
             [],
+        )
+
+    def test_write_roots_for_launch_compile_verify_pins_ir_meta(self) -> None:
+        """Compile.verify's write_root is narrowed to the single ir_meta.json file
+        pin (not the whole <ir_ref>/ dir): the certified spec.ir.yaml must stay
+        non-writable to the verifier so a post-gate mutation cannot bypass --stage
+        compile."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="substep",
+                step="compile",
+                substep="verify",
+                orchestration_id="orch_001",
+                ir_ref=_FIX_IR_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+                node_key="problem/shallow_water2d@0.3.0",
+            ),
+            [f"{_FIX_IR_REF.rstrip('/')}/ir_meta.json"],
+        )
+
+    def test_write_roots_for_launch_compile_generate_keeps_ir_dir(self) -> None:
+        """Compile.generate (authors the IR) keeps the whole <ir_ref>/ directory
+        root; only the verifier is pinned."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="substep",
+                step="compile",
+                substep="generate",
+                orchestration_id="orch_001",
+                ir_ref=_FIX_IR_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+                node_key="problem/shallow_water2d@0.3.0",
+            ),
+            [f"{_FIX_IR_REF.rstrip('/')}/"],
+        )
+
+    def test_write_roots_for_launch_validate_judge_pins_semantic_review(self) -> None:
+        """Validate.judge (a pure semantic pass authoring only semantic_review.json)
+        is narrowed to that single file pin, removing the same-dir host-authored
+        verdict.json / diagnostics.json from its RW surface."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="substep",
+                step="validate",
+                substep="judge",
+                orchestration_id="orch_001",
+                ir_ref=_FIX_IR_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+                node_key="problem/shallow_water2d@0.3.0",
+                run_id="run_20260415_001",
+            ),
+            [f"{_FIX_PIPE_REF}/runs/run_20260415_001/problem__shallow_water2d__0.3.0/semantic_review.json"],
+        )
+
+    def test_write_roots_for_launch_validate_execute_keeps_runs_dir(self) -> None:
+        """Validate.execute writes the whole runs/ evidence tree and keeps the
+        directory root; only the judge is pinned."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="substep",
+                step="validate",
+                substep="execute",
+                orchestration_id="orch_001",
+                ir_ref=_FIX_IR_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+                node_key="problem/shallow_water2d@0.3.0",
+                run_id="run_20260415_001",
+            ),
+            [f"{_FIX_PIPE_REF}/runs/"],
+        )
+
+    def test_write_roots_for_launch_validate_judge_missing_run_id_returns_empty(self) -> None:
+        """Without run_id the judge pin cannot be derived; return [] so the
+        capability_invalid_empty_write_roots fail-closed error fires at launch."""
+        self.assertEqual(
+            _write_roots_for_launch(
+                role="substep",
+                step="validate",
+                substep="judge",
+                orchestration_id="orch_001",
+                ir_ref=_FIX_IR_REF,
+                pipeline_ref=_FIX_PIPE_REF,
+                node_key="problem/shallow_water2d@0.3.0",
+            ),
+            [],
+        )
+
+    def test_write_roots_for_launch_validate_judge_malformed_run_id_returns_empty(self) -> None:
+        """A separator / traversal-bearing run_id must not widen or escape the pin.
+        Fail closed with []."""
+        for bad in ("run_x/../../etc", "run/x", "..", "."):
+            self.assertEqual(
+                _write_roots_for_launch(
+                    role="substep",
+                    step="validate",
+                    substep="judge",
+                    orchestration_id="orch_001",
+                    ir_ref=_FIX_IR_REF,
+                    pipeline_ref=_FIX_PIPE_REF,
+                    node_key="problem/shallow_water2d@0.3.0",
+                    run_id=bad,
+                ),
+                [],
+                f"malformed run_id {bad!r} should yield []",
+            )
+
+    def test_build_capability_document_judge_missing_run_id_raises(self) -> None:
+        """The empty write_roots from a judge launch missing run_id surfaces as the
+        loud capability_invalid_empty_write_roots error, not a silent wide root."""
+        from tools.orchestration_runtime import build_capability_document
+        with self.assertRaises(ValueError) as ctx:
+            build_capability_document(
+                agent_run_id="substep_judge_001",
+                orchestration_id="orch_001",
+                request_payload={
+                    "agent_role": "substep",
+                    "step": "validate",
+                    "substep": "judge",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "ir_ref": _FIX_IR_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                },
+            )
+        self.assertIn("capability_invalid_empty_write_roots", str(ctx.exception))
+
+    def test_build_capability_document_judge_pins_semantic_review(self) -> None:
+        from tools.orchestration_runtime import build_capability_document
+        cap = build_capability_document(
+            agent_run_id="substep_judge_002",
+            orchestration_id="orch_001",
+            request_payload={
+                "agent_role": "substep",
+                "step": "validate",
+                "substep": "judge",
+                "node_key": "problem/shallow_water2d@0.3.0",
+                "ir_ref": _FIX_IR_REF,
+                "pipeline_ref": _FIX_PIPE_REF,
+                "run_id": "run_20260415_001",
+            },
+        )
+        self.assertEqual(
+            cap["write_roots"],
+            [f"{_FIX_PIPE_REF}/runs/run_20260415_001/problem__shallow_water2d__0.3.0/semantic_review.json"],
         )
 
     def test_allowed_output_paths_for_launch_promote_accepts_release_artifact_and_catalog(self) -> None:
