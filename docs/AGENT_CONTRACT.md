@@ -60,7 +60,7 @@ Every LLM substep produces its phase's `<stage>_meta.json` (`ir_meta.json` for C
 - `source_meta.json`: does not record lint or the syntax gate — `static lint` is the conductor-run `Generate.lint` substep and the compiler syntax gate is the conductor-run `Generate.syntax` substep, certified by `post_generate` against the host-authored `lint_evidence/<source_id>.json` / `syntax_evidence/<source_id>.json`.
 - `validate_meta.json`: additionally requires the LLM semantic-check evidence in `judge_command_ref` **only when** `verification_status=pass`.
 - With `debug_mode=false`, do not save failed-attempt artifacts. `verification_status` presumes `fail_closed`: unperformed/unjudgeable verification must never be recorded `pass`.
-- **verify-family substeps (`compile.verify` / `generate.verify`):** a `pass` must (re-)author the verified meta with the `Write`/`Edit` tool even when the inspection finds nothing to change (refresh an idempotent field such as `verify_attempts`). An inspect-only verify that writes nothing cannot terminate `pass`.
+- **verify-family substeps (`compile.verify` / `generate.verify`):** a `pass` must (re-)author the verified meta with `Write`/`Edit` even when nothing changed (refresh e.g. `verify_attempts`); an inspect-only verify cannot `pass`. That meta is your **only** output — its `write_root` is pinned to it, so you cannot rewrite sources/IR.
 
 ## MCP `command_log.jsonl` placement
 

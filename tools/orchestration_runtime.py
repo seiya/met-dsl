@@ -7255,8 +7255,11 @@ def build_bwrap_profile(
             # File pin: pre-create (touch) so bwrap can --bind it at file granularity.
             # File-level bind ensures bwrap cannot write to sibling files/directories —
             # the sandbox boundary is exactly the declared pin, nothing broader.
-            # (P2-7: the stub-recovery machinery was removed; the core workflow declares
-            # no file-pin write_roots, so this is dormant defensive support.)
+            # The verify/judge substeps declare exactly one such file pin (ir_meta.json /
+            # source_meta.json / semantic_review.json); the pre-touch here also covers the
+            # judge's pre-created 0-byte semantic_review.json (all consumers fail-close on
+            # empty JSON). (P2-7 removed the earlier stub-RECOVERY machinery, which is still
+            # unnecessary: these pins are managed artifacts the owning leaf writes in place.)
             pin_path = (repo_root / root_entry).resolve()
             try:
                 pin_path.relative_to(resolved_repo_root)
