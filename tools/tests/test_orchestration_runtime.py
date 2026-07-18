@@ -7957,12 +7957,11 @@ shell_tool                       stable             true
         bodies' source and assert the derived (step, substep) -> tools mapping IS the table."""
         import inspect
         import re
-        import sys
         import tools.workflow_conductor as wc
-        # build_runtime_server is imported bare (`from build_runtime_server import ...`) by the
-        # conductor bodies, so put mcp_servers/ on the path the same way the conductor tests do.
-        sys.path.insert(0, str(Path("mcp_servers").resolve()))
-        import build_runtime_server as brs  # type: ignore
+        # The conductor bodies import build_runtime_server bare at runtime; this test only reads
+        # their source via inspect.getsource, so import the module by its package path (already
+        # used at module top) — no cwd-dependent sys.path insertion needed.
+        from mcp_servers import build_runtime_server as brs
         from tools.orchestration_runtime import _MCP_TOOL_GRANTS_BY_SUBSTEP
 
         # (step, substep) -> the Conductor in-process method that runs it.
