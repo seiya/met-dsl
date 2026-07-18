@@ -1864,6 +1864,32 @@ def _catalog_family_index(repo_root: Path) -> list[dict[str, str]]:
     return out
 
 
+def _exemplar_contract_version_matches(model_src: Path) -> bool:
+    """True iff the certified pure source at ``model_src`` was authored under the CURRENT
+    ``PURE_PROMPT_CONTRACT_VERSION``, read from its ``bundle_meta.json#prompt_contract_version``.
+
+    ``model_src`` is ``.../source/<source_id>/src/<id>_model.f90``, so the pure ``bundle_meta.json``
+    is two parents up. This gates the R5 M3c model+checks exemplar: a sibling's ``<id>_checks.f90``
+    is authored against the checks-module ABI of the contract that certified it, and when that ABI
+    has since changed (e.g. the pure-8 per-id ``checks_compute`` replacing the buffered
+    ``checks_compute(case_id, ncheck, chk_ids, chk_status)``), an older-vintage sibling carries the
+    RETIRED signature. Injecting it as concrete prior art can steer the doc-blind leaf into a bundle
+    the acceptance gate — which checks only procedure name/kind, not arity — admits, and which then
+    fails ``Generate.syntax`` against the current host-rendered runner (an unrepairable-until-
+    reroll waste). The bundle gate cannot see the arity, so gate the exemplar HERE on the vintage.
+
+    Fail-SAFE polarity: any missing / unreadable / mismatched version returns ``False`` (the
+    exemplar is dropped, and Generate proceeds without one), never keeps a possibly-stale exemplar.
+    An exemplar is advisory (never a gate), so dropping a stale-vintage one only forgoes a hint —
+    the correct ABI still reaches the leaf verbatim through the inlined host-rendered runner."""
+    try:
+        doc = json.loads((model_src.parent.parent / "bundle_meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (isinstance(doc, dict)
+            and str(doc.get("prompt_contract_version", "")).strip() == PURE_PROMPT_CONTRACT_VERSION)
+
+
 def _resolve_exemplar_source(repo_root: Path, ir_ref: Any) -> dict[str, Any] | None:
     """R5: resolve a previously-certified SIBLING node's source as a ``generate.generate``
     exemplar — a cacheable, known-good implementation from the SAME ``(family, spec_kind,
@@ -1977,6 +2003,12 @@ def _resolve_exemplar_source(repo_root: Path, ir_ref: Any) -> dict[str, Any] | N
                     continue
                 model_src = _certified_model_source(pipe_dir, cand_id)
                 if model_src is None:
+                    continue
+                # R5 ABI-drift guard (M3c only): the checks exemplar must be authored under the
+                # CURRENT contract, else its `<id>_checks.f90` may carry a retired checks ABI the
+                # acceptance gate (name/kind only) admits but Generate.syntax then rejects. The
+                # non-M3c model+runner exemplar carries no checks module, so it is not gated here.
+                if target_is_m3c and not _exemplar_contract_version_matches(model_src):
                     continue
                 exemplar_files = (
                     (f"{cand_id}_model.f90", f"{cand_id}_checks.f90") if target_is_m3c

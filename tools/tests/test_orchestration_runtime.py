@@ -28232,7 +28232,8 @@ class R5ExemplarSelectorTests(unittest.TestCase):
 
     def _seed_certified_sibling(self, repo: Path, kind: str, sid: str, ver: str, *,
                                 certified: bool = True, date: str = "20260101",
-                                with_checks: bool = False) -> None:
+                                with_checks: bool = False,
+                                contract_version: str | None = None) -> None:
         safe = f"{kind}__{sid}__{ver}"
         # the pipeline dir id must match the canonical `<hyphen-slug>_<date>_<seq>` grammar
         slug = sid.replace("_", "-")
@@ -28252,6 +28253,12 @@ class R5ExemplarSelectorTests(unittest.TestCase):
         if with_checks:
             self._write(src / f"{sid}_checks.f90",
                         f"! checks for {sid}\nmodule {sid}_checks\nend module\n")
+            # An M3c checks exemplar is gated on its recorded contract version matching the
+            # current one; seed a matching `bundle_meta.json` by default (None => current).
+            from tools.pure_leaf import PURE_PROMPT_CONTRACT_VERSION
+            version = contract_version if contract_version is not None else PURE_PROMPT_CONTRACT_VERSION
+            self._write(src.parent / "bundle_meta.json",
+                        json.dumps({"prompt_contract_version": version}))
 
     def test_resolves_certified_sibling(self) -> None:
         from tools.orchestration_runtime import _resolve_exemplar_source
@@ -28299,6 +28306,39 @@ class R5ExemplarSelectorTests(unittest.TestCase):
             ir_ref = self._target_ir(repo, "component", "adv_flux", "0.1.0", infra_dep=True)
             self._seed_certified_sibling(repo, "component", "adv_bndry", "0.1.0",
                                          with_checks=False)  # pre-M3c: model+runner only
+            self.assertIsNone(_resolve_exemplar_source(repo, ir_ref))
+
+    def test_m3c_skips_sibling_with_stale_contract_version(self) -> None:
+        # ABI-drift guard: an M3c checks exemplar authored under an OLDER contract may carry a
+        # retired checks ABI (e.g. the pre-pure-8 buffered `checks_compute`), which the bundle
+        # acceptance gate (name/kind only) would admit but Generate.syntax then rejects. A sibling
+        # whose recorded `prompt_contract_version` != the current one is skipped entirely.
+        from tools.orchestration_runtime import _resolve_exemplar_source
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._catalog(repo, [
+                ("component", "adv_flux", "0.1.0", "advection_diffusion"),
+                ("component", "adv_bndry", "0.1.0", "advection_diffusion")])
+            ir_ref = self._target_ir(repo, "component", "adv_flux", "0.1.0", infra_dep=True)
+            self._seed_certified_sibling(repo, "component", "adv_bndry", "0.1.0",
+                                         with_checks=True, contract_version="pure-STALE")
+            self.assertIsNone(_resolve_exemplar_source(repo, ir_ref))
+
+    def test_m3c_skips_sibling_missing_bundle_meta(self) -> None:
+        # Fail-safe polarity: a certified M3c sibling whose contract version cannot be POSITIVELY
+        # confirmed (no readable bundle_meta.json) is dropped rather than injected blind.
+        from tools.orchestration_runtime import _resolve_exemplar_source
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._catalog(repo, [
+                ("component", "adv_flux", "0.1.0", "advection_diffusion"),
+                ("component", "adv_bndry", "0.1.0", "advection_diffusion")])
+            ir_ref = self._target_ir(repo, "component", "adv_flux", "0.1.0", infra_dep=True)
+            self._seed_certified_sibling(repo, "component", "adv_bndry", "0.1.0", with_checks=True)
+            # Remove the bundle_meta the seed wrote, leaving model+checks but no version record.
+            safe = "component__adv_bndry__0.1.0"
+            (repo / "workspace" / "pipelines" / safe / "adv-bndry_20260101_001"
+             / "source" / "src_20260101_001" / "bundle_meta.json").unlink()
             self.assertIsNone(_resolve_exemplar_source(repo, ir_ref))
 
     def test_excludes_self(self) -> None:
