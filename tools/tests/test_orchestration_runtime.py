@@ -16636,15 +16636,24 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             self.assertTrue(pin_path.exists(), "file-pin target must be pre-created for bwrap file-level bind")
             self.assertIn(pin, profile["write_roots"])
 
-    def test_file_pin_write_root_appears_in_render_bwrap_bind(self) -> None:
-        """render_bwrap_command must emit --bind for the file-pin itself, not its parent directory."""
+    def test_file_pin_binds_parent_dir_rw_and_reprotects_siblings(self) -> None:
+        """A file pin binds its PARENT DIR writable (so the harness Write tool's atomic
+        temp-sibling+rename can create `<pin>.tmp.*` there — a file-granular bind left the
+        parent read-only and broke that write with EROFS). Every existing non-write_root
+        sibling is then re-ro-bound AFTER the parent rw-bind (bwrap later-overrides-earlier),
+        so a same-dir certified artifact keeps its physical write protection while the pin
+        itself stays writable (never appears in the ro-bind list)."""
         from tools.orchestration_runtime import build_bwrap_profile, render_bwrap_command
 
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch = "orch_bwrap_fp_002"
             run_id = "run_bwrap_fp_002"
-            pin = "workspace/pipelines/a__b__1.0/lineage.json"
+            node_dir = "workspace/ir/a__b__1.0/ir_001"
+            pin = f"{node_dir}/ir_meta.json"
+            # a certified sibling in the same node dir that must stay physically read-only
+            (repo_root / node_dir).mkdir(parents=True, exist_ok=True)
+            (repo_root / node_dir / "spec.ir.yaml").write_text("meta: {}\n", encoding="utf-8")
             self._write_cap_and_manifest(
                 repo_root, orchestration_id=orch, agent_run_id=run_id,
                 write_roots=[pin],
@@ -16657,10 +16666,72 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             )
             cmd = render_bwrap_command(profile=profile, command_argv=["python3", "agent.py"])
             pin_abs = str((repo_root / pin).resolve())
-            parent_abs = str((repo_root / pin).resolve().parent)
+            parent_abs = str((repo_root / node_dir).resolve())
+            sibling_abs = str((repo_root / node_dir / "spec.ir.yaml").resolve())
             bind_targets = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--bind"]
-            self.assertIn(pin_abs, bind_targets, "file-pin target must appear in bwrap --bind list")
-            self.assertNotIn(parent_abs, bind_targets, "parent directory must NOT be bound — that would grant access to sibling files")
+            robind_targets = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--ro-bind"]
+            # the pin's parent dir is bound writable so the atomic write mechanism works
+            self.assertIn(parent_abs, bind_targets,
+                          "file-pin parent dir must be a writable --bind")
+            # the pin itself is writable (in the rw parent) — never made read-only
+            self.assertNotIn(pin_abs, robind_targets,
+                             "the pin must stay writable, not appear in --ro-bind")
+            # the certified sibling is re-ro-bound (physically protected) AFTER the parent rw-bind
+            self.assertIn(sibling_abs, robind_targets,
+                          "an existing non-write_root sibling must be re-ro-bound")
+            parent_bind_idx = next(
+                i for i, t in enumerate(cmd) if t == "--bind" and cmd[i + 1] == parent_abs)
+            sib_robind_idx = next(
+                i for i, t in enumerate(cmd) if t == "--ro-bind" and cmd[i + 1] == sibling_abs)
+            self.assertGreater(
+                sib_robind_idx, parent_bind_idx,
+                "sibling ro-bind must come AFTER the parent rw-bind to win (later-overrides-earlier)")
+
+    def test_file_pin_parent_directory_and_symlink_strays_are_rejected(self) -> None:
+        """A new directory or symlink created in a file pin's now-writable parent dir
+        bypasses the file-only FS-diff (`_snapshot_repo_files` records regular files only);
+        terminal validation must still reject it as an unauthorized write — otherwise a leaf
+        could pre-create a host-target pathname (e.g. `aggregate_verdict.json/`) as a directory
+        and break the conductor's later `write_text`, undetected. The pin write itself and the
+        pre-existing certified sibling stay authorized/untouched."""
+        import os
+        from tools.orchestration_runtime import (
+            _validate_actual_write_paths,
+            _write_run_write_baseline,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch = "orch_bwrap_fp_stray"
+            run_id = "run_bwrap_fp_stray"
+            node_dir = "workspace/pipelines/a__b__1.0/pipe_001/runs/run_x/a__b__1.0"
+            pin = f"{node_dir}/semantic_review.json"
+            (repo_root / node_dir).mkdir(parents=True, exist_ok=True)
+            # a pre-existing certified sibling + a pre-existing occupied subdir (raw/)
+            (repo_root / node_dir / "verdict.json").write_text('{"per_test": []}\n', encoding="utf-8")
+            (repo_root / node_dir / "raw").mkdir()
+            (repo_root / node_dir / "raw" / "metrics_basis.json").write_text("{}", encoding="utf-8")
+            (repo_root / pin).write_text("", encoding="utf-8")  # pre-touched pin
+            self._write_cap_and_manifest(
+                repo_root, orchestration_id=orch, agent_run_id=run_id,
+                write_roots=[pin],
+            )
+            _write_run_write_baseline(repo_root, orch, agent_run_id=run_id)
+            # the leaf legitimately rewrites its pin ...
+            (repo_root / pin).write_text('{"decision":"pass"}', encoding="utf-8")
+            # ... but also creates a stray directory (at a host-target path) and a stray symlink.
+            (repo_root / node_dir / "aggregate_verdict.json").mkdir()
+            os.symlink(repo_root / node_dir / "verdict.json", repo_root / node_dir / "sneaky_link")
+            payload = {"agent_role": "substep", "agent_run_id": run_id, "status": "fail"}
+            with self.assertRaises(ValueError) as ctx:
+                _validate_actual_write_paths(repo_root, orch, payload)
+            msg = str(ctx.exception)
+            self.assertIn("unauthorized write paths", msg)
+            self.assertIn(f"{node_dir}/aggregate_verdict.json", msg)
+            self.assertIn(f"{node_dir}/sneaky_link", msg)
+            # the pre-existing occupied subdir raw/ and certified verdict.json are NOT flagged
+            self.assertNotIn(f"{node_dir}/raw", msg)
+            self.assertNotIn(f"{node_dir}/verdict.json,", msg)
 
     def test_runtime_rw_bind_paths_emitted_as_writable_bind(self) -> None:
         """render_bwrap_command must emit a writable --bind (not --ro-bind) for each
@@ -16963,8 +17034,14 @@ class BwrapProfileFilePinTests(unittest.TestCase):
                 "symlink target must not be touched",
             )
 
-    def test_generate_step_bwrap_does_not_bind_pipeline_root_as_writable(self) -> None:
-        """bwrap profile for generate step must NOT make pipeline_ref/ writable — sibling dirs stay read-only."""
+    def test_file_pin_at_pipeline_root_reprotects_sibling_dirs(self) -> None:
+        """A file pin sharing the pipeline root with a dir write_root must not leave the
+        pipeline's OTHER subdirs (binary/, runs/) writable. Under the parent-dir-bind model the
+        pin's parent (the pipeline root) is bound rw so the atomic write works, but every
+        existing sibling that is not itself a declared write_root is re-ro-bound AFTER it, so
+        binary/ and runs/ stay physically read-only while the source/ write_root stays writable.
+        NOTE: the real generate contract no longer declares lineage.json as a write_root (it is
+        conductor-authored host-side); this fixture asserts the general rendering property."""
         from tools.orchestration_runtime import build_bwrap_profile, render_bwrap_command
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -16972,11 +17049,10 @@ class BwrapProfileFilePinTests(unittest.TestCase):
             orch = "orch_bwrap_fp_007"
             run_id = "run_bwrap_fp_007"
             pipeline_root = "workspace/pipelines/a__b__1.0/pipe_001"
-            # Synthetic write_roots exercising a file-pin at the pipeline root (a dir
-            # write_root + a file pin). NOTE: the real generate contract no longer
-            # declares lineage.json as a write_root (it is conductor-authored host-side);
-            # this fixture only asserts the general rendering property that a file pin's
-            # parent directory is NOT bound writable.
+            # sibling subdirs of the pin that must stay read-only (written by build/execute).
+            (repo_root / pipeline_root / "source").mkdir(parents=True, exist_ok=True)
+            (repo_root / pipeline_root / "binary").mkdir(parents=True, exist_ok=True)
+            (repo_root / pipeline_root / "runs").mkdir(parents=True, exist_ok=True)
             write_roots = [
                 f"{pipeline_root}/source/",
                 f"{pipeline_root}/lineage.json",
@@ -16992,12 +17068,29 @@ class BwrapProfileFilePinTests(unittest.TestCase):
                 backend_command="python3 agent.py",
             )
             cmd = render_bwrap_command(profile=profile, command_argv=["python3", "agent.py"])
-            pipeline_abs = str((repo_root / pipeline_root).resolve())
+            root_abs = str((repo_root / pipeline_root).resolve())
+            source_abs = str((repo_root / pipeline_root / "source").resolve())
+            binary_abs = str((repo_root / pipeline_root / "binary").resolve())
+            runs_abs = str((repo_root / pipeline_root / "runs").resolve())
+            pin_abs = str((repo_root / pipeline_root / "lineage.json").resolve())
             bind_targets = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--bind"]
-            self.assertNotIn(
-                pipeline_abs, bind_targets,
-                "pipeline_ref/ directory must NOT appear in bwrap --bind — that would make build/execute writable",
-            )
+            robind_targets = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--ro-bind"]
+            # the source/ write_root stays writable and is never re-ro-bound
+            self.assertIn(source_abs, bind_targets, "source/ write_root must stay a writable --bind")
+            self.assertNotIn(source_abs, robind_targets, "a declared write_root must not be re-ro-bound")
+            # the pin stays writable
+            self.assertNotIn(pin_abs, robind_targets, "the pin must stay writable")
+            # binary/ and runs/ are re-ro-bound AFTER the pipeline-root rw-bind, so net read-only
+            self.assertIn(binary_abs, robind_targets, "binary/ must be re-ro-bound (read-only)")
+            self.assertIn(runs_abs, robind_targets, "runs/ must be re-ro-bound (read-only)")
+            root_bind_idx = next(
+                i for i, t in enumerate(cmd) if t == "--bind" and cmd[i + 1] == root_abs)
+            for sib_abs in (binary_abs, runs_abs):
+                sib_idx = next(
+                    i for i, t in enumerate(cmd) if t == "--ro-bind" and cmd[i + 1] == sib_abs)
+                self.assertGreater(
+                    sib_idx, root_bind_idx,
+                    "sibling ro-bind must come AFTER the pipeline-root rw-bind to win")
 
     def test_extensionless_no_slash_entry_treated_as_file_pin(self) -> None:
         """An extensionless no-slash write_root entry (e.g. Makefile) is treated as a file pin.

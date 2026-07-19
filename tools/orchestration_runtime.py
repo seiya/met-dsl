@@ -7299,14 +7299,17 @@ def build_bwrap_profile(
                 )
             candidate.mkdir(parents=True, exist_ok=True)
         else:
-            # File pin: pre-create (touch) so bwrap can --bind it at file granularity.
-            # File-level bind ensures bwrap cannot write to sibling files/directories —
-            # the sandbox boundary is exactly the declared pin, nothing broader.
-            # The verify/judge substeps declare exactly one such file pin (ir_meta.json /
-            # source_meta.json / semantic_review.json); the pre-touch here also covers the
-            # judge's pre-created 0-byte semantic_review.json (all consumers fail-close on
-            # empty JSON). (P2-7 removed the earlier stub-RECOVERY machinery, which is still
-            # unnecessary: these pins are managed artifacts the owning leaf writes in place.)
+            # File pin: pre-create (touch) so the pin exists for render (and so the judge's
+            # pre-created 0-byte semantic_review.json is present — all consumers fail-close on
+            # empty JSON). render_bwrap_command binds the pin's PARENT DIRECTORY writable (not
+            # the file inode) so the harness Write/Edit tool's atomic temp-sibling-then-rename
+            # can create `<pin>.tmp.*` in that dir; single-file authorization is enforced by
+            # the output-manifest hook + terminal FS-diff, not by a file-granular bwrap bind
+            # (a file-granular bind left the parent dir read-only and broke the atomic write —
+            # see the parent-dir-bind note in render_bwrap_command). The verify/judge substeps
+            # declare exactly one such file pin (ir_meta.json / source_meta.json /
+            # semantic_review.json). (P2-7 removed the earlier stub-RECOVERY machinery, which is
+            # still unnecessary: these pins are managed artifacts the owning leaf rewrites.)
             pin_path = (repo_root / root_entry).resolve()
             try:
                 pin_path.relative_to(resolved_repo_root)
@@ -7534,20 +7537,20 @@ def render_bwrap_command(
     for rel in profile.get("write_roots", []):
         if not isinstance(rel, str) or not rel.strip():
             continue
+        is_dir_root = rel.strip().endswith("/")
         abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
         if not abs_path.exists():
             # File pins must be pre-created by build_bwrap_profile before render.
-            if not rel.strip().endswith("/"):
+            if not is_dir_root:
                 raise ValueError(
                     f"write_roots file pin {rel!r} does not exist; "
                     f"build_bwrap_profile must pre-create it before render_bwrap_command is called"
                 )
             continue
-        # File pins must be plain regular files — not directories or symlinks.
-        # Binding a directory would make the entire subtree writable, not just one file.
-        # Check the original (unresolved) path for symlinks: resolve() follows symlinks
-        # so is_symlink() on abs_path (resolved) is always False.
-        if not rel.strip().endswith("/"):
+        if not is_dir_root:
+            # File pins must be plain regular files — not directories or symlinks.
+            # Check the original (unresolved) path for symlinks: resolve() follows symlinks
+            # so is_symlink() on abs_path (resolved) is always False.
             orig_path = Path(repo_root) / _normalize_rel_posix(rel)
             if orig_path.is_symlink():
                 raise ValueError(
@@ -7559,6 +7562,45 @@ def render_bwrap_command(
                     f"write_roots file pin {rel!r} resolves to a non-file ({abs_path}); "
                     f"add a trailing '/' to declare a directory write root instead"
                 )
+            # Bind the pin's PARENT DIRECTORY writable so the harness Write/Edit tool's atomic
+            # write can create its same-dir temp sibling (`<pin>.tmp.<pid>.<hash>`) and rename
+            # it over the pin. A file-granular `--bind` left the parent dir read-only, so that
+            # temp-sibling creation failed EROFS and a verify/judge leaf could not author its
+            # artifact at all — regressing compile.verify / generate.verify / validate.judge
+            # (i.e. every workflow) once the write_roots were narrowed to single-file pins.
+            # Then re-ro-bind every EXISTING sibling that is not itself a declared write_root,
+            # so certified artifacts sharing the dir (spec.ir.yaml / src/ / the host-authored
+            # verdict.json) keep their physical write protection: bwrap applies binds in order,
+            # later-overriding-earlier, so these ro-binds win over the parent rw-bind. Only NEW
+            # entries (the temp sibling, or a stray write) are physically creatable, and a stray
+            # is caught by the terminal FS-diff (single-file authorization by write_roots
+            # containment) + the output-manifest hook. Net: the atomic-write mechanism works,
+            # while the narrowing's guarantee (a verify/judge leaf cannot mutate a same-dir
+            # certified artifact) is preserved. runtime_rw_file_paths (e.g. a cross-phase MCP
+            # log) are rw-bound later and override any sibling ro-bind here.
+            parent = abs_path.parent
+            cmd.extend(["--bind", str(parent), str(parent)])
+            for sib in sorted(parent.iterdir()):
+                try:
+                    # Symlink siblings are not re-ro-bound (binding a symlink path would
+                    # bind its target, not the link node); regular-file/dir siblings are.
+                    # A symlink or a brand-new directory appearing in this now-writable
+                    # parent is instead caught at terminalization by the dedicated stray
+                    # check (_file_pin_parent_nonfile_strays), so nothing here is fail-open.
+                    if sib.is_symlink() or not sib.exists():
+                        continue
+                    sib_abs = sib.resolve()
+                except OSError:
+                    continue
+                if sib_abs == abs_path:
+                    continue  # the pin itself stays writable (rewritten via temp+rename)
+                if any(
+                    sib_abs == w or sib_abs.is_relative_to(w) or w.is_relative_to(sib_abs)
+                    for w in _write_abs
+                ):
+                    continue  # a declared write_root (or an ancestor/descendant of one) stays writable
+                cmd.extend(["--ro-bind", str(sib_abs), str(sib_abs)])
+            continue
         abs_token = str(abs_path)
         cmd.extend(["--bind", abs_token, abs_token])
     # In-repo runtime bookkeeping dirs the leaf writes via the runtime CLI (gate
@@ -8670,6 +8712,81 @@ def _expected_syntax_evidence_rel_path(
     )
 
 
+def _file_pin_parent_nonfile_strays(
+    repo_root: Path,
+    orchestration_id: str,
+    *,
+    agent_run_id: str,
+    write_roots: list[str],
+) -> list[str]:
+    """Flag directory / symlink strays in a file-pin's now-writable parent dir.
+
+    `render_bwrap_command` binds a file pin's PARENT directory writable (so the harness
+    Write tool's atomic temp-sibling + rename can run — a file-granular bind left the
+    parent read-only and broke that write with EROFS). The terminal FS-diff
+    (`_snapshot_repo_files`) records **regular files only**, so it would miss a leaf
+    creating a new *directory* or a symlink directly in that parent (e.g. an empty
+    `aggregate_verdict.json/`), which both evades unauthorized-write detection AND, by
+    pre-creating a host-target pathname as a directory, breaks the conductor's later
+    `write_text` of that artifact. The ONLY legitimate new entry in a file-pin's parent
+    is a transient regular file (the temp sibling, renamed away before terminalization),
+    so any new non-regular-file entry that was not an occupied path in the write baseline,
+    and is not itself authorized by a directory write_root, is an unauthorized write.
+    Scoped to the file-pin parents only; regular-file strays there are already caught by
+    the file-level FS-diff, and dir-write_root substeps are authorized by containment.
+    """
+    file_pins = [
+        _normalize_rel_posix(r.strip())
+        for r in write_roots
+        if isinstance(r, str) and r.strip() and not r.strip().endswith("/")
+    ]
+    if not file_pins:
+        return []
+    try:
+        baseline = _load_run_write_baseline(repo_root, orchestration_id, agent_run_id=agent_run_id)
+    except ValueError:
+        return []
+    occupied_dirs: set[str] = set()
+    for k in dict(baseline.get("files", {})):
+        parts = _normalize_rel_posix(str(k)).split("/")
+        for i in range(1, len(parts)):
+            occupied_dirs.add("/".join(parts[:i]))
+    strays: set[str] = set()
+    seen_parents: set[str] = set()
+    for pin_rel in file_pins:
+        parent_rel = pin_rel.rsplit("/", 1)[0] if "/" in pin_rel else ""
+        if parent_rel in seen_parents:
+            continue
+        seen_parents.add(parent_rel)
+        parent_abs = (repo_root / parent_rel) if parent_rel else repo_root
+        try:
+            children = list(parent_abs.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            child_rel = _normalize_rel_posix(
+                f"{parent_rel}/{child.name}" if parent_rel else child.name
+            )
+            if child_rel == pin_rel:
+                continue  # the pin itself (a regular file) is legitimate
+            try:
+                is_symlink = child.is_symlink()
+                # a plain regular file is already covered by the file-level FS-diff
+                if not is_symlink and child.is_file():
+                    continue
+                is_dir = (not is_symlink) and child.is_dir()
+            except OSError:
+                continue
+            # a sibling authorized by a directory write_root is legitimate
+            if _path_under_any_write_root(child_rel, write_roots):
+                continue
+            # a directory that already held baseline files pre-existed (not a stray)
+            if is_dir and child_rel in occupied_dirs:
+                continue
+            strays.add(child_rel)
+    return sorted(strays)
+
+
 def _validate_actual_write_paths(
     repo_root: Path,
     orchestration_id: str,
@@ -8918,6 +9035,19 @@ def _validate_actual_write_paths(
             unauthorized.append(path)
             continue
         unauthorized.append(path)
+
+    # A file pin's parent dir is bound writable (for the harness Write tool's atomic
+    # temp-sibling+rename); the file-only FS-diff cannot see a new directory / symlink
+    # stray created there, so detect those explicitly (see _file_pin_parent_nonfile_strays).
+    if actor_role in {"step", "substep"}:
+        for stray in _file_pin_parent_nonfile_strays(
+            repo_root,
+            orchestration_id,
+            agent_run_id=run_id,
+            write_roots=write_roots,
+        ):
+            if stray not in unauthorized:
+                unauthorized.append(stray)
 
     if directory_authorized:
         _write_directory_authorized_paths(

@@ -6,10 +6,13 @@ rendered bwrap profile. A synthetic "leaf" script performs the operations a real
 an out-of-scope write, DNS), and we assert confinement + that the existing FS-diff machinery
 (`_actual_changed_paths_since_baseline`) attributes exactly the in-scope writes.
 
-This encodes the Phase-2 target behavior and currently FAILS against the file-pin model
-(`REWRITE_READINPUT` hits EBUSY/EROFS because the read-input file is ro-pinned while it must
-also be writable). It turns green once write/read binds become directory-level (§1) and
-authorization is FS-diff containment (§2).
+Single-file write pins (verify/judge: ir_meta.json / source_meta.json / semantic_review.json)
+bind the pin's PARENT DIRECTORY writable, not the file inode: the harness Write/Edit tool
+writes atomically via a same-dir temp sibling + rename, which a file-granular bind broke with
+EROFS (it left the parent dir read-only). So these sims exercise the REAL atomic write (temp +
+os.replace of the pin) and assert the current contract: the physical bwrap scope is exactly the
+pin's one parent directory, and single-file *authorization* is the FS-diff containment layer
+(any non-pin change is attributed, and would fail-close the run) — not a file-granular bind.
 """
 from __future__ import annotations
 
@@ -215,9 +218,12 @@ class BwrapSimulationTests(unittest.TestCase):
 @unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
 class BwrapJudgePinSimulationTests(unittest.TestCase):
     """Model Validate.judge's narrowed write_root: a single semantic_review.json FILE pin
-    (not the whole runs/<run_id>/<safe>/ dir). Confirm the judge can rewrite its own
-    semantic_review.json in place but CANNOT touch the same-dir host-authored verdict.json
-    (the R2 verdict) nor create a sibling file — the whole point of the narrowing."""
+    (not the whole runs/<run_id>/<safe>/ dir). The pin's PARENT DIR is bound rw so the judge
+    can author semantic_review.json via the harness Write tool's atomic temp-sibling+rename
+    (a file-granular bind broke this with EROFS), while every existing sibling — the host
+    authored verdict.json — is re-ro-bound and stays physically unwritable. Only a brand-new
+    stray file is physically creatable, and FS-diff attributes it (single-file authorization),
+    so it would fail-close the run. A write outside the one run dir is physically blocked."""
 
     PIPE = "workspace/pipelines/n/p_001"
     RUN_DIR = PIPE + "/runs/run_20260101_001/component__spec_x__0.1.0/"
@@ -262,64 +268,85 @@ class BwrapJudgePinSimulationTests(unittest.TestCase):
                 backend_command="python3", backend_type="claude")
             self.assertEqual((repo / self.PIN).stat().st_mtime_ns, mtime)
 
-    def test_judge_writes_own_review_but_cannot_touch_sibling_verdict(self) -> None:
+    def test_judge_atomic_pin_write_and_fs_diff_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             repo = Path(t).resolve()
             orch, arid = "orch_judge", "arid_judge"
             self._setup(repo, orch, arid)
             _write_run_write_baseline(repo, orch, agent_run_id=arid)
             script = textwrap.dedent(f"""
+                import os
                 from pathlib import Path
                 def report(tag, ok, e=""):
                     print(f"{{tag}}:{{'OK' if ok else 'FAIL'}}", e, flush=True)
-                # (1) rewrite own semantic_review.json in place -> OK: the file pin rw-bind must
-                # override the read-root ro-bind of the enclosing run dir (production ordering).
+                # (1) author semantic_review.json the way the real harness Write tool does:
+                # write a temp sibling, then atomically rename over the pin. This is the exact
+                # operation a file-granular bind broke with EROFS (parent dir read-only).
                 try:
-                    Path("{self.PIN}").write_text('{{"decision":"pass"}}')
-                    report("SEM_WRITE", True)
+                    tmp = "{self.PIN}.tmp.sim"
+                    Path(tmp).write_text('{{"decision":"pass"}}')
+                    os.replace(tmp, "{self.PIN}")
+                    report("PIN_ATOMIC", True)
                 except Exception as e:
-                    report("SEM_WRITE", False, repr(e))
-                # (2) the same-dir host-authored verdict.json is a read input: READABLE (ro-bound)...
+                    report("PIN_ATOMIC", False, repr(e))
+                # (2) the same-dir host-authored verdict.json is a read input: READABLE...
                 try:
                     Path("{self.VERDICT}").read_text(); report("VERDICT_READ", True)
                 except Exception as e:
                     report("VERDICT_READ", False, repr(e))
-                # ...but NOT writable (the run dir is ro; only the one pin file is rw).
+                # ...but NOT writable: it is an existing sibling, re-ro-bound over the parent rw.
                 try:
                     Path("{self.VERDICT}").write_text('{{"forged":true}}')
-                    print("VERDICT_WRITE:ALLOWED", flush=True)  # bad: narrowing failed
+                    print("VERDICT_WRITE:ALLOWED", flush=True)  # bad: sibling protection lost
                 except Exception:
                     print("VERDICT_WRITE:BLOCKED", flush=True)  # good
-                # (3) create a brand-new sibling file in the run dir -> BLOCKED (dir stays ro)
+                # (3) a brand-NEW stray file in the run dir IS physically creatable (parent rw) —
+                # exercised so we can assert FS-diff attributes it (authorization catches it).
                 try:
-                    Path("{self.RUN_DIR}evil.json").write_text("x")
-                    print("SIBLING_NEW:ALLOWED", flush=True)  # bad
+                    Path("{self.RUN_DIR}stray.json").write_text("x")
+                    report("STRAY_NEW", True)
+                except Exception as e:
+                    report("STRAY_NEW", False, repr(e))
+                # (4) a write OUTSIDE the pin's one parent dir (a repo file) must stay BLOCKED.
+                try:
+                    Path("AGENTS_SIM.md").write_text("x")
+                    print("OUTSIDE_WRITE:ALLOWED", flush=True)  # bad: over-widened
                 except Exception:
-                    print("SIBLING_NEW:BLOCKED", flush=True)  # good
+                    print("OUTSIDE_WRITE:BLOCKED", flush=True)  # good
             """)
+            (repo / "AGENTS_SIM.md").write_text("orig\n", encoding="utf-8")
             profile = build_bwrap_profile(
                 repo_root=repo, orchestration_id=orch, agent_run_id=arid,
                 backend_command="python3", backend_type="claude")
             cmd = render_bwrap_command(profile=profile, command_argv=["python3", "-c", script])
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
-            self.assertIn("SEM_WRITE:OK", out, out)
+            self.assertIn("PIN_ATOMIC:OK", out, out)
             self.assertIn("VERDICT_READ:OK", out, out)
-            self.assertIn("VERDICT_WRITE:BLOCKED", out, out)
-            self.assertIn("SIBLING_NEW:BLOCKED", out, out)
-            # The host-side verdict.json must be byte-for-byte unchanged.
+            self.assertIn("VERDICT_WRITE:BLOCKED", out, out)  # existing sibling stays protected
+            self.assertIn("STRAY_NEW:OK", out, out)  # new file physically creatable...
+            self.assertIn("OUTSIDE_WRITE:BLOCKED", out, out)
+            # The host-side verdict.json is byte-for-byte unchanged, and the repo file too.
             self.assertEqual((repo / self.VERDICT).read_text(), '{"per_test": []}\n')
-            # FS-diff attributes only the in-scope semantic_review.json write.
+            self.assertEqual((repo / "AGENTS_SIM.md").read_text(), "orig\n")
+            # ...but authorization is FS-diff: the pin write and the stray new file are both
+            # attributed (the stray would fail-close the run), the protected verdict is not, and
+            # the atomic temp sibling was renamed away.
             changed = set(_actual_changed_paths_since_baseline(repo, orch, agent_run_id=arid))
             self.assertIn(self.PIN, changed, changed)
+            self.assertIn(self.RUN_DIR + "stray.json", changed, changed)
             self.assertNotIn(self.VERDICT, changed, changed)
+            self.assertNotIn(self.PIN + ".tmp.sim", changed, changed)
 
 
 @unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
 class BwrapGenerateVerifyPinSimulationTests(unittest.TestCase):
     """Model Generate.verify's narrowed write_root: a single source_meta.json FILE pin (not the
-    whole source/ dir). Confirm the verifier can rewrite its own source_meta.json in place but
-    CANNOT rewrite a certified producer source (src/<id>_model.f90) nor add a sibling — so an
-    uncertified source can never reach Build via a verify turn."""
+    whole source/ dir). The pin's PARENT DIR is bound rw so the verifier can author
+    source_meta.json via the harness Write tool's atomic temp-sibling+rename (a file-granular
+    bind broke this with EROFS), while the certified src/ subtree is re-ro-bound and stays
+    physically unwritable — so a certified producer source (src/<id>_model.f90) can never be
+    mutated into an uncertified source reaching Build. Only a brand-new stray file is physically
+    creatable, and FS-diff attributes it. A write OUTSIDE the one pin dir stays blocked."""
 
     PIPE = "workspace/pipelines/n/p_001"
     SRC_DIR = PIPE + "/source/src_001/"
@@ -344,38 +371,51 @@ class BwrapGenerateVerifyPinSimulationTests(unittest.TestCase):
             json.dumps({"agent_run_id": arid, "allowed_read_roots": [self.SRC_DIR]}),
             encoding="utf-8")
 
-    def test_verify_rewrites_meta_but_cannot_rewrite_certified_source(self) -> None:
+    def test_verify_atomic_meta_write_and_fs_diff_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             repo = Path(t).resolve()
             orch, arid = "orch_gv", "arid_gv"
             self._setup(repo, orch, arid)
+            (repo / "AGENTS_SIM.md").write_text("orig\n", encoding="utf-8")
             _write_run_write_baseline(repo, orch, agent_run_id=arid)
             script = textwrap.dedent(f"""
+                import os
                 from pathlib import Path
                 def report(tag, ok, e=""):
                     print(f"{{tag}}:{{'OK' if ok else 'FAIL'}}", e, flush=True)
-                # (1) read the certified source -> OK (repo ro-bind), then (2) rewrite own meta.
+                # (1) read the certified source -> OK.
                 try:
                     Path("{self.MODEL}").read_text(); report("READ_SRC", True)
                 except Exception as e:
                     report("READ_SRC", False, repr(e))
+                # (2) author own source_meta.json via atomic temp-sibling+rename (real Write tool).
                 try:
-                    Path("{self.PIN}").write_text('{{"verification_status":"pass"}}')
-                    report("META_WRITE", True)
+                    tmp = "{self.PIN}.tmp.sim"
+                    Path(tmp).write_text('{{"verification_status":"pass"}}')
+                    os.replace(tmp, "{self.PIN}")
+                    report("META_ATOMIC", True)
                 except Exception as e:
-                    report("META_WRITE", False, repr(e))
-                # (3) rewrite the certified source in place -> BLOCKED (src/ stays ro)
+                    report("META_ATOMIC", False, repr(e))
+                # (3) rewriting the certified source in place is BLOCKED: the src/ subtree is an
+                # existing sibling, re-ro-bound over the parent rw (uncertified source can't reach Build).
                 try:
                     Path("{self.MODEL}").write_text("module evil\\nend module\\n")
-                    print("SRC_REWRITE:ALLOWED", flush=True)  # bad: uncertified source to Build
+                    print("SRC_REWRITE:ALLOWED", flush=True)  # bad: certified source mutated
                 except Exception:
                     print("SRC_REWRITE:BLOCKED", flush=True)  # good
-                # (4) add a brand-new sibling source -> BLOCKED
+                # (4) a brand-NEW stray file directly in the pin dir IS physically creatable
+                # (parent rw) — exercised so we can assert FS-diff attributes it below.
                 try:
-                    Path("{self.SRC_DIR}src/evil_model.f90").write_text("x")
-                    print("SIBLING_SRC:ALLOWED", flush=True)  # bad
+                    Path("{self.SRC_DIR}stray.json").write_text("x")
+                    report("STRAY_NEW", True)
+                except Exception as e:
+                    report("STRAY_NEW", False, repr(e))
+                # (5) a write OUTSIDE the one pin dir (a repo file) must stay BLOCKED.
+                try:
+                    Path("AGENTS_SIM.md").write_text("x")
+                    print("OUTSIDE_WRITE:ALLOWED", flush=True)  # bad: over-widened
                 except Exception:
-                    print("SIBLING_SRC:BLOCKED", flush=True)  # good
+                    print("OUTSIDE_WRITE:BLOCKED", flush=True)  # good
             """)
             profile = build_bwrap_profile(
                 repo_root=repo, orchestration_id=orch, agent_run_id=arid,
@@ -383,14 +423,21 @@ class BwrapGenerateVerifyPinSimulationTests(unittest.TestCase):
             cmd = render_bwrap_command(profile=profile, command_argv=["python3", "-c", script])
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
             self.assertIn("READ_SRC:OK", out, out)
-            self.assertIn("META_WRITE:OK", out, out)
-            self.assertIn("SRC_REWRITE:BLOCKED", out, out)
-            self.assertIn("SIBLING_SRC:BLOCKED", out, out)
-            # the certified source is byte-for-byte unchanged on the host
+            self.assertIn("META_ATOMIC:OK", out, out)
+            self.assertIn("SRC_REWRITE:BLOCKED", out, out)  # certified src stays protected
+            self.assertIn("STRAY_NEW:OK", out, out)  # new file physically creatable...
+            self.assertIn("OUTSIDE_WRITE:BLOCKED", out, out)
+            # the certified source is byte-for-byte unchanged on the host, and the repo file too
             self.assertEqual((repo / self.MODEL).read_text(), "module foo\nend module\n")
+            self.assertEqual((repo / "AGENTS_SIM.md").read_text(), "orig\n")
+            # ...but authorization is FS-diff: the pin write and the stray new file are attributed
+            # (the stray would fail-close the verify turn), the protected src is not, and the
+            # atomic temp sibling was renamed away.
             changed = set(_actual_changed_paths_since_baseline(repo, orch, agent_run_id=arid))
             self.assertIn(self.PIN, changed, changed)
+            self.assertIn(self.SRC_DIR + "stray.json", changed, changed)
             self.assertNotIn(self.MODEL, changed, changed)
+            self.assertNotIn(self.PIN + ".tmp.sim", changed, changed)
 
 
 @unittest.skipUnless(_bwrap_usable(), "bwrap / user namespaces not available")
