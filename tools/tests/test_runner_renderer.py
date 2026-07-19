@@ -32,7 +32,7 @@ from tools.runner_renderer import (
     render_runner,
     spec_id_length_violation,
 )
-from tools.validate_pipeline_semantics import _parse_interface_stanzas
+from tools.lang_backend_fortran import parse_signatures_from_fortran
 
 HARNESS = "harness_fortran_cpu"
 BOUNDARY_SID = "dynamics_shallow_water_boundary_2d_periodic_copy"
@@ -285,10 +285,11 @@ _RANK_CHECKS_STUB = textwrap.dedent(f"""\
 
 def _harness_signatures() -> list[dict]:
     """The certified harness IR public_api.signatures, synthesized from §5.1."""
-    ops, types, errs = _parse_interface_stanzas(_HARNESS_V3_INTERFACE)
-    assert not errs, errs
-    return [{"symbol": n, "interface": "\n".join(lines)}
-            for n, lines in {**ops, **types}.items()]
+    struct = parse_signatures_from_fortran(_HARNESS_V3_INTERFACE)
+    return [
+        {"symbol": signature["name"], "signature": signature}
+        for signature in [*struct["procedures"], *struct["types"]]
+    ]
 
 
 # The v3 harness stub source (canonical `type ::` + separate `public ::`), used by
@@ -1195,11 +1196,11 @@ class HarnessPinTest(unittest.TestCase):
             assert_harness_pin(self.ir, BOUNDARY_SID, "harness_other", self.sigs, self.src)
 
     def test_ir_signature_drift(self) -> None:
-        bad = [dict(e) for e in self.sigs]
+        bad = copy.deepcopy(self.sigs)
         for e in bad:
             if e["symbol"].endswith("__write_snapshot"):
-                e["interface"] = e["interface"].replace("intent(in) :: time",
-                                                         "intent(in) :: tstamp")
+                time_arg = next(a for a in e["signature"]["args"] if a["name"] == "time")
+                time_arg["name"] = "tstamp"
         with self.assertRaises(RenderError):
             assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, bad, self.src)
 
@@ -1266,11 +1267,11 @@ class HarnessPinTest(unittest.TestCase):
         # must NOT false-pass the pin — the whole safety net rests on this. The failure is the
         # distinct "no usable public_api.signatures" (missing artifact), NOT the per-symbol
         # "omits ... recert drift" message (which is reserved for a real single-symbol drift).
-        # Blank symbol/interface fields are malformed under the IR validator's non-empty rule,
+        # Blank symbol/signature fields are malformed under the IR validator's non-empty rule,
         # so they must NOT seed a bogus "" key that later reads as per-symbol drift.
         for sigs in ([], None, "not-a-list", 42, [{"symbol": "x"}],
-                     [{"symbol": " ", "interface": ""}],
-                     [{"symbol": "harness_fortran_cpu__box", "interface": "   "}]):
+                     [{"symbol": " ", "signature": {}}],
+                     [{"symbol": "harness_fortran_cpu__box", "signature": {}}]):
             with self.assertRaises(RenderError) as cm:
                 assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, sigs, self.src)
             self.assertIn("no usable public_api.signatures", str(cm.exception))
@@ -1280,22 +1281,22 @@ class HarnessPinTest(unittest.TestCase):
         with self.assertRaises(RenderError):
             assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, self.sigs, "")
 
-    def test_signature_entry_without_interface_fail_closed(self) -> None:
-        junk = [{"symbol": e["symbol"]} for e in self.sigs]  # symbol present, interface dropped
+    def test_signature_entry_without_signature_fail_closed(self) -> None:
+        junk = [{"symbol": e["symbol"]} for e in self.sigs]
         with self.assertRaises(RenderError):
             assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, junk, self.src)
 
     def test_type_component_reorder_drift(self) -> None:
         # Derived-type components are compared as an ORDERED list (component layout is ABI);
         # reordering two components of h_case_result must be caught as drift.
-        bad = [dict(e) for e in self.sigs]
+        bad = copy.deepcopy(self.sigs)
         for e in bad:
             if e["symbol"].endswith("__h_case_result"):
-                lines = e["interface"].split("\n")
-                cid = next(i for i, ln in enumerate(lines) if ":: case_id" in ln)
-                xf = next(i for i, ln in enumerate(lines) if ":: expected_xfail" in ln)
-                lines[cid], lines[xf] = lines[xf], lines[cid]
-                e["interface"] = "\n".join(lines)
+                components = e["signature"]["components"]
+                cid = next(i for i, ent in enumerate(components) if ent["name"] == "case_id")
+                xf = next(
+                    i for i, ent in enumerate(components) if ent["name"] == "expected_xfail")
+                components[cid], components[xf] = components[xf], components[cid]
         with self.assertRaises(RenderError):
             assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, bad, self.src)
 

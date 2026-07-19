@@ -3,8 +3,8 @@
 
 The correctness contract is a round-trip driven by the REAL published interfaces (not a synthetic
 fixture — a hand-built struct could pass while the real §5.1 shape breaks; see the fixture-fiction
-lesson): parsing the real harness §5.1 Fortran block to the structured form and rendering it back
-must reproduce the exact NORMALIZED stanza lines the current gates compare. The same must hold for
+lesson): loading the real harness structured §5.1 block and rendering/reparsing it through Fortran
+must preserve the struct and the exact NORMALIZED stanza lines the current gates compare. The same must hold for
 `runner_renderer._HARNESS_V3_INTERFACE`, the third hardcoded copy of the harness signatures the
 renderer pin uses. Drift tests confirm the structured form keeps the gate's discriminating power
 (a changed intent / rank / type / name changes the normalized index).
@@ -18,6 +18,7 @@ from pathlib import Path
 
 from tools.lang_backend_fortran import (
     SignatureParseError,
+    load_structured_signatures,
     normalized_stanza_index,
     parse_signatures_from_fortran,
     render_signatures_to_fortran,
@@ -32,12 +33,18 @@ HARNESS_SPEC = (
 )
 
 
-def _real_section51_block() -> str:
+def _real_section51_struct() -> dict:
     md = HARNESS_SPEC.read_text(encoding="utf-8")
     section = md.split("### 5.1", 1)[1]
     m = _FENCED_BLOCK_RE.search(section)
     assert m, "harness controlled_spec §5.1 fenced block not found"
-    return m.group(1)
+    struct, err = load_structured_signatures(m.group(1))
+    assert err is None, err
+    return struct
+
+
+def _real_section51_block() -> str:
+    return render_signatures_to_fortran(_real_section51_struct())
 
 
 class RoundTripRealArtifactsTest(unittest.TestCase):
@@ -56,7 +63,8 @@ class RoundTripRealArtifactsTest(unittest.TestCase):
         return struct
 
     def test_round_trip_harness_controlled_spec_section51(self) -> None:
-        struct = self._assert_round_trip(_real_section51_block())
+        published = _real_section51_struct()
+        struct = self._assert_round_trip(render_signatures_to_fortran(published))
         # sanity on the parsed shape (the real harness surface)
         self.assertEqual(len(struct["procedures"]), 13)
         self.assertEqual(len(struct["types"]), 5)
@@ -140,6 +148,51 @@ class FailClosedTest(unittest.TestCase):
             parse_signatures_from_fortran(
                 "subroutine foo(x)\n  frobnicate :: x\nend subroutine foo\n"
             )
+
+
+class FortranStanzaParserTests(unittest.TestCase):
+    """Generated .f90 still uses the stanza splitter; retain its legacy fail-closed coverage."""
+
+    def test_unterminated_stanza_errors(self) -> None:
+        with self.assertRaisesRegex(SignatureParseError, "unterminated"):
+            parse_signatures_from_fortran(
+                "subroutine hx__foo(a)\n  integer, intent(in) :: a\n")
+
+    def test_duplicate_stanza_errors(self) -> None:
+        dup = (
+            "function hx__foo(a) result(s)\n  integer, intent(in) :: a\n"
+            "  character(len=:), allocatable :: s\nend function hx__foo\n"
+            "function hx__foo(a, b) result(s)\n  integer, intent(in) :: a\n"
+            "  integer, intent(in) :: b\n  character(len=:), allocatable :: s\n"
+            "end function hx__foo\n")
+        with self.assertRaisesRegex(SignatureParseError, "duplicate"):
+            parse_signatures_from_fortran(dup)
+
+    def test_bare_end_does_not_swallow_following_procedure(self) -> None:
+        from tools.validate_pipeline_semantics import _parse_interface_stanzas
+
+        block = (
+            "function hx__a(x) result(s)\n  real, intent(in) :: x\n  real :: s\nend\n"
+            "function hx__b(y) result(s)\n  real, intent(in) :: y\n  real :: s\n"
+            "end function hx__b\n")
+        ops, _types, _errors = _parse_interface_stanzas(block)
+        self.assertEqual(set(ops), {"hx__a", "hx__b"})
+
+    def test_type_missing_end_type_is_unterminated(self) -> None:
+        block = (
+            "type :: hx__a\n  integer :: x\n"
+            "type :: hx__b\n  integer :: y\nend type hx__b\n")
+        with self.assertRaisesRegex(SignatureParseError, "unterminated.*hx__a"):
+            parse_signatures_from_fortran(block)
+
+    def test_no_space_end_keyword_closes_stanza(self) -> None:
+        block = (
+            "function hx__a(x) result(s)\n  real, intent(in) :: x\n"
+            "  real :: s\nendfunction hx__a\n"
+            "function hx__b(y) result(s)\n  real, intent(in) :: y\n"
+            "  real :: s\nend function hx__b\n")
+        struct = parse_signatures_from_fortran(block)
+        self.assertEqual({p["name"] for p in struct["procedures"]}, {"hx__a", "hx__b"})
 
 
 def _type_lines(block: str, suffix: str) -> list[str]:

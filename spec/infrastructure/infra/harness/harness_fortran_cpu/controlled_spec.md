@@ -13,7 +13,7 @@ This `infrastructure` node (R1 harness) is responsible for the shared **runner p
 
 The node's own generated code is a `harness_fortran_cpu_model.f90` publishing the plumbing operations plus a self-test `harness_fortran_cpu_runner.f90` that exercises them and emits the standard runner outputs (so the harness is verified through the exact same Compile→Generate→Build→Validate path as any node; it is self-hosting — the self-test writes its evidence using its own emitters).
 
-The published surface is a **binding, signature-level contract**: §5.1 gives the canonical Fortran interface block (every public type and every operation signature) in a machine-readable fenced code block. The generated `harness_fortran_cpu_model.f90` must publish exactly those signatures; a consuming physics node's host-rendered runner glue is written against them and holds no serialization knowledge of its own (the JSON envelope assembly and the verdict fold live only inside these certified operations).
+The published surface is a **binding, signature-level contract**: §5.1 gives the canonical language-neutral structured interface block (every public type and every operation signature) in a machine-readable fenced code block, from which the language backend renders the Fortran surface. The generated `harness_fortran_cpu_model.f90` must publish exactly those signatures; a consuming physics node's host-rendered runner glue is written against them and holds no serialization knowledge of its own (the JSON envelope assembly and the verdict fold live only inside these certified operations).
 
 ## 2. input/output contract
 Input (to the self-test runner): the standard runner argv `--cases <spec.ir.yaml> <case_id>...` — the spec path is taken positionally and need not be read; the trailing tokens are the `case_id`s to run, one per `case.test_case_set[]`. The main program marshals the process argv into a token array and calls `harness_fortran_cpu__parse_cases` on it. Each `case_id` selects, by `select case`, the plumbing aspect that case verifies. Every `case_id` is also the `test_id` of the single-target test that names it, but the converse does not hold: a **multi-target** test ranges over several existing cases and declares no case of its own (`l0_multi_case_evidence_pass` in `tests.md`). A missing `--cases` flag (no cases) makes `__parse_cases` return `ok=.false.` (the input guard); the guard case verifies this by calling `__parse_cases` on a length-0 token array.
@@ -84,120 +84,326 @@ A change breaking compatibility of any signature (or of a published derived type
 - **Skew fail-close** — a consumer that would nonetheless render its runner glue against a drifted interface is stopped before Build by the renderer's signature pin (`tools/runner_renderer.assert_harness_pin`), which compares this §5.1 block against the certified harness IR's `public_api.signatures` and its generated model source.
 
 ### 5.1 Canonical interface block
-The exact published surface, as a machine-readable Fortran interface block. The generated `harness_fortran_cpu_model.f90` must publish every type and operation below with these signatures verbatim (formatting/continuations/comments may differ; identifiers, argument names, argument order, types, ranks, `intent`s, and `result` names may not). The deterministic gates parse this block: the `--stage compile` gate cross-checks its symbol set against §5, and the `Generate.static` gate pins the generated model source against these signatures (normalized: comments stripped, continuations joined, case-folded, whitespace-insensitive).
+The exact published surface, as a machine-readable **language-neutral** signature block (`module_parameters` / `types` / `procedures`). It describes each published type and operation abstractly — for every argument, result, and derived-type component: its `name`, neutral `type` (`real` / `integer` / `logical` / `string` / `derived`), `rank`, and (for an argument) `intent`; plus the value-pinned module parameters the signatures reference. The target language's binding (here Fortran: `real(dp)`, `character(len=...)`, `type(...)`, assumed-shape `(:)` ranks, the `<spec_id>__` names) is produced by the language backend (`tools/lang_backend_fortran`), not authored here — so this contract is not tied to Fortran. The generated `harness_fortran_cpu_model.f90` must publish every symbol below with the signature this block describes (formatting/continuations/comments may differ; names, argument order, types, ranks, `intent`s, `result` names, and component layout may not). The deterministic gates render this block to the target language and pin it: the `--stage compile` gate cross-checks its symbol set against §5, and the `Generate.static` gate pins the generated model source against these signatures (normalized: comments stripped, continuations joined, case-folded, whitespace-insensitive).
 
-```fortran
-! Module integer parameters referenced by the signatures below (internal, value-pinned; not exported).
-integer, parameter :: dp = real64
-integer, parameter :: case_id_len = 64
-
-! ---- Published derived types ----
-type :: harness_fortran_cpu__h_named
-  character(len=:), allocatable :: name
-  character(len=:), allocatable :: json
-end type harness_fortran_cpu__h_named
-
-type :: harness_fortran_cpu__h_check
-  character(len=:), allocatable :: id
-  character(len=4) :: status
-end type harness_fortran_cpu__h_check
-
-type :: harness_fortran_cpu__h_metric
-  character(len=:), allocatable :: name
-  real(dp) :: value
-  logical :: is_na
-  character(len=:), allocatable :: reason_na
-end type harness_fortran_cpu__h_metric
-
-type :: harness_fortran_cpu__h_case_result
-  character(len=:), allocatable :: case_id
-  logical :: expected_xfail
-  type(harness_fortran_cpu__h_check), allocatable :: checks(:)
-  type(harness_fortran_cpu__h_metric), allocatable :: metrics(:)
-end type harness_fortran_cpu__h_case_result
-
-type :: harness_fortran_cpu__h_mb_entry
-  character(len=:), allocatable :: test_id
-  character(len=:), allocatable :: case_id
-  type(harness_fortran_cpu__h_named), allocatable :: values(:)
-end type harness_fortran_cpu__h_mb_entry
-
-! ---- Published operations ----
-subroutine harness_fortran_cpu__parse_cases(tokens, ntokens, case_ids, ncases, ok)
-  character(len=*), intent(in) :: tokens(:)
-  integer, intent(in) :: ntokens
-  character(len=case_id_len), intent(out) :: case_ids(:)
-  integer, intent(out) :: ncases
-  logical, intent(out) :: ok
-end subroutine harness_fortran_cpu__parse_cases
-
-function harness_fortran_cpu__emit_real(x) result(s)
-  real(dp), intent(in) :: x
-  character(len=:), allocatable :: s
-end function harness_fortran_cpu__emit_real
-
-function harness_fortran_cpu__emit_int(i) result(s)
-  integer, intent(in) :: i
-  character(len=:), allocatable :: s
-end function harness_fortran_cpu__emit_int
-
-function harness_fortran_cpu__emit_bool(b) result(s)
-  logical, intent(in) :: b
-  character(len=:), allocatable :: s
-end function harness_fortran_cpu__emit_bool
-
-function harness_fortran_cpu__emit_array_r1(a) result(s)
-  real(dp), intent(in) :: a(:)
-  character(len=:), allocatable :: s
-end function harness_fortran_cpu__emit_array_r1
-
-function harness_fortran_cpu__emit_array_r2(a) result(s)
-  real(dp), intent(in) :: a(:,:)
-  character(len=:), allocatable :: s
-end function harness_fortran_cpu__emit_array_r2
-
-function harness_fortran_cpu__emit_array_r3(a) result(s)
-  real(dp), intent(in) :: a(:,:,:)
-  character(len=:), allocatable :: s
-end function harness_fortran_cpu__emit_array_r3
-
-function harness_fortran_cpu__emit_array_r4(a) result(s)
-  real(dp), intent(in) :: a(:,:,:,:)
-  character(len=:), allocatable :: s
-end function harness_fortran_cpu__emit_array_r4
-
-function harness_fortran_cpu__box(name, json) result(nv)
-  character(len=*), intent(in) :: name
-  character(len=*), intent(in) :: json
-  type(harness_fortran_cpu__h_named) :: nv
-end function harness_fortran_cpu__box
-
-subroutine harness_fortran_cpu__write_snapshot(case_id, values, time)
-  character(len=*), intent(in) :: case_id
-  type(harness_fortran_cpu__h_named), intent(in) :: values(:)
-  real(dp), intent(in) :: time
-end subroutine harness_fortran_cpu__write_snapshot
-
-subroutine harness_fortran_cpu__write_metrics_basis(entries, n)
-  type(harness_fortran_cpu__h_mb_entry), intent(in) :: entries(:)
-  integer, intent(in) :: n
-end subroutine harness_fortran_cpu__write_metrics_basis
-
-subroutine harness_fortran_cpu__write_diagnostics(results, n)
-  type(harness_fortran_cpu__h_case_result), intent(in) :: results(:)
-  integer, intent(in) :: n
-end subroutine harness_fortran_cpu__write_diagnostics
-
-subroutine harness_fortran_cpu__write_perf(case_id, target, steps, cells_updated, walltime_sec, mpi_ranks, threads_per_rank, gpu_devices)
-  character(len=*), intent(in) :: case_id
-  character(len=*), intent(in) :: target
-  integer, intent(in) :: steps
-  integer, intent(in) :: cells_updated
-  real(dp), intent(in) :: walltime_sec
-  integer, intent(in) :: mpi_ranks
-  integer, intent(in) :: threads_per_rank
-  integer, intent(in) :: gpu_devices
-end subroutine harness_fortran_cpu__write_perf
+```yaml
+module_parameters:
+- name: dp
+  value: real64
+- name: case_id_len
+  value: '64'
+types:
+- name: harness_fortran_cpu__h_named
+  components:
+  - name: name
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+  - name: json
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- name: harness_fortran_cpu__h_check
+  components:
+  - name: id
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+  - name: status
+    spec:
+      type: string
+      len: '4'
+- name: harness_fortran_cpu__h_metric
+  components:
+  - name: name
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+  - name: value
+    spec:
+      type: real
+      kind: dp
+  - name: is_na
+    spec:
+      type: logical
+  - name: reason_na
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- name: harness_fortran_cpu__h_case_result
+  components:
+  - name: case_id
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+  - name: expected_xfail
+    spec:
+      type: logical
+  - name: checks
+    rank: 1
+    spec:
+      type: derived
+      name: harness_fortran_cpu__h_check
+      alloc: true
+  - name: metrics
+    rank: 1
+    spec:
+      type: derived
+      name: harness_fortran_cpu__h_metric
+      alloc: true
+- name: harness_fortran_cpu__h_mb_entry
+  components:
+  - name: test_id
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+  - name: case_id
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+  - name: values
+    rank: 1
+    spec:
+      type: derived
+      name: harness_fortran_cpu__h_named
+      alloc: true
+procedures:
+- kind: subroutine
+  name: harness_fortran_cpu__parse_cases
+  args:
+  - name: tokens
+    rank: 1
+    intent: in
+    spec:
+      type: string
+      len: '*'
+  - name: ntokens
+    intent: in
+    spec:
+      type: integer
+  - name: case_ids
+    rank: 1
+    intent: out
+    spec:
+      type: string
+      len: case_id_len
+  - name: ncases
+    intent: out
+    spec:
+      type: integer
+  - name: ok
+    intent: out
+    spec:
+      type: logical
+- kind: function
+  name: harness_fortran_cpu__emit_real
+  args:
+  - name: x
+    intent: in
+    spec:
+      type: real
+      kind: dp
+  result:
+    name: s
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- kind: function
+  name: harness_fortran_cpu__emit_int
+  args:
+  - name: i
+    intent: in
+    spec:
+      type: integer
+  result:
+    name: s
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- kind: function
+  name: harness_fortran_cpu__emit_bool
+  args:
+  - name: b
+    intent: in
+    spec:
+      type: logical
+  result:
+    name: s
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- kind: function
+  name: harness_fortran_cpu__emit_array_r1
+  args:
+  - name: a
+    rank: 1
+    intent: in
+    spec:
+      type: real
+      kind: dp
+  result:
+    name: s
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- kind: function
+  name: harness_fortran_cpu__emit_array_r2
+  args:
+  - name: a
+    rank: 2
+    intent: in
+    spec:
+      type: real
+      kind: dp
+  result:
+    name: s
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- kind: function
+  name: harness_fortran_cpu__emit_array_r3
+  args:
+  - name: a
+    rank: 3
+    intent: in
+    spec:
+      type: real
+      kind: dp
+  result:
+    name: s
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- kind: function
+  name: harness_fortran_cpu__emit_array_r4
+  args:
+  - name: a
+    rank: 4
+    intent: in
+    spec:
+      type: real
+      kind: dp
+  result:
+    name: s
+    spec:
+      type: string
+      len: ':'
+      alloc: true
+- kind: function
+  name: harness_fortran_cpu__box
+  args:
+  - name: name
+    intent: in
+    spec:
+      type: string
+      len: '*'
+  - name: json
+    intent: in
+    spec:
+      type: string
+      len: '*'
+  result:
+    name: nv
+    spec:
+      type: derived
+      name: harness_fortran_cpu__h_named
+- kind: subroutine
+  name: harness_fortran_cpu__write_snapshot
+  args:
+  - name: case_id
+    intent: in
+    spec:
+      type: string
+      len: '*'
+  - name: values
+    rank: 1
+    intent: in
+    spec:
+      type: derived
+      name: harness_fortran_cpu__h_named
+  - name: time
+    intent: in
+    spec:
+      type: real
+      kind: dp
+- kind: subroutine
+  name: harness_fortran_cpu__write_metrics_basis
+  args:
+  - name: entries
+    rank: 1
+    intent: in
+    spec:
+      type: derived
+      name: harness_fortran_cpu__h_mb_entry
+  - name: n
+    intent: in
+    spec:
+      type: integer
+- kind: subroutine
+  name: harness_fortran_cpu__write_diagnostics
+  args:
+  - name: results
+    rank: 1
+    intent: in
+    spec:
+      type: derived
+      name: harness_fortran_cpu__h_case_result
+  - name: n
+    intent: in
+    spec:
+      type: integer
+- kind: subroutine
+  name: harness_fortran_cpu__write_perf
+  args:
+  - name: case_id
+    intent: in
+    spec:
+      type: string
+      len: '*'
+  - name: target
+    intent: in
+    spec:
+      type: string
+      len: '*'
+  - name: steps
+    intent: in
+    spec:
+      type: integer
+  - name: cells_updated
+    intent: in
+    spec:
+      type: integer
+  - name: walltime_sec
+    intent: in
+    spec:
+      type: real
+      kind: dp
+  - name: mpi_ranks
+    intent: in
+    spec:
+      type: integer
+  - name: threads_per_rank
+    intent: in
+    spec:
+      type: integer
+  - name: gpu_devices
+    intent: in
+    spec:
+      type: integer
 ```
 
 ## 6. Prohibitions

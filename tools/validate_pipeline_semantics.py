@@ -5130,14 +5130,21 @@ def _section51_fence_body(controlled_spec_path: Path) -> tuple[str | None, str |
 
 def _section51_parameter_lines(controlled_spec_path: Path) -> list[str]:
     """The §5.1 module-level ``parameter`` declaration lines (e.g. ``integer, parameter :: dp =
-    real64``). These are part of the published ABI a consuming node sees but are not stanzas, so
-    they are pinned separately against the generated source."""
+    real64``). These are part of the published ABI a consuming node sees; the Fortran-language
+    backend renders them from the structured block's ``module_parameters`` so they can be pinned
+    (by value) against the generated source in the language the source is written in."""
+    from tools.lang_backend_fortran import load_structured_signatures
+
     body, err = _section51_fence_body(controlled_spec_path)
     if err or body is None:
         return []
+    struct, perr = load_structured_signatures(body)
+    if perr:
+        return []
     return [
-        line for line in _fortran_logical_lines(body)
-        if "::" in line and re.search(r"\bparameter\b", line, re.IGNORECASE)
+        f"integer, parameter :: {mp['name']} = {mp['value']}"
+        for mp in struct.get("module_parameters", [])
+        if isinstance(mp, dict) and mp.get("name") is not None and mp.get("value") is not None
     ]
 
 
@@ -5146,13 +5153,31 @@ def _parse_canonical_interface_from_controlled_spec(
 ) -> tuple[dict[str, list[str]], dict[str, list[str]], str | None]:
     """Extract and parse an infrastructure node's §5.1 canonical interface block.
 
-    Returns ``(op_stanzas, type_stanzas, error)``. ``error`` is a non-``None`` message when the
-    block is missing, duplicated, unterminated, or parses to zero signatures — every such case is
-    fail-closed at the gate (a spec that fails to pin its own surface cannot certify)."""
+    §5.1 is a language-neutral *structured* signature block (Objective B). The Fortran-language
+    backend loads it and renders each published symbol back to a canonical Fortran stanza, so the
+    downstream gates compare in the same Fortran currency the generated ``.f90`` is written in
+    (``_parse_interface_stanzas`` on the rendered block reproduces the exact stanza shape).
+
+    Returns ``(op_stanzas, type_stanzas, error)``. ``error`` is non-``None`` when the block is
+    missing, duplicated, not valid structured YAML, or renders to zero signatures — every such case
+    is fail-closed at the gate (a spec that fails to pin its own surface cannot certify)."""
+    from tools.lang_backend_fortran import (
+        SignatureParseError,
+        load_structured_signatures,
+        render_signatures_to_fortran,
+    )
+
     body, err = _section51_fence_body(controlled_spec_path)
     if err or body is None:
         return ({}, {}, err)
-    op_stanzas, type_stanzas, errors = _parse_interface_stanzas(body)
+    struct, perr = load_structured_signatures(body)
+    if perr:
+        return ({}, {}, perr)
+    try:
+        rendered = render_signatures_to_fortran(struct)
+    except SignatureParseError as exc:
+        return ({}, {}, f"§5.1 structured block could not render to Fortran: {exc}")
+    op_stanzas, type_stanzas, errors = _parse_interface_stanzas(rendered)
     if errors:
         return (op_stanzas, type_stanzas, "; ".join(errors))
     if not op_stanzas and not type_stanzas:
@@ -10050,14 +10075,17 @@ def _validate_ir_signatures_against_section51(
     violations: list[str],
 ) -> None:
     """Pin the IR's ``public_api.signatures`` == the controlled_spec §5.1 canonical interface
-    block. Each entry is ``{symbol, interface}`` (``symbol`` names the published op/type; ``interface``
-    is its verbatim Fortran stanza). Validation: every entry is a mapping with a non-empty string
-    ``symbol`` + ``interface``; each ``interface`` parses to EXACTLY ONE stanza whose own header name
-    equals the declared ``symbol`` (a lying ``symbol`` or a multi/zero-stanza interface is fail-closed);
-    no symbol is declared twice; the symbol set equals §5.1's; and each symbol's normalized
-    interface-line LIST equals §5.1's (ordered — a derived type's component layout is part of the
+    block. Each entry is ``{symbol, signature}`` (``symbol`` names the published op/type;
+    ``signature`` is its language-neutral structured signature — Objective B). Validation: every
+    entry is a mapping with a non-empty string ``symbol`` + a mapping ``signature``; the Fortran
+    backend renders each ``signature`` to EXACTLY ONE stanza whose own header name equals the
+    declared ``symbol`` (a lying ``symbol`` or a struct that renders to no/many stanzas is
+    fail-closed); no symbol is declared twice; the symbol set equals §5.1's; and each symbol's
+    normalized stanza LIST equals §5.1's (ordered — a derived type's component layout is part of the
     §5 compatibility contract, so a component reorder must NOT be accepted). A drift here becomes a
     drift in the model the Generate leaf transcribes, so it is a Compile fail to Compile.generate."""
+    from tools.lang_backend_fortran import SignatureParseError, render_symbol_to_fortran
+
     spec51: dict[str, tuple[str, ...]] = {}
     for name, lines in {**op_stanzas, **type_stanzas}.items():
         spec51[name] = _stanza_line_list(lines)
@@ -10066,7 +10094,7 @@ def _validate_ir_signatures_against_section51(
     if not isinstance(sigs_raw, list) or not sigs_raw:
         violations.append(
             f"{derived_path}:public_api.signatures missing — an infrastructure node must "
-            "transcribe every controlled_spec §5.1 signature (each {symbol, interface}) so the "
+            "transcribe every controlled_spec §5.1 signature (each {symbol, signature}) so the "
             "Generate leaf can publish them verbatim")
         return
 
@@ -10075,18 +10103,25 @@ def _validate_ir_signatures_against_section51(
         if not isinstance(entry, dict):
             violations.append(
                 f"{derived_path}:public_api.signatures[{idx}] is not a mapping "
-                "(expected {symbol, interface})")
+                "(expected {symbol, signature})")
             continue
         symbol = entry.get("symbol")
-        interface = entry.get("interface")
+        signature = entry.get("signature")
         if not isinstance(symbol, str) or not symbol.strip():
             violations.append(
                 f"{derived_path}:public_api.signatures[{idx}] missing a non-empty 'symbol'")
             continue
         symbol = symbol.strip()
-        if not isinstance(interface, str) or not interface.strip():
+        if not isinstance(signature, dict) or not signature:
             violations.append(
-                f"{derived_path}:public_api.signatures['{symbol}'] missing a non-empty 'interface'")
+                f"{derived_path}:public_api.signatures['{symbol}'] missing a mapping 'signature' "
+                "(a language-neutral structured signature)")
+            continue
+        try:
+            interface = render_symbol_to_fortran(signature)
+        except SignatureParseError as exc:
+            violations.append(
+                f"{derived_path}:public_api.signatures['{symbol}'] signature is not renderable: {exc}")
             continue
         e_ops, e_types, e_errors = _parse_interface_stanzas(interface)
         for err in e_errors:

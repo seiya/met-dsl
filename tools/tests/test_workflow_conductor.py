@@ -8,6 +8,7 @@ assembled. The decision-table tests pin the deterministic failure routing.
 
 from __future__ import annotations
 
+import copy
 import glob
 import io
 import json
@@ -4835,8 +4836,8 @@ class WriteRunnerTest(unittest.TestCase):
             safe = "infrastructure__harness_fortran_cpu__0.2.0"
             newer = repo / "workspace" / "ir" / safe / "harness-fortran-cpu_20260707_004"
             newer.mkdir(parents=True, exist_ok=True)
-            bad_sigs = [dict(e) for e in _harness_signatures()]
-            bad_sigs[0]["interface"] = "subroutine bogus()\nend subroutine"
+            bad_sigs = copy.deepcopy(_harness_signatures())
+            bad_sigs[0]["signature"]["name"] = "bogus"
             (newer / "spec.ir.yaml").write_text(
                 _yaml.safe_dump({"public_api": {"signatures": bad_sigs}}), encoding="utf-8")
             (newer / "ir_meta.json").write_text(
@@ -4959,7 +4960,7 @@ class WriteRunnerTest(unittest.TestCase):
         from tools.runner_renderer import RenderError
         for kwargs in ({"no_public_api_signatures": True},
                        {"signatures": [{"garbage": 1}]},
-                       {"signatures": [{"symbol": " ", "interface": ""}]}):
+                       {"signatures": [{"symbol": " ", "signature": {}}]}):
             with tempfile.TemporaryDirectory() as tmp:
                 repo = Path(tmp)
                 refs = self._refs()

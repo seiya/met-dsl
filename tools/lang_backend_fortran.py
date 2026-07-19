@@ -264,7 +264,7 @@ def _render_entity(ent: dict[str, Any]) -> str:
     spec = _render_spec(ent["spec"])
     intent = ent.get("intent")
     attr = f", intent({intent})" if intent else ""
-    return f"{spec}{attr} :: {ent['name']}{_render_dims(ent['rank'])}"
+    return f"{spec}{attr} :: {ent['name']}{_render_dims(ent.get('rank', 0))}"
 
 
 def _render_procedure(proc: dict[str, Any]) -> list[str]:
@@ -303,6 +303,53 @@ def render_signatures_to_fortran(struct: dict[str, Any]) -> str:
     for proc in struct.get("procedures", []):
         blocks.append("\n".join(_render_procedure(proc)))
     return "\n\n".join(blocks) + "\n"
+
+
+def render_symbol_to_fortran(sig: dict[str, Any]) -> str:
+    """Render ONE published-symbol signature (a procedure or a derived-type struct) to its Fortran
+    stanza. Used to compare a single IR ``public_api.signatures`` entry against §5.1 by rendering it
+    into the same Fortran currency the existing stanza comparison uses. ``kind`` present ->
+    procedure; ``components`` present -> type."""
+    if sig.get("kind") in ("subroutine", "function"):
+        return "\n".join(_render_procedure(sig)) + "\n"
+    if "components" in sig:
+        return "\n".join(_render_type(sig)) + "\n"
+    raise SignatureParseError(
+        "signature struct is neither a procedure (kind: subroutine/function) nor a type "
+        "(components: [...])"
+    )
+
+
+_STRUCT_TOP_KEYS = ("module_parameters", "types", "procedures")
+
+
+def load_structured_signatures(body: str) -> tuple[dict[str, Any], str | None]:
+    """Load a structured (YAML) §5.1 signature block into the canonical struct. Returns
+    ``(struct, error)``; ``error`` is non-``None`` (and ``struct`` empty) when the block is not a
+    mapping of the expected shape — fail-closed at the gate. Every top key is optional but must be a
+    list when present; an unknown top key is rejected so a typo cannot silently drop signatures."""
+    import yaml  # local import: keep the backend import-light for pure render/parse callers
+
+    try:
+        data = yaml.safe_load(body)
+    except yaml.YAMLError as exc:
+        return ({}, f"structured §5.1 block is not valid YAML: {exc}")
+    if not isinstance(data, dict):
+        return ({}, "structured §5.1 block must be a YAML mapping "
+                    "with keys module_parameters / types / procedures")
+    unknown = sorted(set(data) - set(_STRUCT_TOP_KEYS))
+    if unknown:
+        return ({}, f"structured §5.1 block has unknown key(s) {unknown}; "
+                    f"allowed: {list(_STRUCT_TOP_KEYS)}")
+    struct: dict[str, Any] = {"module_parameters": [], "types": [], "procedures": []}
+    for key in _STRUCT_TOP_KEYS:
+        val = data.get(key)
+        if val is None:
+            continue
+        if not isinstance(val, list):
+            return ({}, f"structured §5.1 block's '{key}' must be a list")
+        struct[key] = val
+    return (struct, None)
 
 
 # --- helpers for gate comparison (used by the deterministic gates once §5.1 is structured) --------

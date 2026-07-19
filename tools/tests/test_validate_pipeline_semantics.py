@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import tempfile
@@ -12,6 +13,7 @@ from pathlib import Path
 import yaml
 
 import tools.validate_pipeline_semantics as vps
+from tools.lang_backend_fortran import parse_signatures_from_fortran
 from tools.validate_pipeline_semantics import (
     _BUNDLED_SHAPE_EXPR_SCHEMA_PATH,
     NodeExecution,
@@ -49,6 +51,25 @@ from tools.validate_pipeline_semantics import (
 # absent, and those gates no-op exactly as they do for an IR whose tests.md is missing.
 MOCK_SPEC_DIR = "spec/problem/mock_domain/mock_family/mock_spec"
 MOCK_TESTS_REF = f"{MOCK_SPEC_DIR}/tests.md"
+
+
+def _structured_section51_from_fortran(fortran_block: str) -> str:
+    """Keep readable Fortran fixtures as truth while publishing §5.1 as structured YAML."""
+    struct = parse_signatures_from_fortran(fortran_block)
+    return (
+        "### 5.1 Canonical interface block\n"
+        "```yaml\n"
+        + yaml.safe_dump(struct, sort_keys=False)
+        + "```\n"
+    )
+
+
+def _structured_ir_signatures_from_fortran(fortran_block: str) -> list[dict]:
+    struct = parse_signatures_from_fortran(fortran_block)
+    return [
+        {"symbol": signature["name"], "signature": signature}
+        for signature in [*struct["procedures"], *struct["types"]]
+    ]
 
 
 def _seed_shape_expr_schema_into(repo_root: Path) -> None:
@@ -12454,11 +12475,9 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
 
     _SPEC_ID = "hx"
 
-    # A canonical §5.1 interface block matching the §5 surface (3 ops + 1 type). The gate's
-    # cross-check requires §5.1's symbol set == §5's; the containment check pins these lines.
-    _SECTION_51 = (
-        "### 5.1 Canonical interface block\n"
-        "```fortran\n"
+    # Readable Fortran remains the fixture's source of truth. The helper lowers it to the
+    # language-neutral structured YAML representation now published by §5.1.
+    _SECTION_51_FORTRAN = (
         "integer, parameter :: dp = real64\n"
         "type :: hx__h_named\n"
         "  character(len=:), allocatable :: name\n"
@@ -12476,8 +12495,8 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
         "  type(hx__h_named), intent(in) :: entries(:)\n"
         "  integer, intent(in) :: n\n"
         "end subroutine hx__write_metrics_basis\n"
-        "```\n"
     )
+    _SECTION_51 = _structured_section51_from_fortran(_SECTION_51_FORTRAN)
 
     def _controlled_spec(self, section_51: str | None = None) -> str:
         # A §5 section in the same shape the harness spec uses: an "operation_ids are
@@ -12573,30 +12592,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             self.assertIn("hx__foo", ops, body)
             self.assertEqual(types, set(), body)
 
-    # public_api.signatures transcribing the _SECTION_51 fence (the leaf's source of the
-    # signatures). Formatting may differ from §5.1 — the gate compares normalized.
-    _SIGNATURES = [
-        {"symbol": "hx__h_named", "interface":
-            "type :: hx__h_named\n"
-            "  character(len=:), allocatable :: name\n"
-            "  character(len=:), allocatable :: json\n"
-            "end type hx__h_named\n"},
-        {"symbol": "hx__emit_real", "interface":
-            "function hx__emit_real(x) result(s)\n"
-            "  real(dp), intent(in) :: x\n"
-            "  character(len=:), allocatable :: s\n"
-            "end function hx__emit_real\n"},
-        {"symbol": "hx__emit_int", "interface":
-            "function hx__emit_int(i) result(s)\n"
-            "  integer, intent(in) :: i\n"
-            "  character(len=:), allocatable :: s\n"
-            "end function hx__emit_int\n"},
-        {"symbol": "hx__write_metrics_basis", "interface":
-            "subroutine hx__write_metrics_basis(entries, n)\n"
-            "  type(hx__h_named), intent(in) :: entries(:)\n"
-            "  integer, intent(in) :: n\n"
-            "end subroutine hx__write_metrics_basis\n"},
-    ]
+    _SIGNATURES = _structured_ir_signatures_from_fortran(_SECTION_51_FORTRAN)
 
     def _full_api(self) -> dict:
         return {
@@ -12606,7 +12602,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
                 {"operation_id": "hx__write_metrics_basis"},
             ],
             "published_types": ["hx__h_named"],
-            "signatures": [dict(s) for s in self._SIGNATURES],
+            "signatures": copy.deepcopy(self._SIGNATURES),
         }
 
     def test_exact_match_no_violation(self) -> None:
@@ -12727,11 +12723,11 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
         # it is exactly what the leaf would transcribe into the model.
         with tempfile.TemporaryDirectory() as tmp:
             api = self._full_api()
-            api["signatures"][3]["interface"] = (
-                "subroutine hx__write_metrics_basis(entries, n)\n"
-                "  character(len=*), intent(in) :: entries(:)\n"
-                "  integer, intent(in) :: n\n"
-                "end subroutine hx__write_metrics_basis\n")
+            signature = api["signatures"][2]["signature"]
+            signature["args"][0]["spec"] = {
+                "type": "string", "kind": None, "len": "*", "name": None,
+                "alloc": False,
+            }
             ir_dir = self._seed(Path(tmp), public_api=api)
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
@@ -12743,11 +12739,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
         # compatibility (positional-construction) drift — the ordered comparison must catch it.
         with tempfile.TemporaryDirectory() as tmp:
             api = self._full_api()
-            api["signatures"][0]["interface"] = (
-                "type :: hx__h_named\n"
-                "  character(len=:), allocatable :: json\n"
-                "  character(len=:), allocatable :: name\n"
-                "end type hx__h_named\n")
+            api["signatures"][3]["signature"]["components"].reverse()
             ir_dir = self._seed(Path(tmp), public_api=api)
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
@@ -12758,7 +12750,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
         # A `symbol` that disagrees with the interface it carries is fail-closed.
         with tempfile.TemporaryDirectory() as tmp:
             api = self._full_api()
-            api["signatures"][1]["symbol"] = "hx__not_emit_real"
+            api["signatures"][0]["symbol"] = "hx__not_emit_real"
             ir_dir = self._seed(Path(tmp), public_api=api)
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
@@ -12774,17 +12766,12 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
             self.assertTrue(any("is not a mapping" in v for v in violations), violations)
 
-    def test_signatures_formatting_difference_passes(self) -> None:
-        # A signature transcribed with different alignment / a split continuation still matches
-        # (normalized comparison).
+    def test_signatures_independent_struct_copy_passes(self) -> None:
+        # A separately parsed structured transcription of the same Fortran source still matches.
         with tempfile.TemporaryDirectory() as tmp:
             api = self._full_api()
-            api["signatures"][3]["interface"] = (
-                "subroutine hx__write_metrics_basis(entries, &\n"
-                "    n)\n"
-                "  type(hx__h_named),   intent(in) :: entries(:)   ! boxed\n"
-                "  integer,             intent(in) :: n\n"
-                "end subroutine hx__write_metrics_basis\n")
+            api["signatures"] = _structured_ir_signatures_from_fortran(
+                self._SECTION_51_FORTRAN)
             ir_dir = self._seed(Path(tmp), public_api=api)
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
@@ -12807,11 +12794,12 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
     def test_section51_op_set_mismatch_flagged(self) -> None:
         # §5.1 omitting an op that §5 lists (here: drop hx__emit_int from the fence) is a
         # spec-internal-consistency violation caught at Compile.
-        broken_fence = self._SECTION_51.replace(
-            "function hx__emit_int(i) result(s)\n"
-            "  integer, intent(in) :: i\n"
-            "  character(len=:), allocatable :: s\n"
-            "end function hx__emit_int\n", "")
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        struct["procedures"] = [
+            p for p in struct["procedures"] if p["name"] != "hx__emit_int"]
+        broken_fence = (
+            "### 5.1 Canonical interface block\n```yaml\n"
+            + yaml.safe_dump(struct, sort_keys=False) + "```\n")
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "cs.md").write_text(
                 self._controlled_spec(section_51=broken_fence), encoding="utf-8")
@@ -12826,12 +12814,18 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
 
     def test_section51_extra_type_flagged(self) -> None:
         # §5.1 defining a type absent from §5's derived-type list is flagged.
-        extra_fence = self._SECTION_51.replace(
-            "```\n",
-            "type :: hx__h_extra\n"
-            "  integer :: v\n"
-            "end type hx__h_extra\n"
-            "```\n", 1)
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        struct["types"].append({
+            "name": "hx__h_extra",
+            "components": [{
+                "name": "v", "rank": 0, "intent": None,
+                "spec": {"type": "integer", "kind": None, "len": None,
+                         "name": None, "alloc": False},
+            }],
+        })
+        extra_fence = (
+            "### 5.1 Canonical interface block\n```yaml\n"
+            + yaml.safe_dump(struct, sort_keys=False) + "```\n")
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "cs.md").write_text(
                 self._controlled_spec(section_51=extra_fence), encoding="utf-8")
@@ -12846,9 +12840,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
 
 
 class CanonicalInterfaceParserTests(unittest.TestCase):
-    """_parse_canonical_interface_from_controlled_spec + the Fortran normalization helpers:
-    parse the §5.1 fenced interface block into per-symbol stanzas, fail-closed on a
-    missing/duplicate/unterminated fence."""
+    """Parse structured §5.1 and retain focused coverage of normalization helpers."""
 
     _FENCE = InfrastructurePublicApiGateTests._SECTION_51
 
@@ -12880,28 +12872,41 @@ class CanonicalInterfaceParserTests(unittest.TestCase):
 
     def test_multiple_fences_errors(self) -> None:
         _, _, err = vps._parse_canonical_interface_from_controlled_spec(
-            self._cs(self._FENCE + "```fortran\ninteger :: x\n```\n"))
+            self._cs(self._FENCE + "```yaml\nprocedures: []\n```\n"))
         self.assertIsNotNone(err)
         self.assertIn("multiple", err)
 
-    def test_unterminated_stanza_errors(self) -> None:
-        bad = "```fortran\nsubroutine hx__foo(a)\n  integer, intent(in) :: a\n```\n"
+    def test_invalid_yaml_errors(self) -> None:
+        bad = "```yaml\nprocedures: [unterminated\n```\n"
         _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(bad))
         self.assertIsNotNone(err)
-        self.assertIn("unterminated", err)
+        self.assertIn("not valid YAML", err)
 
-    def test_duplicate_stanza_errors(self) -> None:
-        # A malformed first copy must not hide behind a correct second (dict-overwrite would).
-        dup = (
-            "```fortran\n"
-            "function hx__foo(a) result(s)\n  integer, intent(in) :: a\n"
-            "  character(len=:), allocatable :: s\nend function hx__foo\n"
-            "function hx__foo(a, b) result(s)\n  integer, intent(in) :: a\n"
-            "  integer, intent(in) :: b\n  character(len=:), allocatable :: s\n"
-            "end function hx__foo\n```\n")
-        _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(dup))
+    def test_non_mapping_yaml_errors(self) -> None:
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(
+            self._cs("```yaml\n- procedures\n```\n"))
         self.assertIsNotNone(err)
-        self.assertIn("duplicate", err)
+        self.assertIn("must be a YAML mapping", err)
+
+    def test_unknown_top_key_errors(self) -> None:
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(
+            self._cs("```yaml\nprocedurez: []\n```\n"))
+        self.assertIsNotNone(err)
+        self.assertIn("unknown key", err)
+
+    def test_zero_signature_block_errors(self) -> None:
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(
+            self._cs("```yaml\nmodule_parameters: []\ntypes: []\nprocedures: []\n```\n"))
+        self.assertIsNotNone(err)
+        self.assertIn("parsed 0 signatures", err)
+
+    def test_unrenderable_signature_struct_errors(self) -> None:
+        bad = (
+            "```yaml\nprocedures:\n- kind: function\n  name: hx__bad\n"
+            "  args: []\n  result:\n    name: value\n    spec:\n      type: mystery\n```\n")
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(bad))
+        self.assertIsNotNone(err)
+        self.assertIn("could not render", err)
 
     def test_declaration_atoms_split_combined_declarators(self) -> None:
         # A combined declarator splits into one atom per entity; array-spec commas stay intact.
@@ -12921,47 +12926,12 @@ class CanonicalInterfaceParserTests(unittest.TestCase):
             ["integer, intent(in) :: a", "integer, intent(in) :: b"])
         self.assertEqual(combined, split)
 
-    def test_bare_end_does_not_swallow_following_procedure(self) -> None:
-        # A bare `end` (legal for a module procedure) must not consume the next procedure's header.
-        fence = (
-            "```fortran\n"
-            "function hx__a(x) result(s)\n  real, intent(in) :: x\n  real :: s\nend\n"
-            "function hx__b(y) result(s)\n  real, intent(in) :: y\n  real :: s\n"
-            "end function hx__b\n```\n")
-        ops, types, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(fence))
-        self.assertEqual(set(ops), {"hx__a", "hx__b"})
-
-    def test_type_missing_end_type_is_unterminated(self) -> None:
-        # A derived type MUST close with `end type` (a bare `end` does not close a type). A type
-        # stanza terminated by the next header without `end type` is malformed → fail-closed, while
-        # the next symbol still registers (no cascade).
-        block = (
-            "```fortran\n"
-            "type :: hx__a\n  integer :: x\n"
-            "type :: hx__b\n  integer :: y\nend type hx__b\n```\n")
-        ops, types, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(block))
-        self.assertIsNotNone(err)
-        self.assertIn("unterminated", err)
-        self.assertIn("hx__a", err)
-
     def test_end_line_canonicalizes_trailing_name(self) -> None:
         # bare `end type` compares equal to `end type NAME` (the name is pinned by the header).
         with_name = vps._stanza_atoms(
             ["type :: hx__t", "  integer :: a", "end type hx__t"])
         bare = vps._stanza_atoms(["type :: hx__t", "  integer :: a", "end type"])
         self.assertEqual(with_name, bare)
-
-    def test_no_space_end_keyword_closes_stanza(self) -> None:
-        # `endfunction` / `endtype` (legal free-form) must close a stanza, not swallow the next.
-        fence = (
-            "```fortran\n"
-            "function hx__a(x) result(s)\n  real, intent(in) :: x\n"
-            "  real :: s\nendfunction hx__a\n"
-            "function hx__b(y) result(s)\n  real, intent(in) :: y\n"
-            "  real :: s\nend function hx__b\n```\n")
-        ops, types, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(fence))
-        self.assertIsNone(err)
-        self.assertEqual(set(ops), {"hx__a", "hx__b"})
 
     def test_continuation_join_skips_interleaved_comment_and_blank(self) -> None:
         # Free-form Fortran allows blank / full-comment lines inside a `&` continuation; the join

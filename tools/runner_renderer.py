@@ -1103,17 +1103,25 @@ def assert_harness_pin(
     used_symbols = [_hname(harness_spec_id, op) for op in _used_harness_ops(ir)]
     used_symbols += [_hname(harness_spec_id, t) for t in _HARNESS_TYPES]
 
-    # Certified IR signatures, keyed by symbol.
+    # Certified IR signatures, keyed by symbol. Each entry's `signature` is the language-neutral
+    # structured form (Objective B); the Fortran backend renders it back to the stanza currency the
+    # pin compares in (the same rendering `_validate_ir_signatures_against_section51` uses).
+    from tools.lang_backend_fortran import SignatureParseError, render_symbol_to_fortran
+
     ir_iface: dict[str, str] = {}
     for entry in (harness_signatures if isinstance(harness_signatures, list) else []):
-        # A usable entry has a NON-BLANK str symbol and interface — the same rule the IR
-        # validator (`_validate_ir_signatures_against_section51`) pins, so a blank-field entry
-        # (which that validator rejects) is skipped here rather than seeding a bogus `""` key
-        # that would later masquerade as per-symbol interface drift.
-        if isinstance(entry, dict) and isinstance(entry.get("symbol"), str) \
-                and entry["symbol"].strip() and isinstance(entry.get("interface"), str) \
-                and entry["interface"].strip():
-            ir_iface[entry["symbol"].strip()] = entry["interface"]
+        # A usable entry has a NON-BLANK str symbol and a non-empty mapping signature that renders —
+        # the same rule the IR validator (`_validate_ir_signatures_against_section51`) pins, so a
+        # blank/unrenderable entry (which that validator rejects) is skipped here rather than seeding
+        # a bogus `""` key that would later masquerade as per-symbol interface drift.
+        if not (isinstance(entry, dict) and isinstance(entry.get("symbol"), str)
+                and entry["symbol"].strip() and isinstance(entry.get("signature"), dict)
+                and entry["signature"]):
+            continue
+        try:
+            ir_iface[entry["symbol"].strip()] = render_symbol_to_fortran(entry["signature"])
+        except SignatureParseError:
+            continue
 
     # No usable signatures at all (None / [] / non-list / every entry malformed) is an
     # absent-or-incomplete certified-IR artifact — or a caller that failed to resolve it —

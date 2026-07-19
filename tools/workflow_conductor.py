@@ -2163,15 +2163,15 @@ class Conductor:
         harness_signatures: Any = pub.get("signatures") if isinstance(pub, dict) else None
         # "Usable" mirrors both assert_harness_pin's ir_iface build AND the validator's
         # non-empty-field rule (_validate_ir_signatures_against_section51): at least one entry
-        # with a NON-BLANK str `symbol` and a NON-BLANK str `interface` (a blank field is
-        # malformed under that contract, not a real signature). A missing / empty / all-malformed
-        # list is an incomplete certified artifact (a build precondition), routed here as
-        # RuntimeError so the pin's RenderError stays reserved for genuine interface drift (a
-        # present, usable signature that no longer matches).
+        # with a NON-BLANK str `symbol` and a NON-EMPTY mapping `signature` (the language-neutral
+        # structured form — Objective B; a blank/absent field is malformed under that contract, not
+        # a real signature). A missing / empty / all-malformed list is an incomplete certified
+        # artifact (a build precondition), routed here as RuntimeError so the pin's RenderError stays
+        # reserved for genuine interface drift (a present, usable signature that no longer matches).
         if not (isinstance(harness_signatures, list) and any(
                 isinstance(e, dict)
                 and isinstance(e.get("symbol"), str) and e["symbol"].strip()
-                and isinstance(e.get("interface"), str) and e["interface"].strip()
+                and isinstance(e.get("signature"), dict) and e["signature"]
                 for e in harness_signatures)):
             raise RuntimeError(
                 f"harness dependency {harness_nk}: certified IR under "

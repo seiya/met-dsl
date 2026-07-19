@@ -1472,8 +1472,8 @@ source of truth. `tests.md`/catalog bumped to 0.2.0 (in-place respec — no cons
 comments, `&` continuations (spanning interleaved blank/comment lines — the §5.1 `write_perf`
 header is >132 cols and MUST wrap), case, and whitespace. Three deterministic pins:
 - **Compile** (`_validate_infrastructure_public_api` + `_validate_ir_signatures_against_section51`):
-  §5-prose name set == §5.1 symbol set, AND the IR's `public_api.signatures` (`{symbol, interface}`,
-  authored by Compile.generate transcribing §5.1) == §5.1. A derived type's component layout is
+  §5-prose name set == §5.1 symbol set, AND the IR's `public_api.signatures` (`{symbol, signature}`,
+  the language-neutral structured form authored by Compile.generate transcribing §5.1) == §5.1. A derived type's component layout is
   compared ORDERED (positional-construction ABI); a procedure's dummy decls as a SET (the header
   already pins call order). Malformed / mislabeled / duplicated entries are fail-closed.
 - **Generate.static** (`_validate_infrastructure_generated_signatures`): the generated
