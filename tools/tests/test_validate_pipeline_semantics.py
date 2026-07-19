@@ -12908,6 +12908,30 @@ class CanonicalInterfaceParserTests(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertIn("could not render", err)
 
+    def test_duplicate_symbol_errors(self) -> None:
+        # Two procedures sharing a name render to two same-named stanzas; the render -> stanza
+        # duplicate detection (still live on the rendered Fortran) must fail closed rather than
+        # silently keep one — a structured-form duplicate is as unsafe as a Fortran-form one.
+        dup = (
+            "```yaml\nprocedures:\n"
+            "- kind: function\n  name: hx__dup\n  args: []\n"
+            "  result: {name: s, spec: {type: string, len: ':', alloc: true}}\n"
+            "- kind: function\n  name: hx__dup\n  args: []\n"
+            "  result: {name: s, spec: {type: string, len: ':', alloc: true}}\n```\n")
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(dup))
+        self.assertIsNotNone(err)
+        self.assertIn("duplicate", err.lower())
+
+    def test_malformed_signature_fails_closed_not_crash(self) -> None:
+        # A leaf-fabricated malformed struct (function with a null result) must surface as a clean
+        # error string, never propagate an uncaught KeyError/TypeError that crashes the gate.
+        bad = (
+            "```yaml\nprocedures:\n- kind: function\n  name: hx__bad\n  args: []\n"
+            "  result: null\n```\n")
+        _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(bad))
+        self.assertIsNotNone(err)
+        self.assertIn("could not render", err)
+
     def test_declaration_atoms_split_combined_declarators(self) -> None:
         # A combined declarator splits into one atom per entity; array-spec commas stay intact.
         self.assertEqual(

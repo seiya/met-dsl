@@ -22,6 +22,7 @@ from tools.lang_backend_fortran import (
     normalized_stanza_index,
     parse_signatures_from_fortran,
     render_signatures_to_fortran,
+    render_symbol_to_fortran,
 )
 from tools.runner_renderer import _HARNESS_V3_INTERFACE, _HARNESS_V3_PARAMETERS
 from tools.validate_pipeline_semantics import _FENCED_BLOCK_RE
@@ -201,6 +202,106 @@ def _type_lines(block: str, suffix: str) -> list[str]:
     _ops, types, _errs = _parse_interface_stanzas(block)
     name = next(n for n in types if n.endswith(suffix))
     return [_normalize_fortran_line(ln) for ln in types[name] if _normalize_fortran_line(ln)]
+
+
+class MalformedStructFailClosedTest(unittest.TestCase):
+    """A leaf-fabricated malformed signature struct must raise SignatureParseError (clean fail-closed
+    the gate turns into a repairable violation), NEVER an uncaught KeyError/TypeError/AttributeError
+    that crashes the gate with a Python traceback."""
+
+    def _proc(self) -> dict:
+        # a minimal VALID function to mutate into each malformed shape
+        return {
+            "kind": "function", "name": "hx__f",
+            "args": [{"name": "x", "rank": 0, "intent": "in",
+                      "spec": {"type": "real", "kind": "dp"}}],
+            "result": {"name": "s", "rank": 0,
+                       "spec": {"type": "string", "len": ":", "alloc": True}},
+        }
+
+    def test_valid_baseline_renders(self) -> None:
+        render_symbol_to_fortran(self._proc())  # must not raise
+
+    def test_function_null_result_raises(self) -> None:
+        p = self._proc(); p["result"] = None
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(p)
+
+    def test_derived_spec_missing_name_raises(self) -> None:
+        p = self._proc(); p["args"][0]["spec"] = {"type": "derived"}
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(p)
+
+    def test_string_spec_missing_len_raises(self) -> None:  # closes F2 fail-open (no silent len=*)
+        p = self._proc(); p["args"][0]["spec"] = {"type": "string"}
+        with self.assertRaisesRegex(SignatureParseError, "len"):
+            render_symbol_to_fortran(p)
+
+    def test_spec_not_a_mapping_raises(self) -> None:
+        p = self._proc(); p["args"][0]["spec"] = "real"
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(p)
+
+    def test_rank_wrong_type_raises(self) -> None:
+        p = self._proc(); p["args"][0]["rank"] = "1"
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(p)
+
+    def test_unknown_entity_key_raises(self) -> None:  # closes F4 (typo silently defaulting)
+        p = self._proc(); p["args"][0]["rankk"] = 1
+        with self.assertRaisesRegex(SignatureParseError, "unknown key"):
+            render_symbol_to_fortran(p)
+
+    def test_bad_intent_value_raises(self) -> None:
+        p = self._proc(); p["args"][0]["intent"] = "sideways"
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(p)
+
+    def test_intent_on_result_raises(self) -> None:
+        p = self._proc(); p["result"]["intent"] = "out"
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(p)
+
+    def test_subroutine_with_result_raises(self) -> None:
+        p = self._proc(); p["kind"] = "subroutine"  # keeps a `result` -> illegal
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(p)
+
+    def test_module_parameter_missing_value_raises(self) -> None:
+        with self.assertRaises(SignatureParseError):
+            render_signatures_to_fortran(
+                {"module_parameters": [{"name": "dp"}], "types": [], "procedures": []})
+
+    def test_whole_struct_non_mapping_procedure_raises(self) -> None:
+        with self.assertRaises(SignatureParseError):
+            render_signatures_to_fortran(
+                {"procedures": ["not a mapping"], "types": [], "module_parameters": []})
+
+
+class ExplicitDimsTest(unittest.TestCase):
+    """A signature can express a fixed dimension bound (e.g. coef(3)), not only assumed-shape (:)."""
+
+    def test_fixed_dim_round_trips(self) -> None:
+        block = ("subroutine hx__g(coef)\n"
+                 "  real(dp), intent(in) :: coef(3)\n"
+                 "end subroutine hx__g\n")
+        struct = parse_signatures_from_fortran(block)
+        self.assertEqual(struct["procedures"][0]["args"][0]["dims"], ["3"])
+        rendered = render_signatures_to_fortran(struct)
+        self.assertEqual(normalized_stanza_index(block), normalized_stanza_index(rendered))
+
+    def test_assumed_shape_carries_no_dims_key(self) -> None:
+        block = "subroutine hx__h(a)\n  real(dp), intent(in) :: a(:,:)\nend subroutine hx__h\n"
+        arg = parse_signatures_from_fortran(block)["procedures"][0]["args"][0]
+        self.assertNotIn("dims", arg)
+        self.assertEqual(arg["rank"], 2)
+
+    def test_dims_rank_disagreement_fails_closed(self) -> None:
+        with self.assertRaises(SignatureParseError):
+            render_signatures_to_fortran({"module_parameters": [], "types": [], "procedures": [
+                {"kind": "subroutine", "name": "hx__g", "args": [
+                    {"name": "c", "rank": 2, "dims": ["3"],
+                     "spec": {"type": "real", "kind": "dp"}}]}]})
 
 
 if __name__ == "__main__":

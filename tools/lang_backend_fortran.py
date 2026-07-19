@@ -118,10 +118,13 @@ def _parse_type_spec(head: str) -> dict[str, Any]:
     raise SignatureParseError(f"unrecognized type-spec: {head!r}")
 
 
-def _parse_entities(rhs: str) -> list[tuple[str, int]]:
-    """Parse the entity list on the right of ``::`` into ``[(name, rank), ...]``. Rank is the number
-    of assumed/deferred dimensions from a trailing ``(...)`` (``(:)`` -> 1, ``(:,:)`` -> 2)."""
-    out: list[tuple[str, int]] = []
+def _parse_entities(rhs: str) -> list[tuple[str, int, list[str] | None]]:
+    """Parse the entity list on the right of ``::`` into ``[(name, rank, dims), ...]``. ``rank`` is
+    the number of dimensions from a trailing ``(...)`` (``(:)`` -> 1, ``(:,:)`` -> 2). ``dims`` is
+    ``None`` for a pure assumed-shape declaration (every dim is ``:``) and the explicit token list
+    otherwise (e.g. ``coef(3)`` -> ``['3']``), so a fixed bound round-trips instead of collapsing to
+    assumed-shape."""
+    out: list[tuple[str, int, list[str] | None]] = []
     for ent in _split_paren_aware(rhs):
         ent = ent.strip()
         if not ent:
@@ -131,9 +134,13 @@ def _parse_entities(rhs: str) -> list[tuple[str, int]]:
         if not m:
             raise SignatureParseError(f"unparseable entity: {ent!r}")
         name = m.group(1)
-        dims = m.group(3)
-        rank = 0 if dims is None else (len(_split_paren_aware(dims)) if dims.strip() else 0)
-        out.append((name, rank))
+        dims_src = m.group(3)
+        if dims_src is None or not dims_src.strip():
+            out.append((name, 0, None))
+            continue
+        toks = [t.strip() for t in _split_paren_aware(dims_src)]
+        explicit = None if all(t == ":" for t in toks) else toks
+        out.append((name, len(toks), explicit))
     return out
 
 
@@ -160,8 +167,11 @@ def _parse_decl_line(line: str) -> list[dict[str, Any]]:
                 intent = m.group(1).lower()
             # other attributes (target/pointer/...) are not part of the published surface here
     entities: list[dict[str, Any]] = []
-    for name, rank in _parse_entities(right):
-        entities.append({"name": name, "rank": rank, "intent": intent, "spec": dict(spec)})
+    for name, rank, dims in _parse_entities(right):
+        ent: dict[str, Any] = {"name": name, "rank": rank, "intent": intent, "spec": dict(spec)}
+        if dims is not None:
+            ent["dims"] = dims
+        entities.append(ent)
     return entities
 
 
@@ -239,12 +249,158 @@ def parse_signatures_from_fortran(block_body: str) -> dict[str, Any]:
     }
 
 
+# --- validation: fail-closed on any malformed struct ---------------------------------------------
+#
+# The struct is authored by an LLM (the Compile leaf transcribing §5.1 into the IR, or a §5.1
+# author); a malformed shape must produce a clean ``SignatureParseError`` that the gates turn into a
+# repairable violation, NEVER an uncaught KeyError/TypeError that crashes the gate with a traceback
+# (the "gate-only field fabricated by the leaf -> conductor crash" bug-class). Both render entry
+# points validate first, so every downstream ``dict``/``list`` index is known-safe.
+
+_VALID_SPEC_TYPES = frozenset({"real", "integer", "logical", "string", "derived"})
+_VALID_INTENTS = frozenset({"in", "out", "inout"})
+_SPEC_KEYS = frozenset({"type", "kind", "len", "name", "alloc"})
+_ENTITY_KEYS = frozenset({"name", "rank", "intent", "dims", "spec"})
+_PROC_KEYS = frozenset({"kind", "name", "args", "result"})
+_TYPE_KEYS = frozenset({"name", "components"})
+_PARAM_KEYS = frozenset({"name", "base", "value"})
+
+
+def _require_nonempty_str(value: Any, ctx: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SignatureParseError(f"{ctx} must be a non-empty string (got {value!r})")
+    return value
+
+
+def _reject_unknown_keys(mapping: dict[str, Any], allowed: frozenset[str], ctx: str) -> None:
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise SignatureParseError(
+            f"{ctx} has unknown key(s) {unknown}; allowed: {sorted(allowed)} "
+            "(a mistyped key must fail closed, not silently fall to a default)")
+
+
+def _validate_spec(spec: Any, ctx: str) -> None:
+    if not isinstance(spec, dict):
+        raise SignatureParseError(f"{ctx}.spec must be a mapping (got {type(spec).__name__})")
+    _reject_unknown_keys(spec, _SPEC_KEYS, f"{ctx}.spec")
+    t = spec.get("type")
+    if t not in _VALID_SPEC_TYPES:
+        raise SignatureParseError(
+            f"{ctx}.spec.type must be one of {sorted(_VALID_SPEC_TYPES)} (got {t!r})")
+    if t == "string":
+        _require_nonempty_str(spec.get("len"), f"{ctx}.spec.len (string length is required)")
+    elif t == "derived":
+        _require_nonempty_str(spec.get("name"), f"{ctx}.spec.name (derived type name is required)")
+    else:  # real / integer / logical: kind optional but non-empty when present
+        if spec.get("kind") is not None:
+            _require_nonempty_str(spec.get("kind"), f"{ctx}.spec.kind")
+    if spec.get("alloc") not in (None, True, False):
+        raise SignatureParseError(f"{ctx}.spec.alloc must be a boolean (got {spec.get('alloc')!r})")
+
+
+def _validate_entity(ent: Any, ctx: str, *, allow_intent: bool) -> None:
+    if not isinstance(ent, dict):
+        raise SignatureParseError(f"{ctx} must be a mapping (got {type(ent).__name__})")
+    _reject_unknown_keys(ent, _ENTITY_KEYS, ctx)
+    _require_nonempty_str(ent.get("name"), f"{ctx}.name")
+    rank = ent.get("rank", 0)
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+        raise SignatureParseError(f"{ctx}.rank must be a non-negative integer (got {rank!r})")
+    dims = ent.get("dims")
+    if dims is not None:
+        if not isinstance(dims, list) or not dims or not all(
+                isinstance(d, str) and d.strip() for d in dims):
+            raise SignatureParseError(
+                f"{ctx}.dims must be a non-empty list of dimension strings (e.g. ['3', ':'])")
+        if "rank" in ent and rank != len(dims):
+            raise SignatureParseError(
+                f"{ctx}: rank ({rank}) disagrees with dims length ({len(dims)})")
+    intent = ent.get("intent")
+    if intent is not None:
+        if not allow_intent:
+            raise SignatureParseError(
+                f"{ctx}.intent is not allowed here (a result / component carries no intent)")
+        if intent not in _VALID_INTENTS:
+            raise SignatureParseError(
+                f"{ctx}.intent must be one of {sorted(_VALID_INTENTS)} (got {intent!r})")
+    _validate_spec(ent.get("spec"), ctx)
+
+
+def _validate_procedure(proc: Any, ctx: str) -> None:
+    if not isinstance(proc, dict):
+        raise SignatureParseError(f"{ctx} must be a mapping (got {type(proc).__name__})")
+    _reject_unknown_keys(proc, _PROC_KEYS, ctx)
+    kind = proc.get("kind")
+    if kind not in ("subroutine", "function"):
+        raise SignatureParseError(f"{ctx}.kind must be 'subroutine' or 'function' (got {kind!r})")
+    name = _require_nonempty_str(proc.get("name"), f"{ctx}.name")
+    args = proc.get("args", [])
+    if not isinstance(args, list):
+        raise SignatureParseError(f"{ctx}.args must be a list (got {type(args).__name__})")
+    for i, arg in enumerate(args):
+        _validate_entity(arg, f"{ctx}.args[{i}]", allow_intent=True)
+    result = proc.get("result")
+    if kind == "function":
+        if not isinstance(result, dict):
+            raise SignatureParseError(f"{ctx} (function {name}) requires a mapping 'result'")
+        _validate_entity(result, f"{ctx}.result", allow_intent=False)
+    elif result is not None:
+        raise SignatureParseError(f"{ctx} (subroutine {name}) must not carry a 'result'")
+
+
+def _validate_type(tdef: Any, ctx: str) -> None:
+    if not isinstance(tdef, dict):
+        raise SignatureParseError(f"{ctx} must be a mapping (got {type(tdef).__name__})")
+    _reject_unknown_keys(tdef, _TYPE_KEYS, ctx)
+    _require_nonempty_str(tdef.get("name"), f"{ctx}.name")
+    comps = tdef.get("components", [])
+    if not isinstance(comps, list) or not comps:
+        raise SignatureParseError(f"{ctx}.components must be a non-empty list")
+    for i, comp in enumerate(comps):
+        _validate_entity(comp, f"{ctx}.components[{i}]", allow_intent=False)
+
+
+def _validate_module_parameter(mp: Any, ctx: str) -> None:
+    if not isinstance(mp, dict):
+        raise SignatureParseError(f"{ctx} must be a mapping (got {type(mp).__name__})")
+    _reject_unknown_keys(mp, _PARAM_KEYS, ctx)
+    _require_nonempty_str(mp.get("name"), f"{ctx}.name")
+    value = mp.get("value")
+    if not (isinstance(value, str) and value.strip()) and not isinstance(value, int):
+        raise SignatureParseError(f"{ctx}.value must be a non-empty string or integer (got {value!r})")
+
+
+def _validate_symbol(sig: Any, ctx: str = "signature") -> None:
+    """Validate ONE published symbol (procedure or type) — the shape ``render_symbol_to_fortran``
+    accepts. A struct that is neither is fail-closed."""
+    if isinstance(sig, dict) and sig.get("kind") in ("subroutine", "function"):
+        _validate_procedure(sig, ctx)
+    elif isinstance(sig, dict) and "components" in sig:
+        _validate_type(sig, ctx)
+    else:
+        raise SignatureParseError(
+            f"{ctx} is neither a procedure (kind: subroutine/function) nor a type (components: [...])")
+
+
+def _validate_struct(struct: dict[str, Any]) -> None:
+    """Validate a whole ``{module_parameters, types, procedures}`` struct, fail-closed."""
+    for i, mp in enumerate(struct.get("module_parameters") or []):
+        _validate_module_parameter(mp, f"module_parameters[{i}]")
+    for i, tdef in enumerate(struct.get("types") or []):
+        _validate_type(tdef, f"types[{i}]")
+    for i, proc in enumerate(struct.get("procedures") or []):
+        _validate_procedure(proc, f"procedures[{i}]")
+
+
 # --- render: structured signatures -> Fortran interface block ------------------------------------
 
 def _render_spec(spec: dict[str, Any]) -> str:
-    t = spec.get("type")
+    # Callers render only AFTER validation, so required fields (string `len`, derived `name`) are
+    # known present; the accesses below cannot KeyError on a validated struct.
+    t = spec["type"]
     if t == "string":
-        base = f"character(len={spec.get('len', '*')})"
+        base = f"character(len={spec['len']})"
     elif t == "derived":
         base = f"type({spec['name']})"
     elif t in ("real", "integer", "logical"):
@@ -256,7 +412,11 @@ def _render_spec(spec: dict[str, Any]) -> str:
     return base
 
 
-def _render_dims(rank: int) -> str:
+def _render_dims(rank: int, dims: list[str] | None = None) -> str:
+    # Explicit `dims` (e.g. ['3'] for a fixed bound) render verbatim; otherwise `rank` assumed-shape
+    # colons. This lets a signature express `coef(3)` and not only assumed-shape `(:)`.
+    if dims:
+        return "(" + ",".join(dims) + ")"
     return "" if not rank else "(" + ",".join([":"] * rank) + ")"
 
 
@@ -264,7 +424,7 @@ def _render_entity(ent: dict[str, Any]) -> str:
     spec = _render_spec(ent["spec"])
     intent = ent.get("intent")
     attr = f", intent({intent})" if intent else ""
-    return f"{spec}{attr} :: {ent['name']}{_render_dims(ent.get('rank', 0))}"
+    return f"{spec}{attr} :: {ent['name']}{_render_dims(ent.get('rank', 0), ent.get('dims'))}"
 
 
 def _render_procedure(proc: dict[str, Any]) -> list[str]:
@@ -294,7 +454,9 @@ def _render_type(t: dict[str, Any]) -> list[str]:
 
 def render_signatures_to_fortran(struct: dict[str, Any]) -> str:
     """Render the structured representation back to a canonical Fortran interface block. The output's
-    NORMALIZED lines are what the §5.1 gates compare; exact spacing/comments are irrelevant."""
+    NORMALIZED lines are what the §5.1 gates compare; exact spacing/comments are irrelevant.
+    Fail-closed (``SignatureParseError``) on any malformed struct — never an uncaught index error."""
+    _validate_struct(struct)
     blocks: list[str] = []
     for mp in struct.get("module_parameters", []):
         blocks.append(f"integer, parameter :: {mp['name']} = {mp['value']}")
@@ -309,15 +471,11 @@ def render_symbol_to_fortran(sig: dict[str, Any]) -> str:
     """Render ONE published-symbol signature (a procedure or a derived-type struct) to its Fortran
     stanza. Used to compare a single IR ``public_api.signatures`` entry against §5.1 by rendering it
     into the same Fortran currency the existing stanza comparison uses. ``kind`` present ->
-    procedure; ``components`` present -> type."""
+    procedure; ``components`` present -> type. Fail-closed on any malformed struct."""
+    _validate_symbol(sig)
     if sig.get("kind") in ("subroutine", "function"):
         return "\n".join(_render_procedure(sig)) + "\n"
-    if "components" in sig:
-        return "\n".join(_render_type(sig)) + "\n"
-    raise SignatureParseError(
-        "signature struct is neither a procedure (kind: subroutine/function) nor a type "
-        "(components: [...])"
-    )
+    return "\n".join(_render_type(sig)) + "\n"
 
 
 _STRUCT_TOP_KEYS = ("module_parameters", "types", "procedures")
