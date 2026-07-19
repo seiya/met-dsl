@@ -304,5 +304,57 @@ class ExplicitDimsTest(unittest.TestCase):
                      "spec": {"type": "real", "kind": "dp"}}]}]})
 
 
+class Round2HardeningTest(unittest.TestCase):
+    """Second-pass review fixes: bounded rank, empty-type symmetry, identifier/token injection guard,
+    boolean parameter value."""
+
+    def _arg(self, **over) -> dict:
+        ent = {"name": "x", "rank": 0, "intent": "in", "spec": {"type": "real", "kind": "dp"}}
+        ent.update(over)
+        return {"kind": "subroutine", "name": "hx__f", "args": [ent]}
+
+    def test_out_of_range_rank_fails_closed_not_oom(self) -> None:
+        # An unbounded rank would amplify one int into a multi-GB string; it must fail closed fast.
+        with self.assertRaisesRegex(SignatureParseError, "rank"):
+            render_symbol_to_fortran(self._arg(rank=500_000_000))
+        with self.assertRaisesRegex(SignatureParseError, "rank"):
+            render_symbol_to_fortran(self._arg(rank=50))
+
+    def test_empty_derived_type_round_trips(self) -> None:
+        # parse and validate must agree: an empty (opaque tag) type is Fortran-legal and was
+        # accepted by the pre-B Fortran-fence gate, so it must not false-reject now.
+        block = "type :: hx__opaque\nend type hx__opaque\n"
+        struct = parse_signatures_from_fortran(block)
+        self.assertEqual(struct["types"][0]["components"], [])
+        rendered = render_signatures_to_fortran(struct)  # must not raise
+        self.assertEqual(normalized_stanza_index(block), normalized_stanza_index(rendered))
+
+    def test_name_with_structural_chars_rejected(self) -> None:
+        # A name carrying `end subroutine` / a newline could split into a second stanza.
+        with self.assertRaisesRegex(SignatureParseError, "identifier"):
+            render_symbol_to_fortran(
+                {"kind": "subroutine", "name": "hx__f\nend subroutine hx__f\nsubroutine hx__evil",
+                 "args": []})
+
+    def test_dims_token_injection_rejected(self) -> None:
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(self._arg(rank=1, dims=["3) :: evil ! "]))
+
+    def test_string_len_injection_rejected(self) -> None:
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(self._arg(spec={"type": "string", "len": "4) :: evil"}))
+
+    def test_boolean_parameter_value_rejected(self) -> None:
+        with self.assertRaisesRegex(SignatureParseError, "boolean"):
+            render_signatures_to_fortran(
+                {"module_parameters": [{"name": "dp", "value": True}],
+                 "types": [], "procedures": []})
+
+    def test_integer_parameter_value_accepted(self) -> None:
+        render_signatures_to_fortran(
+            {"module_parameters": [{"name": "case_id_len", "value": 64}],
+             "types": [], "procedures": []})  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

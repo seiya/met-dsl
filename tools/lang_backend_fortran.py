@@ -280,6 +280,36 @@ def _reject_unknown_keys(mapping: dict[str, Any], allowed: frozenset[str], ctx: 
             "(a mistyped key must fail closed, not silently fall to a default)")
 
 
+# Fortran 2008 caps array rank at 15; a larger value is malformed and, unbounded, would let
+# ``_render_dims`` amplify one integer into a multi-GB string (OOM/hang) instead of failing closed.
+_MAX_RANK = 15
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _require_identifier(value: Any, ctx: str) -> str:
+    """A published NAME (symbol / argument / component / derived-type / parameter) must be a plain
+    Fortran identifier. This is also the injection guard: names flow verbatim into rendered Fortran
+    that is re-parsed into stanzas, so a name carrying ``::`` / a newline / ``end subroutine`` could
+    otherwise smuggle or split a stanza."""
+    _require_nonempty_str(value, ctx)
+    if not _IDENTIFIER_RE.match(value):
+        raise SignatureParseError(
+            f"{ctx} must be a Fortran identifier [A-Za-z][A-Za-z0-9_]* (got {value!r})")
+    return value
+
+
+def _require_safe_token(value: Any, ctx: str) -> str:
+    """A value-ish token (string length, kind, a dimension bound, a parameter value) may be ``*`` /
+    ``:`` / a number / a symbol, but must not carry structural Fortran characters that would break or
+    smuggle a declaration when rendered verbatim (``::``, a newline, a comment ``!``, or parens)."""
+    _require_nonempty_str(value, ctx)
+    if "::" in value or any(ch in value for ch in "\n\r!()"):
+        raise SignatureParseError(
+            f"{ctx} must not contain structural Fortran characters (::, newline, !, parentheses); "
+            f"got {value!r}")
+    return value
+
+
 def _validate_spec(spec: Any, ctx: str) -> None:
     if not isinstance(spec, dict):
         raise SignatureParseError(f"{ctx}.spec must be a mapping (got {type(spec).__name__})")
@@ -289,12 +319,12 @@ def _validate_spec(spec: Any, ctx: str) -> None:
         raise SignatureParseError(
             f"{ctx}.spec.type must be one of {sorted(_VALID_SPEC_TYPES)} (got {t!r})")
     if t == "string":
-        _require_nonempty_str(spec.get("len"), f"{ctx}.spec.len (string length is required)")
+        _require_safe_token(spec.get("len"), f"{ctx}.spec.len (string length is required)")
     elif t == "derived":
-        _require_nonempty_str(spec.get("name"), f"{ctx}.spec.name (derived type name is required)")
-    else:  # real / integer / logical: kind optional but non-empty when present
+        _require_identifier(spec.get("name"), f"{ctx}.spec.name (derived type name is required)")
+    else:  # real / integer / logical: kind optional but a safe token when present
         if spec.get("kind") is not None:
-            _require_nonempty_str(spec.get("kind"), f"{ctx}.spec.kind")
+            _require_safe_token(spec.get("kind"), f"{ctx}.spec.kind")
     if spec.get("alloc") not in (None, True, False):
         raise SignatureParseError(f"{ctx}.spec.alloc must be a boolean (got {spec.get('alloc')!r})")
 
@@ -303,16 +333,24 @@ def _validate_entity(ent: Any, ctx: str, *, allow_intent: bool) -> None:
     if not isinstance(ent, dict):
         raise SignatureParseError(f"{ctx} must be a mapping (got {type(ent).__name__})")
     _reject_unknown_keys(ent, _ENTITY_KEYS, ctx)
-    _require_nonempty_str(ent.get("name"), f"{ctx}.name")
+    _require_identifier(ent.get("name"), f"{ctx}.name")
     rank = ent.get("rank", 0)
     if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
         raise SignatureParseError(f"{ctx}.rank must be a non-negative integer (got {rank!r})")
+    if rank > _MAX_RANK:
+        raise SignatureParseError(
+            f"{ctx}.rank must be <= {_MAX_RANK} (Fortran maximum array rank; got {rank})")
     dims = ent.get("dims")
     if dims is not None:
         if not isinstance(dims, list) or not dims or not all(
                 isinstance(d, str) and d.strip() for d in dims):
             raise SignatureParseError(
                 f"{ctx}.dims must be a non-empty list of dimension strings (e.g. ['3', ':'])")
+        if len(dims) > _MAX_RANK:
+            raise SignatureParseError(
+                f"{ctx}.dims has {len(dims)} entries (Fortran maximum array rank is {_MAX_RANK})")
+        for d in dims:
+            _require_safe_token(d, f"{ctx}.dims entry")
         if "rank" in ent and rank != len(dims):
             raise SignatureParseError(
                 f"{ctx}: rank ({rank}) disagrees with dims length ({len(dims)})")
@@ -334,7 +372,7 @@ def _validate_procedure(proc: Any, ctx: str) -> None:
     kind = proc.get("kind")
     if kind not in ("subroutine", "function"):
         raise SignatureParseError(f"{ctx}.kind must be 'subroutine' or 'function' (got {kind!r})")
-    name = _require_nonempty_str(proc.get("name"), f"{ctx}.name")
+    name = _require_identifier(proc.get("name"), f"{ctx}.name")
     args = proc.get("args", [])
     if not isinstance(args, list):
         raise SignatureParseError(f"{ctx}.args must be a list (got {type(args).__name__})")
@@ -353,10 +391,13 @@ def _validate_type(tdef: Any, ctx: str) -> None:
     if not isinstance(tdef, dict):
         raise SignatureParseError(f"{ctx} must be a mapping (got {type(tdef).__name__})")
     _reject_unknown_keys(tdef, _TYPE_KEYS, ctx)
-    _require_nonempty_str(tdef.get("name"), f"{ctx}.name")
+    _require_identifier(tdef.get("name"), f"{ctx}.name")
     comps = tdef.get("components", [])
-    if not isinstance(comps, list) or not comps:
-        raise SignatureParseError(f"{ctx}.components must be a non-empty list")
+    # An empty component list is Fortran-legal (an opaque tag type) and is what
+    # ``_parse_type`` produces for ``type :: x`` / ``end type x``; accepting it keeps parse and
+    # validate symmetric and matches the pre-B Fortran-fence gate (which accepted empty types too).
+    if not isinstance(comps, list):
+        raise SignatureParseError(f"{ctx}.components must be a list (got {type(comps).__name__})")
     for i, comp in enumerate(comps):
         _validate_entity(comp, f"{ctx}.components[{i}]", allow_intent=False)
 
@@ -365,10 +406,13 @@ def _validate_module_parameter(mp: Any, ctx: str) -> None:
     if not isinstance(mp, dict):
         raise SignatureParseError(f"{ctx} must be a mapping (got {type(mp).__name__})")
     _reject_unknown_keys(mp, _PARAM_KEYS, ctx)
-    _require_nonempty_str(mp.get("name"), f"{ctx}.name")
+    _require_identifier(mp.get("name"), f"{ctx}.name")
     value = mp.get("value")
-    if not (isinstance(value, str) and value.strip()) and not isinstance(value, int):
-        raise SignatureParseError(f"{ctx}.value must be a non-empty string or integer (got {value!r})")
+    if isinstance(value, bool):  # bool is an int subclass; `value: true` is not a parameter value
+        raise SignatureParseError(f"{ctx}.value must be a number or symbol, not a boolean")
+    if isinstance(value, int):
+        return  # rendered as its decimal string
+    _require_safe_token(value, f"{ctx}.value")
 
 
 def _validate_symbol(sig: Any, ctx: str = "signature") -> None:
