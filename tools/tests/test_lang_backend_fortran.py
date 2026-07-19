@@ -355,6 +355,20 @@ class Round2HardeningTest(unittest.TestCase):
             {"module_parameters": [{"name": "case_id_len", "value": 64}],
              "types": [], "procedures": []})  # must not raise
 
+    def test_parenthesized_kind_parameter_value_accepted(self) -> None:
+        # A module-parameter value renders OUTSIDE parens, so the portable-kind idiom must not
+        # false-reject (and it round-trips from parse).
+        block = "integer, parameter :: dp = selected_real_kind(15, 307)\n"
+        struct = parse_signatures_from_fortran(block)
+        self.assertEqual(struct["module_parameters"][0]["value"], "selected_real_kind(15, 307)")
+        render_signatures_to_fortran(struct)  # must not raise
+
+    def test_parameter_value_with_double_colon_rejected(self) -> None:
+        with self.assertRaises(SignatureParseError):
+            render_signatures_to_fortran(
+                {"module_parameters": [{"name": "dp", "value": "real64 :: evil"}],
+                 "types": [], "procedures": []})
+
 
 if __name__ == "__main__":
     unittest.main()

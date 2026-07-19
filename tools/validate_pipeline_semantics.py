@@ -10129,13 +10129,13 @@ def _validate_ir_signatures_against_section51(
         parsed = {**e_ops, **e_types}
         if len(parsed) != 1:
             violations.append(
-                f"{derived_path}:public_api.signatures['{symbol}'].interface must contain exactly "
+                f"{derived_path}:public_api.signatures['{symbol}'].signature must render to exactly "
                 f"one signature stanza (found {len(parsed)})")
             continue
         (parsed_name, parsed_lines), = parsed.items()
         if parsed_name != symbol:
             violations.append(
-                f"{derived_path}:public_api.signatures['{symbol}'].interface declares a different "
+                f"{derived_path}:public_api.signatures['{symbol}'].signature declares a different "
                 f"symbol '{parsed_name}'")
             continue
         if symbol in ir_stanzas:

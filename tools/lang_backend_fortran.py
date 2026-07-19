@@ -299,14 +299,28 @@ def _require_identifier(value: Any, ctx: str) -> str:
 
 
 def _require_safe_token(value: Any, ctx: str) -> str:
-    """A value-ish token (string length, kind, a dimension bound, a parameter value) may be ``*`` /
-    ``:`` / a number / a symbol, but must not carry structural Fortran characters that would break or
-    smuggle a declaration when rendered verbatim (``::``, a newline, a comment ``!``, or parens)."""
+    """A token that renders INSIDE parentheses — a string length, a kind, a dimension bound
+    (``character(len=<len>)`` / ``real(<kind>)`` / ``(<dim>)``) — may be ``*`` / ``:`` / a number /
+    a symbol / a simple expression, but must not carry a ``)`` (which would close the enclosing
+    parens and smuggle a declaration) nor the other structural characters (``::``, a newline, a
+    comment ``!``, or an opening ``(``)."""
     _require_nonempty_str(value, ctx)
     if "::" in value or any(ch in value for ch in "\n\r!()"):
         raise SignatureParseError(
             f"{ctx} must not contain structural Fortran characters (::, newline, !, parentheses); "
             f"got {value!r}")
+    return value
+
+
+def _require_parameter_value(value: str, ctx: str) -> str:
+    """A module-parameter VALUE renders OUTSIDE parentheses (``parameter :: <name> = <value>``), so —
+    unlike the inside-parens tokens above — it may carry balanced parens (the portable-kind idiom
+    ``selected_real_kind(15, 307)``). It must still not carry a ``::`` / newline / comment ``!`` that
+    would break or smuggle a declaration on the parameter line."""
+    _require_nonempty_str(value, ctx)
+    if "::" in value or any(ch in value for ch in "\n\r!"):
+        raise SignatureParseError(
+            f"{ctx} must not contain '::', a newline, or '!'; got {value!r}")
     return value
 
 
@@ -412,7 +426,7 @@ def _validate_module_parameter(mp: Any, ctx: str) -> None:
         raise SignatureParseError(f"{ctx}.value must be a number or symbol, not a boolean")
     if isinstance(value, int):
         return  # rendered as its decimal string
-    _require_safe_token(value, f"{ctx}.value")
+    _require_parameter_value(value, f"{ctx}.value")
 
 
 def _validate_symbol(sig: Any, ctx: str = "signature") -> None:

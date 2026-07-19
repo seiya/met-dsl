@@ -27056,8 +27056,8 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # EXACTLY the IR public_api set (every operation incl. helper emitters/writers, types by
         # fully-qualified name; runner calls them, never reimplements) — after E2E #2 surfaced the
         # runner reimplementing __write_metrics_basis and inlining __emit_int.
-        # Bumped 25300->26400: R1 (M3c-α) — the model must publish each public_api symbol with its
-        # IR public_api.signatures[].interface VERBATIM (arg name/order/type/rank/intent/result;
+        # Bumped 25300->26400: R1 (M3c-α) — the model must publish each public_api symbol with the
+        # signature its IR public_api.signatures[].signature describes (arg name/order/type/rank/intent/result;
         # the leaf reads the IR, not controlled_spec); the deterministic Generate.static gate
         # (_validate_infrastructure_generated_signatures) pins the generated .f90 against §5.1,
         # moving signature-exactness off the Generate.verify leaf.
