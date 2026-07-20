@@ -526,7 +526,8 @@ def _render_entity(ent: dict[str, Any]) -> str:
 
 def _render_procedure(proc: dict[str, Any]) -> list[str]:
     name = proc["name"]
-    arg_names = ", ".join(a["name"] for a in proc["args"])
+    args = proc.get("args", [])  # validation tolerates an omitted args list (a no-arg procedure);
+    arg_names = ", ".join(a["name"] for a in args)  # render must too, not KeyError on proc["args"].
     lines: list[str] = []
     if proc["kind"] == "function":
         result = proc["result"]
@@ -539,7 +540,7 @@ def _render_procedure(proc: dict[str, Any]) -> list[str]:
             lines.append(f"function {name}({arg_names}) result({result['name']})")
     else:
         lines.append(f"subroutine {name}({arg_names})")
-    for a in proc["args"]:
+    for a in args:
         lines.append(f"  {_render_entity(a)}")
     if proc["kind"] == "function":
         lines.append(f"  {_render_entity(proc['result'])}")
@@ -549,8 +550,8 @@ def _render_procedure(proc: dict[str, Any]) -> list[str]:
 
 def _render_type(t: dict[str, Any]) -> list[str]:
     lines = [f"type :: {t['name']}"]
-    for c in t["components"]:
-        lines.append(f"  {_render_entity(c)}")
+    for c in t.get("components", []):  # validation allows an omitted/empty component list (an
+        lines.append(f"  {_render_entity(c)}")  # opaque tag type); render must not KeyError.
     lines.append(f"end type {t['name']}")
     return lines
 

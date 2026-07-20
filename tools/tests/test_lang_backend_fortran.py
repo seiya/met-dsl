@@ -277,6 +277,20 @@ class MalformedStructFailClosedTest(unittest.TestCase):
             render_signatures_to_fortran(
                 {"procedures": ["not a mapping"], "types": [], "module_parameters": []})
 
+    def test_omitted_args_renders_no_arg_procedure_not_crash(self) -> None:
+        # validation tolerates an omitted args list; render must too (no KeyError on proc["args"]).
+        out = render_signatures_to_fortran(
+            {"module_parameters": [], "types": [],
+             "procedures": [{"kind": "subroutine", "name": "hx__f"}]})
+        self.assertIn("subroutine hx__f()", out)
+
+    def test_omitted_components_renders_empty_type_not_crash(self) -> None:
+        out = render_signatures_to_fortran(
+            {"module_parameters": [], "procedures": [],
+             "types": [{"name": "hx__opaque"}]})
+        self.assertIn("type :: hx__opaque", out)
+        self.assertIn("end type hx__opaque", out)
+
 
 class ExplicitDimsTest(unittest.TestCase):
     """A signature can express a fixed dimension bound (e.g. coef(3)), not only assumed-shape (:)."""
