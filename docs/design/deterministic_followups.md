@@ -2590,8 +2590,8 @@ located.
 
 A `pure-function leaf` is unaffected — its per-attempt `model` / `usage` come from the CLI result envelope and are
 persisted to `bundle_meta.json` / `verdict_meta.json` (`Z2` M-E), which is why the `Z2` A/B reads its `pure` arm from
-the pure-leaf metrics section and its `legacy` arm by summing `<agent_run_id>.jsonl` directly
-(`orchestration_diagnostics.summarize_transcript_usage`).
+the pure-leaf metrics section and its `legacy` arm by summing the leaf's `<agent_run_id>.jsonl`
+transcript directly.
 
 **What is required.** `aggregate_child_usage` must also resolve `~/.claude/projects/<slug>/<agent_run_id>.jsonl`, the
 layout a conductor-spawned leaf actually produces, and keep the `subagents/` scan for the Agent-tool case. The existing

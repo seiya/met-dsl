@@ -308,7 +308,7 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertFalse(ns.run_conductor)
 
     def test_parse_args_deprecated_invoke_llm_aliases(self) -> None:
-        # The legacy --invoke-llm / --no-run-conductor spellings still work (they map
+        # The legacy --invoke-llm / --no-invoke-llm spellings still work (they map
         # onto the canonical run_conductor dest) so existing operator muscle memory
         # and scripts keep functioning after the rename.
         ns = run_workflow._parse_args(["spec/problem.md", "generate", "--no-invoke-llm"])
