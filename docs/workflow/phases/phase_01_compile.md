@@ -178,14 +178,14 @@ public_api:
     - operation_id: "<spec_id>__<name>"   # every §5 operation_id (set equality with §5)
       exercised_by: ["<test_id>", ...]    # optional: tests exercising it ([] for a helper)
   published_types: ["<spec_id>__<type>", ...]   # every §5 published derived type (set equality)
-  signatures:                             # transcribe controlled_spec §5.1 VERBATIM, one per symbol
+  signatures:                             # copy §5.1 structured signatures, one {symbol, signature} each
     - symbol: "<spec_id>__<name>"         # every §5.1 op AND type (set equality with §5.1)
-      interface: |                        # the exact Fortran interface stanza (block scalar):
-        subroutine <spec_id>__<name>(a, b)   #   header + dummy-arg decls (+ `result` for a function);
-          <type>, intent(in) :: a            #   a type stanza is `type :: name` .. `end type name`.
-          <type>, intent(in) :: b            # The Generate leaf publishes these verbatim (it cannot
-        end subroutine <spec_id>__<name>     # read controlled_spec — phase_02 §2-1); the gate pins
-                                             # signatures == §5.1 (normalized) at Compile (V8).
+      signature:                          # structured MAPPING, NOT Fortran text: a procedure
+        kind: subroutine                  #   {kind, name, args, result?} or a type {name, components};
+        name: "<spec_id>__<name>"         #   entity {name, rank?, intent?, spec:{type, kind?, len?,
+        args:                             #   name?, alloc?}}. Generate renders it to Fortran
+          - {name: a, intent: in, spec: {type: real, kind: dp}}   #  (phase_02 §2-1); the gate
+          - {name: b, intent: in, spec: {type: string, len: case_id_len}}   # pins == §5.1 (V8).
 ```
 
 ### `<ir_ref>/dependency_graph.json` sidecar (conductor-authored)

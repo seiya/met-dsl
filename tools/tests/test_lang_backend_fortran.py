@@ -386,6 +386,29 @@ class Round2HardeningTest(unittest.TestCase):
                      "args": [{"name": "x", "intent": bad_intent,
                                "spec": {"type": "real", "kind": "dp"}}]})
 
+    def test_inapplicable_type_field_fails_closed(self) -> None:
+        # A field the renderer drops for this type would let §5.1 and the IR differ yet render equal.
+        cases = [
+            {"type": "real", "len": "case_id_len"},   # len ignored on real
+            {"type": "real", "name": "foo"},          # name ignored on real
+            {"type": "string", "len": ":", "kind": "dp"},   # kind ignored on string
+            {"type": "string", "len": ":", "name": "foo"},  # name ignored on string
+            {"type": "derived", "name": "hx__t", "len": ":"},  # len ignored on derived
+        ]
+        for spec in cases:
+            with self.assertRaisesRegex(SignatureParseError, "not applicable"):
+                render_symbol_to_fortran(
+                    {"kind": "subroutine", "name": "hx__f",
+                     "args": [{"name": "x", "spec": spec}]})
+
+    def test_full_form_spec_with_none_inapplicable_fields_accepted(self) -> None:
+        # The full-form struct parse_signatures_from_fortran emits carries kind/len/name=None for
+        # inapplicable fields; None must NOT trip the inapplicable-field guard.
+        render_symbol_to_fortran(
+            {"kind": "subroutine", "name": "hx__f", "args": [
+                {"name": "x", "rank": 0, "intent": "in",
+                 "spec": {"type": "real", "kind": "dp", "len": None, "name": None, "alloc": False}}]})
+
 
 if __name__ == "__main__":
     unittest.main()

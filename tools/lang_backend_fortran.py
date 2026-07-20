@@ -335,6 +335,19 @@ def _validate_spec(spec: Any, ctx: str) -> None:
     if not isinstance(t, str) or t not in _VALID_SPEC_TYPES:
         raise SignatureParseError(
             f"{ctx}.spec.type must be one of {sorted(_VALID_SPEC_TYPES)} (got {t!r})")
+    # A field the renderer does not use for this `type` would be SILENTLY DROPPED at render — so
+    # §5.1 and the IR could carry different authored info yet render/compare equal (fail-open).
+    # Reject any inapplicable field (present and non-None); `alloc` applies to every type.
+    _inapplicable = {
+        "string": ("kind", "name"),
+        "derived": ("kind", "len"),
+        "real": ("len", "name"), "integer": ("len", "name"), "logical": ("len", "name"),
+    }[t]
+    for bad in _inapplicable:
+        if spec.get(bad) is not None:
+            raise SignatureParseError(
+                f"{ctx}.spec.{bad} is not applicable to type '{t}' (it would be silently dropped at "
+                "render, letting §5.1 and the IR differ yet compare equal)")
     if t == "string":
         _require_safe_token(spec.get("len"), f"{ctx}.spec.len (string length is required)")
     elif t == "derived":
