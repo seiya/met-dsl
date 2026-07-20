@@ -12718,6 +12718,22 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             self.assertTrue(any("public_api.signatures missing" in v for v in violations),
                             violations)
 
+    def test_non_fortran_infra_language_fails_closed(self) -> None:
+        # The signature pin renders to Fortran; only a Fortran backend exists, so a non-Fortran
+        # infrastructure node must fail closed (not be silently rendered/compared as Fortran).
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpp = Path(tmp)
+            (tmpp / "cs.md").write_text(self._controlled_spec(), encoding="utf-8")
+            _write_json(tmpp / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "impl_defaults": {"toolchain": {"language": "c"}},
+                "public_api": self._full_api()})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(tmpp, tmpp, violations)
+            self.assertTrue(any("only a Fortran language backend" in v for v in violations),
+                            violations)
+
     def test_signatures_type_drift_flagged(self) -> None:
         # An IR signature that drifts from §5.1 (here: change entries' element type) is flagged —
         # it is exactly what the leaf would transcribe into the model.

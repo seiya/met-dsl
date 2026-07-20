@@ -407,6 +407,27 @@ class Round2HardeningTest(unittest.TestCase):
         self.assertEqual(struct["types"], [])
         self.assertEqual(struct["module_parameters"], [])
 
+    def test_implicit_result_function_round_trips(self) -> None:
+        # `function f(x)` (no result clause) has the function NAME as its result variable; rendering
+        # `result(f)` would be invalid Fortran (result name must differ from the function name).
+        block = ("function hx__f(x)\n"
+                 "  real(dp), intent(in) :: x\n"
+                 "  real(dp) :: hx__f\n"
+                 "end function hx__f\n")
+        struct = parse_signatures_from_fortran(block)
+        rendered = render_signatures_to_fortran(struct)
+        self.assertNotIn("result(", rendered)
+        self.assertEqual(normalized_stanza_index(block), normalized_stanza_index(rendered))
+
+    def test_unsupported_declaration_attribute_rejected(self) -> None:
+        # `dimension(:)` / `optional` / `pointer` / `value` are not modeled; silently dropping them
+        # would change the ABI (a `dimension(:)` arg parsed as a scalar).
+        for decl in ("real, dimension(:), intent(in) :: x", "real, optional, intent(in) :: x",
+                     "real, pointer :: x", "real, value :: x"):
+            with self.assertRaisesRegex(SignatureParseError, "unsupported declaration attribute"):
+                parse_signatures_from_fortran(
+                    f"subroutine hx__g(x)\n  {decl}\nend subroutine hx__g\n")
+
     def test_unhashable_type_value_fails_closed_not_crash(self) -> None:
         # `type: []` / `type: {}` is unhashable; a raw `not in frozenset` would TypeError and escape
         # the callers' `except SignatureParseError`, crashing the gate instead of failing closed.

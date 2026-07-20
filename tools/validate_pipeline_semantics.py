@@ -9886,6 +9886,22 @@ def _validate_infrastructure_public_api(
     if meta.get("spec_kind") != "infrastructure":
         return  # exact-published-surface contract is infrastructure-only
 
+    # The §5.1 signature pin renders the structured signatures to the target language, and only a
+    # Fortran backend exists (tools/lang_backend_fortran). A non-Fortran infrastructure node is
+    # fail-closed here — never silently rendered as Fortran and compared against non-Fortran source
+    # — until its language backend is implemented. (No such node exists yet: the sole harness is
+    # fortran/cpu.) The §5 published-NAME surface is language-neutral, but without a signature
+    # backend the node cannot certify at all, so stop early with one clear message.
+    impl = ir.get("impl_defaults") if isinstance(ir.get("impl_defaults"), dict) else {}
+    tc = impl.get("toolchain") if isinstance(impl.get("toolchain"), dict) else {}
+    language = str(tc.get("language") or "").strip().lower()
+    if language and language != "fortran":
+        violations.append(
+            f"{derived_path}: infrastructure signature pinning has only a Fortran language backend "
+            f"(tools/lang_backend_fortran); a '{language}' infrastructure node needs its own backend "
+            "before its §5.1 / public_api.signatures can be pinned")
+        return
+
     spec_id = meta.get("spec_id")
     if not isinstance(spec_id, str) or not spec_id.strip():
         violations.append(
@@ -10226,6 +10242,20 @@ def _validate_infrastructure_generated_signatures(
         cs_path = repo_root / cs_path
     if not _is_readable_file(cs_path):
         _fail_closed_if_infra(f"controlled_spec ({cs_ref}) unresolvable")
+        return
+
+    # Only a Fortran signature backend exists (tools/lang_backend_fortran); render+compare below is
+    # Fortran. A non-Fortran infrastructure node is fail-closed rather than pinned against the wrong
+    # language. (Compile's _validate_infrastructure_public_api already fail-closes it, so this is a
+    # defense-in-depth stop; no non-Fortran infra node exists yet.)
+    impl = ir.get("impl_defaults") if isinstance(ir.get("impl_defaults"), dict) else {}
+    tc = impl.get("toolchain") if isinstance(impl.get("toolchain"), dict) else {}
+    language = str(tc.get("language") or "").strip().lower()
+    if language and language != "fortran":
+        loc = model_files[0] if model_files else ir_path
+        violations.append(
+            f"{loc}: a '{language}' infrastructure node's signatures cannot be pinned — only a "
+            "Fortran language backend is implemented (tools/lang_backend_fortran)")
         return
 
     op_stanzas, type_stanzas, iface_err = _parse_canonical_interface_from_controlled_spec(cs_path)

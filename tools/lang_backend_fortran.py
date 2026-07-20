@@ -165,7 +165,15 @@ def _parse_decl_line(line: str) -> list[dict[str, Any]]:
             m = _INTENT_RE.match(attr.strip())
             if m:
                 intent = m.group(1).lower()
-            # other attributes (target/pointer/...) are not part of the published surface here
+            else:
+                # Fail closed on an attribute the neutral structure does not model — silently
+                # dropping `dimension(:)` / `optional` / `pointer` / `value` would change the ABI
+                # (e.g. `real, dimension(:) :: x` parsed as a scalar). The neutral form models only
+                # type/kind/len, rank (via the entity's `(:)` dimensions), intent, and allocatable.
+                raise SignatureParseError(
+                    f"unsupported declaration attribute {attr.strip()!r} in {line!r}; the neutral "
+                    "signature models only intent / allocatable (rank comes from the entity's "
+                    "dimensions, e.g. `x(:)`, not a `dimension` attribute)")
     entities: list[dict[str, Any]] = []
     for name, rank, dims in _parse_entities(right):
         ent: dict[str, Any] = {"name": name, "rank": rank, "intent": intent, "spec": dict(spec)}
@@ -512,7 +520,13 @@ def _render_procedure(proc: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     if proc["kind"] == "function":
         result = proc["result"]
-        lines.append(f"function {name}({arg_names}) result({result['name']})")
+        # Fortran forbids a `result` name equal to the function name; that form is the IMPLICIT
+        # result (the function name IS the result variable), so omit the clause — emitting
+        # `function f(...) result(f)` would be invalid source.
+        if result["name"] == name:
+            lines.append(f"function {name}({arg_names})")
+        else:
+            lines.append(f"function {name}({arg_names}) result({result['name']})")
     else:
         lines.append(f"subroutine {name}({arg_names})")
     for a in proc["args"]:
