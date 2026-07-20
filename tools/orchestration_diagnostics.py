@@ -15,7 +15,7 @@ If the host ``claude`` process then exits cleanly (e.g. the orchestration agent
 ends its turn with an "I've paused" message, returncode 0), nothing in-repo
 records *why* it stopped, and the only decisive evidence (the child's last
 activity and the dead-air before the abort) lives in the **ephemeral**
-``~/.claude/projects/<slug>/<host_session_id>/subagents/agent-*.jsonl`` transcript,
+``~/.claude/projects/<slug>/<session>/subagents/agent-*.jsonl`` transcript,
 which ``~/.claude`` cleanup can delete.
 
 This module makes that diagnosis reproducible and persists the decisive transcript
@@ -401,100 +401,6 @@ def _claude_projects_dir(repo_root: Path) -> Path:
     return Path.home() / ".claude" / "projects" / slug
 
 
-def _last_agent_tool_use_id(host_records: list[dict[str, Any]]) -> str | None:
-    """Find the id of the last ``Agent``/``Task`` tool_use in the host transcript."""
-    for record in reversed(host_records):
-        message = record.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_use"
-                and block.get("name") in ("Agent", "Task")
-            ):
-                tid = block.get("id")
-                if isinstance(tid, str) and tid:
-                    return tid
-    return None
-
-
-def resolve_transcripts(
-    repo_root: Path, meta: dict[str, Any], child_arid: str
-) -> dict[str, Any]:
-    """Resolve host + child subagent transcript paths from ``~/.claude``.
-
-    Primary child match: the last host ``Agent`` tool_use id <-> a
-    ``subagents/agent-*.meta.json#toolUseId``. Fallback: a ``subagents/agent-*.jsonl``
-    whose body references ``child_arid`` (the child prompt embeds it).
-    """
-    host_session_id = str(meta.get("host_session_id") or "").strip()
-    projects_dir = _claude_projects_dir(repo_root)
-    result: dict[str, Any] = {
-        "host_session_id": host_session_id or None,
-        "projects_dir": str(projects_dir),
-    }
-    if not host_session_id:
-        result["host_transcript"] = {"found": False, "reason": "no host_session_id in meta"}
-        result["child_transcript"] = {"found": False, "reason": "no host_session_id in meta"}
-        return result
-
-    host_path = projects_dir / f"{host_session_id}.jsonl"
-    host_records = _read_jsonl(host_path) if host_path.exists() else []
-    result["host_transcript"] = {
-        "found": host_path.exists(),
-        "path": str(host_path),
-    }
-
-    subagents_dir = projects_dir / host_session_id / "subagents"
-    child_path: Path | None = None
-    match_method: str | None = None
-
-    if subagents_dir.is_dir():
-        # Primary: toolUseId correlation.
-        target_tool_id = _last_agent_tool_use_id(host_records)
-        if target_tool_id:
-            for meta_file in sorted(subagents_dir.glob("agent-*.meta.json")):
-                sub_meta = _read_json(meta_file) or {}
-                if str(sub_meta.get("toolUseId") or "") == target_tool_id:
-                    # meta_file is agent-<id>.meta.json; transcript is agent-<id>.jsonl
-                    candidate = subagents_dir / (meta_file.name[: -len(".meta.json")] + ".jsonl")
-                    if candidate.exists():
-                        child_path = candidate
-                        match_method = "tool_use_id"
-                    break
-        # Fallback: body references child_arid.
-        if child_path is None:
-            for jsonl_file in sorted(subagents_dir.glob("agent-*.jsonl")):
-                try:
-                    if child_arid in jsonl_file.read_text(encoding="utf-8"):
-                        child_path = jsonl_file
-                        match_method = "arid_in_body"
-                        break
-                except OSError:
-                    continue
-
-    if child_path is None:
-        result["child_transcript"] = {
-            "found": False,
-            "subagents_dir": str(subagents_dir),
-            "reason": (
-                "subagents dir missing (transcript may be ephemeral/cleaned)"
-                if not subagents_dir.is_dir()
-                else "no matching subagent transcript"
-            ),
-        }
-    else:
-        summary = summarize_transcript_tail(child_path)
-        summary["match_method"] = match_method
-        result["child_transcript"] = summary
-
-    return result
-
-
 def summarize_jsonl_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Sum token usage across the assistant turns of a Claude Code transcript.
 
@@ -533,16 +439,6 @@ def summarize_jsonl_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
         "assistant_turns": turns,
         "peak_context_tokens": peak,
     }
-
-
-def summarize_transcript_usage(path: Path) -> dict[str, Any]:
-    """Token-usage summary for a single transcript jsonl (``found=False`` if absent)."""
-    if not path.exists():
-        return {"found": False, "path": str(path)}
-    summary = summarize_jsonl_usage(_read_jsonl(path))
-    summary["found"] = True
-    summary["path"] = str(path)
-    return summary
 
 
 # The four token classes a Claude CLI `usage` object reports. Both sum-key tuples
@@ -625,25 +521,19 @@ def _first_user_text_contains(records: list[dict[str, Any]], needle: str) -> boo
 def aggregate_child_usage(
     repo_root: Path,
     agent_run_ids: list[str],
-    *,
-    host_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Attribute per-child token usage from the ephemeral ``~/.claude`` transcripts.
 
-    Child ``Agent`` subagents are NOT recorded as sidechains in the host
-    transcript and ``agent_runs.jsonl`` carries no usage fields, so child token
-    cost (empirically the majority of a workflow node's cost) is otherwise
-    invisible. This locates each child's
-    ``~/.claude/projects/<slug>/<host>/subagents/agent-*.jsonl`` transcript by
-    arid-in-body (the child launch prompt embeds its own arid) and sums usage.
+    Child subagents are NOT recorded as sidechains in the host transcript and
+    ``agent_runs.jsonl`` carries no usage fields, so child token cost (empirically
+    the majority of a workflow node's cost) is otherwise invisible. This locates
+    each child's ``~/.claude/projects/<slug>/<host>/subagents/agent-*.jsonl``
+    transcript by arid-in-body (the child launch prompt embeds its own arid) and
+    sums usage.
 
-    By default scans every host session's ``subagents`` dir (not just one), which
-    is robust to multi-session nodes — e.g. a ``--resume`` that ran some children
-    under a different host session than the others. Pass ``host_session_id`` to
-    restrict the scan to a single session's ``subagents`` dir; the live
-    ``finalize_child`` path uses this because the just-returned child is always
-    under the current host session, which avoids reading every other session's
-    transcripts on each finalize. Best-effort: returns ``available=False`` with a
+    Scans every host session's ``subagents`` dir, which is robust to multi-session
+    nodes — e.g. a ``--resume`` that ran some children under a different host
+    session than the others. Best-effort: returns ``available=False`` with a
     reason when ``~/.claude`` is absent/cleaned; never raises.
     """
     targets = [a for a in agent_run_ids if isinstance(a, str) and a]
@@ -665,12 +555,7 @@ def aggregate_child_usage(
 
     target_set = set(targets)
     per_child: dict[str, Any] = {}
-    glob_pat = (
-        f"{host_session_id}/subagents/agent-*.jsonl"
-        if host_session_id
-        else "*/subagents/agent-*.jsonl"
-    )
-    for sub in sorted(projects_dir.glob(glob_pat)):
+    for sub in sorted(projects_dir.glob("*/subagents/agent-*.jsonl")):
         try:
             text = sub.read_text(encoding="utf-8")
         except OSError:
@@ -718,9 +603,9 @@ def aggregate_parent_usage(
     """Sum the orchestration (parent) agent's token usage across all its host sessions.
 
     A node that was ``--resume``-d runs the parent under more than one host session
-    (the original plus each resume), so reading only the current
-    ``host_session_id`` understates the parent total and skews the parent/children
-    ratio. A parent session's *first user message* is the orchestration launch
+    (the original plus each resume), so reading only one session understates the
+    parent total and skews the parent/children ratio. A parent session's *first
+    user message* is the orchestration launch
     prompt, which embeds ``workspace/tmp/<orchestration_agent_run_id>`` (its
     allowed_tmp_root) — a token unique to this parent. Matching on the FIRST user
     message (not anywhere in the body) is what makes this precise: a diagnostic /
@@ -915,35 +800,20 @@ def build_launch_incident(
 ) -> dict[str, Any] | None:
     """Assemble a launch-incident report, or ``None`` if no dangling window.
 
-    Combines dangling-child detection (in-repo artifacts) with transcript
-    correlation (``~/.claude``). The transcript portion degrades gracefully when
-    ``~/.claude`` is absent or cleaned.
+    Reports the dangling child from in-repo artifacts only. Live ``~/.claude``
+    transcript correlation is not attempted: the conductor is a plain Python
+    process with no host session, so there is no parent transcript to walk.
+    Persisted ``launch_incident.runtime.*.json`` snapshots from older runs (which
+    carried transcript/abort-marker evidence) are still surfaced by the audit
+    renderer when present.
     """
     dangling = detect_dangling_active_child(repo_root, orchestration_id)
     if dangling is None:
         return None
-
-    meta = _read_json(_orch_root(repo_root, orchestration_id) / "orchestration_meta.json") or {}
-    transcripts = resolve_transcripts(repo_root, meta, dangling["agent_run_id"])
-
-    child = transcripts.get("child_transcript", {})
-    abort_marker = None
-    if isinstance(child, dict) and child.get("found"):
-        abort_marker = {
-            "interrupted": child.get("interrupted"),
-            "interrupt_ts": child.get("interrupt_ts"),
-            "interrupt_text": child.get("interrupt_text"),
-            "last_activity_ts": child.get("last_activity_ts"),
-            "dead_air_seconds": child.get("dead_air_seconds"),
-            "api_error": child.get("api_error"),
-        }
 
     return {
         "schema": "launch_incident/v1",
         "orchestration_id": orchestration_id,
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "dangling_child": dangling,
-        "host_session_id": transcripts.get("host_session_id"),
-        "transcripts": transcripts,
-        "abort_marker": abort_marker,
     }

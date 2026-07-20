@@ -32,9 +32,7 @@ try:  # script run: sys.path[0] is tools/ ; package import: repo root on path
         api_error_from_records,
         aggregate_child_usage,
         aggregate_parent_usage,
-        summarize_transcript_usage,
         summarize_pure_leaf_metas,
-        _claude_projects_dir,
     )
 except ImportError:  # pragma: no cover - import-path shim
     from tools.orchestration_diagnostics import (
@@ -42,9 +40,7 @@ except ImportError:  # pragma: no cover - import-path shim
         api_error_from_records,
         aggregate_child_usage,
         aggregate_parent_usage,
-        summarize_transcript_usage,
         summarize_pure_leaf_metas,
-        _claude_projects_dir,
     )
 
 
@@ -470,21 +466,13 @@ def collect_token_cost_summary(
     if not per_child:
         children["reason"] = transcripts.get("reason") or "no child usage located"
 
-    # Parent usage: prefer the multi-session sum (a resumed node ran the parent
-    # under more than one host session), falling back to the single current host
-    # transcript when the orchestration_agent_run_id is unknown.
+    # Parent usage: the multi-session sum across the orchestration agent's host
+    # sessions (a resumed node may run the parent under more than one host session).
     parent: dict[str, Any] = {"found": False}
-    host_session_id = str(meta.get("host_session_id") or "").strip()
     if parent_arid:
         agg_parent = aggregate_parent_usage(repo_root, parent_arid)
         if agg_parent.get("available"):
             parent = agg_parent
-            if host_session_id:
-                parent["host_session_id"] = host_session_id
-    if not parent.get("found") and host_session_id:
-        host_path = _claude_projects_dir(repo_root) / f"{host_session_id}.jsonl"
-        parent = summarize_transcript_usage(host_path)
-        parent["host_session_id"] = host_session_id
 
     # Available when EITHER side actually yielded data: in a post-cleanup audit the
     # parent session may survive while child transcripts are gone (or vice-versa),
@@ -774,7 +762,6 @@ def _render_incident_body(incident: dict[str, Any], lines: list[str]) -> None:
     lines.append(f"| launch_recorded_at | `{child.get('launch_recorded_at')}` |")
     elapsed = child.get("elapsed_seconds")
     lines.append(f"| elapsed since launch | {f'{elapsed:.0f}s' if isinstance(elapsed, (int, float)) else 'n/a'} |")
-    lines.append(f"| host_session_id | `{incident.get('host_session_id')}` |")
     lines.append("")
 
     transcripts = incident.get("transcripts", {})

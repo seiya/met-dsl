@@ -322,93 +322,25 @@ class TranscriptSummaryTests(unittest.TestCase):
 
 
 class BuildLaunchIncidentTests(unittest.TestCase):
-    def _fake_home_with_transcripts(self, repo: Path, home: Path) -> None:
-        slug = str(repo.resolve()).replace("/", "-")
-        host_session = "hostsess"
-        (repo / "workspace" / "orchestrations" / ORCH_ID / "orchestration_meta.json").write_text(
-            json.dumps({"orchestration_id": ORCH_ID, "status": "running", "host_session_id": host_session}),
-            encoding="utf-8",
-        )
-        projects = home / ".claude" / "projects" / slug
-        subagents = projects / host_session / "subagents"
-        subagents.mkdir(parents=True, exist_ok=True)
-        # Host transcript with an Agent tool_use whose id ties to the subagent meta.
-        (projects / f"{host_session}.jsonl").write_text(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "timestamp": "2026-06-16T12:37:46Z",
-                    "message": {
-                        "role": "assistant",
-                        "content": [
-                            {"type": "tool_use", "name": "Agent", "id": "toolu_X", "input": {"prompt": "go"}}
-                        ],
-                    },
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        (subagents / "agent-abc.meta.json").write_text(
-            json.dumps({"agentType": "general-purpose", "toolUseId": "toolu_X"}), encoding="utf-8"
-        )
-        (subagents / "agent-abc.jsonl").write_text(
-            "\n".join(
-                json.dumps(r)
-                for r in [
-                    {
-                        "type": "user",
-                        "timestamp": "2026-06-16T12:38:47.421Z",
-                        "message": {"role": "user", "content": [{"type": "tool_result", "content": "PASS"}]},
-                    },
-                    {
-                        "type": "user",
-                        "timestamp": "2026-06-16T12:48:47.526Z",
-                        "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]},
-                    },
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-
-    def test_incident_with_transcript_correlation(self) -> None:
+    def test_incident_reports_dangling_from_repo_artifacts(self) -> None:
+        # The dangling launch is detected from in-repo artifacts alone. The
+        # conductor has no host session, so no ~/.claude transcript correlation is
+        # attempted and the incident carries no transcript/abort-marker fields.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
-            home = Path(tmp) / "home"
-            _open_dangling_window(_orch_root(repo))
-            self._fake_home_with_transcripts(repo, home)
-            with mock.patch.object(diag.Path, "home", return_value=home):
-                incident = diag.build_launch_incident(repo, ORCH_ID)
-            self.assertIsNotNone(incident)
-            assert incident is not None
-            self.assertEqual(incident["dangling_child"]["agent_run_id"], CHILD_ARID)
-            child = incident["transcripts"]["child_transcript"]
-            self.assertTrue(child["found"])
-            self.assertEqual(child["match_method"], "tool_use_id")
-            self.assertEqual(incident["abort_marker"]["interrupt_text"], "[Request interrupted by user]")
-            self.assertAlmostEqual(incident["abort_marker"]["dead_air_seconds"], 600.105, places=2)
-
-    def test_incident_degrades_when_transcript_ephemeral(self) -> None:
-        # ~/.claude cleaned: dangling still detected from in-repo artifacts, child
-        # transcript reported as not-found rather than raising.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            empty_home = Path(tmp) / "home"
-            empty_home.mkdir()
             root = _orch_root(repo)
             _open_dangling_window(root)
             (root / "orchestration_meta.json").write_text(
-                json.dumps({"orchestration_id": ORCH_ID, "status": "running", "host_session_id": "gone"}),
+                json.dumps({"orchestration_id": ORCH_ID, "status": "running"}),
                 encoding="utf-8",
             )
-            with mock.patch.object(diag.Path, "home", return_value=empty_home):
-                incident = diag.build_launch_incident(repo, ORCH_ID)
+            incident = diag.build_launch_incident(repo, ORCH_ID)
             self.assertIsNotNone(incident)
             assert incident is not None
             self.assertEqual(incident["dangling_child"]["agent_run_id"], CHILD_ARID)
-            self.assertFalse(incident["transcripts"]["child_transcript"]["found"])
-            self.assertIsNone(incident["abort_marker"])
+            self.assertNotIn("transcripts", incident)
+            self.assertNotIn("abort_marker", incident)
+            self.assertNotIn("host_session_id", incident)
 
     def test_no_incident_when_window_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -530,7 +462,7 @@ class AggregateChildUsageTests(unittest.TestCase):
             agg = diag.aggregate_child_usage(Path(tmp), [])
             self.assertFalse(agg["available"])
 
-    def test_host_session_hint_narrows_scan(self) -> None:
+    def test_scans_all_host_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -544,13 +476,11 @@ class AggregateChildUsageTests(unittest.TestCase):
                 d.mkdir(parents=True, exist_ok=True)
                 self._write_child(d, "agent-x.jsonl", child, parent, [_usage_record(1, 1, 100, 0)])
             with mock.patch.object(diag.Path, "home", return_value=home):
-                # Without hint: first glob-sorted session wins (one match).
+                # Every host session's subagents dir is scanned; the child is found
+                # regardless of which session ran it.
                 agg_all = diag.aggregate_child_usage(repo, [child])
-                # With hint: only sessB scanned.
-                agg_b = diag.aggregate_child_usage(repo, [child], host_session_id="sessB")
             self.assertTrue(agg_all["available"])
-            self.assertIn(child, agg_b["per_child"])
-            self.assertIn("sessB", agg_b["per_child"][child]["transcript"])
+            self.assertIn(child, agg_all["per_child"])
 
 
 class AggregateParentUsageTests(unittest.TestCase):

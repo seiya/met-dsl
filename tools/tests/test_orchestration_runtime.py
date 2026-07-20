@@ -2088,67 +2088,6 @@ shell_tool                       stable             true
             self.assertIn("agent_run_id: substep_run_plan_generate_001", summary_text)
             self.assertIn("output_refs:", summary_text)
 
-    def test_write_preflight_records_host_session_id_only_when_launchable(self) -> None:
-        import json as _json
-
-        def _read_meta(repo_root: Path) -> dict:
-            return _json.loads(
-                (
-                    repo_root
-                    / "workspace" / "orchestrations" / "orch_001"
-                    / "orchestration_meta.json"
-                ).read_text(encoding="utf-8")
-            )
-
-        launchable_payload = {
-            "status": "pass",
-            "sandbox_runtime": "bwrap",
-            "sandbox_enforced": True,
-            "can_launch_step_agents": True,
-            "can_launch_substep_agents": True,
-            "feature_states": {"multi_agent": True, "hooks": True},
-            "checks": [{"name": "multi_agent_enabled", "pass": True}],
-        }
-        non_launchable_payload = {
-            "status": "fail",
-            "sandbox_runtime": "bwrap",
-            "sandbox_enforced": True,
-            "can_launch_step_agents": False,
-            "can_launch_substep_agents": False,
-            "feature_states": {"multi_agent": True, "hooks": True},
-            "checks": [{"name": "multi_agent_enabled", "pass": True}],
-        }
-
-        # Launchable preflight: host_session_id is recorded.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _mark_dependencies_ready(repo_root)
-            write_preflight(
-                repo_root=repo_root,
-                orchestration_id="orch_001",
-                payload=dict(launchable_payload),
-                host_session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            )
-            self.assertEqual(
-                _read_meta(repo_root).get("host_session_id"),
-                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            )
-
-        # Non-launchable preflight: host_session_id must NOT be recorded (it would
-        # point meta at a session that never started).
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            init_orchestration(repo_root=repo_root, orchestration_id="orch_001")
-            _mark_dependencies_ready(repo_root)
-            write_preflight(
-                repo_root=repo_root,
-                orchestration_id="orch_001",
-                payload=dict(non_launchable_payload),
-                host_session_id="ffffffff-0000-1111-2222-333333333333",
-            )
-            self.assertNotIn("host_session_id", _read_meta(repo_root))
-
     def test_init_records_orchestration_agent_model_when_supplied(self) -> None:
         """init_orchestration writes agent_model onto the orchestration agent_runs row
         when given, so the top-level row is not a cost-attribution blind spot."""
@@ -27207,7 +27146,6 @@ class ReopenPhaseTest(unittest.TestCase):
             repo_root=repo_root,
             orchestration_id=oid,
             payload=dict(_REOPEN_LAUNCHABLE_PREFLIGHT),
-            host_session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         )
         root = repo_root / "workspace" / "orchestrations" / oid
         orch_arid = json.loads(

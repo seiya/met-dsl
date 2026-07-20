@@ -153,7 +153,6 @@ class TokenCostSummaryTests(unittest.TestCase):
             json.dumps(
                 {
                     "orchestration_id": orch_id,
-                    "host_session_id": host_session,
                     "orchestration_agent_run_id": parent_arid,
                 }
             ),
@@ -172,9 +171,25 @@ class TokenCostSummaryTests(unittest.TestCase):
         projects = home / ".claude" / "projects" / slug
         subagents = projects / host_session / "subagents"
         subagents.mkdir(parents=True, exist_ok=True)
-        # Parent host transcript: 1 turn.
+        # Parent host transcript: 1 turn. Located by aggregate_parent_usage via the
+        # `workspace/tmp/<parent_arid>` marker in its first user (launch) message.
         (projects / f"{host_session}.jsonl").write_text(
-            json.dumps(_usage_rec(100, 50, 2000, 0)) + "\n", encoding="utf-8"
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": f"Start the workflow workspace/tmp/{parent_arid}",
+                            },
+                        }
+                    ),
+                    json.dumps(_usage_rec(100, 50, 2000, 0)),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
         def _child(fname: str, arid: str, rec: dict) -> None:
@@ -238,7 +253,7 @@ class TokenCostSummaryTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            meta = {"orchestration_agent_run_id": parent_arid, "host_session_id": "orig"}
+            meta = {"orchestration_agent_run_id": parent_arid}
             # No child agent_runs (only the parent): child attribution is
             # unavailable, but the parent total must still be reported.
             runs = [{"agent_run_id": parent_arid, "agent_role": "orchestration", "status": "pass"}]
@@ -312,7 +327,7 @@ class TokenCostSummaryTests(unittest.TestCase):
 
     def test_render_partial_when_only_children_locatable(self) -> None:
         # Children present, parent session not locatable (no orchestration_agent_run_id
-        # / host_session in meta): the child total must still render, with the parent
+        # in meta): the child total must still render, with the parent
         # side marked unavailable and the node total flagged partial.
         from tools.audit_orchestration import collect_token_cost_summary, _render_token_cost
 

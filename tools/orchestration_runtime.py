@@ -15108,8 +15108,6 @@ def write_preflight(
     repo_root: Path,
     orchestration_id: str,
     payload: dict[str, Any],
-    *,
-    host_session_id: str | None = None,
 ) -> dict[str, Any]:
     _validate_preflight_payload(payload)
     root = _orchestration_root(repo_root, orchestration_id)
@@ -15276,19 +15274,6 @@ def write_preflight(
                         meta["dependency_readiness"] = computed
                         _write_json(meta_path, meta)
     if _preflight_allows_agent_launch(stored):
-        # Record the host session id ONLY when preflight is launchable — i.e. when the
-        # caller will actually start the backend session. Recording it at init (before
-        # preflight) would leave a failed-preflight orchestration, or a resume whose
-        # preflight then fails, pointing meta.host_session_id at a session that never
-        # launched (Codex review). orchestration_meta.json is runtime-owned and exempt
-        # from the agent write-baseline check (_should_ignore_runtime_snapshot_path),
-        # so this post-init meta write is safe.
-        if isinstance(host_session_id, str) and host_session_id.strip():
-            with _orchestration_meta_exclusive_lock(repo_root, orchestration_id):
-                hs_meta = _read_json(meta_path)
-                if isinstance(hs_meta, dict):
-                    hs_meta["host_session_id"] = host_session_id.strip()
-                    _write_json(meta_path, hs_meta)
         _transition_phase_state(
             repo_root,
             orchestration_id,
@@ -16824,19 +16809,7 @@ def _collect_child_usage_for_finalize(
             from orchestration_diagnostics import aggregate_child_usage
         except ImportError:  # pragma: no cover - import-path shim
             from tools.orchestration_diagnostics import aggregate_child_usage
-        # The just-returned child is under the current host session, so hint that
-        # session to avoid scanning every other session's subagents on each finalize.
-        meta = _read_json(
-            _orchestration_root(repo_root, orchestration_id) / "orchestration_meta.json"
-        )
-        host_session_id = None
-        if isinstance(meta, dict):
-            hs = meta.get("host_session_id")
-            if isinstance(hs, str) and hs.strip():
-                host_session_id = hs.strip()
-        agg = aggregate_child_usage(
-            repo_root, [agent_run_id], host_session_id=host_session_id
-        )
+        agg = aggregate_child_usage(repo_root, [agent_run_id])
         usage = (agg.get("per_child") or {}).get(agent_run_id)
         if isinstance(usage, dict) and usage:
             return usage
@@ -18802,16 +18775,6 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser.add_argument("--agent-command")
     preflight_parser.add_argument("--codex-command", default="codex")
     preflight_parser.add_argument("--claude-command", default="claude")
-    preflight_parser.add_argument(
-        "--host-session-id",
-        help=(
-            "The real backend session id the orchestration agent will run inside (e.g. "
-            "the Claude Code session UUID pinned via `claude --session-id`). Recorded in "
-            "orchestration_meta.json#host_session_id ONLY when preflight is launchable, "
-            "so a failed/non-launchable preflight does not point meta at a session that "
-            "never started."
-        ),
-    )
 
     preflight_status_parser = subparsers.add_parser("preflight-status")
     preflight_status_parser.add_argument("--repo-root", required=True)
@@ -19423,7 +19386,6 @@ def main(argv: list[str] | None = None) -> int:
                 agent_command=agent_command,
                 repo_root=repo_root,
             ),
-            host_session_id=getattr(args, "host_session_id", None),
         )
     elif args.command == "preflight-status":
         result = get_preflight_ttl_status(
