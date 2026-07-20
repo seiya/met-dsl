@@ -23,7 +23,7 @@ profile builder, the leaf-launch path, or the build toolchain.
    which is the correct behavior, not a regression). bwrap is Linux-userns-only.
 2. Claude backend preflight already passes (MCP `build-runtime` registered + tool
    permission granted): see `docs/RUNBOOK.md` §0-2. Run the normal preflight first.
-3. **Run this standalone.** It is a billed, autonomous `--invoke-llm` orchestration; do
+3. **Run this standalone.** It is a billed, autonomous `--run-conductor` orchestration; do
    not run it concurrently with other manual workflow activity or it will pollute the
    workspace-global baseline (the truth is `meta=pass` + `aggregate_verdict`; a polluted
    parallel run can false-fail). Use a clean workspace state.

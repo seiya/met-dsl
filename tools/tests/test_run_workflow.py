@@ -289,23 +289,32 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertIsNone(ns.mode)
         self.assertIsNone(ns.llm)
         self.assertFalse(ns.resume)
-        self.assertTrue(ns.invoke_llm)
+        self.assertTrue(ns.run_conductor)
 
     def test_parse_args_allows_omitted_positionals_for_resume(self) -> None:
-        ns = run_workflow._parse_args(["--resume", "--no-invoke-llm"])
+        ns = run_workflow._parse_args(["--resume", "--no-run-conductor"])
         self.assertTrue(ns.resume)
         self.assertIsNone(ns.spec_ref)
         self.assertIsNone(ns.until_phase)
 
-    def test_parse_args_supports_no_invoke_flag(self) -> None:
+    def test_parse_args_supports_no_run_conductor_flag(self) -> None:
         ns = run_workflow._parse_args(
             [
                 "spec/problem.md",
                 "generate",
-                "--no-invoke-llm",
+                "--no-run-conductor",
             ]
         )
-        self.assertFalse(ns.invoke_llm)
+        self.assertFalse(ns.run_conductor)
+
+    def test_parse_args_deprecated_invoke_llm_aliases(self) -> None:
+        # The legacy --invoke-llm / --no-run-conductor spellings still work (they map
+        # onto the canonical run_conductor dest) so existing operator muscle memory
+        # and scripts keep functioning after the rename.
+        ns = run_workflow._parse_args(["spec/problem.md", "generate", "--no-invoke-llm"])
+        self.assertFalse(ns.run_conductor)
+        ns = run_workflow._parse_args(["--resume", "--invoke-llm"])
+        self.assertTrue(ns.run_conductor)
 
 
 
@@ -489,7 +498,7 @@ class RunWorkflowTests(unittest.TestCase):
                             str(repo_root),
                             "--orchestration-id",
                             "orch_node_start",
-                            "--no-invoke-llm",
+                            "--no-run-conductor",
                             "--stdout-format",
                             "jsonl",
                         ]
@@ -569,7 +578,7 @@ class RunWorkflowTests(unittest.TestCase):
                 backend="claude",
             )
             code, out, calls = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["status"], "ok")
@@ -600,7 +609,7 @@ class RunWorkflowTests(unittest.TestCase):
                 mode="dev", backend="claude",
             )
             code, out, calls = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm",
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor",
                  "--agent-model", "claude-opus-4-8"]
             )
             self.assertEqual(code, 0, out)
@@ -621,7 +630,7 @@ class RunWorkflowTests(unittest.TestCase):
                 mode="dev", backend="claude",
             )
             code, out, calls = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             init_calls = [c for c in calls if c and c[0] == "init"]
@@ -637,7 +646,7 @@ class RunWorkflowTests(unittest.TestCase):
             self._seed_spec_tree(repo_root)
             code, out, calls = self._run_main_with_fake_runtime(
                 ["spec/problem/test.md", "compile", "--llm", "claude",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             init_calls = [c for c in calls if c and c[0] == "init"]
@@ -656,7 +665,7 @@ class RunWorkflowTests(unittest.TestCase):
             code, out, calls = self._run_main_with_fake_runtime(
                 ["spec/problem/test.md", "compile", "--llm", "claude",
                  "--agent-model", "claude-sonnet-4-6",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             init_calls = [c for c in calls if c and c[0] == "init"]
@@ -669,7 +678,7 @@ class RunWorkflowTests(unittest.TestCase):
             self._seed_spec_tree(repo_root)
             code, out, calls = self._run_main_with_fake_runtime(
                 ["spec/problem/test.md", "compile", "--llm", "codex",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             init_calls = [c for c in calls if c and c[0] == "init"]
@@ -685,7 +694,7 @@ class RunWorkflowTests(unittest.TestCase):
             code, out, calls = self._run_main_with_fake_runtime(
                 ["spec/problem/test.md", "compile", "--llm", "claude",
                  "--llm-command", "claude --model claude-sonnet-4-6",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             init_calls = [c for c in calls if c and c[0] == "init"]
@@ -700,7 +709,7 @@ class RunWorkflowTests(unittest.TestCase):
                 ["spec/problem/test.md", "compile", "--llm", "claude",
                  "--llm-command", "claude --model claude-sonnet-4-6",
                  "--agent-model", "claude-sonnet-4-6",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             init_calls = [c for c in calls if c and c[0] == "init"]
@@ -720,7 +729,7 @@ class RunWorkflowTests(unittest.TestCase):
                     until_phase=phase, mode="dev", backend="codex", started_at=started,
                 )
             code, out, _ = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["orchestration_id"], "orch_20260301T000000Z_bbbbbbbb")
@@ -752,7 +761,7 @@ class RunWorkflowTests(unittest.TestCase):
                 started_at="2026-01-01T00:00:00.000000Z",
             )
             code, out, _ = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             # The 2026-05-01 start wins despite its lexically-smaller id.
@@ -777,7 +786,7 @@ class RunWorkflowTests(unittest.TestCase):
                 started_at="2026-05-01T00:00:00.000000Z",
             )
             code, out, _ = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["orchestration_id"], "customrun")
@@ -802,7 +811,7 @@ class RunWorkflowTests(unittest.TestCase):
                 source_dependency_ref="spec/problem/sub/deps.yaml",
             )
             code, out, _ = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             prompt = (
@@ -824,7 +833,7 @@ class RunWorkflowTests(unittest.TestCase):
                 probe_command="/opt/wrappers/claude-wrapper",
             )
             code, out, calls = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["llm_command"], "/opt/wrappers/claude-wrapper")
@@ -851,7 +860,7 @@ class RunWorkflowTests(unittest.TestCase):
             )
             code, out, _ = self._run_main_with_fake_runtime(
                 ["--resume", "spec/problem/test.md",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             prompt = (
@@ -874,7 +883,7 @@ class RunWorkflowTests(unittest.TestCase):
             )
             code, out, _ = self._run_main_with_fake_runtime(
                 ["--resume", "--llm", "claude",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["llm"], "claude")
@@ -891,7 +900,7 @@ class RunWorkflowTests(unittest.TestCase):
             )
             code, out, _ = self._run_main_with_fake_runtime(
                 ["--resume", "--llm-command", "/opt/wrappers/new",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["llm_command"], "/opt/wrappers/new")
@@ -908,7 +917,7 @@ class RunWorkflowTests(unittest.TestCase):
                 probe_command="/opt/wrappers/claude-wrapper",
             )
             code, out, _ = self._run_main_with_fake_runtime(
-                ["--resume", "--llm", "codex", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--llm", "codex", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["llm"], "codex")
@@ -924,7 +933,7 @@ class RunWorkflowTests(unittest.TestCase):
                 mode="dev", backend="claude",
             )
             code, out, _ = self._run_main_with_fake_runtime(
-                ["--resume", "build", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "build", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["until_phase"], "Build")
@@ -947,7 +956,7 @@ class RunWorkflowTests(unittest.TestCase):
             meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
             code, out, calls = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 2)
             self.assertEqual(out["reason"], "latest_orchestration_not_resumable")
@@ -956,7 +965,7 @@ class RunWorkflowTests(unittest.TestCase):
             # An explicit --orchestration-id bypasses the guard (deliberate choice).
             code2, out2, _ = self._run_main_with_fake_runtime(
                 ["--resume", "--orchestration-id", oid,
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code2, 0, out2)
             self.assertEqual(out2["orchestration_id"], oid)
@@ -976,7 +985,7 @@ class RunWorkflowTests(unittest.TestCase):
             )
             code, out, calls = self._run_main_with_fake_runtime(
                 ["--resume", "spec/other/alt.md",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0, out)
             self.assertEqual(out["target_spec_ref"], "spec/other/alt.md")
@@ -992,7 +1001,7 @@ class RunWorkflowTests(unittest.TestCase):
             repo_root = Path(tmp)
             self._seed_spec_tree(repo_root)
             code, out, calls = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 2)
             self.assertEqual(out["reason"], "no_resumable_orchestration")
@@ -1013,7 +1022,7 @@ class RunWorkflowTests(unittest.TestCase):
                 / "launches" / "orchestration.start.prompt.txt"
             ).write_text("no parseable params here\n", encoding="utf-8")
             code, out, calls = self._run_main_with_fake_runtime(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 2)
             self.assertEqual(out["reason"], "resume_params_unrecoverable")
@@ -1133,7 +1142,7 @@ class RunWorkflowTests(unittest.TestCase):
                         extra_argv: list[str]) -> tuple[int, dict]:
         """Resume with the fake runtime and return (exit_code, final_json)."""
         code, out, _ = self._run_main_with_fake_runtime(
-            ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm", *extra_argv])
+            ["--resume", "--repo-root", str(repo_root), "--no-run-conductor", *extra_argv])
         return code, out
 
     def test_resume_pure_recorded_orchestration_succeeds(self) -> None:
@@ -1316,7 +1325,7 @@ class RunWorkflowTests(unittest.TestCase):
                 },
             )
             code, closure_kwargs, run_node_kwargs = self._run_main_with_closure_spy(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0)
             self.assertIsNotNone(closure_kwargs, "should enter closure driver")
@@ -1339,7 +1348,7 @@ class RunWorkflowTests(unittest.TestCase):
                 until_phase="Validate", mode="dev", backend="claude",
             )
             code, closure_kwargs, run_node_kwargs = self._run_main_with_closure_spy(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0)
             self.assertIsNone(closure_kwargs, "legacy resume must not enter closure driver")
@@ -1358,7 +1367,7 @@ class RunWorkflowTests(unittest.TestCase):
             self._seed_spec_tree(repo_root)
             code, out, calls = self._run_main_with_fake_runtime(
                 ["spec/problem/test.md", "validate", "--repo-root", str(repo_root),
-                 "--no-invoke-llm"]
+                 "--no-run-conductor"]
             )
             self.assertEqual(code, 0)
             inv = self._find_init_invocation(calls)
@@ -1379,7 +1388,7 @@ class RunWorkflowTests(unittest.TestCase):
             _load_spec_catalog.cache_clear()
             code, out, calls = self._run_main_with_fake_runtime(
                 ["spec/problem/a", "validate", "--with-deps",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             # closure stops at the first dep (not ready after a no-op run), but its
             # cold init must already carry the closure back-link.
@@ -1415,7 +1424,7 @@ class RunWorkflowTests(unittest.TestCase):
                             "closure_until_phase": "Compile"})
             code, closure_kwargs, _ = self._run_main_with_closure_spy(
                 ["--resume", "--orchestration-id", "orch_dep_c",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"])
+                 "--repo-root", str(repo_root), "--no-run-conductor"])
             self.assertEqual(code, 0)
             self.assertIsNotNone(closure_kwargs)
             self.assertEqual(closure_kwargs["until_phase"], "Validate")
@@ -1443,7 +1452,7 @@ class RunWorkflowTests(unittest.TestCase):
                 invocation={"spec_ref": "spec/problem/a", "closure_id": "OTHER"})
             code, closure_kwargs, _ = self._run_main_with_closure_spy(
                 ["--resume", "--orchestration-id", "orch_dep_c",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"])
+                 "--repo-root", str(repo_root), "--no-run-conductor"])
             self.assertEqual(code, 0)
             self.assertIsNotNone(closure_kwargs)
             self.assertEqual(closure_kwargs["until_phase"], "Compile")
@@ -1464,7 +1473,7 @@ class RunWorkflowTests(unittest.TestCase):
                 },
             )
             code, closure_kwargs, run_node_kwargs = self._run_main_with_closure_spy(
-                ["--resume", "--repo-root", str(repo_root), "--no-invoke-llm"]
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0)
             self.assertIsNone(closure_kwargs, "partial closure block must not drive closure")
@@ -1488,7 +1497,7 @@ class RunWorkflowTests(unittest.TestCase):
             # explicit spec positional (non-phase) → single-node escape hatch
             code, closure_kwargs, run_node_kwargs = self._run_main_with_closure_spy(
                 ["spec/component/c", "--resume", "--orchestration-id", "orch_target",
-                 "--repo-root", str(repo_root), "--no-invoke-llm"]
+                 "--repo-root", str(repo_root), "--no-run-conductor"]
             )
             self.assertEqual(code, 0)
             self.assertIsNone(closure_kwargs)
@@ -1536,7 +1545,7 @@ class RunWorkflowTests(unittest.TestCase):
                         str(repo_root),
                         "--orchestration-id",
                         "orch_unit",
-                        "--no-invoke-llm",
+                        "--no-run-conductor",
                     ]
                 )
             finally:
@@ -1601,7 +1610,7 @@ class RunWorkflowTests(unittest.TestCase):
                     "build",
                     "--repo-root", str(repo_root),
                     "--orchestration-id", "orch_direct_cli",
-                    "--no-invoke-llm",
+                    "--no-run-conductor",
                 ],
                 cwd=str(repo_root),
                 env=env,
@@ -1647,7 +1656,7 @@ class RunWorkflowTests(unittest.TestCase):
                         "build",
                         "--repo-root", str(repo_root),
                         "--orchestration-id", "orch_no_schema",
-                        "--no-invoke-llm",
+                        "--no-run-conductor",
                         "--stdout-format", "jsonl",
                     ]
                 )
@@ -1690,7 +1699,7 @@ class RunWorkflowTests(unittest.TestCase):
                         "build",
                         "--repo-root", str(repo_root),
                         "--orchestration-id", "orch_corrupt_schema",
-                        "--no-invoke-llm",
+                        "--no-run-conductor",
                         "--stdout-format", "jsonl",
                     ]
                 )
@@ -1724,7 +1733,7 @@ class RunWorkflowTests(unittest.TestCase):
                     str(repo_root),
                     "--orchestration-id",
                     "orch_missing",
-                    "--no-invoke-llm",
+                    "--no-run-conductor",
                 ]
             )
             self.assertEqual(code, 2)
@@ -1758,7 +1767,7 @@ class RunWorkflowTests(unittest.TestCase):
                             str(repo_root),
                             "--orchestration-id",
                             "orch_init_fail",
-                            "--no-invoke-llm",
+                            "--no-run-conductor",
                             "--stdout-format",
                             "jsonl",
                         ]
@@ -1807,7 +1816,7 @@ class RunWorkflowTests(unittest.TestCase):
                             str(repo_root),
                             "--orchestration-id",
                             "orch_preflight_fail",
-                            "--no-invoke-llm",
+                            "--no-run-conductor",
                             "--stdout-format",
                             "jsonl",
                         ]
@@ -1851,7 +1860,7 @@ class RunWorkflowTests(unittest.TestCase):
                             str(repo_root),
                             "--orchestration-id",
                             "orch_init_missing_run_id",
-                            "--no-invoke-llm",
+                            "--no-run-conductor",
                             "--stdout-format",
                             "jsonl",
                         ]
@@ -1909,7 +1918,7 @@ class RunWorkflowTests(unittest.TestCase):
                         str(repo_root),
                         "--orchestration-id",
                         "orch_auto_dep",
-                        "--no-invoke-llm",
+                        "--no-run-conductor",
                     ]
                 )
             finally:
@@ -1961,7 +1970,7 @@ class RunWorkflowTests(unittest.TestCase):
                         str(repo_root),
                         "--orchestration-id",
                         "orch_no_dep",
-                        "--no-invoke-llm",
+                        "--no-run-conductor",
                     ]
                 )
             finally:
@@ -2271,7 +2280,7 @@ class DependencyClosureTests(unittest.TestCase):
                         workflow_mode="dev",
                         agent_model=None,
                         status="running",
-                        invoke_llm=False,
+                        run_conductor=False,
                     )
             finally:
                 run_workflow._run_node = orig  # type: ignore[assignment]
@@ -2319,7 +2328,7 @@ class DependencyClosureTests(unittest.TestCase):
                     workflow_mode="dev",
                     agent_model=None,
                     status="running",
-                    invoke_llm=False,
+                    run_conductor=False,
                     resume=resume,
                     prior_orch_by_spec=prior_orch_by_spec,
                     raw_argv=["spec/problem/a", "validate", "--with-deps"],
@@ -2534,7 +2543,7 @@ class DependencyClosureTests(unittest.TestCase):
                         workflow_mode="dev",
                         agent_model=None,
                         status="running",
-                        invoke_llm=False,
+                        run_conductor=False,
                         stdout_format="human",
                     )
             finally:
@@ -2561,7 +2570,7 @@ class DependencyClosureTests(unittest.TestCase):
 
     def test_driver_stops_when_dependency_not_ready_after_run(self) -> None:
         # A dependency that exits 0 without producing readiness evidence
-        # (e.g. --no-invoke-llm) must stop the run before the dependent/target.
+        # (e.g. --no-run-conductor) must stop the run before the dependent/target.
         from tools.orchestration_runtime import _load_spec_catalog
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -2592,7 +2601,7 @@ class DependencyClosureTests(unittest.TestCase):
                         workflow_mode="dev",
                         agent_model=None,
                         status="running",
-                        invoke_llm=False,
+                        run_conductor=False,
                     )
             finally:
                 run_workflow._run_node = orig  # type: ignore[assignment]
@@ -2636,7 +2645,7 @@ class DependencyClosureTests(unittest.TestCase):
                         workflow_mode="dev",
                         agent_model=None,
                         status="running",
-                        invoke_llm=False,
+                        run_conductor=False,
                     )
             finally:
                 run_workflow._run_node = orig  # type: ignore[assignment]
@@ -2792,7 +2801,7 @@ class StdoutTeeTests(unittest.TestCase):
                         workflow_mode="dev",
                         agent_model=None,
                         status="running",
-                        invoke_llm=False,
+                        run_conductor=False,
                         resume_mode=False,
                     )
                 # stdout restored to the original stream (not left wrapped), and the
@@ -2855,7 +2864,7 @@ class StdoutFormatTests(unittest.TestCase):
                         "spec/problem/test.md", "build",
                         "--repo-root", str(repo_root),
                         "--orchestration-id", "orch_human_fmt",
-                        "--no-invoke-llm",
+                        "--no-run-conductor",
                         "--stdout-format", "human",
                     ])
             finally:
@@ -2889,7 +2898,7 @@ class StdoutFormatTests(unittest.TestCase):
                         "spec/problem/test.md", "build",
                         "--repo-root", str(repo_root),
                         "--orchestration-id", "orch_jsonl_fmt",
-                        "--no-invoke-llm",
+                        "--no-run-conductor",
                         "--stdout-format", "jsonl",
                     ])
             finally:
@@ -2918,7 +2927,7 @@ class StdoutFormatTests(unittest.TestCase):
                             "spec/problem/test.md", "build",
                             "--repo-root", str(repo_root),
                             "--orchestration-id", oid,
-                            "--no-invoke-llm",
+                            "--no-run-conductor",
                             "--stdout-format", mode,
                         ])
                     finally:

@@ -879,6 +879,26 @@ def _generate_executor_resume_rejection(
     }
 
 
+class _DeprecatedAliasAction(argparse.Action):
+    """A flag alias that sets a fixed value and warns once toward its canonical name.
+
+    Used to keep the legacy ``--invoke-llm`` / ``--no-invoke-llm`` spellings working
+    after the option was renamed to ``--run-conductor`` (the flag no longer invokes an
+    LLM; it runs the deterministic conductor).
+    """
+
+    def __init__(self, option_strings, dest, canonical, store_value, **kwargs):
+        self._canonical = canonical
+        self._store_value = store_value
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        sys.stderr.write(
+            f"warning: {option_string} is a deprecated alias; use {self._canonical} instead\n"
+        )
+        setattr(namespace, self.dest, self._store_value)
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bootstrap workflow startup (init + preflight + prompt).",
@@ -951,18 +971,34 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--orchestration-id", help="If omitted, generated automatically (or, with --resume, the latest orchestration).")
     parser.add_argument("--status", default="running", help="Initial orchestration status for init.")
-    parser.set_defaults(invoke_llm=True)
+    parser.set_defaults(run_conductor=True)
+    parser.add_argument(
+        "--run-conductor",
+        dest="run_conductor",
+        action="store_true",
+        help="Run the deterministic conductor over the prepared orchestration (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-run-conductor",
+        dest="run_conductor",
+        action="store_false",
+        help="Prepare orchestration artifacts only; do not run the conductor.",
+    )
     parser.add_argument(
         "--invoke-llm",
-        dest="invoke_llm",
-        action="store_true",
-        help="Invoke the selected LLM command and pipe startup prompt via stdin (default: enabled).",
+        dest="run_conductor",
+        action=_DeprecatedAliasAction,
+        canonical="--run-conductor",
+        store_value=True,
+        help="Deprecated alias for --run-conductor.",
     )
     parser.add_argument(
         "--no-invoke-llm",
-        dest="invoke_llm",
-        action="store_false",
-        help="Prepare orchestration artifacts only; do not run the conductor.",
+        dest="run_conductor",
+        action=_DeprecatedAliasAction,
+        canonical="--no-run-conductor",
+        store_value=False,
+        help="Deprecated alias for --no-run-conductor.",
     )
     parser.add_argument(
         "--stdout-format",
@@ -1337,7 +1373,7 @@ def main(argv: list[str] | None = None) -> int:
             workflow_mode=workflow_mode,
             agent_model=args.agent_model,
             status=args.status,
-            invoke_llm=args.invoke_llm,
+            run_conductor=args.run_conductor,
             stdout_format=args.stdout_format,
             resume=True,
             prior_orch_by_spec=prior_map,
@@ -1360,7 +1396,7 @@ def main(argv: list[str] | None = None) -> int:
             workflow_mode=workflow_mode,
             agent_model=args.agent_model,
             status=args.status,
-            invoke_llm=args.invoke_llm,
+            run_conductor=args.run_conductor,
             stdout_format=args.stdout_format,
             resume=False,
             prior_orch_by_spec=None,
@@ -1395,7 +1431,7 @@ def main(argv: list[str] | None = None) -> int:
         workflow_mode=workflow_mode,
         agent_model=args.agent_model,
         status=args.status,
-        invoke_llm=args.invoke_llm,
+        run_conductor=args.run_conductor,
         resume_mode=resume_mode,
         invocation=single_node_invocation,
         stdout_format=args.stdout_format,
@@ -1656,7 +1692,7 @@ def _run_node(
     workflow_mode: str,
     agent_model: str | None,
     status: str,
-    invoke_llm: bool,
+    run_conductor: bool,
     resume_mode: bool,
     invocation: dict[str, Any] | None = None,
     closure_until_phase: str | None = None,
@@ -1878,7 +1914,7 @@ def _run_node(
 
         launched = False
         workflow_status = "running"
-        if invoke_llm:
+        if run_conductor:
             # Deterministic conductor: drive the phase loop in Python (no parent
             # orchestration LLM). The leaf substeps are spawned by the conductor.
             from tools.workflow_conductor import run_conductor
@@ -2249,7 +2285,7 @@ def _run_with_dependency_closure(
     workflow_mode: str,
     agent_model: str | None,
     status: str,
-    invoke_llm: bool,
+    run_conductor: bool,
     stdout_format: str = "jsonl",
     resume: bool = False,
     prior_orch_by_spec: dict[str, str] | None = None,
@@ -2396,7 +2432,7 @@ def _run_with_dependency_closure(
             workflow_mode=workflow_mode,
             agent_model=agent_model,
             status=status,
-            invoke_llm=invoke_llm,
+            run_conductor=run_conductor,
             resume_mode=dep_resume,
             invocation=dep_invocation,
             # On resume, refresh this dep's persisted closure end-phase to the
@@ -2432,7 +2468,7 @@ def _run_with_dependency_closure(
             return rc
 
         # A zero exit code does not by itself prove the dependency reached the
-        # required readiness: `--no-invoke-llm` only prepares artifacts, and a
+        # required readiness: `--no-run-conductor` only prepares artifacts, and a
         # launched agent can exit cleanly with the orchestration still
         # non-terminal ("running") without producing the ir/pipeline/verdict
         # evidence. Re-verify before launching the dependent/target node;
@@ -2446,7 +2482,7 @@ def _run_with_dependency_closure(
                     "detail": (
                         f"{node_label} ran (exit 0) but did not produce the "
                         f"required readiness ({'/'.join(required_stages)}); "
-                        "common causes: --no-invoke-llm, or the agent exited "
+                        "common causes: --no-run-conductor, or the agent exited "
                         "without recording a terminal pass (status still running)."
                     ),
                     "failed_dependency_node": node_label,
@@ -2520,7 +2556,7 @@ def _run_with_dependency_closure(
         workflow_mode=workflow_mode,
         agent_model=agent_model,
         status=status,
-        invoke_llm=invoke_llm,
+        run_conductor=run_conductor,
         resume_mode=target_resume,
         invocation=target_invocation,
         closure_until_phase=until_phase if target_resume else None,
