@@ -11,17 +11,18 @@ is left mid-launch:
 - ``child_returns/<arid>.txt`` is absent,
 - no terminal ``agent_runs.jsonl`` row exists for ``<arid>``.
 
-If the host ``claude`` process then exits cleanly (e.g. the orchestration agent
-ends its turn with an "I've paused" message, returncode 0), nothing in-repo
-records *why* it stopped, and the only decisive evidence (the child's last
-activity and the dead-air before the abort) lives in the **ephemeral**
-``~/.claude/projects/<slug>/<session>/subagents/agent-*.jsonl`` transcript,
-which ``~/.claude`` cleanup can delete.
+Under the deterministic conductor (a plain Python process with no host session)
+such a dangling launch is diagnosed from these in-repo artifacts alone — there is
+no parent transcript to correlate. Older runs from the removed LLM-orchestrator
+path may still carry a persisted ``launch_incident.runtime.<uuid>.json`` snapshot
+whose transcript tail (the child's last activity and the dead-air before the
+abort) this module surfaces when present; the conductor writes no new ones.
 
-This module makes that diagnosis reproducible and persists the decisive transcript
-tail in-repo. It is intentionally dependency-free (stdlib only) and **defensive**
-against the Claude Code transcript format: parse failures degrade to raw tails
-and ``found=False`` markers rather than raising.
+The module also aggregates leaf token usage from the **ephemeral**
+``~/.claude/projects/<slug>/<session>/subagents/agent-*.jsonl`` transcripts (which
+``~/.claude`` cleanup can delete). It is intentionally dependency-free (stdlib
+only) and **defensive** against the Claude Code transcript format: parse failures
+degrade to raw tails and ``found=False`` markers rather than raising.
 
 Callers:
 - ``tools/audit_orchestration.py`` invokes it on demand for after-the-fact analysis
