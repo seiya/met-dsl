@@ -11,18 +11,21 @@ is left mid-launch:
 - ``child_returns/<arid>.txt`` is absent,
 - no terminal ``agent_runs.jsonl`` row exists for ``<arid>``.
 
-Under the deterministic conductor (a plain Python process with no host session)
-such a dangling launch is diagnosed from these in-repo artifacts alone — there is
-no parent transcript to correlate. Older runs from the removed LLM-orchestrator
-path may still carry a persisted ``launch_incident.runtime.<uuid>.json`` snapshot
-whose transcript tail (the child's last activity and the dead-air before the
-abort) this module surfaces when present; the conductor writes no new ones.
+The conductor is a plain Python process with no host/parent session, but each
+leaf is launched with its ``agent_run_id`` pinned as the Claude session id
+(``claude --session-id <arid>``), so the dangling child's OWN transcript is
+directly addressable as the **ephemeral** ``~/.claude/projects/<slug>/<arid>.jsonl``
+(which ``~/.claude`` cleanup can delete). Its last activity, the dead-air before
+the abort, and any final API error are the decisive evidence for whether the
+launch was a retryable transport blip or a hang; this module recovers them from
+that transcript when it is still on disk, and also aggregates leaf token usage
+from it. Older runs may additionally carry a persisted
+``launch_incident.runtime.<uuid>.json`` snapshot, which the audit renderer
+surfaces; the conductor writes no new ones.
 
-The module also aggregates leaf token usage from the **ephemeral**
-``~/.claude/projects/<slug>/<session>/subagents/agent-*.jsonl`` transcripts (which
-``~/.claude`` cleanup can delete). It is intentionally dependency-free (stdlib
-only) and **defensive** against the Claude Code transcript format: parse failures
-degrade to raw tails and ``found=False`` markers rather than raising.
+It is intentionally dependency-free (stdlib only) and **defensive** against the
+Claude Code transcript format: parse failures degrade to raw tails and
+``found=False`` markers rather than raising.
 
 Callers:
 - ``tools/audit_orchestration.py`` invokes it on demand for after-the-fact analysis
@@ -293,9 +296,9 @@ def api_error_from_records(records: list[dict[str, Any]] | None) -> dict[str, An
     Reports an API error only when it is the FINAL relevant activity: any later
     non-interrupt, non-error record means the error was recovered, so it is cleared
     (otherwise a later unrelated hang would be mislabeled as a retryable transport
-    blip). Used by the audit renderer's fallback for legacy incident snapshots that
-    predate the structured `api_error` field but still carry `isApiErrorMessage` /
-    `apiErrorStatus` in their `raw_tail`.
+    blip). Shared by `summarize_transcript_tail` and the audit renderer's fallback
+    for legacy incident snapshots that predate the structured `api_error` field but
+    still carry `isApiErrorMessage` / `apiErrorStatus` in their `raw_tail`.
     """
     if not records:
         return None
@@ -308,6 +311,107 @@ def api_error_from_records(records: list[dict[str, Any]] | None) -> dict[str, An
         err = _api_error(record)
         api_error = err if err is not None else None
     return api_error
+
+
+def _last_tool_use(record: dict[str, Any]) -> dict[str, Any] | None:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            return {
+                "name": block.get("name"),
+                "input_preview": json.dumps(block.get("input", {}), ensure_ascii=False)[:200],
+            }
+    return None
+
+
+def summarize_transcript_tail(path: Path, *, n: int = 40) -> dict[str, Any]:
+    """Summarize the last ``n`` records of a transcript jsonl.
+
+    Returns last activity timestamp, last tool_use, interrupt-marker presence,
+    the dead-air gap (last real activity -> interrupt / now), and the raw tail
+    records (so the decisive evidence survives ``~/.claude`` cleanup even if the
+    parsing assumptions later drift).
+    """
+    if not path.exists():
+        return {"found": False, "path": str(path)}
+    records = _read_jsonl(path)
+    tail = records[-n:] if len(records) > n else records
+
+    last_activity_ts: str | None = None
+    last_activity_dt: datetime | None = None
+    last_event_type: str | None = None
+    last_tool: dict[str, Any] | None = None
+    interrupt_ts: str | None = None
+    interrupt_dt: datetime | None = None
+    interrupt_text: str | None = None
+
+    for record in records:
+        ts = record.get("timestamp") or record.get("ts")
+        dt = _parse_ts(ts)
+        if _is_interrupt_record(record):
+            if isinstance(ts, str):
+                interrupt_ts = ts
+            interrupt_dt = dt
+            blocks = _record_text_blocks(record)
+            interrupt_text = blocks[-1][:200] if blocks else None
+            continue
+        if isinstance(ts, str):
+            last_activity_ts = ts
+        if dt is not None:
+            last_activity_dt = dt
+        last_event_type = record.get("type")
+        tu = _last_tool_use(record)
+        if tu is not None:
+            last_tool = tu
+
+    # Surface an API error only when it is the final relevant activity (see helper).
+    api_error = api_error_from_records(records)
+
+    dead_air_seconds: float | None = None
+    if last_activity_dt is not None:
+        end_dt = interrupt_dt or datetime.now(timezone.utc)
+        dead_air_seconds = (end_dt - last_activity_dt).total_seconds()
+
+    return {
+        "found": True,
+        "path": str(path),
+        "record_count": len(records),
+        "last_activity_ts": last_activity_ts,
+        "last_event_type": last_event_type,
+        "last_tool_use": last_tool,
+        "interrupted": interrupt_ts is not None,
+        "interrupt_ts": interrupt_ts,
+        "interrupt_text": interrupt_text,
+        "dead_air_seconds": dead_air_seconds,
+        "api_error": api_error,
+        "raw_tail": tail,
+    }
+
+
+def _leaf_transcript_path(child_arid: str) -> Path | None:
+    """Locate a conductor-spawned leaf's OWN transcript, or ``None``.
+
+    The conductor pins each leaf's Claude session id to its ``agent_run_id``
+    (``claude --session-id <arid>``, workflow_conductor.spawn_leaf), so the leaf's
+    transcript is directly addressable as ``~/.claude/projects/<slug>/<arid>.jsonl``
+    — no host/parent session is involved. Mirrors the wildcard-slug lookup in
+    ``workflow_conductor._claude_session_resumable`` so a leaf that ran under a
+    slightly different cwd slug is still found; the arid (a uuid) is unique, so the
+    wildcard cannot collide across projects.
+    """
+    arid = str(child_arid or "").strip()
+    if not arid:
+        return None
+    try:
+        matches = sorted((Path.home() / ".claude" / "projects").glob(f"*/{arid}.jsonl"))
+    except OSError:
+        return None
+    return matches[0] if matches else None
 
 
 def _claude_projects_dir(repo_root: Path) -> Path:
@@ -721,20 +825,42 @@ def build_launch_incident(
 ) -> dict[str, Any] | None:
     """Assemble a launch-incident report, or ``None`` if no dangling window.
 
-    Reports the dangling child from in-repo artifacts only. Live ``~/.claude``
-    transcript correlation is not attempted: the conductor is a plain Python
-    process with no host session, so there is no parent transcript to walk.
-    Persisted ``launch_incident.runtime.*.json`` snapshots from older runs (which
-    carried transcript/abort-marker evidence) are still surfaced by the audit
-    renderer when present.
+    Combines dangling-child detection (in-repo artifacts) with the dangling leaf's
+    OWN ``~/.claude`` transcript. The conductor pins each leaf's Claude session id
+    to its ``agent_run_id``, so that transcript is directly addressable by the
+    child arid (no host/parent session is needed); it yields the child's last
+    activity, the dead-air before the abort, and the final API error (so a
+    retryable 529 is distinguishable from other failures). Degrades gracefully to
+    the in-repo facts when ``~/.claude`` is absent or cleaned. Persisted
+    ``launch_incident.runtime.*.json`` snapshots from older runs are additionally
+    surfaced by the audit renderer.
     """
     dangling = detect_dangling_active_child(repo_root, orchestration_id)
     if dangling is None:
         return None
+
+    transcript_path = _leaf_transcript_path(dangling["agent_run_id"])
+    if transcript_path is not None:
+        child = summarize_transcript_tail(transcript_path)
+    else:
+        child = {"found": False, "reason": "no leaf transcript located (~/.claude ephemeral/cleaned)"}
+
+    abort_marker = None
+    if child.get("found"):
+        abort_marker = {
+            "interrupted": child.get("interrupted"),
+            "interrupt_ts": child.get("interrupt_ts"),
+            "interrupt_text": child.get("interrupt_text"),
+            "last_activity_ts": child.get("last_activity_ts"),
+            "dead_air_seconds": child.get("dead_air_seconds"),
+            "api_error": child.get("api_error"),
+        }
 
     return {
         "schema": "launch_incident/v1",
         "orchestration_id": orchestration_id,
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "dangling_child": dangling,
+        "transcripts": {"child_transcript": child},
+        "abort_marker": abort_marker,
     }

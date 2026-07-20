@@ -264,26 +264,107 @@ class ApiErrorFromRecordsTests(unittest.TestCase):
         self.assertIsNone(diag.api_error_from_records(records))
 
 
+class TranscriptTailTests(unittest.TestCase):
+    def test_dead_air_and_interrupt_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "child.jsonl"
+            records = [
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-06-16T12:38:47.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "python3 x.py"}}
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-06-16T12:38:47.421Z",
+                    "message": {"role": "user", "content": [{"type": "tool_result", "content": "PASS"}]},
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-06-16T12:48:47.526Z",
+                    "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]},
+                },
+            ]
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+            summary = diag.summarize_transcript_tail(path)
+            self.assertTrue(summary["found"])
+            self.assertEqual(summary["last_activity_ts"], "2026-06-16T12:38:47.421Z")
+            self.assertTrue(summary["interrupted"])
+            self.assertEqual(summary["interrupt_ts"], "2026-06-16T12:48:47.526Z")
+            self.assertAlmostEqual(summary["dead_air_seconds"], 600.105, places=2)
+            self.assertEqual(summary["last_tool_use"]["name"], "Bash")
+
+    def test_missing_file_is_not_found(self) -> None:
+        summary = diag.summarize_transcript_tail(Path("/nonexistent/x.jsonl"))
+        self.assertFalse(summary["found"])
+
+
 class BuildLaunchIncidentTests(unittest.TestCase):
-    def test_incident_reports_dangling_from_repo_artifacts(self) -> None:
-        # The dangling launch is detected from in-repo artifacts alone. The
-        # conductor has no host session, so no ~/.claude transcript correlation is
-        # attempted and the incident carries no transcript/abort-marker fields.
+    def test_incident_correlates_leaf_transcript_by_arid(self) -> None:
+        # The conductor pins each leaf's Claude session id to its agent_run_id, so
+        # the child transcript is addressable as ~/.claude/projects/<slug>/<arid>.jsonl
+        # — no host session needed. build_launch_incident recovers last-activity /
+        # dead-air / abort-marker from it.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
-            root = _orch_root(repo)
-            _open_dangling_window(root)
-            (root / "orchestration_meta.json").write_text(
-                json.dumps({"orchestration_id": ORCH_ID, "status": "running"}),
-                encoding="utf-8",
+            home = Path(tmp) / "home"
+            _open_dangling_window(_orch_root(repo))
+            proj = home / ".claude" / "projects" / "some-slug"
+            proj.mkdir(parents=True)
+            records = [
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-06-16T12:38:47.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "python3 x.py"}}
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-06-16T12:48:47.000Z",
+                    "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]},
+                },
+            ]
+            (proj / f"{CHILD_ARID}.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
             )
-            incident = diag.build_launch_incident(repo, ORCH_ID)
+            with mock.patch.object(diag.Path, "home", return_value=home):
+                incident = diag.build_launch_incident(repo, ORCH_ID)
             self.assertIsNotNone(incident)
             assert incident is not None
             self.assertEqual(incident["dangling_child"]["agent_run_id"], CHILD_ARID)
-            self.assertNotIn("transcripts", incident)
-            self.assertNotIn("abort_marker", incident)
-            self.assertNotIn("host_session_id", incident)
+            child = incident["transcripts"]["child_transcript"]
+            self.assertTrue(child["found"])
+            self.assertEqual(child["last_tool_use"]["name"], "Bash")
+            self.assertTrue(incident["abort_marker"]["interrupted"])
+            self.assertEqual(
+                incident["abort_marker"]["interrupt_text"], "[Request interrupted by user]"
+            )
+            self.assertAlmostEqual(incident["abort_marker"]["dead_air_seconds"], 600.0, places=1)
+
+    def test_incident_degrades_when_transcript_ephemeral(self) -> None:
+        # ~/.claude cleaned/absent: dangling still detected from in-repo artifacts;
+        # child transcript reported not-found and abort_marker is None (never raises).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            empty_home = Path(tmp) / "home"
+            empty_home.mkdir()
+            _open_dangling_window(_orch_root(repo))
+            with mock.patch.object(diag.Path, "home", return_value=empty_home):
+                incident = diag.build_launch_incident(repo, ORCH_ID)
+            self.assertIsNotNone(incident)
+            assert incident is not None
+            self.assertEqual(incident["dangling_child"]["agent_run_id"], CHILD_ARID)
+            self.assertFalse(incident["transcripts"]["child_transcript"]["found"])
+            self.assertIsNone(incident["abort_marker"])
 
     def test_no_incident_when_window_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

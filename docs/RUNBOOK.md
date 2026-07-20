@@ -381,11 +381,11 @@ There is **no automatic launch-incident capture**; recovery is the `--resume` re
 
 ```bash
 python3 tools/audit_orchestration.py --orchestration-id <orchestration_id>
-# → "## Dangling launch (active_child window)" section: which child and when it was
-#   launched (from in-repo artifacts).
+# → "## Dangling launch (active_child window)" section: which child, when launched,
+#   last activity, dead-air seconds, the abort marker, and any final API error.
 ```
 
-`audit_orchestration.py` reports the dangling child on demand from in-repo artifacts alone — the conductor is a plain Python process with no host session, so no `~/.claude` transcript is correlated for a live incident. Older runs from the removed LLM-orchestrator path may still carry a persisted `launch_incident.runtime.*.json` snapshot whose transcript tail (last activity, dead-air seconds, abort marker) is surfaced when present; the conductor does not write new ones.
+`audit_orchestration.py` correlates the dangling leaf's OWN `~/.claude` transcript on demand: the conductor pins each leaf's Claude session id to its `agent_run_id`, so the transcript is directly addressable as `~/.claude/projects/<slug>/<arid>.jsonl` (no host session needed). This recovers the child's last activity, dead-air interval, and final API error — distinguishing a retryable 529 from other failures — and degrades to the in-repo facts when `~/.claude` has been cleaned. Older runs may additionally carry persisted `launch_incident.runtime.*.json` snapshots, which are surfaced too.
 
 Recovery is the normal `python3 tools/run_workflow.py --resume --orchestration-id <orchestration_id>` (§3-1): the completed substeps are skipped and the dangling substep is re-launched. As part of the terminal→`running` reset (`enable_checkpoint_resume`), `--resume` reconciles the artifacts the dead host left behind for the abandoned launch:
 
