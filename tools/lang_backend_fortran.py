@@ -574,9 +574,9 @@ def load_structured_signatures(body: str) -> tuple[dict[str, Any], str | None]:
     if not isinstance(data, dict):
         return ({}, "structured §5.1 block must be a YAML mapping "
                     "with keys module_parameters / types / procedures")
-    unknown = sorted(set(data) - set(_STRUCT_TOP_KEYS))
-    if unknown:
-        return ({}, f"structured §5.1 block has unknown key(s) {unknown}; "
+    unknown = sorted(set(data) - set(_STRUCT_TOP_KEYS), key=str)  # key=str: mixed key types (a YAML
+    if unknown:                                                    # `1:` next to `foo:`) must not
+        return ({}, f"structured §5.1 block has unknown key(s) {unknown}; "  # TypeError-crash sorted
                     f"allowed: {list(_STRUCT_TOP_KEYS)}")
     struct: dict[str, Any] = {"module_parameters": [], "types": [], "procedures": []}
     for key in _STRUCT_TOP_KEYS:
