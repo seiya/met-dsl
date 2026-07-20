@@ -887,12 +887,25 @@ class _DeprecatedAliasAction(argparse.Action):
     LLM; it runs the deterministic conductor).
     """
 
-    def __init__(self, option_strings, dest, canonical, store_value, **kwargs):
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str,
+        canonical: str,
+        store_value: bool,
+        **kwargs: Any,
+    ) -> None:
         self._canonical = canonical
         self._store_value = store_value
         super().__init__(option_strings, dest, nargs=0, **kwargs)
 
-    def __call__(self, parser, namespace, values, option_string=None):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
         sys.stderr.write(
             f"warning: {option_string} is a deprecated alias; use {self._canonical} instead\n"
         )

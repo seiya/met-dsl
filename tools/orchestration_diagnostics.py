@@ -260,22 +260,6 @@ def _is_interrupt_record(record: dict[str, Any]) -> bool:
     return False
 
 
-def _last_tool_use(record: dict[str, Any]) -> dict[str, Any] | None:
-    message = record.get("message")
-    if not isinstance(message, dict):
-        return None
-    content = message.get("content")
-    if not isinstance(content, list):
-        return None
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "tool_use":
-            return {
-                "name": block.get("name"),
-                "input_preview": json.dumps(block.get("input", {}), ensure_ascii=False)[:200],
-            }
-    return None
-
-
 # HTTP statuses that the Claude transport retries / that are transient and safe to
 # `--resume` without investigation (overload, rate limit, gateway/server blips).
 _RETRYABLE_API_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 529})
@@ -308,9 +292,9 @@ def api_error_from_records(records: list[dict[str, Any]] | None) -> dict[str, An
     Reports an API error only when it is the FINAL relevant activity: any later
     non-interrupt, non-error record means the error was recovered, so it is cleared
     (otherwise a later unrelated hang would be mislabeled as a retryable transport
-    blip). Shared by `summarize_transcript_tail` and the audit renderer's fallback
-    for legacy incident snapshots that predate the structured `api_error` field but
-    still carry `isApiErrorMessage` / `apiErrorStatus` in their `raw_tail`.
+    blip). Used by the audit renderer's fallback for legacy incident snapshots that
+    predate the structured `api_error` field but still carry `isApiErrorMessage` /
+    `apiErrorStatus` in their `raw_tail`.
     """
     if not records:
         return None
@@ -323,70 +307,6 @@ def api_error_from_records(records: list[dict[str, Any]] | None) -> dict[str, An
         err = _api_error(record)
         api_error = err if err is not None else None
     return api_error
-
-
-def summarize_transcript_tail(path: Path, *, n: int = 40) -> dict[str, Any]:
-    """Summarize the last ``n`` records of a transcript jsonl.
-
-    Returns last activity timestamp, last tool_use, interrupt-marker presence,
-    the dead-air gap (last real activity -> interrupt / now), and the raw tail
-    records (so the decisive evidence survives ``~/.claude`` cleanup even if the
-    parsing assumptions later drift).
-    """
-    if not path.exists():
-        return {"found": False, "path": str(path)}
-    records = _read_jsonl(path)
-    tail = records[-n:] if len(records) > n else records
-
-    last_activity_ts: str | None = None
-    last_activity_dt: datetime | None = None
-    last_event_type: str | None = None
-    last_tool: dict[str, Any] | None = None
-    interrupt_ts: str | None = None
-    interrupt_dt: datetime | None = None
-    interrupt_text: str | None = None
-
-    for record in records:
-        ts = record.get("timestamp") or record.get("ts")
-        dt = _parse_ts(ts)
-        if _is_interrupt_record(record):
-            if isinstance(ts, str):
-                interrupt_ts = ts
-            interrupt_dt = dt
-            blocks = _record_text_blocks(record)
-            interrupt_text = blocks[-1][:200] if blocks else None
-            continue
-        if isinstance(ts, str):
-            last_activity_ts = ts
-        if dt is not None:
-            last_activity_dt = dt
-        last_event_type = record.get("type")
-        tu = _last_tool_use(record)
-        if tu is not None:
-            last_tool = tu
-
-    # Surface an API error only when it is the final relevant activity (see helper).
-    api_error = api_error_from_records(records)
-
-    dead_air_seconds: float | None = None
-    if last_activity_dt is not None:
-        end_dt = interrupt_dt or datetime.now(timezone.utc)
-        dead_air_seconds = (end_dt - last_activity_dt).total_seconds()
-
-    return {
-        "found": True,
-        "path": str(path),
-        "record_count": len(records),
-        "last_activity_ts": last_activity_ts,
-        "last_event_type": last_event_type,
-        "last_tool_use": last_tool,
-        "interrupted": interrupt_ts is not None,
-        "interrupt_ts": interrupt_ts,
-        "interrupt_text": interrupt_text,
-        "dead_air_seconds": dead_air_seconds,
-        "api_error": api_error,
-        "raw_tail": tail,
-    }
 
 
 def _claude_projects_dir(repo_root: Path) -> Path:
