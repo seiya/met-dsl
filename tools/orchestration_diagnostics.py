@@ -834,6 +834,13 @@ def build_launch_incident(
     the in-repo facts when ``~/.claude`` is absent or cleaned. Persisted
     ``launch_incident.runtime.*.json`` snapshots from older runs are additionally
     surfaced by the audit renderer.
+
+    Only conductor-spawned leaves (arid-pinned sessions) are correlated. Transcripts
+    from pre-migration LLM-orchestrator runs lived under the old
+    ``<host_session_id>/subagents/`` layout and are intentionally NOT resolved:
+    ``host_session_id`` was removed, and reviving that lookup is out of scope (such
+    ``~/.claude`` transcripts are long since GC'd, and any persisted incident
+    snapshot is still surfaced).
     """
     dangling = detect_dangling_active_child(repo_root, orchestration_id)
     if dangling is None:
