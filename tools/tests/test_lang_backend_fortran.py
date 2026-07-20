@@ -369,6 +369,28 @@ class Round2HardeningTest(unittest.TestCase):
                 {"module_parameters": [{"name": "dp", "value": "real64 :: evil"}],
                  "types": [], "procedures": []})
 
+    def test_mixed_type_unknown_keys_fails_closed_not_crash(self) -> None:
+        # A YAML mapping mixing an int key with string keys must not crash `sorted(...)` on the
+        # unknown-key path; it must fail closed.
+        with self.assertRaisesRegex(SignatureParseError, "unknown key"):
+            render_symbol_to_fortran(
+                {"kind": "subroutine", "name": "hx__f",
+                 "args": [{"name": "x", 1: "z", "q": "z", "spec": {"type": "real", "kind": "dp"}}]})
+
+    def test_dims_comma_injection_rejected(self) -> None:
+        # `dims: ['3,4']` is one entry (rank passes) but would render the rank-2 `(3,4)`.
+        with self.assertRaises(SignatureParseError):
+            render_symbol_to_fortran(
+                {"kind": "subroutine", "name": "hx__f",
+                 "args": [{"name": "a", "rank": 1, "dims": ["3,4"],
+                           "spec": {"type": "real", "kind": "dp"}}]})
+
+    def test_parameter_value_semicolon_rejected(self) -> None:
+        with self.assertRaises(SignatureParseError):
+            render_signatures_to_fortran(
+                {"module_parameters": [{"name": "dp", "value": "real64; integer evil"}],
+                 "types": [], "procedures": []})
+
     def test_unhashable_type_value_fails_closed_not_crash(self) -> None:
         # `type: []` / `type: {}` is unhashable; a raw `not in frozenset` would TypeError and escape
         # the callers' `except SignatureParseError`, crashing the gate instead of failing closed.

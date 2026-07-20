@@ -273,7 +273,10 @@ def _require_nonempty_str(value: Any, ctx: str) -> str:
 
 
 def _reject_unknown_keys(mapping: dict[str, Any], allowed: frozenset[str], ctx: str) -> None:
-    unknown = sorted(set(mapping) - allowed)
+    # `key=str`: a YAML mapping can mix key types (e.g. an int key alongside string keys); a bare
+    # `sorted` would raise `TypeError: '<' not supported between int and str` and escape the callers'
+    # `except SignatureParseError`, crashing the gate instead of failing closed.
+    unknown = sorted(set(mapping) - allowed, key=str)
     if unknown:
         raise SignatureParseError(
             f"{ctx} has unknown key(s) {unknown}; allowed: {sorted(allowed)} "
@@ -299,28 +302,30 @@ def _require_identifier(value: Any, ctx: str) -> str:
 
 
 def _require_safe_token(value: Any, ctx: str) -> str:
-    """A token that renders INSIDE parentheses — a string length, a kind, a dimension bound
+    """A token that renders INSIDE parentheses — a string length, a kind, a SINGLE dimension bound
     (``character(len=<len>)`` / ``real(<kind>)`` / ``(<dim>)``) — may be ``*`` / ``:`` / a number /
     a symbol / a simple expression, but must not carry a ``)`` (which would close the enclosing
-    parens and smuggle a declaration) nor the other structural characters (``::``, a newline, a
-    comment ``!``, or an opening ``(``)."""
+    parens and smuggle a declaration), a ``,`` (which would add dimensions to a single bound —
+    ``dims: ['3,4']`` must not render the rank-2 ``(3,4)``), a ``;`` (statement separator), nor the
+    other structural characters (``::``, a newline, a comment ``!``, or an opening ``(``)."""
     _require_nonempty_str(value, ctx)
-    if "::" in value or any(ch in value for ch in "\n\r!()"):
+    if "::" in value or any(ch in value for ch in "\n\r!(),;"):
         raise SignatureParseError(
-            f"{ctx} must not contain structural Fortran characters (::, newline, !, parentheses); "
-            f"got {value!r}")
+            f"{ctx} must not contain structural Fortran characters (::, newline, !, parentheses, "
+            f"comma, semicolon); got {value!r}")
     return value
 
 
 def _require_parameter_value(value: str, ctx: str) -> str:
     """A module-parameter VALUE renders OUTSIDE parentheses (``parameter :: <name> = <value>``), so —
     unlike the inside-parens tokens above — it may carry balanced parens (the portable-kind idiom
-    ``selected_real_kind(15, 307)``). It must still not carry a ``::`` / newline / comment ``!`` that
-    would break or smuggle a declaration on the parameter line."""
+    ``selected_real_kind(15, 307)``). It must still not carry a ``::`` / ``;`` (statement separator —
+    ``real64; integer evil`` would emit a second declaration) / newline / comment ``!`` that would
+    break or smuggle a declaration on the parameter line."""
     _require_nonempty_str(value, ctx)
-    if "::" in value or any(ch in value for ch in "\n\r!"):
+    if "::" in value or any(ch in value for ch in "\n\r!;"):
         raise SignatureParseError(
-            f"{ctx} must not contain '::', a newline, or '!'; got {value!r}")
+            f"{ctx} must not contain '::', ';', a newline, or '!'; got {value!r}")
     return value
 
 
