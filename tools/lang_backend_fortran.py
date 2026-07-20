@@ -580,11 +580,15 @@ def load_structured_signatures(body: str) -> tuple[dict[str, Any], str | None]:
                     f"allowed: {list(_STRUCT_TOP_KEYS)}")
     struct: dict[str, Any] = {"module_parameters": [], "types": [], "procedures": []}
     for key in _STRUCT_TOP_KEYS:
-        val = data.get(key)
-        if val is None:
-            continue
+        if key not in data:
+            continue  # ABSENT key -> that category is empty (a pruned §5.1 may omit e.g. types)
+        val = data[key]
+        # A PRESENT-but-null (`module_parameters:` / `module_parameters: null`) must fail closed,
+        # NOT be silently treated as empty: an empty module_parameters would drop the dp/case_id_len
+        # value pins, letting a `dp = real32` / `case_id_len = 32` drift pass the parameter check.
         if not isinstance(val, list):
-            return ({}, f"structured §5.1 block's '{key}' must be a list")
+            return ({}, f"structured §5.1 block's '{key}' must be a list (got "
+                        f"{type(val).__name__}); a present-but-null key must fail closed")
         struct[key] = val
     return (struct, None)
 

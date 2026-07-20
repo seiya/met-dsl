@@ -391,6 +391,22 @@ class Round2HardeningTest(unittest.TestCase):
                 {"module_parameters": [{"name": "dp", "value": "real64; integer evil"}],
                  "types": [], "procedures": []})
 
+    def test_present_null_top_key_fails_closed(self) -> None:
+        # `module_parameters: null` (present but null) must fail closed — silently emptying it
+        # would drop the dp/case_id_len value pins and let a drifted parameter pass.
+        struct, err = load_structured_signatures(
+            "module_parameters: null\ntypes: []\nprocedures: []\n")
+        self.assertIsNotNone(err)
+        self.assertIn("must be a list", err)
+
+    def test_absent_top_key_is_empty(self) -> None:
+        # An ABSENT key legitimately means that category is empty (a pruned §5.1 may omit types).
+        struct, err = load_structured_signatures(
+            "procedures:\n- {kind: subroutine, name: hx__f, args: []}\n")
+        self.assertIsNone(err)
+        self.assertEqual(struct["types"], [])
+        self.assertEqual(struct["module_parameters"], [])
+
     def test_unhashable_type_value_fails_closed_not_crash(self) -> None:
         # `type: []` / `type: {}` is unhashable; a raw `not in frozenset` would TypeError and escape
         # the callers' `except SignatureParseError`, crashing the gate instead of failing closed.
