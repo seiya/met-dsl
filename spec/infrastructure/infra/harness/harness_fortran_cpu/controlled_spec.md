@@ -2,7 +2,7 @@
 
 ## 0. Meta information
 - `spec_id`: `harness_fortran_cpu`
-- `spec_version`: `0.3.0`
+- `spec_version`: `0.4.0`
 - `status`: `controlled_draft`
 - `spec_kind`: `infrastructure`
 - `domain`: `infra`
@@ -78,7 +78,7 @@ A missing `--cases` flag (or no `case_id` after it) is a hard input error — `_
 ## 5. Public API and compatibility
 The published `operation_id`s are exactly: `harness_fortran_cpu__parse_cases`, `harness_fortran_cpu__emit_real`, `harness_fortran_cpu__emit_int`, `harness_fortran_cpu__emit_bool`, `harness_fortran_cpu__emit_array_r1`, `harness_fortran_cpu__emit_array_r2`, `harness_fortran_cpu__emit_array_r3`, `harness_fortran_cpu__emit_array_r4`, `harness_fortran_cpu__box`, `harness_fortran_cpu__write_snapshot`, `harness_fortran_cpu__write_metrics_basis`, `harness_fortran_cpu__write_diagnostics`, `harness_fortran_cpu__write_perf`. The module also publishes the derived types `harness_fortran_cpu__h_named`, `harness_fortran_cpu__h_check`, `harness_fortran_cpu__h_metric`, `harness_fortran_cpu__h_case_result`, and `harness_fortran_cpu__h_mb_entry`.
 
-A change breaking compatibility of any signature (or of a published derived type's component layout) is a **breaking change released under a new `spec_version`**, not a rename: `0.2.1` → `0.3.0` added the `case_id` component to `harness_fortran_cpu__h_mb_entry`. Dependent nodes are not migrated by hand and need no content-free version bump of their own. The workflow enforces the skew mechanically at two points:
+A change breaking compatibility of any signature (or of a published derived type's component layout) is a **breaking change released under a new `spec_version`**, not a rename: `0.2.1` → `0.3.0` added the `case_id` component to `harness_fortran_cpu__h_mb_entry`. A change to how the published surface is CARRIED — the §5.1 / `IR public_api.signatures` REPRESENTATION — is likewise released under a new `spec_version` even when the ABI is byte-identical, because dependency freshness invalidates a stale certified `IR` only via its version: `0.3.0` → `0.4.0` moved §5.1 and `public_api.signatures` from a Fortran interface block to the language-neutral structured form (`{symbol, signature}`); the published operations, argument types/ranks/`intent`s, and component layouts are unchanged. Dependent nodes are not migrated by hand and need no content-free version bump of their own. The workflow enforces the skew mechanically at two points:
 
 - **Regeneration** — a node's certified dependency resolution is recorded in its `dependency_graph.json` sidecar; when the catalog moves the harness to a new version, every dependent's recorded resolution stops matching the one `deps.yaml` + `spec_catalog.yaml` derive, so the dependency-freshness readiness check reports it stale and `run_workflow.py --with-deps` re-certifies the closure bottom-up.
 - **Skew fail-close** — a consumer that would nonetheless render its runner glue against a drifted interface is stopped before Build by the renderer's signature pin (`tools/runner_renderer.assert_harness_pin`), which compares this §5.1 block against the certified harness IR's `public_api.signatures` and its generated model source.

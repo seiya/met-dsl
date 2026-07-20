@@ -2793,7 +2793,7 @@ the first place — the previous text named `module` / `capture` and left every 
   `checks_getter` bindings — compliant with the prompt and rejected by the host. The rule is therefore written as a
   biconditional, with the reason the producer can act on: `capability_requirements` states what the code USES, not what
   the harness offers. `HARNESS_CAPABILITY_MANIFESTS` gives
-  `harness_fortran_cpu@0.3.0` only `sync_single_case@1` (`state_registration` is Z6-reserved), so on today's certified
+  `harness_fortran_cpu@0.4.0` only `sync_single_case@1` (`state_registration` is Z6-reserved), so on today's certified
   harness every `harness_registration` binding is rejected by the capability layer and `checks_getter` with a null
   `capability` is the only accepted form. The rule is keyed to the INLINED MANIFEST rather than hard-coding that fact:
   `checks_getter` is mandated UNLESS the manifest lists `state_registration@N`, and the token may be declared only as
