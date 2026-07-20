@@ -3520,7 +3520,7 @@ class LeafSpawnTest(unittest.TestCase):
             # a passing substep carries no result_summary
             self.assertNotIn("result_summary", runs[0])
 
-    def test_run_substep_reuse_resume_gated_by_flag(self) -> None:
+    def test_run_substep_reuse_resume_always_resumes_producer(self) -> None:
         refs = wc.NodeRefs(node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
                            ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1")
         reuse = {"repair_strategy": "reuse", "repair_target_agent_run_id": "producer-arid"}
