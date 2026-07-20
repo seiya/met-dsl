@@ -369,6 +369,23 @@ class Round2HardeningTest(unittest.TestCase):
                 {"module_parameters": [{"name": "dp", "value": "real64 :: evil"}],
                  "types": [], "procedures": []})
 
+    def test_unhashable_type_value_fails_closed_not_crash(self) -> None:
+        # `type: []` / `type: {}` is unhashable; a raw `not in frozenset` would TypeError and escape
+        # the callers' `except SignatureParseError`, crashing the gate instead of failing closed.
+        for bad_type in ([], {}, 3):
+            with self.assertRaisesRegex(SignatureParseError, "spec.type"):
+                render_symbol_to_fortran(
+                    {"kind": "subroutine", "name": "hx__f",
+                     "args": [{"name": "x", "spec": {"type": bad_type}}]})
+
+    def test_unhashable_intent_value_fails_closed_not_crash(self) -> None:
+        for bad_intent in ([], {}):
+            with self.assertRaisesRegex(SignatureParseError, "intent"):
+                render_symbol_to_fortran(
+                    {"kind": "subroutine", "name": "hx__f",
+                     "args": [{"name": "x", "intent": bad_intent,
+                               "spec": {"type": "real", "kind": "dp"}}]})
+
 
 if __name__ == "__main__":
     unittest.main()

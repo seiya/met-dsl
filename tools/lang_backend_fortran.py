@@ -329,7 +329,10 @@ def _validate_spec(spec: Any, ctx: str) -> None:
         raise SignatureParseError(f"{ctx}.spec must be a mapping (got {type(spec).__name__})")
     _reject_unknown_keys(spec, _SPEC_KEYS, f"{ctx}.spec")
     t = spec.get("type")
-    if t not in _VALID_SPEC_TYPES:
+    # `isinstance(str)` BEFORE the frozenset membership: an unhashable `type: []` / `type: {}` would
+    # otherwise raise a raw TypeError (unhashable) that escapes the callers' `except
+    # SignatureParseError`, crashing the gate instead of failing closed.
+    if not isinstance(t, str) or t not in _VALID_SPEC_TYPES:
         raise SignatureParseError(
             f"{ctx}.spec.type must be one of {sorted(_VALID_SPEC_TYPES)} (got {t!r})")
     if t == "string":
@@ -373,7 +376,7 @@ def _validate_entity(ent: Any, ctx: str, *, allow_intent: bool) -> None:
         if not allow_intent:
             raise SignatureParseError(
                 f"{ctx}.intent is not allowed here (a result / component carries no intent)")
-        if intent not in _VALID_INTENTS:
+        if not isinstance(intent, str) or intent not in _VALID_INTENTS:  # isinstance guards unhashable
             raise SignatureParseError(
                 f"{ctx}.intent must be one of {sorted(_VALID_INTENTS)} (got {intent!r})")
     _validate_spec(ent.get("spec"), ctx)
