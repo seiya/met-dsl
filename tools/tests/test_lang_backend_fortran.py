@@ -350,6 +350,20 @@ class Round2HardeningTest(unittest.TestCase):
                 {"module_parameters": [{"name": "dp", "value": True}],
                  "types": [], "procedures": []})
 
+    def test_non_integer_parameter_base_rejected(self) -> None:
+        # `base` other than integer is silently dropped by the renderer -> fail closed.
+        with self.assertRaisesRegex(SignatureParseError, "base"):
+            render_signatures_to_fortran(
+                {"module_parameters": [{"name": "dp", "base": "real", "value": "64"}],
+                 "types": [], "procedures": []})
+
+    def test_integer_alloc_flag_rejected(self) -> None:
+        # `alloc: 1` (1 == True) must not slip the boolean check and render by truthiness.
+        with self.assertRaisesRegex(SignatureParseError, "alloc"):
+            render_symbol_to_fortran(
+                {"kind": "subroutine", "name": "hx__f",
+                 "args": [{"name": "x", "spec": {"type": "string", "len": ":", "alloc": 1}}]})
+
     def test_integer_parameter_value_accepted(self) -> None:
         render_signatures_to_fortran(
             {"module_parameters": [{"name": "case_id_len", "value": 64}],

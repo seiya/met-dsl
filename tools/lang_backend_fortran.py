@@ -368,8 +368,11 @@ def _validate_spec(spec: Any, ctx: str) -> None:
     else:  # real / integer / logical: kind optional but a safe token when present
         if spec.get("kind") is not None:
             _require_safe_token(spec.get("kind"), f"{ctx}.spec.kind")
-    if spec.get("alloc") not in (None, True, False):
-        raise SignatureParseError(f"{ctx}.spec.alloc must be a boolean (got {spec.get('alloc')!r})")
+    alloc = spec.get("alloc")
+    if alloc is not None and not isinstance(alloc, bool):
+        # `not in (None, True, False)` would accept `alloc: 1` (1 == True) and render by truthiness;
+        # require a real boolean.
+        raise SignatureParseError(f"{ctx}.spec.alloc must be a boolean (got {alloc!r})")
 
 
 def _validate_entity(ent: Any, ctx: str, *, allow_intent: bool) -> None:
@@ -450,6 +453,13 @@ def _validate_module_parameter(mp: Any, ctx: str) -> None:
         raise SignatureParseError(f"{ctx} must be a mapping (got {type(mp).__name__})")
     _reject_unknown_keys(mp, _PARAM_KEYS, ctx)
     _require_identifier(mp.get("name"), f"{ctx}.name")
+    base = mp.get("base")
+    if base is not None and base != "integer":
+        # The renderer emits `integer, parameter :: <name> = <value>` unconditionally, so any other
+        # `base` would be authored but silently dropped — fail closed.
+        raise SignatureParseError(
+            f"{ctx}.base must be 'integer' (the only module-parameter base the renderer emits); "
+            f"got {base!r}")
     value = mp.get("value")
     if isinstance(value, bool):  # bool is an int subclass; `value: true` is not a parameter value
         raise SignatureParseError(f"{ctx}.value must be a number or symbol, not a boolean")
