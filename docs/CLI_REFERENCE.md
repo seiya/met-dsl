@@ -323,7 +323,7 @@ The pre-phase gate. Checks execution-platform availability, session policy, depe
 | `--orchestration-id` | yes | |
 | `--node-key` | yes | |
 | `--step` | yes | `compile` / `generate` / `build` / `validate` (core 5-phase) |
-| `--backend` | no | default `codex` |
+| `--backend` | no | default `claude` |
 | `--require-child-agent` | yes | `step` or `substep`. Compile / Generate / Validate are `substep`, Build is `step` |
 | `--launch-request-json` | no | the launch request payload for the downstream artifact check |
 

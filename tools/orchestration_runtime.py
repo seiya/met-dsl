@@ -9399,7 +9399,7 @@ def _run_live_probe_and_update(
     """
     backend = cached_payload.get("backend")
     if not isinstance(backend, str) or backend.strip() not in SUPPORTED_BACKENDS:
-        backend = "codex"
+        backend = "claude"
     command = cached_payload.get("probe_command")
     probe_command = command.strip() if isinstance(command, str) and command.strip() else None
 
@@ -14909,7 +14909,9 @@ def init_orchestration(
     spec_ref: str | None = None,
     source_dependency_ref: str | None = None,
     status: str = "running",
-    agent_backend: str = "codex",
+    # claude is the primary/default backend (matches run_workflow.py DEFAULT_LLM);
+    # codex remains a supported choice, selected explicitly.
+    agent_backend: str = "claude",
     agent_model: str | None = None,
     invocation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -15380,7 +15382,7 @@ def record_launch(
         if isinstance(preflight_payload, dict)
         else ""
     )
-    backend_token = preflight_backend if preflight_backend in SUPPORTED_BACKENDS else "codex"
+    backend_token = preflight_backend if preflight_backend in SUPPORTED_BACKENDS else "claude"
 
     # The Claude backend enforces sequential child launch via the active file.
     if backend_token == "claude":
@@ -15461,7 +15463,10 @@ def record_launch(
                 "record-launch blocked by pre_phase_launch / workflow-launch-check: "
                 f"reason_code={reason_code}"
             )
-    backend_command = "codex"
+    # Fall back to the default command for the preflight's own backend (not a fixed
+    # backend), so a codex preflight without a probe_command still binds ~/.codex — a
+    # hardcoded command would resolve the wrong runtime home in _backend_runtime_bind_paths.
+    backend_command = DEFAULT_BACKEND_COMMANDS[backend_token]
     if isinstance(preflight_payload, dict):
         probe_command = preflight_payload.get("probe_command")
         if isinstance(probe_command, str) and probe_command.strip():
@@ -18773,7 +18778,7 @@ def main(argv: list[str] | None = None) -> int:
     init_parser.add_argument("--spec-ref")
     init_parser.add_argument("--source-dependency-ref")
     init_parser.add_argument("--status", default="running")
-    init_parser.add_argument("--agent-backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
+    init_parser.add_argument("--agent-backend", default="claude", choices=sorted(SUPPORTED_BACKENDS))
     init_parser.add_argument(
         "--agent-model",
         default=None,
@@ -18808,7 +18813,7 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser = subparsers.add_parser("preflight")
     preflight_parser.add_argument("--repo-root", required=True)
     preflight_parser.add_argument("--orchestration-id", required=True)
-    preflight_parser.add_argument("--backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
+    preflight_parser.add_argument("--backend", default="claude", choices=sorted(SUPPORTED_BACKENDS))
     preflight_parser.add_argument("--agent-command")
     preflight_parser.add_argument("--codex-command", default="codex")
     preflight_parser.add_argument("--claude-command", default="claude")
@@ -19132,7 +19137,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     launch_check_parser.add_argument("--step", required=True,
                                      help="Workflow step name: plan, generate, build, execute, judge, etc.")
-    launch_check_parser.add_argument("--backend", default="codex", choices=sorted(SUPPORTED_BACKENDS))
+    launch_check_parser.add_argument("--backend", default="claude", choices=sorted(SUPPORTED_BACKENDS))
     launch_check_parser.add_argument(
         "--require-child-agent", required=True, choices=("step", "substep"),
         help="Expected child agent kind. Plan/Generate/Tune require 'substep'; "

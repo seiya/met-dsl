@@ -1692,6 +1692,7 @@ shell_tool                       stable             true
                 orchestration_id="orch_001",
                 payload={
                     "status": "pass",
+                    "backend": "codex",
                     "sandbox_runtime": "bwrap",
                     "sandbox_enforced": True,
                     "can_launch_step_agents": True,
@@ -1699,6 +1700,8 @@ shell_tool                       stable             true
                     "feature_states": {"multi_agent": True, "hooks": True},
                     "checks": [
                         {"name": "multi_agent_enabled", "pass": True},
+                        {"name": "hooks_enabled", "pass": True},
+                        {"name": "codex_home_writable", "pass": True},
                     ],
                 },
             )

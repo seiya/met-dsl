@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import json  # kept for BLOCK path
+import json
 from typing import Any
 
 from tools.hooks.common import (
