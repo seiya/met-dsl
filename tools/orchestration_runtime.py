@@ -7895,20 +7895,6 @@ def _should_ignore_runtime_snapshot_path(
         token,
     ):
         return True
-    # `launch_incident.runtime.<uuid12>.json` (LEGACY: written by the removed
-    # LLM-orchestrator launch path's dangling-active_child capture; the conductor
-    # never emits it, so this exemption only matters when reading older on-disk
-    # runs). Same runtime-owned rationale as the failure_analysis sidecar above:
-    # emitted only by the outer run_workflow process, never by a child agent, and it
-    # could land while the dangling child's launch baseline is still captured —
-    # without this exemption it would surface in that child's terminal diff as an
-    # unauthorized_write_violation and dead-lock terminalization. Intentionally
-    # narrow: only the UUID-suffixed runtime sidecar.
-    if re.fullmatch(
-        rf"{re.escape(orch_root)}/launch_incident\.runtime\.[0-9a-f]{{12}}\.json",
-        token,
-    ):
-        return True
     runtime_files = {
         f"{orch_root}/agent_graph.json",
         f"{orch_root}/agent_runs.jsonl",

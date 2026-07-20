@@ -25698,31 +25698,6 @@ class FailureAnalysisRuntimeSidecarExemptionTests(unittest.TestCase):
             )
         )
 
-    def test_should_ignore_classifies_launch_incident_runtime_sidecar(self) -> None:
-        from tools.orchestration_runtime import _should_ignore_runtime_snapshot_path
-
-        orch_id = "orch_001"
-        base = f"workspace/orchestrations/{orch_id}"
-        kwargs = {"orchestration_id": orch_id, "agent_run_id": "child_arid"}
-
-        # UUID-suffixed launch_incident runtime sidecar → exempt.
-        self.assertTrue(
-            _should_ignore_runtime_snapshot_path(
-                f"{base}/launch_incident.runtime.abc123abc123.json", **kwargs
-            )
-        )
-        # Non-conforming slug must NOT be blanket-exempt.
-        self.assertFalse(
-            _should_ignore_runtime_snapshot_path(
-                f"{base}/launch_incident.runtime.NOTHEX12345.json", **kwargs
-            )
-        )
-        self.assertFalse(
-            _should_ignore_runtime_snapshot_path(
-                f"{base}/launch_incident.json", **kwargs
-            )
-        )
-
     def test_should_ignore_classifies_host_run_log(self) -> None:
         """Host-side run logs (run_workflow.py's stdout JSONL tee, under
         `<orch>/run_logs/`) must be exempt: the outer driver — not a child —
