@@ -108,14 +108,14 @@ class DetectDanglingTests(unittest.TestCase):
             self.assertEqual(result["agent_run_id"], CHILD_ARID)
 
     def test_codex_backend_dangling_detected_without_claude_pointer(self) -> None:
-        # codex/cursor: record_launch writes active_children/<arid>.txt for ALL
+        # codex: record_launch writes active_children/<arid>.txt for ALL
         # backends but NOT active_child_agent_run_id.txt (Claude-only). Detection
         # must key off the backend-neutral marker, else these dangling launches are
         # missed and the orchestration stays `running`.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             root = _orch_root(repo)
-            # No active_child_agent_run_id.txt (codex/cursor have no pointer).
+            # No active_child_agent_run_id.txt (codex has no pointer).
             markers = root / "active_children"
             markers.mkdir(exist_ok=True)
             (markers / f"{CHILD_ARID}.txt").write_text(CHILD_ARID, encoding="utf-8")
@@ -158,7 +158,7 @@ class DetectDanglingTests(unittest.TestCase):
             self.assertIsNone(diag.detect_dangling_active_child(repo, ORCH_ID))
 
     def test_multiple_parallel_dangling_children_all_listed(self) -> None:
-        # Parallel (codex/cursor) backends can leave several dangling markers.
+        # Parallel backends can leave several dangling markers.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             root = _orch_root(repo)

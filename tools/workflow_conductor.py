@@ -4,8 +4,8 @@ Drives the Compile -> Generate -> Build -> Validate phase/substep loop in plain
 Python, calling the orchestration_runtime.py bookkeeping subcommands directly and
 spawning each substep BODY as an isolated leaf LLM (``claude -p`` / ``codex exec``).
 
-Motivation (see docs/design/deterministic_conductor.md): the legacy path uses an
-LLM "orchestration agent" to drive a deterministic bookkeeping state machine. For
+Motivation (see docs/design/deterministic_conductor.md): the pre-migration path used
+an LLM "orchestration agent" to drive a deterministic bookkeeping state machine. For
 a trivial node the LLM makes essentially no decisions, yet every bookkeeping CLI
 output accumulates in its context and is re-read every turn (cache_read grows
 O(turns^2)). Moving the deterministic loop into Python removes the parent LLM's
@@ -891,8 +891,9 @@ class NodeRefs:
 
 # --- launch-request payload builder -------------------------------------------
 #
-# Reproduces, deterministically, the request payload the LLM orchestration agent
-# assembles by following the tools/prompt_templates/ templates. Validated field-for-field
+# Assembles the launch-request payload deterministically from the
+# tools/prompt_templates/ templates (the payload the pre-migration LLM orchestration
+# agent used to assemble by hand). Validated field-for-field
 # against real working launches/*.request.json (test_workflow_conductor.py).
 # NOTE: `launch_prompt_full` is intentionally OMITTED so record-launch renders the
 # canonical prompt and returns it as `launch_prompt_text` (tools/prompt_templates/).

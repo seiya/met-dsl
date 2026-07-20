@@ -112,7 +112,7 @@ except ModuleNotFoundError:  # pragma: no cover - import bootstrap for direct CL
 
 TERMINAL_STATUSES = {"pass", "fail", "blocked", "timeout", "cancel"}
 # Budget (chars) for a child's verbatim final reply (launches/<arid>.reply.txt). The reply
-# lands in the orchestration transcript twice (the Agent tool return + the record-reply
+# lands in the orchestration transcript twice (the child leaf return + the record-reply
 # argument) and is re-read every turn (cache_read scales with context × turns), so an
 # over-long reply is a primary driver of the quadratic orchestration cost. record_agent_run
 # flags an over-budget reply as telemetry by default; METDSL_ENFORCE_REPLY_BUDGET=1 makes it
@@ -2926,7 +2926,7 @@ def _prune_orphan_agent_graph_edges(
             validation (sandbox / session-id / output-manifest). It has no
             `agent_runs.jsonl` row, but its edge must be kept so validation surfaces the
             invalid terminal attempt;
-          - a `child_returns/<child>.txt` ack — the Agent tool already returned, so a
+          - a `child_returns/<child>.txt` ack — the child leaf already returned, so a
             missing run row is lost finalization, not abandonment.
 
     The remaining set — launched but with no record of returning/attempting to
@@ -2979,7 +2979,7 @@ def _protected_child_arids(repo_root: Path, orchestration_id: str) -> set[str]:
     Any child appearing here is NOT an abandoned launch: it has a terminal
     `agent_runs.jsonl` row, is vouched for by a `step_result.json`, has an
     `agent_runs_invalid.jsonl` entry (terminal-payload validation diverted it), or
-    left a `child_returns/<arid>.txt` ack (the Agent tool already returned). Used to
+    left a `child_returns/<arid>.txt` ack (the child leaf already returned). Used to
     keep `_prune_orphan_agent_graph_edges` from pruning such edges AND to keep the
     resume orphan-tombstone set from mislabeling these as expected orphans.
     """
@@ -3020,7 +3020,7 @@ def _protected_child_arids(repo_root: Path, orchestration_id: str) -> set[str]:
                     protected.add(rid.strip())
         except OSError:
             pass
-    # A child_returns/<arid>.txt ack means the Agent tool already RETURNED for that
+    # A child_returns/<arid>.txt ack means the child leaf already RETURNED for that
     # child (record-child-return ran). A missing run row is then incomplete
     # finalization / corruption, not an abandoned launch.
     returns_dir = _child_returns_dir(repo_root, orchestration_id)
@@ -3105,7 +3105,7 @@ def _write_orphan_launch_tombstones(
     separate from `_protected_child_arids` on purpose: `deactivate-child` CONSUMES the
     `child_returns/<arid>.txt` ack (so a child that returned + deactivated but died
     before `record-agent-run` is no longer ack-protected), yet the durable snapshot
-    proves the Agent tool returned — that is a lost-finalization / corruption case,
+    proves the child leaf returned — that is a lost-finalization / corruption case,
     not an abandoned launch, so it must not be tombstoned as an "expected orphan". It
     is excluded HERE rather than in `_protected_child_arids` because
     `_prune_orphan_agent_graph_edges` must still prune that child's orphan edge for the
@@ -3115,7 +3115,7 @@ def _write_orphan_launch_tombstones(
     launches_dir = root / "launches"
     launches_dir.mkdir(parents=True, exist_ok=True)
     protected = _protected_child_arids(repo_root, orchestration_id)
-    # Children that returned + deactivated (Agent tool returned) — proven by the
+    # Children that returned + deactivated (child leaf returned) — proven by the
     # durable deactivate snapshot even after the ack was consumed. Not orphans.
     deactivated: set[str] = {
         p.parent.name for p in (root / "agents").glob("*/deactivate_snapshot.json")
@@ -3350,10 +3350,10 @@ def _child_returns_dir(repo_root: Path, orchestration_id: str) -> Path:
     """Per-arid child-return acknowledgment directory (Adv-20).
 
     The orchestration agent calls `record-child-return --agent-run-id <arid>`
-    AFTER it has observed the Agent tool actually returning. The resulting
+    AFTER it has observed the child leaf actually returning. The resulting
     `child_returns/<arid>.txt` file is a separate proof, distinct from the
     launch-time `active_children/<arid>.txt` marker, that the orch agent has
-    witnessed the Agent tool return for THIS specific arid. deactivate-child
+    witnessed the child leaf return for THIS specific arid. deactivate-child
     refuses to clear the active_children marker without this ack — without
     it a misrouted deactivate-child call would erase the only liveness guard
     for a still-running Codex child.
@@ -3374,7 +3374,7 @@ def record_child_return(
     reply_excerpt: str | None = None,
 ) -> dict[str, Any]:
     """Adv-20/Adv-30: record that the orchestration agent has observed the
-    Agent tool returning for this child run.
+    child leaf returning for this child run.
 
     The `return_token` MUST match the per-arid token written by record-launch
     to launches/<arid>.parent_return_token. This binds the ack to "the
@@ -7879,11 +7879,10 @@ def _should_ignore_runtime_snapshot_path(
     )
     if any(token.startswith(prefix) for prefix in runtime_prefixes):
         return True
-    # `failure_analysis.runtime.<uuid12>.json` safety-net sidecar (LEGACY: written
-    # by the removed LLM-orchestrator launch path's `_write_failure_analysis`; the
-    # conductor never emits it, so this exemption only matters when reading older
-    # on-disk runs). It was emitted by the outer run_workflow process — never by a
-    # child agent, which cannot reach the path through tool hooks
+    # `failure_analysis.runtime.<uuid12>.json` safety-net sidecar, written by the
+    # outer run_workflow process's dev-mode failure-analysis path
+    # (`_write_failure_analysis`) when the canonical `failure_analysis.json` already
+    # exists — never by a child agent, which cannot reach the path through tool hooks
     # (`output_manifest_write_guard`). The write could land after an interrupted
     # child's launch baseline is captured but before `record-timeout` terminalizes
     # it; without this exemption the sidecar shows up in that child's terminal-diff
@@ -10815,7 +10814,7 @@ def _extract_response_agent_session_id(response_payload: dict[str, Any]) -> str 
 def _validate_response_agent_session_id(response_payload: dict[str, Any]) -> str:
     session_id = _extract_response_agent_session_id(response_payload)
     if session_id is None:
-        raise ValueError("launch response must include child agent identifier from spawn_agent")
+        raise ValueError("launch response must include the child agent identifier")
     if _is_placeholder_ref(session_id):
         raise ValueError("launch response child agent identifier must not contain placeholder tokens")
     return session_id
@@ -15566,9 +15565,9 @@ def record_launch(
         "child_launch_reply_ref": child_reply_ref,
         # The exact prompt text record-launch rendered and wrote to
         # launches/<child_arid>.prompt.txt. Returned so the orchestration agent
-        # can pass it verbatim to the Agent tool WITHOUT reading the template
+        # can pass it verbatim to the child leaf WITHOUT reading the template
         # (the tools/prompt_templates/ templates) or the written prompt file (both blocked for the
-        # orchestration). The Agent-tool prompt is then identical in content to
+        # orchestration). The child-leaf prompt is then identical in content to
         # the recorded artifact by construction (audit 1-to-1); the .prompt.txt
         # file only differs by a trailing newline the text writer appends.
         # Retained in terse output.
@@ -15968,7 +15967,7 @@ def record_launch(
         )
     # Adv-16: backend-neutral per-arid active-child marker. Codex lack
     # the single-active-child constraint that the Claude marker enforces, but
-    # they still need a "the Agent tool actually returned" handshake before
+    # they still need a "the child leaf actually returned" handshake before
     # record-timeout may finalize a run. Marker is created here for ALL
     # backends (LAST per NEW-M1 ordering above) and removed by
     # deactivate-child / record-agent-run terminal.
@@ -16104,13 +16103,13 @@ def record_timeout(
 ) -> dict[str, Any]:
     """Canonical recovery for substep/step API stream idle timeout.
 
-    Normal path: orchestration agent observes Agent tool returning, calls
+    Normal path: orchestration agent observes child leaf returning, calls
     record-child-return → deactivate-child → record-timeout. The Adv-14/16/20
     guards refuse to finalize while liveness markers are still present.
 
     Adv-26 escape hatch: pass `force_reason` (or --force-reason on CLI) to
     bypass the active-children/legacy-marker guards for genuinely wedged
-    children where deactivate-child is unreachable (Agent tool process killed
+    children where deactivate-child is unreachable (child leaf process killed
     before the parent observed any return). The bypass clears both markers
     on the operator's responsibility; force_reason is appended to the audit
     trail (timeout_reason) and recorded as `forced=True` in the run payload.
@@ -16134,7 +16133,7 @@ def record_timeout(
     if not req_path.exists():
         raise ValueError(
             f"record-timeout cannot find launch request: {req_path}. "
-            "Ensure record-launch was executed before the Agent tool call."
+            "Ensure record-launch was executed before the child leaf launch."
         )
     if not resp_path.exists():
         raise ValueError(
@@ -16213,7 +16212,7 @@ def record_timeout(
             break
     # Adv-16: backend-neutral active-child marker check. record-launch creates
     # `active_children/<arid>.txt` for ALL backends; deactivate-child (the
-    # documented signal that the Agent tool returned) removes it. While the
+    # documented signal that the child leaf returned) removes it. While the
     # marker exists, the orchestration agent has not yet acknowledged that the
     # child finished — firing record-timeout in that state would race the
     # still-pending leaf return on Codex as well as Claude.
@@ -16231,7 +16230,7 @@ def record_timeout(
                 f"record-timeout: active-child marker {marker_path.name} still exists "
                 f"under workspace/orchestrations/{orchestration_id}/active_children/. "
                 f"Run `deactivate-child --child-run-id {arid}` first to confirm the "
-                f"Agent tool actually returned, then retry record-timeout. "
+                f"child leaf actually returned, then retry record-timeout. "
                 f"For genuinely-wedged children where deactivate-child is "
                 f"unreachable, use --force-reason '<text>' to bypass."
             )
@@ -16252,7 +16251,7 @@ def record_timeout(
                     raise ValueError(
                         f"record-timeout: active_child_agent_run_id.txt still points "
                         f"to {arid!r}. Run `deactivate-child --child-run-id {arid}` "
-                        f"first to confirm the Agent tool actually returned, then "
+                        f"first to confirm the child leaf actually returned, then "
                         f"retry record-timeout. For genuinely-wedged children, "
                         f"use --force-reason '<text>' to bypass."
                     )
@@ -16670,7 +16669,7 @@ def deactivate_child_agent(
     `record-child-return` ack to validate against and is finalized via
     `update_orchestration_status` directly. The Adv-30 parent-bound token
     and Adv-20 ack file therefore protect ONLY child runs (where the
-    "Agent tool returned" signal is the actual security boundary). The
+    "child leaf returned" signal is the actual security boundary). The
     orch's own scratch is cleaned at terminal `set-status` time and is
     guarded by the `is_owner_via_orchestration` proof in
     `_cleanup_agent_tmp_root` (orchestration_meta.json identity).
@@ -16702,7 +16701,7 @@ def deactivate_child_agent(
             "deactivated_at": _utc_now_iso(),
             "already_inactive": True,
         }
-    # Adv-20: require explicit "Agent tool returned" ack. The orchestration
+    # Adv-20: require explicit "child leaf returned" ack. The orchestration
     # agent must call record-child-return before deactivate-child. Without
     # this gate, a misrouted deactivate-child for a still-running Codex
     # child clears its only liveness guard (active_children marker) and lets
@@ -16712,7 +16711,7 @@ def deactivate_child_agent(
         raise ValueError(
             f"deactivate-child: child_returns/{child_run_id}.txt is missing — "
             f"call `record-child-return --agent-run-id {child_run_id}` AFTER "
-            f"observing the Agent tool actually return, BEFORE deactivate-child."
+            f"observing the child leaf actually return, BEFORE deactivate-child."
         )
     # Adv-30: re-verify the parent-bound token at unlink time. Even if the
     # ack file was created legitimately, an attacker who later edits the file
@@ -18712,7 +18711,7 @@ _TERSE_RESULT_FIELDS: dict[str, tuple[str, ...]] = {
         "sandbox_profile_ref",
         "launch_prompt_ref",
         # The rendered prompt text the orchestration must pass verbatim to the
-        # Agent tool (it cannot read the template or the written prompt file).
+        # child leaf (it cannot read the template or the written prompt file).
         "launch_prompt_text",
     ),
     # record_agent_run returns the run record; it carries started_at/finished_at,
@@ -18869,8 +18868,8 @@ def main(argv: list[str] | None = None) -> int:
         '{"agent_run_id": "<uuid>", "agent_session_id": "<same uuid>", '
         '"started_at": "<ISO8601>", "backend": "claude"}. '
         "sandbox_runtime/sandbox_enforced/sandbox_profile_ref are added automatically. "
-        "Call record-launch BEFORE Agent tool so capability_token is available to the child agent; "
-        "then overwrite launches/<child_agent_run_id>.reply.txt with the actual Agent tool response."
+        "Call record-launch BEFORE launching the child leaf so capability_token is available to the child agent; "
+        "then overwrite launches/<child_agent_run_id>.reply.txt with the actual child leaf response."
     )
     _RUN_GATE_ARGS_HELP = (
         "JSON object for gate-specific arguments. Allowed gates and minimal args_json schema: "
@@ -18901,7 +18900,7 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Record a child agent launch: runs live preflight, generates capability_token, "
             "sandbox profile, output/read manifests, and writes launches/<child_id>.* artifacts. "
-            "For Claude Code: call this BEFORE Agent tool invocation so the child can read "
+            "For Claude Code: call this BEFORE launching the child leaf so the child can read "
             "its capability_token from capabilities/<child_id>.json during execution."
         ),
     )
@@ -19036,7 +19035,7 @@ def main(argv: list[str] | None = None) -> int:
         "record-child-return",
         description=(
             "Adv-20: record that the orchestration agent has observed the "
-            "Agent tool returning for this child. Required precondition for "
+            "child leaf returning for this child. Required precondition for "
             "deactivate-child (and hence for record-timeout). Writes "
             "workspace/orchestrations/<orch>/child_returns/<arid>.txt as the "
             "ack signal; deactivate-child consumes the file when it succeeds."
@@ -19085,7 +19084,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Adv-26 escape hatch: bypass the active-children/legacy marker guards "
             "for genuinely-wedged children where deactivate-child is unreachable "
-            "(e.g. Agent tool process killed before parent observed return). "
+            "(e.g. child leaf process killed before parent observed return). "
             "Required text becomes part of timeout_reason and the run payload "
             "carries forced=True + forced_reason for audit. Use sparingly — the "
             "normal record-child-return → deactivate-child → record-timeout flow "

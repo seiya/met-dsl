@@ -149,8 +149,7 @@ class Tool:
 
 
 def _write_message(payload: dict[str, Any]) -> None:
-    # Cursor MCP client expects newline-delimited JSON on stdio.
-    # Keep this server compatible with that transport by default.
+    # The MCP stdio transport frames messages as newline-delimited JSON.
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
     sys.stdout.write("\n")
     sys.stdout.flush()

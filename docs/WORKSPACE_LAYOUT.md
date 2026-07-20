@@ -30,7 +30,7 @@ workspace/
 │       ├── phase_state_log.jsonl                  (the chronology of events such as set_status)
 │       │
 │       ├── launches/
-│       │   ├── orchestration.start.prompt.txt     (the prompt run_workflow.py passed to the orchestration agent)
+│       │   ├── orchestration.start.prompt.txt     (startup-parameter carrier written by run_workflow.py; read back on --resume, not an LLM prompt)
 │       │   ├── <agent_run_id>.request.json        (the launch request written by record-launch)
 │       │   ├── <agent_run_id>.response.json       (the launch response written by record-launch)
 │       │   ├── <agent_run_id>.prompt.txt          (the child agent prompt body. 1-to-1 with the leaf launch prompt input; the child is blocked from Reading this file by read_manifest_read_guard)

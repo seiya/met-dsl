@@ -19847,7 +19847,7 @@ class RecordTimeoutTests(unittest.TestCase):
     def test_record_timeout_refuses_when_active_child_marker_still_set(self) -> None:
         """Adv-14 + Adv-16: refuse if backend-neutral per-arid marker
         active_children/<arid>.txt still exists. The orchestration must call
-        deactivate-child first (signaling that the Agent tool actually
+        deactivate-child first (signaling that the child leaf actually
         returned) before record-timeout can run, regardless of backend."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -19869,7 +19869,7 @@ class RecordTimeoutTests(unittest.TestCase):
                 )
 
     def test_record_timeout_refuses_for_codex_backend_when_marker_present(self) -> None:
-        """Adv-16: backend-neutral guard. Codex/Cursor never had the legacy
+        """Adv-16: backend-neutral guard. Codex never had the legacy
         single-file Claude marker, so the per-arid marker is the only
         liveness handshake protecting them from delayed/duplicated timeouts.
         """
