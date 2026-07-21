@@ -9678,6 +9678,7 @@ def _validate_compile_stage_impl(
     _validate_ir_source_refs_tests(repo_root, ir_dir, violations)
     _validate_ir_meta_json(ir_dir, violations)
     _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
+    _validate_component_dep_operations(repo_root, ir_dir, violations)
     _validate_test_predicates(repo_root, ir_dir, violations)
     _validate_case_ids(ir_dir, violations)
     _validate_infrastructure_public_api(repo_root, ir_dir, violations)
@@ -9729,6 +9730,101 @@ def _validate_case_ids(ir_dir: Path, violations: list[str]) -> None:
             "not safe tokens; a case_id is concatenated into the per-case snapshot path "
             "(raw/state_snapshots/<case_id>.json), so it must match [A-Za-z0-9._-] with no '..' "
             "(else the run writes outside its directory)")
+
+
+def _validate_component_dep_operations(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """Deterministic compile gate: every ``component/`` direct dependency must author a
+    NON-EMPTY ``operations`` list (each entry a non-empty string).
+
+    The failure this pins is a closure fail_closed with no repairable signal. The
+    generate-side gate (``_validate_dependency_operation_on_model_files``) requires a
+    component dep's model to ``use <dep>_model`` + ``call <dep>__*`` UNCONDITIONALLY, while
+    the host injects that dependency's published call-site interfaces
+    (``_resolve_dependency_facts``) keyed off the IR's ``operations`` list. When Compile
+    authors ``operations: []`` (an authoring wobble — the 7/19 run authored the real op
+    names, 7/21 authored ``[]``), the injected ``<dependency_facts>`` name no ops, yet the
+    leaf must still emit the calls — so a pure (tool-less) leaf invents symbol names /
+    argument orders that ``Generate.syntax`` rejects every retry until the budget is
+    exhausted. Pinning non-emptiness at Compile catches the wobble at IR-authoring time and
+    routes (via ``classify_compile_static_failure`` -> ``COMPILE_STATIC_FAILURE_ROUTING``)
+    back to ``compile.generate`` for a warm re-author. The host also carries a resume-safe
+    fallback (``_resolve_dependency_facts`` surfaces all ``<dep>__`` subroutines when
+    ``operations`` is empty) so an already-certified wobbly IR still converges; this gate is
+    the forward-looking pin that stops the wobble from being certified in the first place.
+
+    Only ``component/`` deps are gated: an ``infrastructure`` (harness) dep correctly
+    authors ``operations: []`` (the physics leaf never calls the harness API — the
+    host-rendered runner is the sole caller), and ``profile`` / ``problem`` deps are not
+    called through the ``<dep>__*`` operation surface. No-op on a missing / unparseable IR
+    (already flagged upstream) or a node with no component dependency."""
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return
+    try:
+        ir = _read_yaml(derived_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return
+    if not isinstance(ir, dict):
+        return
+    dep = ir.get("dependency")
+    direct_deps = dep.get("direct_deps") if isinstance(dep, dict) else None
+    if not isinstance(direct_deps, list):
+        return
+    for entry in direct_deps:
+        # Resolve the node_key whether the entry is a bare string or a dict. Walk
+        # `direct_deps` directly (NOT `_component_dep_spec_ids`, which drops the entry
+        # shape we must inspect here — bare string vs. dict, and the `operations` field).
+        if isinstance(entry, str):
+            node_key = entry.strip()
+            ops = None
+            ops_present = False
+        elif isinstance(entry, dict):
+            nk = entry.get("node_key")
+            node_key = nk.strip() if isinstance(nk, str) else ""
+            ops = entry.get("operations")
+            ops_present = "operations" in entry
+        else:
+            continue
+        if not node_key.startswith("component/"):
+            continue
+        # EVERY entry must be a non-empty string — a single malformed entry (a non-string or
+        # blank) is enough to fail, not merely "no valid entry exists". A mixed list like
+        # `["dep__op", 3, ""]` is certified-malformed IR: the dependency-facts resolver
+        # silently drops the invalid entries, so certifying them hides an authoring error the
+        # (unambiguous, structural) gate should catch here.
+        ops_is_list = isinstance(ops, list)
+        invalid_ops = (
+            [o for o in ops if not (isinstance(o, str) and o.strip())]
+            if ops_is_list else []
+        )
+        if ops_is_list and ops and not invalid_ops:
+            continue  # non-empty list, every entry a non-empty string
+        if isinstance(entry, str):
+            detail = "is declared as a bare string (no `operations` field)"
+        elif not ops_present:
+            detail = "is missing its `operations` field"
+        elif not ops_is_list:
+            detail = f"has a non-list `operations` ({type(ops).__name__})"
+        elif not ops:
+            detail = "has an empty `operations: []`"
+        elif len(invalid_ops) == len(ops):
+            detail = "has an `operations` list with no valid (non-empty string) entries"
+        else:
+            detail = (
+                f"has `operations` entries that are not non-empty strings ({invalid_ops!r}); "
+                "every entry must name a `<dep_spec_id>__*` subroutine"
+            )
+        violations.append(
+            f"{derived_path}: component dependency {node_key!r} {detail}; a component "
+            "dependency must author a non-empty `operations` list naming the "
+            "`<dep_spec_id>__*` subroutines this node calls. The generate gate requires "
+            "the model to `use <dep>_model` + `call <dep>__*`, and the host injects those "
+            "call-site interfaces from `operations`; an empty list starves the injected "
+            "<dependency_facts> while the calls are still required, so the leaf cannot "
+            "converge (its retry budget exhausts)"
+        )
 
 
 def _validate_harness_dependency_consistency(

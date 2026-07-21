@@ -7761,7 +7761,7 @@ end program shallow_water2d_runner
                 io_contract=self._io_contract_with_predicates(preds),
                 dependency_resolved={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+                    "direct_deps": [{"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0", "kind": "component", "operations": ["dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux"]}],
                     "transitive_deps": [], "topo_level": 1,
                     "all_nodes": [
                         {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
@@ -7804,7 +7804,7 @@ end program shallow_water2d_runner
             io_contract=io_contract,
             dependency_resolved={
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+                "direct_deps": [{"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0", "kind": "component", "operations": ["dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux"]}],
                 "transitive_deps": [],
                 "topo_level": 1,
                 "all_nodes": [
@@ -7890,7 +7890,7 @@ end program shallow_water2d_runner
             },
             dependency_resolved={
                 "node_key": "problem/shallow_water2d@0.3.0",
-                "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+                "direct_deps": [{"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0", "kind": "component", "operations": ["dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux"]}],
                 "transitive_deps": [],
                 "topo_level": 1,
                 "all_nodes": [
@@ -8129,7 +8129,7 @@ end program shallow_water2d_runner
                 run_command=["x", "y"], io_contract=io,
                 dependency_resolved={
                     "node_key": "problem/shallow_water2d@0.3.0",
-                    "direct_deps": ["component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0"],
+                    "direct_deps": [{"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0", "kind": "component", "operations": ["dynamics_shallow_water_flux_2d_rusanov_p0__compute_flux"]}],
                     "transitive_deps": [], "topo_level": 1,
                     "all_nodes": [
                         {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
@@ -13926,6 +13926,135 @@ class HarnessDependencyConsistencyTests(unittest.TestCase):
     def test_missing_target_class(self) -> None:
         v = self._run(hw_class="")
         self.assertTrue(any("cannot derive the expected harness id" in x for x in v), v)
+
+
+class ComponentDepOperationsGateTests(unittest.TestCase):
+    """`_validate_component_dep_operations` (compile stage): a `component/` direct dep must
+    author a non-empty `operations` list. The empty-list wobble otherwise starves the injected
+    `<dependency_facts>` while the generate gate still requires `use`/`call`, leaving the pure
+    leaf no way to converge. Only component deps are gated (infra correctly authors `[]`)."""
+
+    def _run(self, direct_deps: object) -> list[str]:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ir_dir = tmp / "ir"
+            ir_dir.mkdir()
+            ir = {"dependency": {"direct_deps": direct_deps}}
+            (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(ir))
+            violations: list[str] = []
+            vps._validate_component_dep_operations(tmp, ir_dir, violations)
+            return violations
+
+    def _dep(self, **kw) -> dict:
+        d = {"node_key": "component/dep_base@0.1.0", "kind": "component"}
+        d.update(kw)
+        return d
+
+    def test_non_empty_operations_passes(self) -> None:
+        self.assertEqual(self._run([self._dep(operations=["dep_base__scale"])]), [])
+
+    def test_empty_operations_flagged(self) -> None:
+        v = self._run([self._dep(operations=[])])
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("component/dep_base@0.1.0", v[0])
+        self.assertIn("empty `operations: []`", v[0])
+
+    def test_missing_operations_key_flagged(self) -> None:
+        v = self._run([self._dep()])
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("missing its `operations` field", v[0])
+
+    def test_non_list_operations_flagged(self) -> None:
+        v = self._run([self._dep(operations="dep_base__scale")])
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("non-list `operations`", v[0])
+
+    def test_operations_with_no_valid_strings_flagged(self) -> None:
+        v = self._run([self._dep(operations=["", "   ", 3])])
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("no valid", v[0])
+
+    def test_mixed_valid_and_invalid_operations_flagged(self) -> None:
+        # A list with a valid entry alongside a non-string/blank one is still malformed IR —
+        # EVERY entry must be a non-empty string, not merely one of them (Codex P2).
+        v = self._run([self._dep(operations=["dep_base__scale", 3, ""])])
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("not non-empty strings", v[0])
+        self.assertIn("dep_base@0.1.0", v[0])
+        # The offending entries are named; the valid one is not the complaint.
+        self.assertIn("3", v[0])
+
+    def test_bare_string_component_dep_flagged(self) -> None:
+        v = self._run(["component/dep_base@0.1.0"])
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("bare string", v[0])
+
+    def test_infra_dep_ignored(self) -> None:
+        # An infrastructure (harness) dep correctly authors operations: [] — never gated.
+        self.assertEqual(
+            self._run([{"node_key": "infrastructure/harness_fortran_cpu@0.2.0",
+                        "kind": "infrastructure", "operations": []}]), [])
+
+    def test_profile_dep_ignored(self) -> None:
+        # profile/problem deps are not called through the `<dep>__*` operation surface.
+        self.assertEqual(
+            self._run([{"node_key": "profile/some_profile@0.1.0", "operations": []}]), [])
+
+    def test_malformed_direct_deps_no_crash_no_violation(self) -> None:
+        self.assertEqual(self._run("not-a-list"), [])
+        self.assertEqual(self._run([42, None]), [])
+
+    def test_missing_ir_no_crash_no_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ir_dir = tmp / "ir"
+            ir_dir.mkdir()
+            violations: list[str] = []
+            vps._validate_component_dep_operations(tmp, ir_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_multiple_component_deps_each_flagged(self) -> None:
+        v = self._run([
+            {"node_key": "component/a@0.1.0", "kind": "component", "operations": []},
+            {"node_key": "component/b@0.1.0", "kind": "component",
+             "operations": ["b__op"]},
+            {"node_key": "component/c@0.1.0", "kind": "component"},
+        ])
+        self.assertEqual(len(v), 2, v)
+        self.assertTrue(any("component/a@0.1.0" in x for x in v), v)
+        self.assertTrue(any("component/c@0.1.0" in x for x in v), v)
+
+    def test_end_to_end_through_validate_compile_stage(self) -> None:
+        # Wiring: an empty-operations component dep must be rejected THROUGH the full compile
+        # stage (`_validate_component_dep_operations` is called from
+        # `_validate_compile_stage_impl`), not only when invoked directly. Other gates may add
+        # unrelated violations for this minimal tree; the assertion only requires that the
+        # operations violation is present (this is the wiring check, not an isolation check).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id="dynamics_shallow_water_flux_2d_rusanov_p0",
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+                dependency_resolved={
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "direct_deps": [
+                        {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
+                         "kind": "component", "operations": []}],
+                    "transitive_deps": [], "topo_level": 1,
+                    "all_nodes": [
+                        {"node_key": "component/dynamics_shallow_water_flux_2d_rusanov_p0@0.1.0",
+                         "topo_level": 0},
+                        {"node_key": "problem/shallow_water2d@0.3.0", "topo_level": 1}]},
+            )
+            v = validate_compile_stage(
+                repo_root, "workspace",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001")
+            self.assertTrue(
+                any("component dependency" in x and "empty `operations: []`" in x for x in v), v)
 
 
 class CaseIdGrammarGateTests(unittest.TestCase):

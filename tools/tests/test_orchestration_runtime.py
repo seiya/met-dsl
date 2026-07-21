@@ -17969,6 +17969,301 @@ class ResolveDependencyFactsTests(unittest.TestCase):
             self.assertEqual(len(facts), 1)
             self.assertNotIn("published_operations", facts[0])
 
+    # A dep source with two `<dep>__`-prefixed public ops plus a non-prefixed internal helper.
+    # The fallback surfaces the prefixed ops (in source order) and excludes the helper.
+    _MULTI_OP_MODEL = (
+        "module dep_base_model\n"
+        "contains\n"
+        "  subroutine dep_base__scale(x, n, y)\n"
+        "    integer, intent(in) :: n\n"
+        "    real(8), intent(in) :: x(n)\n"
+        "    real(8), intent(out) :: y(n)\n"
+        "  end subroutine dep_base__scale\n"
+        "  subroutine dep_base__shift(a, b)\n"
+        "    real(8), intent(in) :: a\n"
+        "    real(8), intent(out) :: b\n"
+        "  end subroutine dep_base__shift\n"
+        "  subroutine helper_internal(z)\n"
+        "    real(8), intent(inout) :: z\n"
+        "  end subroutine helper_internal\n"
+        "end module dep_base_model\n"
+    )
+
+    def _write_multi_op_pipeline(self, repo_root: Path) -> None:
+        self._write_dep_pipeline(
+            repo_root, "component__dep_base__0.1.0",
+            "p_20260601_002", "bin_20260601_002", "run_20260601_002",
+            source_id="src_20260601_001", spec_id="dep_base",
+            model_text=self._MULTI_OP_MODEL)
+
+    def test_empty_operations_falls_back_to_prefixed_subroutines(self) -> None:
+        # Fix A: `operations: []` (an authoring wobble) → the fallback surfaces EVERY
+        # `<dep_spec_id>__` public subroutine (in source order), excluding non-prefixed
+        # internal helpers, so the pure leaf can build its mandatory `call <dep>__*`.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_multi_op_pipeline(repo_root)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": []}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            pub = facts[0]["published_operations"]
+            self.assertEqual([p["operation"] for p in pub],
+                             ["dep_base__scale", "dep_base__shift"])
+            # The interface / argument order still flow through (fallback reuses the extractor).
+            self.assertEqual(pub[0]["argument_order"], ["x", "n", "y"])
+
+    def test_empty_operations_fallback_surfaces_parenless_op(self) -> None:
+        # The resume-path fallback must recover a component dep whose only published op is a
+        # zero-arg subroutine declared without parens — else <dependency_facts> stays empty and
+        # the fail_closed loop this fallback closes recurs (Codex round-3 P2).
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = (
+                "module dep_base_model\ncontains\n"
+                "  subroutine dep_base__ping\n"
+                "  end subroutine dep_base__ping\n"
+                "end module dep_base_model\n")
+            self._write_dep_pipeline(
+                repo_root, "component__dep_base__0.1.0",
+                "p_20260601_002", "bin_20260601_002", "run_20260601_002",
+                source_id="src_20260601_001", spec_id="dep_base", model_text=model_text)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": []}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            pub = facts[0]["published_operations"]
+            self.assertEqual([p["operation"] for p in pub], ["dep_base__ping"])
+            self.assertEqual(pub[0]["argument_order"], [])
+
+    def test_missing_operations_key_falls_back(self) -> None:
+        # `operations` absent entirely (not just empty) → same fallback.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_multi_op_pipeline(repo_root)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component"}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(
+                [p["operation"] for p in facts[0]["published_operations"]],
+                ["dep_base__scale", "dep_base__shift"])
+
+    def test_empty_operations_fallback_suppressed_for_non_fortran(self) -> None:
+        # A c/cpp/mixed consumer calls via its own ABI, not the Fortran signature: no
+        # fallback interfaces (mirrors the enumerated-ops non-Fortran suppression).
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_multi_op_pipeline(repo_root)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": []}],
+                impl_defaults={"toolchain": {"language": "c"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            self.assertNotIn("published_operations", facts[0])
+
+    def test_empty_operations_fallback_suppressed_for_infra_dep(self) -> None:
+        # An infrastructure (harness) dep never surfaces interfaces to the leaf — the
+        # fallback must NOT resurrect the harness surface (the runner is the sole caller).
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = (
+                "module harness_fortran_cpu_model\ncontains\n"
+                "subroutine harness_fortran_cpu__box(name, json)\n"
+                "  character(len=*), intent(in) :: name, json\n"
+                "end subroutine\nend module\n")
+            self._write_dep_pipeline(
+                repo_root, "infrastructure__harness_fortran_cpu__0.2.0",
+                "harness_20260601_002", "bin_20260601_002", "run_20260601_002",
+                source_id="src_20260601_002", spec_id="harness_fortran_cpu",
+                model_text=model_text)
+            self._write_ir(
+                repo_root, "workspace/ir/component__bx__0.1.0/bx_001",
+                [{"node_key": "infrastructure/harness_fortran_cpu@0.2.0",
+                  "kind": "infrastructure", "operations": []}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__bx__0.1.0/bx_001")
+            self.assertEqual(len(facts), 1)
+            self.assertNotIn("published_operations", facts[0])
+
+    def test_empty_operations_fallback_suppressed_for_profile_dep(self) -> None:
+        # A profile/problem dep authors `operations: []` legitimately and must NOT be called;
+        # the fallback is component-only, so even a profile source carrying `<spec_id>__`
+        # subroutines surfaces no published_operations (else Generate is tempted into an
+        # undeclared call the validator + docs exempt). Codex round-2 P2.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            model_text = (
+                "module some_profile_model\ncontains\n"
+                "subroutine some_profile__foo(a)\n"
+                "  real(8), intent(in) :: a\n"
+                "end subroutine\nend module\n")
+            self._write_dep_pipeline(
+                repo_root, "profile__some_profile__0.1.0",
+                "p_20260601_002", "bin_20260601_002", "run_20260601_002",
+                source_id="src_20260601_001", spec_id="some_profile",
+                model_text=model_text)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "profile/some_profile@0.1.0", "kind": "profile",
+                  "operations": []}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            self.assertEqual(facts[0]["node_key"], "profile/some_profile@0.1.0")
+            self.assertNotIn("published_operations", facts[0])
+
+    def test_non_empty_operations_not_unioned_with_fallback(self) -> None:
+        # Drift guard: when the IR DOES enumerate ops, only that surface is published — the
+        # fallback is empty-list-only, never unioned (IR is the sole carrier).
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_multi_op_pipeline(repo_root)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": ["dep_base__shift"]}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(
+                [p["operation"] for p in facts[0]["published_operations"]],
+                ["dep_base__shift"])
+
+    def test_empty_operations_unresolvable_source_keeps_fact_no_raise(self) -> None:
+        # Fallback path with no certified source → fact still emitted, no published_operations,
+        # never raises.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_dep_pipeline(
+                repo_root, "component__dep_base__0.1.0",
+                "p_20260601_002", "bin_20260601_002", "run_20260601_002")
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": []}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            self.assertNotIn("published_operations", facts[0])
+
+
+class ListPrefixedSubroutinesTests(unittest.TestCase):
+    """_list_prefixed_subroutines returns the distinct, source-ordered names of subroutines
+    whose name begins (case-insensitive) with a prefix; robust to continuations / interface-
+    block re-declarations / prefixes; never raises."""
+
+    def test_selects_prefixed_only_in_source_order(self) -> None:
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        src = (
+            "module m\ncontains\n"
+            "  subroutine dep__two(a)\n  end subroutine\n"
+            "  subroutine other(b)\n  end subroutine\n"
+            "  subroutine dep__one(c)\n  end subroutine\n"
+            "end module\n"
+        )
+        self.assertEqual(
+            _list_prefixed_subroutines(src, "dep__"), ["dep__two", "dep__one"])
+
+    def test_case_insensitive_match(self) -> None:
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        src = "subroutine DEP__Compute(a)\nend subroutine\n"
+        self.assertEqual(
+            _list_prefixed_subroutines(src, "dep__"), ["DEP__Compute"])
+
+    def test_continuation_header(self) -> None:
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        src = (
+            "  subroutine dep__wrapped(a, &\n"
+            "       & b, c)\n"
+            "  end subroutine\n"
+        )
+        self.assertEqual(
+            _list_prefixed_subroutines(src, "dep__"), ["dep__wrapped"])
+
+    def test_interface_block_redeclaration_deduped(self) -> None:
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        src = (
+            "interface\n"
+            "  subroutine dep__op(a)\n  end subroutine\n"
+            "end interface\n"
+            "subroutine dep__op(a)\nend subroutine\n"
+        )
+        self.assertEqual(_list_prefixed_subroutines(src, "dep__"), ["dep__op"])
+
+    def test_pure_and_module_prefixes(self) -> None:
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        src = (
+            "pure subroutine dep__p(a)\nend subroutine\n"
+            "module subroutine dep__m(a)\nend subroutine\n"
+        )
+        self.assertEqual(
+            _list_prefixed_subroutines(src, "dep__"), ["dep__p", "dep__m"])
+
+    def test_parenless_zero_arg_subroutine_surfaced(self) -> None:
+        # A zero-argument subroutine declared without a parameter list must still be
+        # discovered by the fallback (Codex round-3 P2), and a call-site line must NOT match.
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        src = (
+            "subroutine dep__ping\nend subroutine\n"
+            "subroutine dep__go(a)\nend subroutine\n"
+            "call dep__ping()\n"
+        )
+        self.assertEqual(
+            _list_prefixed_subroutines(src, "dep__"), ["dep__ping", "dep__go"])
+
+    def test_semicolon_packed_statements_surfaced(self) -> None:
+        # Fortran allows several statements on one line via `;`; a declaration after a `;`
+        # (e.g. `contains; subroutine dep__ping()`) must still be discovered (Codex round-4 P2).
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        src = (
+            "module m\n"
+            "contains; subroutine dep__ping()\nend subroutine\n"
+            "subroutine dep__go(a); real(8), intent(in) :: a\nend subroutine\n"
+            "end module\n"
+        )
+        self.assertEqual(
+            _list_prefixed_subroutines(src, "dep__"), ["dep__ping", "dep__go"])
+
+    def test_semicolon_inside_string_is_not_a_separator(self) -> None:
+        # A `;` inside a string literal must not split the statement (else a spurious match).
+        from tools.orchestration_runtime import _split_fortran_statements
+        self.assertEqual(
+            _split_fortran_statements("write(*,*) 'a;b'; x = 1"),
+            ["write(*,*) 'a;b'", "x = 1"])
+        self.assertEqual(_split_fortran_statements("just one statement"),
+                         ["just one statement"])
+        self.assertEqual(_split_fortran_statements("   "), [])
+
+    def test_garbage_and_empty_prefix_return_empty(self) -> None:
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        self.assertEqual(_list_prefixed_subroutines("not fortran at all", "dep__"), [])
+        self.assertEqual(_list_prefixed_subroutines(None, "dep__"), [])  # type: ignore[arg-type]
+        self.assertEqual(_list_prefixed_subroutines("subroutine dep__x(a)\n", ""), [])
+
 
 class CertifiedModelSourceTests(unittest.TestCase):
     """_certified_model_source binds to the CERTIFIED binary's source_source_id (the exact
@@ -18025,6 +18320,19 @@ class ExtractSubroutineInterfaceTests(unittest.TestCase):
             {"interface": "subroutine foo__bar(a, b, c)",
              "argument_order": ["a", "b", "c"],
              "arguments": self._unknown("a", "b", "c")})
+
+    def test_zero_arg_subroutine_without_parens(self) -> None:
+        # A zero-argument subroutine may be declared without a parameter list (legal Fortran);
+        # the extractor returns an empty argument_order rather than None (Codex round-3 P2).
+        from tools.orchestration_runtime import _extract_subroutine_interface
+        self.assertEqual(
+            _extract_subroutine_interface("subroutine foo__ping\nend subroutine\n", "foo__ping"),
+            {"interface": "subroutine foo__ping", "argument_order": [], "arguments": []})
+        # prefix preserved; trailing space trimmed
+        self.assertEqual(
+            _extract_subroutine_interface(
+                "pure subroutine foo__reset  \nend subroutine\n", "foo__reset")["interface"],
+            "pure subroutine foo__reset")
 
     def test_continuation_and_comments(self) -> None:
         from tools.orchestration_runtime import _extract_subroutine_interface
@@ -26892,7 +27200,13 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Generate.static, but Generate.generate is walled off from controlled_spec, so — like the
         # signatures — the IR is the leaf's only carrier of the values; a Compile-failing rule that
         # must live in the force-read schema doc.
-        "docs/workflow/phases/phase_01_compile.md": 37600,
+        # Bumped 37600->39600: V4c splits into V4c-i (component `operations` non-empty — a new
+        # deterministic Compile gate `_validate_component_dep_operations`) and V4c-ii (operations
+        # ⊆ published, still LLM-verified), the IR template + authoring bullet gain the non-empty
+        # obligation, and the Verification-tools list gains the gate. Fixes the closure fail_closed
+        # where an empty `operations` starved the injected <dependency_facts> while the Generate
+        # gate still required use/call — a Compile-failing rule that must live in the force-read doc.
+        "docs/workflow/phases/phase_01_compile.md": 39600,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the

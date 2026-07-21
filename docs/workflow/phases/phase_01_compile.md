@@ -166,7 +166,9 @@ dependency:
   direct_deps:
     - node_key: "<spec_kind>/<spec_id>@<spec_version>"
       kind: "<component|profile|problem|infrastructure>"
-      operations: ["<operation_id>", ...]
+      operations: ["<operation_id>", ...]   # `component/` dep: non-empty (each called `<dep_spec_id>__*` op),
+                                             #   pinned by gate _validate_component_dep_operations (V4c-i).
+                                             #   `infrastructure` dep: `[]` (leaf never calls the harness API).
 
 public_api:
   # infrastructure nodes ONLY (spec_kind: infrastructure); OMIT for component/profile/problem.
@@ -229,7 +231,7 @@ Only `boundary_apply` / `reconstruct` / `flux_compute` / `source_term` / `time_i
 
 ### 1-1. Compile.generate substep
 - Read the physics algorithm (A) of the `Controlled Spec`, deterministically expand the input conditions and `sweep` / `refinement` from `tests.md`, and generate the 5 sections `case` / `algorithm` / `impl_defaults` / `io_contract` / `dependency` of `spec.ir.yaml`. For an `infrastructure` node additionally author the `public_api` section — the COMPLETE published surface controlled_spec §5 declares (every `operation_id`, incl. helper emitters/writers no test exercises directly, plus every published derived type) AND `public_api.signatures` (each `{symbol, signature}`) copying the §5.1 structured signatures AND `public_api.module_parameters` (each `{name, base?, value}`) copying the §5.1 module_parameters value-included; the gate pins names == §5, `signatures` == §5.1, and `module_parameters` == §5.1 by value (V8).
-- Author `dependency.node_key` and `dependency.direct_deps[]` (each with `kind` + `operations`) — the directly-read dependencies from `deps.yaml`. Do NOT author `transitive_deps` / `all_nodes`: the conductor derives that closure/topo graph host-side into `<ir_ref>/dependency_graph.json` (a pure function of `deps.yaml` + `spec_catalog.yaml`).
+- Author `dependency.node_key` and `dependency.direct_deps[]` (each with `kind` + `operations`) — the directly-read dependencies from `deps.yaml`. A `component/` dep's `operations` MUST be non-empty (every `<dep_spec_id>__*` subroutine this node calls) — pinned by the deterministic gate `_validate_component_dep_operations` (V4c-i, below); an `infrastructure` dep authors `operations: []`. Do NOT author `transitive_deps` / `all_nodes`: the conductor derives that closure/topo graph host-side into `<ir_ref>/dependency_graph.json` (a pure function of `deps.yaml` + `spec_catalog.yaml`).
 - The default values of `impl_defaults` follow the rules of `IMPL_PLAN_SPEC.md` (existing). Considering variant exploration in the Tune optional flow, express the knob set of `abstract` / `backend_overrides` in the IR.
 - When the intent of `controlled_spec.md` does not fit the schema during generation, do not extend the schema; instead treat it as `Compile fail`, record "IR schema insufficiency" in `last_fail_reason`, and stop. For schema extension, separately update the `spec.ir.yaml` schema design by hand, then retry.
 
@@ -266,11 +268,19 @@ The required invariant set for the self-check (finalized as a **minimal set**):
 The derived-closure invariants (former V4a `direct∪transitive == all_nodes`, V4b
 `expected_node_set == all_nodes`, and topo ordering) are now **correct-by-construction** — the
 conductor authors the closure/topo graph into the sidecar and the `--stage compile` gate
-cross-checks the IR's `direct_deps` against it (see below); the LLM no longer verifies them. The
-one remaining LLM-verified invariant:
-- **V4c (operations ⊆ published)**: each `direct_deps[].operations` is in the published
-  `operation_id` set of the dependency `node` (from the dependency IR if generated, else
-  `spec_catalog.yaml`). `operations` is semantic with no host data source, so it stays LLM-verified.
+cross-checks the IR's `direct_deps` against it (see below). The remaining `operations` invariants:
+- **V4c-i (component `operations` non-empty) — deterministic Compile gate.** Every `component/`
+  `direct_deps[]` entry authors a non-empty `operations` list (each a non-empty string). Emptiness
+  is an *unambiguous structural* fact, so it is pinned by `_validate_component_dep_operations` (a
+  `compile_static_violation` routed to `Compile.generate`), NOT left to the LLM: an empty list
+  starves the host-injected `<dependency_facts>` while the Generate-side gate unconditionally
+  requires the `use`/`call`, so a `pure` leaf cannot converge (retry budget exhausts). `infrastructure`
+  / `profile` / `problem` deps are out of scope (an infra dep correctly authors `[]`).
+- **V4c-ii (operations ⊆ published) — LLM-verified.** Each `direct_deps[].operations` is in the
+  published `operation_id` set of the dependency `node` (from the dependency IR if generated, else
+  `spec_catalog.yaml`). Set-*membership* has no reliable host data source — a component dep IR
+  carries no `public_api`, and its certified source drifts on regeneration (a once-valid op name
+  would be false-rejected) — so it stays LLM-verified, not a deterministic gate.
 
 #### V5. impl_defaults consistency
 - The combination of `impl_defaults.toolchain.language` and `impl_defaults.toolchain.build_system` is consistent with the default-value rules of `IMPL_PLAN_SPEC.md`.
@@ -286,6 +296,7 @@ These deterministic gates run in the conductor's `Compile.static` substep (`_com
 - Syntax validity via `python3 tools/check_artifact_syntax.py --expect-top object <ir_ref>/spec.ir.yaml <ir_ref>/ir_meta.json`; on `fail` it is a `Compile fail` (routed to `Compile.generate`).
 - `python3 tools/validate_pipeline_semantics.py --stage compile --ir-ref workspace/ir/<node_key_safe>/<ir_id>/`, with `exit code 0` required. The result is recorded in `compile_static_meta.json`; on `fail` the substep fails before `Compile.verify` runs, so `verification_status=pass` is never reached on a structurally-invalid IR. (The `--stage compile` validator checks the internal-consistency / shape-grammar invariants; the spec-cross-reference invariants are the `Compile.verify` LLM responsibility — see the substep structure note.)
   - **dependency direct_deps consistency** (`_validate_compile_dependency_consistency`): the IR's `dependency.direct_deps` (`(kind, spec_id)` set, version-agnostic) must equal `{all_nodes} − {self} − {transitive}` from the `dependency_graph.json` sidecar. A mismatch is a `Compile fail` routed to `Compile.generate`. Version drift is soft (gfortran backstop). Closes the former V4a/V4b gap.
+  - **component dependency operations non-empty** (`_validate_component_dep_operations`, V4c-i): every `component/` `direct_deps[]` entry carries a non-empty `operations` list in which **every** entry is a non-empty string (a bare-string entry, a missing/non-list/empty `operations`, or a list containing **any** non-string/blank entry — even alongside valid ones — all fail); a violation is a `Compile fail` routed to `Compile.generate`. Rationale + the resume-safe host fallback are under V4c-i above. `infrastructure` / `profile` / `problem` deps are out of scope.
   - **infrastructure public_api surface** (`_validate_infrastructure_public_api`, infra nodes only): `public_api.published_operations`/`published_types` must equal the controlled_spec §5 surface, and `public_api.signatures`/`public_api.module_parameters` must equal the §5.1 canonical interface block (signatures by rendered stanza, module_parameters by value). A missing controlled_spec ref, a §5 parsing to zero ops, an absent `public_api`, or a set/value mismatch is a `Compile fail` to `Compile.generate` (V8).
   - **harness render preconditions** (`_validate_harness_render_preconditions`, M3c physics nodes only — `make` + `fortran` with exactly one `infrastructure` dependency): the node's `<spec_id>_runner.f90` is host-rendered from this IR alone, so IR *content* the renderer cannot render is caught here instead of at the render backstop (which terminates the workflow rather than retrying). The gate delegates to `tools/runner_renderer.ir_content_violations`, which invokes `render_runner` itself, so it cannot drift. Each violation is a `Compile fail` routed to `Compile.generate`:
     - `raw_requirements.required_evidence` holds a `state_snapshots` entry with a non-empty `schema.variables[]`, and its `schema.time_variable` is `t` (the harness's fixed snapshot-time key);

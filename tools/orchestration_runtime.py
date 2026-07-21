@@ -1265,12 +1265,125 @@ def _certified_model_source(pipe_dir: Path, spec_id: str) -> Path | None:
 
 
 # `subroutine` header opener: optional prefixes (pure / elemental / recursive / impure /
-# module), then `subroutine <name>(`. Case-insensitive, name captured for selection.
+# module), then `subroutine <name>` with an OPTIONAL `(` — a zero-argument subroutine is
+# legally declared without a parameter list (`subroutine dep__ping`), and the fallback must
+# still discover it. `lparen` is captured so the extractor can distinguish the two forms.
+# Case-insensitive, name captured for selection. `.match` anchors at the logical-line start,
+# so only declaration lines match (a `call`/`end subroutine` line starts with another token).
 _FORTRAN_SUBROUTINE_RE = re.compile(
     r"(?:(?:pure|impure|elemental|recursive|module)\s+)*"
-    r"subroutine\s+(?P<name>[A-Za-z]\w*)\s*\(",
+    r"subroutine\s+(?P<name>[A-Za-z]\w*)\s*(?P<lparen>\()?",
     re.IGNORECASE,
 )
+
+
+def _split_fortran_statements(logical_line: str) -> list[str]:
+    """Split one comment-stripped, continuation-joined Fortran logical line into its
+    individual statements at top-level ``;`` separators — a ``;`` inside a ``'``/``"`` string
+    literal is NOT a separator. Returns stripped, non-empty statements (``[]`` for blank).
+    Fortran permits several statements on one line (``contains; subroutine foo()``); scanning
+    at the statement level, not the raw line, keeps the declaration discovery robust to that
+    form. NEVER raises. For the common one-statement-per-line source this returns the single
+    stripped line unchanged."""
+    try:
+        if not isinstance(logical_line, str):
+            return []
+        out: list[str] = []
+        quote: str | None = None
+        start = 0
+        for i, ch in enumerate(logical_line):
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch == ";":
+                seg = logical_line[start:i].strip()
+                if seg:
+                    out.append(seg)
+                start = i + 1
+        seg = logical_line[start:].strip()
+        if seg:
+            out.append(seg)
+        return out
+    except Exception:
+        return []
+
+
+def _fortran_logical_lines(source_text: str) -> list[str]:
+    """Collapse Fortran ``source_text`` into logical STATEMENTS: strip ``!`` comments,
+    join ``&`` continuations, split each joined line at top-level ``;`` separators
+    (``_split_fortran_statements``), and drop lines that are blank / comment-only.
+
+    A trailing ``&`` continues onto the next non-comment line; a leading ``&`` on the
+    continuation is dropped. A line that is blank or comment-only after the strip is
+    skipped WHETHER OR NOT a continuation is in progress — a full-line comment is
+    permitted between continuation lines and must not flush the buffer (otherwise a
+    wrapped header ``(...)`` would terminate early). Semicolon-packed statements
+    (``contains; subroutine foo()``) are separated so a declaration after a ``;`` is still
+    seen. NEVER raises (``[]`` on non-str / error). Shared by
+    ``_extract_subroutine_interface`` and ``_list_prefixed_subroutines`` so both see the
+    identical statement view. For one-statement-per-line source the result is unchanged
+    from a plain strip+join.
+    """
+    try:
+        if not isinstance(source_text, str):
+            return []
+        logical: list[str] = []
+        buf = ""
+        for raw in source_text.splitlines():
+            code = _strip_fortran_comment(raw)
+            if not code.strip():
+                continue
+            stripped = code.strip()
+            piece = stripped[1:].lstrip() if (buf and stripped.startswith("&")) else stripped
+            if piece.endswith("&"):
+                buf += piece[:-1].rstrip() + " "
+                continue
+            buf += piece
+            logical.extend(_split_fortran_statements(buf))
+            buf = ""
+        logical.extend(_split_fortran_statements(buf))
+        return logical
+    except Exception:
+        return []
+
+
+def _list_prefixed_subroutines(source_text: str, prefix: str) -> list[str]:
+    """Return, in first-appearance order, the distinct ``subroutine`` names in
+    ``source_text`` whose name begins (case-insensitive) with ``prefix``.
+
+    Used as the FALLBACK dependency-interface surface when the IR authors an empty
+    ``operations`` list for a component dependency (an authoring wobble): the certified
+    dependency source is the authority on which ``<dep_spec_id>__`` entry points exist. The
+    ``<dep_spec_id>__`` prefix IS the published-surface convention (this selects by prefix,
+    not by a Fortran ``private``/``public`` attribute — same as the pre-existing extractor),
+    so surfacing them all lets the pure leaf build its ``call``s against real symbol names /
+    argument orders instead of inventing ones ``Generate.syntax`` rejects. Surfacing an extra
+    interface fact never forces a call, so an over-broad match is orientation-only, not a gate.
+    De-duplicates repeat declarations (a subroutine also declared in an ``interface``
+    block appears twice). NEVER raises (``[]`` on any error)."""
+    try:
+        if not isinstance(prefix, str) or not prefix:
+            return []
+        pfx = prefix.lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in _fortran_logical_lines(source_text):
+            m = _FORTRAN_SUBROUTINE_RE.match(line)
+            if m is None:
+                continue
+            name = m.group("name")
+            if not name.lower().startswith(pfx):
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+        return out
+    except Exception:
+        return []
 
 
 def _extract_subroutine_interface(source_text: str, op_name: str) -> dict[str, Any] | None:
@@ -1285,41 +1398,31 @@ def _extract_subroutine_interface(source_text: str, op_name: str) -> dict[str, A
     Robust to the real shapes Generate emits: free-form ``&`` continuations on the header
     (the generate SKILL forces wrapping at <=100 cols for fortitude S001), ``!`` comments
     (incl. full-line comment between continuations), case-insensitivity, leading
-    ``pure``/``impure``/``elemental``/``recursive``/``module`` prefixes, and several
-    subroutines in one file (selects by name, not the first). NEVER raises.
+    ``pure``/``impure``/``elemental``/``recursive``/``module`` prefixes, several subroutines
+    in one file (selects by name, not the first), and a zero-argument subroutine declared
+    WITHOUT a parameter list (``subroutine dep__ping`` -> ``argument_order: []``). NEVER raises.
     """
     try:
         if not isinstance(source_text, str) or not op_name:
             return None
         # 1) Strip `!` comments line-by-line, then join `&` continuations into logical
-        #    lines so a wrapped header `(...)` parses as one unit. A trailing `&` continues
-        #    onto the next non-comment line; a leading `&` on the continuation is dropped.
-        #    A line that is blank or comment-only after the strip carries no statement text
-        #    and is skipped WHETHER OR NOT a continuation is in progress — a full-line
-        #    comment is permitted between continuation lines and must not flush the buffer
-        #    (otherwise the wrapped header would terminate early and fail to parse).
-        logical: list[str] = []
-        buf = ""
-        for raw in source_text.splitlines():
-            code = _strip_fortran_comment(raw)
-            if not code.strip():
-                continue
-            stripped = code.strip()
-            piece = stripped[1:].lstrip() if (buf and stripped.startswith("&")) else stripped
-            if piece.endswith("&"):
-                buf += piece[:-1].rstrip() + " "
-                continue
-            buf += piece
-            if buf.strip():
-                logical.append(buf.strip())
-            buf = ""
-        if buf.strip():
-            logical.append(buf.strip())
+        #    lines so a wrapped header `(...)` parses as one unit (see
+        #    `_fortran_logical_lines` for the continuation rules).
+        logical = _fortran_logical_lines(source_text)
         # 2) Find the `subroutine <op_name>(...)` header among possibly several.
         for idx, line in enumerate(logical):
             m = _FORTRAN_SUBROUTINE_RE.match(line)
             if m is None or m.group("name").lower() != op_name.lower():
                 continue
+            if m.group("lparen") is None:
+                # Zero-argument subroutine declared WITHOUT a parameter list
+                # (`subroutine dep__ping`, legal Fortran). No argument order to pin — a
+                # `call <name>` / `call <name>()` needs none. Emit the header verbatim.
+                return {
+                    "interface": line[: m.end()].rstrip(),
+                    "argument_order": [],
+                    "arguments": [],
+                }
             open_idx = line.index("(", m.end() - 1)
             depth = 0
             close_idx = None
@@ -1720,6 +1823,19 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, An
     ``published_operations`` and keeps its pipeline/run/verdict fact. Non-Fortran consumers
     (c/cpp/mixed call via their own ABI, not the Fortran signature) get no interfaces.
 
+    FALLBACK: when a (Fortran) ``component/`` dep's ``operations`` is empty / absent — an IR
+    authoring wobble the ``_validate_component_dep_operations`` compile gate is meant to
+    catch, but which a resume can still step over on an already-certified IR — the
+    interfaces of ALL ``<dep_spec_id>__``-prefixed public subroutines in the certified
+    source are surfaced instead. Scoped to ``component/`` deps: a ``profile``/``problem`` dep
+    authors ``operations: []`` legitimately and must not be called, so its prefixed
+    subroutines are never surfaced (matching the ``_validate_component_dep_operations`` scope). Without this, the ``use``/``call`` the generate-side gate
+    unconditionally requires for a component dep has no facts to build against, and the
+    pure (tool-less) leaf must invent symbol names / argument orders that ``Generate.syntax``
+    rejects every retry — the closure fail_closed this fallback closes. The fallback is
+    empty-list-only: when the IR DOES enumerate operations, only that enumerated surface is
+    injected (IR is the sole carrier; never union in the fallback set).
+
     The dependency ``@version`` is taken from the IR ``direct_deps[].node_key`` (a well-
     formed IR pins the resolved version, consistent with how readiness resolves it from
     ``deps.yaml`` + catalog). Because this output only orients the leaf's semantic review
@@ -1808,13 +1924,16 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, An
             # host-rendered runner is the sole caller), so surfacing the harness surface
             # would only tempt a `use harness_*` the checks/model contract forbids. Skip it
             # (the IR also authors `operations: []` for an infra dep, so `ops` is empty).
-            is_infra_dep = node_key.split("/", 1)[0].strip() == "infrastructure"
+            dep_kind = node_key.split("/", 1)[0].strip()
+            is_infra_dep = dep_kind == "infrastructure"
+            is_component_dep = dep_kind == "component"
             ops = entry.get("operations") if isinstance(entry, dict) else None
-            if consumer_is_fortran and not is_infra_dep and isinstance(ops, list) and ops:
+            if consumer_is_fortran and not is_infra_dep:
                 try:
                     dep_spec_id = _parse_node_key_strict(node_key)[1]
                     model_src = _certified_model_source(pipe_dir, dep_spec_id)
                 except Exception:
+                    dep_spec_id = None
                     model_src = None
                 if model_src is not None:
                     try:
@@ -1822,13 +1941,31 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, An
                     except Exception:
                         source_text = None
                     if source_text is not None:
+                        op_names = (
+                            [op.strip() for op in ops if isinstance(op, str) and op.strip()]
+                            if isinstance(ops, list) else []
+                        )
+                        # FALLBACK (empty-list-only, COMPONENT deps only): the IR authored no
+                        # operations for this component dep. Surface every `<dep_spec_id>__`
+                        # subroutine from the certified source so the leaf's mandatory
+                        # `call <dep>__*` has a real interface to build against. When ops IS
+                        # enumerated, only that surface is used — never unioned (IR is the sole
+                        # carrier). Scoped to `component/` deps because the empty-ops fail_closed
+                        # loop this closes is driven by the component-only generate gate
+                        # (`_validate_dependency_operation_on_model_files`); a profile/problem
+                        # dep authors `operations: []` legitimately and must NOT be called (the
+                        # validator + docs exempt it), so surfacing its prefixed subroutines
+                        # would tempt Generate into an undeclared call. See
+                        # `_validate_component_dep_operations`.
+                        if not op_names and is_component_dep and dep_spec_id:
+                            op_names = _list_prefixed_subroutines(
+                                source_text, f"{dep_spec_id}__"
+                            )
                         published: list[dict[str, Any]] = []
-                        for op in ops:
-                            if not isinstance(op, str) or not op.strip():
-                                continue
-                            iface = _extract_subroutine_interface(source_text, op.strip())
+                        for op in op_names:
+                            iface = _extract_subroutine_interface(source_text, op)
                             if iface is not None:
-                                published.append({"operation": op.strip(), **iface})
+                                published.append({"operation": op, **iface})
                         if published:
                             fact["published_operations"] = published
             facts.append(fact)
