@@ -26886,7 +26886,13 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # V2 gains the IR self-sufficiency obligation (a non-dependency operation_ref must lower its
         # defining math — the removal trigger for the pure leaf's controlled_spec carve-out). Both
         # are Compile-failing rules, so they must live in the force-read canonical schema doc.
-        "docs/workflow/phases/phase_01_compile.md": 36100,
+        # Bumped 36100->37600: V8 gains the `public_api.module_parameters` pin (== §5.1 by value —
+        # dp / case_id_len), the IR template gains the block, and substep 1-1 gains its authoring
+        # obligation. The §5.1 module parameters are value-pinned against the generated source at
+        # Generate.static, but Generate.generate is walled off from controlled_spec, so — like the
+        # signatures — the IR is the leaf's only carrier of the values; a Compile-failing rule that
+        # must live in the force-read schema doc.
+        "docs/workflow/phases/phase_01_compile.md": 37600,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -26933,7 +26939,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # must lower its defining math + forbidden forms — the pure-leaf controlled_spec carve-out
         # removal trigger). This leaf authors the predicates and the algorithm section and does not
         # read the validator, so both Compile-failing rules must be here.
-        "skills/workflow-compile-generate/SKILL.md": 21500,
+        # Bumped 21500->22200: the public_api bullet gains the `module_parameters` obligation (copy
+        # §5.1's list value-included; the gate pins it == §5.1 by value). This leaf authors public_api
+        # and does not read the validator, and Generate.generate is walled off from controlled_spec, so
+        # the IR is the leaf's only carrier of the dp/case_id_len values — a Compile-failing rule.
+        "skills/workflow-compile-generate/SKILL.md": 22200,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
@@ -27021,7 +27031,10 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # The stage-meta contract gate now terminalizes a missing key / a dict last_fail_reason
         # as `generate_fail_meta_schema`, so the producer must be told the same contract its
         # verify twin is told. E2E #4 (orch_20260712T014005Z_e02a2d4d).
-        "skills/workflow-generate-generate/SKILL.md": 35200,
+        # Bumped 35200->35500: the module-parameter declarations are now IR-driven — each
+        # `public_api.module_parameters[]` entry rendered `integer, parameter :: <name> = <value>`
+        # (values from the IR, Generate.static value-pins them) instead of the hardcoded dp/case_id_len.
+        "skills/workflow-generate-generate/SKILL.md": 35500,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare

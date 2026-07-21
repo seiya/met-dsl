@@ -5128,11 +5128,13 @@ def _section51_fence_body(controlled_spec_path: Path) -> tuple[str | None, str |
     return (blocks[0], None)
 
 
-def _section51_parameter_lines(controlled_spec_path: Path) -> list[str]:
-    """The §5.1 module-level ``parameter`` declaration lines (e.g. ``integer, parameter :: dp =
-    real64``). These are part of the published ABI a consuming node sees; the Fortran-language
-    backend renders them from the structured block's ``module_parameters`` so they can be pinned
-    (by value) against the generated source in the language the source is written in."""
+def _section51_module_parameters(controlled_spec_path: Path) -> list[dict]:
+    """The §5.1 structured ``module_parameters`` entries (each ``{name, base?, value}``). These are
+    part of the published ABI a consuming node sees. Returns the well-formed entries (both ``name``
+    and ``value`` present); a missing subsection / fence / non-YAML block yields ``[]`` (fail-closed
+    at the calling gate, which flags a §5.1 that cannot be parsed). Used both to render the Fortran
+    declaration lines for the Generate.static source pin and to pin the IR's ``public_api.
+    module_parameters`` at Compile."""
     from tools.lang_backend_fortran import load_structured_signatures
 
     body, err = _section51_fence_body(controlled_spec_path)
@@ -5142,9 +5144,20 @@ def _section51_parameter_lines(controlled_spec_path: Path) -> list[str]:
     if perr:
         return []
     return [
-        f"integer, parameter :: {mp['name']} = {mp['value']}"
+        mp
         for mp in struct.get("module_parameters", [])
         if isinstance(mp, dict) and mp.get("name") is not None and mp.get("value") is not None
+    ]
+
+
+def _section51_parameter_lines(controlled_spec_path: Path) -> list[str]:
+    """The §5.1 module-level ``parameter`` declaration lines (e.g. ``integer, parameter :: dp =
+    real64``). These are part of the published ABI a consuming node sees; the Fortran-language
+    backend renders them from the structured block's ``module_parameters`` so they can be pinned
+    (by value) against the generated source in the language the source is written in."""
+    return [
+        f"integer, parameter :: {mp['name']} = {mp['value']}"
+        for mp in _section51_module_parameters(controlled_spec_path)
     ]
 
 
@@ -9866,7 +9879,10 @@ def _validate_infrastructure_public_api(
     resolved via ``meta.source_refs.controlled_spec`` and its §5 parsed with
     ``_parse_public_api_from_controlled_spec``; the IR's
     ``public_api.published_operations[].operation_id`` set must equal the §5 operation set
-    and ``public_api.published_types`` must equal the §5 derived-type set. Fail-closed
+    and ``public_api.published_types`` must equal the §5 derived-type set. The IR's
+    ``public_api.signatures`` and ``public_api.module_parameters`` are additionally pinned == the
+    §5.1 canonical interface block (the leaf's only carrier of the signature bodies and the
+    module-parameter values, since Generate.generate is walled off from controlled_spec). Fail-closed
     (never a silent no-op): a missing/unresolvable controlled_spec ref, a §5 parsing to zero
     operations, or an absent ``public_api`` block is itself a violation.
 
@@ -9975,10 +9991,11 @@ def _validate_infrastructure_public_api(
 
     # §5.1 canonical interface block: cross-check its signature set against §5's name lists so
     # the two halves of the spec (prose surface + machine-readable signatures) cannot drift, and
-    # pin the IR's public_api.signatures == §5.1 so the Generate.generate leaf — which is walled
-    # off from controlled_spec.md (phase_02 §2-1) — carries the exact signatures to publish in
-    # its IR. The signature bodies are pinned against the GENERATED source separately by the
-    # Generate.static gate (_validate_infrastructure_generated_signatures).
+    # pin the IR's public_api.signatures AND public_api.module_parameters == §5.1 so the
+    # Generate.generate leaf — which is walled off from controlled_spec.md (phase_02 §2-1) —
+    # carries the exact signatures and module-parameter values to publish in its IR. The signature
+    # bodies and the parameter declarations are pinned against the GENERATED source separately by
+    # the Generate.static gate (_validate_infrastructure_generated_signatures).
     op_stanzas, type_stanzas, iface_err = _parse_canonical_interface_from_controlled_spec(cs_path)
     if iface_err:
         violations.append(
@@ -10007,6 +10024,13 @@ def _validate_infrastructure_public_api(
     # IR public_api.signatures == §5.1 (the leaf's only source of the signatures to publish).
     _validate_ir_signatures_against_section51(
         derived_path, public_api, op_stanzas, type_stanzas, violations)
+
+    # IR public_api.module_parameters == §5.1 module_parameters (value-pinned). The Generate.static
+    # gate pins these declarations (name AND value) against the GENERATED source, but the
+    # Generate.generate leaf is walled off from controlled_spec.md — so, like the signatures, the IR
+    # is the only carrier that gets the values (dp / case_id_len) to the leaf. Pin them here.
+    _validate_ir_module_parameters_against_section51(
+        derived_path, public_api, cs_path, violations)
 
 
 def _split_top_level_commas(text: str) -> list[str]:
@@ -10182,6 +10206,130 @@ def _validate_ir_signatures_against_section51(
                 "§5.1 (argument name/type/rank/intent/result or component-layout/order drift)")
 
 
+def _validate_ir_module_parameters_against_section51(
+    derived_path: Path,
+    public_api: dict[str, Any],
+    cs_path: Path,
+    violations: list[str],
+) -> None:
+    """Pin the IR's ``public_api.module_parameters`` == the controlled_spec §5.1 module-level
+    parameters (``dp = real64`` / ``case_id_len = 64``), by name AND value. These are part of the
+    published ABI, and the Generate.static gate value-pins them against the GENERATED source — but
+    the Generate.generate leaf is walled off from controlled_spec.md (phase_02 §2-1), so the IR is
+    the only carrier that gets the values to the leaf. A drop / extra / value drift here becomes a
+    drift (or a fail-closed Generate.static miss) in the generated model, so it is a Compile fail to
+    Compile.generate.
+
+    Validation (fail-closed): each §5.1 entry is ``{name, base?, value}``. Names are compared
+    case-insensitively (Fortran identifiers are), so ``dp``/``DP`` are the same parameter. A §5.1
+    that declares the same module-parameter name twice (even case-only) is itself a violation (it
+    cannot be pinned coherently, and the un-deduped Generate.static source pin would demand
+    contradictory declarations). If §5.1 declares zero module parameters, an absent IR
+    ``module_parameters`` key passes; otherwise it is a violation.
+    A present-but-non-list key fail-closes (mirrors ``load_structured_signatures``' present-but-null
+    rule). Each IR entry must be a well-formed module parameter (``_validate_module_parameter``);
+    a duplicate name, an omitted §5.1 name, an extra name, or a value drift is a violation. Values
+    compare whitespace-and-case-insensitively (all whitespace removed, then case-folded — matching
+    the Generate.static source pin), so YAML int ``64`` == string ``"64"``, ``real64`` == ``REAL64``,
+    and ``selected_real_kind(15, 307)`` == ``SELECTED_REAL_KIND(15,307)``; ``base`` is not compared
+    (the validator constrains it to integer/absent and the renderer fixes it)."""
+    from tools.lang_backend_fortran import SignatureParseError, _validate_module_parameter
+
+    def _norm(value: Any) -> str:
+        # Remove ALL whitespace (not just surrounding) and case-fold, matching the Generate.static
+        # source pin (_stanza_atoms strips every space), so a schema-valid expression value like
+        # `selected_real_kind(15, 307)` compares equal to the equivalent `SELECTED_REAL_KIND(15,307)`
+        # — Fortran ignores that internal whitespace and the source pin does too, so the Compile pin
+        # must not false-reject an IR that renders to the identical declaration. Case/whitespace
+        # folding is SOUND here because `_require_parameter_value` forbids character literals (a
+        # quote), the only values whose meaning that folding would change (`iachar('A')` vs `('a')`).
+        return "".join(str(value).split()).lower()
+
+    def _norm_name(name: str) -> str:
+        # Fortran identifiers are case-insensitive, so `dp` and `DP` are the SAME module parameter.
+        # Compare and dedupe on the case-folded name so a case-only "duplicate" (§5.1 declaring both
+        # `dp` and `DP` with diverging values) cannot slip a contradictory declaration past this gate
+        # into an unsatisfiable Generate.static pin, and a case-only §5.1↔IR name variant is not a
+        # false drift.
+        return name.strip().lower()
+
+    # Build the §5.1 name->value map (keyed by case-folded name), but FAIL CLOSED on a duplicate name
+    # rather than collapsing it (a plain dict comprehension keeps the last value). A repeated §5.1
+    # module parameter cannot be pinned coherently: an identical duplicate would be accepted against a
+    # single IR/source declaration, and a differing duplicate (`dp = real64` and `dp = real32`, or the
+    # case-only `dp`/`DP`) would pass this map yet require BOTH contradictory `integer, parameter`
+    # lines in the source at Generate.static (which renders the full list, un-deduped) — an
+    # unsatisfiable contract that wedges Generate. Catch it here at Compile with a clear message.
+    spec_params: dict[str, Any] = {}
+    spec_dupe_names: list[str] = []
+    for mp in _section51_module_parameters(cs_path):
+        name = _norm_name(mp["name"])
+        if name in spec_params:
+            spec_dupe_names.append(name)
+        else:
+            spec_params[name] = mp["value"]
+    for name in sorted(set(spec_dupe_names)):
+        violations.append(
+            f"{cs_path}: §5.1 declares module parameter '{name}' more than once (case-insensitively) "
+            "— each module parameter must be declared once (a duplicate collapses the value pin and "
+            "can require contradictory declarations in the generated source at Generate.static)")
+    if spec_dupe_names:
+        return
+
+    if "module_parameters" not in public_api:
+        if spec_params:
+            violations.append(
+                f"{derived_path}:public_api.module_parameters missing — an infrastructure node must "
+                "transcribe every controlled_spec §5.1 module-level parameter (each {name, base?, "
+                "value}); the Generate.generate leaf is walled off from controlled_spec so the IR "
+                "is the only carrier of the pinned values")
+        return
+
+    mps_raw = public_api.get("module_parameters")
+    if not isinstance(mps_raw, list):
+        violations.append(
+            f"{derived_path}:public_api.module_parameters must be a list (got "
+            f"{type(mps_raw).__name__}); a present-but-null key must fail closed")
+        return
+
+    ir_params: dict[str, Any] = {}
+    for idx, entry in enumerate(mps_raw):
+        try:
+            _validate_module_parameter(entry, f"public_api.module_parameters[{idx}]")
+        except SignatureParseError as exc:
+            violations.append(f"{derived_path}:{exc}")
+            continue
+        name = _norm_name(entry["name"])
+        if name in ir_params:
+            violations.append(
+                f"{derived_path}:public_api.module_parameters declares parameter '{name}' more "
+                "than once (case-insensitively)")
+            continue
+        ir_params[name] = entry["value"]
+
+    for missing in sorted(set(spec_params) - set(ir_params)):
+        violations.append(
+            f"{derived_path}:public_api.module_parameters omits controlled_spec §5.1 module "
+            f"parameter '{missing}'")
+    for extra in sorted(set(ir_params) - set(spec_params)):
+        violations.append(
+            f"{derived_path}:public_api.module_parameters declares parameter '{extra}' absent from "
+            "controlled_spec §5.1")
+    for name in sorted(set(spec_params) & set(ir_params)):
+        if _norm(ir_params[name]) != _norm(spec_params[name]):
+            violations.append(
+                f"{derived_path}:public_api.module_parameters['{name}'] value "
+                f"'{ir_params[name]}' does not match controlled_spec §5.1 value "
+                f"'{spec_params[name]}'")
+
+
+# Sentinel embedded in the Generate.static stale-IR violation so the conductor can route it as a
+# TERMINAL failure (fail_closed) rather than a warm Generate.generate retry: the leaf cannot mutate
+# the certified IR, so retrying Generate is futile — the fix is a re-certification, not a re-author.
+# workflow_conductor._static_inproc keys on this exact string.
+STALE_DEPENDENCY_IR_MARKER = "[stale-dependency-ir]"
+
+
 def _validate_infrastructure_generated_signatures(
     repo_root: Path, execution: NodeExecution, model_files: list[Path], violations: list[str]
 ) -> None:
@@ -10263,6 +10411,31 @@ def _validate_infrastructure_generated_signatures(
         violations.append(
             f"{cs_path}: §5.1 canonical interface block {iface_err} — cannot pin the generated "
             "model signatures against it")
+        return
+
+    # Backward-compatibility guard for a stale / pre-contract certified IR. An IR compiled BEFORE the
+    # public_api.module_parameters contract carries no such key; a partially-migrated or corrupt one
+    # can carry an empty/null list or drifted values. On a --resume into Generate, Compile.static does
+    # NOT re-run, so that IR reaches here unvalidated; the Generate leaf now authors the `integer,
+    # parameter` lines from public_api.module_parameters, so any of those shapes would make it emit
+    # none/wrong and this gate would fail below with a confusing source drift that re-running Generate
+    # can never repair. Run the SAME comparison Compile.static uses (IR module_parameters == §5.1 by
+    # normalized name+value): ANY mismatch means the certified IR is stale/corrupt, so fail closed
+    # with the actionable re-certify signal + the terminal marker, rather than a warm-retry drift.
+    pub = ir.get("public_api")
+    stale_ir_violations: list[str] = []
+    _validate_ir_module_parameters_against_section51(
+        ir_path, pub if isinstance(pub, dict) else {}, cs_path, stale_ir_violations)
+    if stale_ir_violations:
+        loc = model_files[0] if model_files else ir_path
+        violations.append(
+            f"{loc}: {STALE_DEPENDENCY_IR_MARKER} the certified IR at {ir_path} does not carry the "
+            "controlled_spec §5.1 module parameters the current contract pins (absent, empty, null, "
+            "or drifted public_api.module_parameters — a pre-contract or corrupt IR that "
+            "Compile.static, skipped on this resume, would have rejected) — re-certify the harness "
+            "(run_workflow.py --with-deps, which the harness version bump makes freshness re-run) so "
+            "Compile transcribes the module-parameter values into the IR; a certified IR cannot be "
+            "repaired by re-running Generate")
         return
 
     target = model_files[0] if model_files else (repo_root / "<model>")

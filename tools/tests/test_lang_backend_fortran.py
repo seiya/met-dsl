@@ -419,6 +419,16 @@ class Round2HardeningTest(unittest.TestCase):
                 {"module_parameters": [{"name": "dp", "value": "real64; integer evil"}],
                  "types": [], "procedures": []})
 
+    def test_parameter_value_character_literal_rejected(self) -> None:
+        # `iachar('A')` and `iachar('a')` are different integers, but the value pin folds case and
+        # whitespace — so a character literal in a module-parameter value would let ABI drift pass.
+        # Fail closed at the grammar for both quote forms.
+        for bad in ("iachar('A')", 'iachar("A")', "'a b'"):
+            with self.assertRaises(SignatureParseError):
+                render_signatures_to_fortran(
+                    {"module_parameters": [{"name": "wp", "value": bad}],
+                     "types": [], "procedures": []})
+
     def test_present_null_top_key_fails_closed(self) -> None:
         # `module_parameters: null` (present but null) must fail closed — silently emptying it
         # would drop the dp/case_id_len value pins and let a drifted parameter pass.

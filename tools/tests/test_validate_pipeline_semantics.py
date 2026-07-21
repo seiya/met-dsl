@@ -72,6 +72,10 @@ def _structured_ir_signatures_from_fortran(fortran_block: str) -> list[dict]:
     ]
 
 
+def _structured_ir_module_parameters_from_fortran(fortran_block: str) -> list[dict]:
+    return parse_signatures_from_fortran(fortran_block)["module_parameters"]
+
+
 def _seed_shape_expr_schema_into(repo_root: Path) -> None:
     """Copy the validator-bundled shape_expr.schema.json into a test's tmp
     repo so the public validate_*() entrypoints (which fail-closed when a
@@ -12593,6 +12597,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             self.assertEqual(types, set(), body)
 
     _SIGNATURES = _structured_ir_signatures_from_fortran(_SECTION_51_FORTRAN)
+    _MODULE_PARAMETERS = _structured_ir_module_parameters_from_fortran(_SECTION_51_FORTRAN)
 
     def _full_api(self) -> dict:
         return {
@@ -12603,6 +12608,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             ],
             "published_types": ["hx__h_named"],
             "signatures": copy.deepcopy(self._SIGNATURES),
+            "module_parameters": copy.deepcopy(self._MODULE_PARAMETERS),
         }
 
     def test_exact_match_no_violation(self) -> None:
@@ -12788,6 +12794,8 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             api = self._full_api()
             api["signatures"] = _structured_ir_signatures_from_fortran(
                 self._SECTION_51_FORTRAN)
+            api["module_parameters"] = _structured_ir_module_parameters_from_fortran(
+                self._SECTION_51_FORTRAN)
             ir_dir = self._seed(Path(tmp), public_api=api)
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
@@ -12853,6 +12861,215 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
             self.assertTrue(any("defines a derived type 'hx__h_extra' absent" in v
                                 for v in violations), violations)
+
+    def test_module_parameters_missing_key_flagged(self) -> None:
+        # §5.1 declares dp but the IR omits the module_parameters key — the leaf's only carrier of
+        # the value is gone, so this is a Compile fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            del api["module_parameters"]
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("public_api.module_parameters missing" in v for v in violations),
+                            violations)
+
+    def test_module_parameters_null_fails_closed(self) -> None:
+        # A present-but-null module_parameters must fail closed (mirrors load_structured_signatures).
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["module_parameters"] = None
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("module_parameters must be a list" in v for v in violations),
+                            violations)
+
+    def test_module_parameters_value_drift_flagged(self) -> None:
+        # dp = real64 in §5.1 but real32 in the IR — a silent ABI change.
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["module_parameters"][0]["value"] = "real32"
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("module_parameters['dp'] value" in v and "does not match" in v
+                                for v in violations), violations)
+
+    def test_module_parameters_extra_flagged(self) -> None:
+        # An IR module parameter absent from §5.1 is flagged (the leaf must not invent one).
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["module_parameters"].append(
+                {"name": "case_id_len", "base": "integer", "value": 64})
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("declares parameter 'case_id_len' absent" in v
+                                for v in violations), violations)
+
+    def test_module_parameters_malformed_entry_flagged(self) -> None:
+        # A non-integer base is fail-closed (the renderer only emits `integer, parameter`).
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["module_parameters"][0]["base"] = "real"
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("module_parameters[0].base must be 'integer'" in v
+                                for v in violations), violations)
+
+    def test_module_parameters_duplicate_name_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["module_parameters"].append(
+                {"name": "dp", "base": "integer", "value": "real64"})
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("declares parameter 'dp' more than once" in v
+                                for v in violations), violations)
+
+    def test_module_parameters_absent_both_passes(self) -> None:
+        # §5.1 declares zero module parameters and the IR omits the key — a clean pass.
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        struct["module_parameters"] = []
+        no_param_fence = (
+            "### 5.1 Canonical interface block\n```yaml\n"
+            + yaml.safe_dump(struct, sort_keys=False) + "```\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=no_param_fence), encoding="utf-8")
+            api = self._full_api()
+            del api["module_parameters"]
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": api})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertEqual(violations, [])
+
+    def test_module_parameters_omitted_flagged(self) -> None:
+        # A present module_parameters list that DROPS a §5.1 parameter (dp) is flagged — the
+        # symmetric twin of the "extra" case, and the exact cold-generate failure this gate exists
+        # to catch (the leaf's IR would carry no dp value for Generate.static to pin).
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["module_parameters"] = []
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertTrue(any("omits controlled_spec §5.1 module parameter 'dp'" in v
+                                for v in violations), violations)
+
+    def test_section51_duplicate_module_parameter_name_flagged(self) -> None:
+        # A §5.1 that declares the same module parameter twice cannot be pinned coherently — the
+        # gate must fail closed here at Compile rather than collapse it (last-wins) and let a
+        # contradictory/unsatisfiable contract wedge Generate.static.
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        struct["module_parameters"].append(
+            {"name": "dp", "base": "integer", "value": "real32"})  # dp declared twice, diverging
+        dup_fence = (
+            "### 5.1 Canonical interface block\n```yaml\n"
+            + yaml.safe_dump(struct, sort_keys=False) + "```\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=dup_fence), encoding="utf-8")
+            api = self._full_api()
+            api["module_parameters"] = [{"name": "dp", "base": "integer", "value": "real32"}]
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": api})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("§5.1 declares module parameter 'dp' more than once" in v
+                                for v in violations), violations)
+
+    def test_section51_case_only_duplicate_module_parameter_name_flagged(self) -> None:
+        # Fortran identifiers are case-insensitive, so §5.1 declaring `dp` AND `DP` is a duplicate of
+        # the SAME parameter — a case-sensitive check would let a diverging pair through and demand
+        # contradictory `integer, parameter :: dp/DP` declarations for one Fortran symbol.
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        struct["module_parameters"].append(
+            {"name": "DP", "base": "integer", "value": "real32"})  # same symbol as dp, diverging
+        dup_fence = (
+            "### 5.1 Canonical interface block\n```yaml\n"
+            + yaml.safe_dump(struct, sort_keys=False) + "```\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=dup_fence), encoding="utf-8")
+            api = self._full_api()
+            api["module_parameters"] = [{"name": "dp", "base": "integer", "value": "real64"}]
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": api})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("more than once (case-insensitively)" in v for v in violations),
+                            violations)
+
+    def test_module_parameters_case_only_name_variant_passes(self) -> None:
+        # §5.1 declares `dp`, the IR transcribes it as `DP` (same Fortran symbol, same value) — a
+        # case-sensitive name comparison would false-reject it as omit+extra; case-folding accepts it.
+        with tempfile.TemporaryDirectory() as tmp:
+            api = self._full_api()
+            api["module_parameters"][0]["name"] = "DP"  # §5.1 has "dp"; same symbol
+            ir_dir = self._seed(Path(tmp), public_api=api)
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
+            self.assertEqual(violations, [])
+
+    def test_module_parameters_value_internal_whitespace_equivalence_passes(self) -> None:
+        # A schema-valid expression value with internal whitespace (`selected_real_kind(15, 307)`)
+        # must compare equal to the equivalent `SELECTED_REAL_KIND(15,307)` — the Generate.static
+        # source pin strips all whitespace, so the Compile pin must not false-reject the IR form.
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        struct["module_parameters"].append(
+            {"name": "wp", "base": "integer", "value": "selected_real_kind(15, 307)"})
+        fence = (
+            "### 5.1 Canonical interface block\n```yaml\n"
+            + yaml.safe_dump(struct, sort_keys=False) + "```\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=fence), encoding="utf-8")
+            api = self._full_api()
+            api["module_parameters"].append(
+                {"name": "wp", "base": "integer", "value": "SELECTED_REAL_KIND(15,307)"})
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": api})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertEqual(violations, [])
+
+    def test_module_parameters_value_normalization_equivalence_passes(self) -> None:
+        # Values compare normalized (str().strip().lower()): a YAML int 64 == "64" and
+        # REAL64 == real64. This pins that behavior — a regression to a plain str() compare (or
+        # dropping the normalization) would flag a drift here and fail this test.
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        struct["module_parameters"].append(
+            {"name": "case_id_len", "base": "integer", "value": "64"})  # §5.1 renders "64" (string)
+        fence = (
+            "### 5.1 Canonical interface block\n```yaml\n"
+            + yaml.safe_dump(struct, sort_keys=False) + "```\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=fence), encoding="utf-8")
+            api = self._full_api()
+            api["module_parameters"][0]["value"] = "REAL64"        # vs §5.1 "real64" (case differs)
+            api["module_parameters"].append(
+                {"name": "case_id_len", "base": "integer", "value": 64})  # int vs §5.1 "64" string
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": api})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertEqual(violations, [])
 
 
 class CanonicalInterfaceParserTests(unittest.TestCase):
@@ -13057,9 +13274,15 @@ class InfrastructureGeneratedSignatureGateTests(unittest.TestCase):
         (tmp / "cs.md").write_text(
             "## 5. Public API\nprose.\n" + (self._FENCE if section_51 is None else section_51)
             + "## 6. x\n", encoding="utf-8")
+        # Seed a realistic POST-contract IR: an infrastructure IR carries public_api.module_parameters
+        # (Compile pins it == §5.1). The Generate.static gate's stale-IR guard fires when that key is
+        # absent while §5.1 declares parameters, so the fixture must include it to represent a
+        # freshly-compiled IR (tests exercising the stale/pre-contract path strip it explicitly).
         _write_json(ir_dir / "spec.ir.yaml", {
             "meta": {"spec_kind": spec_kind, "spec_id": "hx",
-                     "source_refs": {"controlled_spec": "cs.md"}}})
+                     "source_refs": {"controlled_spec": "cs.md"}},
+            "public_api": {"module_parameters": copy.deepcopy(
+                InfrastructurePublicApiGateTests._MODULE_PARAMETERS)}})
         pipe = tmp / "pipe"
         src_dir = pipe / "src"
         src_dir.mkdir(parents=True)
@@ -13203,6 +13426,46 @@ class InfrastructureGeneratedSignatureGateTests(unittest.TestCase):
             # a component node with a garbage source: gate must not fire
             ex = self._seed(tmp, source="module m\nend module m\n", spec_kind="component")
             self.assertEqual(self._run(ex, tmp), [])
+
+    def test_stale_pre_contract_ir_fails_closed(self) -> None:
+        # A certified IR that predates the public_api.module_parameters contract (public_api present
+        # but no module_parameters key) reaching Generate.static on a --resume — where Compile.static
+        # does NOT re-run — must fail closed with an actionable "re-certify" signal, NOT proceed to a
+        # confusing source-drift error the Generate leaf can never repair. The source here is
+        # otherwise faithful, so only the stale-IR guard can flag it.
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ex = self._seed(tmp, source=self._GOOD_SOURCE)
+            ir_path = tmp / "workspace" / "ir" / "x" / "spec.ir.yaml"
+            ir = json.loads(ir_path.read_text(encoding="utf-8"))
+            ir["public_api"] = {"signatures": []}  # pre-contract shape: no module_parameters key
+            ir_path.write_text(json.dumps(ir), encoding="utf-8")
+            violations = self._run(ex, tmp)
+            # Carries the sentinel the conductor keys on to route this TERMINAL (fail_closed), not a
+            # futile warm Generate retry (a leaf cannot mutate the certified IR).
+            self.assertTrue(any(vps.STALE_DEPENDENCY_IR_MARKER in v
+                                and "does not carry the controlled_spec §5.1 module parameters" in v
+                                and "re-certify" in v for v in violations), violations)
+
+    def test_stale_ir_empty_or_drifted_module_parameters_fails_closed(self) -> None:
+        # The guard must fire not only on an ABSENT key but on any §5.1 mismatch a pre-contract /
+        # corrupt IR can carry through a Compile-skipping resume: an empty list, or drifted values.
+        # Each is unrepairable by re-running Generate, so each must carry the terminal marker.
+        for stale_pub in (
+            {"module_parameters": []},                                              # empty list
+            {"module_parameters": [{"name": "dp", "base": "integer",
+                                    "value": "real32"}]},                           # drifted value
+        ):
+            with tempfile.TemporaryDirectory() as t:
+                tmp = Path(t)
+                ex = self._seed(tmp, source=self._GOOD_SOURCE)
+                ir_path = tmp / "workspace" / "ir" / "x" / "spec.ir.yaml"
+                ir = json.loads(ir_path.read_text(encoding="utf-8"))
+                ir["public_api"] = stale_pub
+                ir_path.write_text(json.dumps(ir), encoding="utf-8")
+                violations = self._run(ex, tmp)
+                self.assertTrue(any(vps.STALE_DEPENDENCY_IR_MARKER in v for v in violations),
+                                (stale_pub, violations))
 
     def test_parameter_value_drift_flagged(self) -> None:
         # A drifted `dp = real32` (vs §5.1 `real64`) changes the published ABI but the symbolic

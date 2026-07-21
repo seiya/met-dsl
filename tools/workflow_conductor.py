@@ -184,6 +184,13 @@ STATIC_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     "workspace_root_violation": ("generate", "reuse"),
 }
 
+# Static-gate categories that are TERMINAL (fail_closed), NOT a warm Generate.generate retry: the
+# failing condition is one the Generate leaf cannot repair by re-authoring its source, so retrying is
+# futile. `stale_dependency_ir` — a certified dependency IR predating a carrier contract (e.g. the
+# harness's public_api.module_parameters) reached Generate.static on a resume that skipped Compile;
+# the fix is a re-certification (a version bump makes dependency freshness re-run it), not a re-author.
+STATIC_FAILURE_TERMINAL: frozenset[str] = frozenset({"stale_dependency_ir"})
+
 # Compile static-gate (compile.static) failure_category -> (retry_target_phase, repair_strategy).
 # The deterministic workspace_root / check_artifact_syntax / --stage compile gates run AFTER
 # compile.generate and BEFORE compile.verify; a structural IR violation re-runs
@@ -521,6 +528,10 @@ def classify_syntax_failure(failure_category: str | None) -> RouteDecision:
 def classify_static_failure(failure_category: str | None) -> RouteDecision:
     if not failure_category:
         return RouteDecision("escalate", reason="static_fail_no_category")
+    if failure_category in STATIC_FAILURE_TERMINAL:
+        # No warm retry: the leaf cannot repair a stale certified dependency IR by re-authoring
+        # source. Fail closed so the operator re-certifies instead of exhausting Generate retries.
+        return RouteDecision("fail_closed", reason=f"static_{failure_category}")
     routed = STATIC_FAILURE_ROUTING.get(failure_category)
     if routed is None:
         return RouteDecision("escalate", reason=f"static_unknown_category:{failure_category}")
@@ -4607,8 +4618,13 @@ clean:
                  "--pipeline-root", refs.pipeline_ref, "--source-id", refs.source_id or ""],
                 cwd=self.repo_root, env=self.env, text=True, capture_output=True, check=False)
             if pg.returncode != 0:
+                from tools.validate_pipeline_semantics import STALE_DEPENDENCY_IR_MARKER
                 status = "fail"
-                failure_category = "post_generate_violation"
+                # A stale-dependency-IR violation is TERMINAL, not a warm Generate retry (the leaf
+                # cannot repair a certified dependency IR); classify_static_failure fail_closes it.
+                failure_category = ("stale_dependency_ir"
+                                    if STALE_DEPENDENCY_IR_MARKER in (pg.stdout + pg.stderr)
+                                    else "post_generate_violation")
                 failure_excerpt = "\n".join((pg.stdout + pg.stderr).splitlines()[-50:])
                 stderr = "[post_generate gate fail]\n" + pg.stdout + pg.stderr
 

@@ -329,11 +329,18 @@ def _require_parameter_value(value: str, ctx: str) -> str:
     unlike the inside-parens tokens above — it may carry balanced parens (the portable-kind idiom
     ``selected_real_kind(15, 307)``). It must still not carry a ``::`` / ``;`` (statement separator —
     ``real64; integer evil`` would emit a second declaration) / newline / comment ``!`` that would
-    break or smuggle a declaration on the parameter line."""
+    break or smuggle a declaration on the parameter line.
+
+    It must also carry no character literal (a ``'`` / ``"`` quote). The value pin (both the Compile
+    gate and the Generate.static source pin) compares values case- and whitespace-INSENSITIVELY, so
+    ``iachar('A')`` and ``iachar('a')`` — different integer values — would compare equal, letting the
+    ABI drift silently. A published module parameter that needs a character literal is unsupported;
+    fail closed rather than pin it unsoundly."""
     _require_nonempty_str(value, ctx)
-    if "::" in value or any(ch in value for ch in "\n\r!;"):
+    if "::" in value or any(ch in value for ch in "\n\r!;\"'"):
         raise SignatureParseError(
-            f"{ctx} must not contain '::', ';', a newline, or '!'; got {value!r}")
+            f"{ctx} must not contain '::', ';', a quote (a character literal cannot be pinned "
+            f"case/whitespace-insensitively), a newline, or '!'; got {value!r}")
     return value
 
 

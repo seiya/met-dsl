@@ -399,6 +399,16 @@ class DecisionTableTest(unittest.TestCase):
         self.assertEqual(wc.classify_build_failure("weird").action, "escalate")
         self.assertEqual(wc.classify_build_failure(None).action, "escalate")
 
+    def test_static_failure_routing(self) -> None:
+        # Ordinary content violations warm-retry generate.generate.
+        d = wc.classify_static_failure("post_generate_violation")
+        self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))
+        # A stale certified dependency IR is TERMINAL — the leaf cannot repair it, so no warm retry.
+        d = wc.classify_static_failure("stale_dependency_ir")
+        self.assertEqual(d.action, "fail_closed")
+        self.assertIn("stale_dependency_ir", wc.STATIC_FAILURE_TERMINAL)
+        self.assertEqual(wc.classify_static_failure(None).action, "escalate")
+
     def test_validate_judge_routing(self) -> None:
         self.assertEqual(wc.classify_validate_judge("pass", None).action, "advance")
         d = wc.classify_validate_judge("structural_violation", "ir")
