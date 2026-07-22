@@ -123,6 +123,7 @@ def _build_invocation_record(
     workflow_mode: str,
     agent_model: str | None,
     with_deps: bool,
+    wait_usage_reset: bool = False,
     closure_id: str | None = None,
     closure_target_spec_ref: str | None = None,
     closure_until_phase: str | None = None,
@@ -146,6 +147,10 @@ def _build_invocation_record(
         "llm_command": llm_command,
         "mode": workflow_mode,
         "with_deps": bool(with_deps),
+        # --wait-usage-reset is recorded for provenance/observability only. It is a PER-INVOCATION
+        # runtime preference, NOT auto-recovered on --resume (that decision is intentional — see the
+        # flag help and RUNBOOK); a resume must re-pass the flag to keep the wait active.
+        "wait_usage_reset": bool(wait_usage_reset),
         # Z2 executor provenance. Since M-F the generate-executor is always `pure` (legacy removed),
         # so this is a hardcoded provenance stamp rather than a per-run choice. It is still the value
         # read by the M-F resume fail-close gate in main(): a resume of an orchestration whose
@@ -981,6 +986,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "--with-deps)."
         ),
     )
+    parser.add_argument(
+        "--wait-usage-reset",
+        action="store_true",
+        help=(
+            "Opt in to waiting out a leaf usage limit IN PLACE instead of fail-closing. "
+            "Only takes effect when the dead leaf carried a MACHINE-FORM reset time (a "
+            "trailing unix epoch); a human-worded reset is never guessed at. Bounded: one "
+            "wait per substep, at most 6h, +120s margin. Default OFF (a usage limit stays "
+            "terminal for a manual --resume after the reset). NOT recovered automatically on "
+            "--resume — re-pass --wait-usage-reset to keep it active."
+        ),
+    )
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--orchestration-id", help="If omitted, generated automatically (or, with --resume, the latest orchestration).")
     parser.add_argument("--status", default="running", help="Initial orchestration status for init.")
@@ -1387,6 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
             agent_model=args.agent_model,
             status=args.status,
             run_conductor=args.run_conductor,
+            wait_usage_reset=args.wait_usage_reset,
             stdout_format=args.stdout_format,
             resume=True,
             prior_orch_by_spec=prior_map,
@@ -1410,6 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
             agent_model=args.agent_model,
             status=args.status,
             run_conductor=args.run_conductor,
+            wait_usage_reset=args.wait_usage_reset,
             stdout_format=args.stdout_format,
             resume=False,
             prior_orch_by_spec=None,
@@ -1430,6 +1449,7 @@ def main(argv: list[str] | None = None) -> int:
             workflow_mode=workflow_mode,
             agent_model=args.agent_model,
             with_deps=False,
+            wait_usage_reset=args.wait_usage_reset,
         )
     )
     return _run_node(
@@ -1446,6 +1466,7 @@ def main(argv: list[str] | None = None) -> int:
         status=args.status,
         run_conductor=args.run_conductor,
         resume_mode=resume_mode,
+        wait_usage_reset=args.wait_usage_reset,
         invocation=single_node_invocation,
         stdout_format=args.stdout_format,
     )
@@ -1530,6 +1551,14 @@ def _format_event_human(payload: dict[str, Any]) -> str | None:
         backoff = payload.get("backoff_seconds", "?")
         return (f"    [warn   ] transient leaf failure ({tag}) in {phase}.{substep} "
                 f"[attempt {attempt}/{total}]: retrying in {backoff}s")
+
+    if status == "info" and event == "leaf_usage_limit_wait":
+        phase = payload.get("step", "?")
+        substep = payload.get("substep") or "step"
+        wait = payload.get("wait_seconds", "?")
+        attempt = payload.get("wait_attempt", "?")
+        return (f"    [warn   ] usage limit in {phase}.{substep} [wait {attempt}]: "
+                f"waiting {wait}s for the reset, then re-launching")
 
     if status == "info" and event == "diagnose_launch_failed":
         phase = payload.get("phase", "?")
@@ -1707,6 +1736,7 @@ def _run_node(
     status: str,
     run_conductor: bool,
     resume_mode: bool,
+    wait_usage_reset: bool = False,
     invocation: dict[str, Any] | None = None,
     closure_until_phase: str | None = None,
     extra_output: dict[str, Any] | None = None,
@@ -1946,6 +1976,7 @@ def _run_node(
                     env=env,
                     llm_command=llm_command,
                     resume=resume_mode,
+                    wait_usage_reset=wait_usage_reset,
                 )
             except Exception as exc:  # noqa: BLE001 - terminalize on conductor error
                 # If the conductor/runtime already terminalized with a specific terminal
@@ -2299,6 +2330,7 @@ def _run_with_dependency_closure(
     agent_model: str | None,
     status: str,
     run_conductor: bool,
+    wait_usage_reset: bool = False,
     stdout_format: str = "jsonl",
     resume: bool = False,
     prior_orch_by_spec: dict[str, str] | None = None,
@@ -2429,6 +2461,7 @@ def _run_with_dependency_closure(
             workflow_mode=workflow_mode,
             agent_model=agent_model,
             with_deps=True,
+            wait_usage_reset=wait_usage_reset,
             closure_id=target_orchestration_id,
             closure_target_spec_ref=target_spec_ref,
             closure_until_phase=until_phase,
@@ -2447,6 +2480,7 @@ def _run_with_dependency_closure(
             status=status,
             run_conductor=run_conductor,
             resume_mode=dep_resume,
+            wait_usage_reset=wait_usage_reset,
             invocation=dep_invocation,
             # On resume, refresh this dep's persisted closure end-phase to the
             # effective closure until_phase so an operator phase override stays durable
@@ -2553,6 +2587,7 @@ def _run_with_dependency_closure(
         workflow_mode=workflow_mode,
         agent_model=agent_model,
         with_deps=True,
+        wait_usage_reset=wait_usage_reset,
         closure_id=target_orchestration_id,
         closure_target_spec_ref=target_spec_ref,
         closure_until_phase=until_phase,
@@ -2571,6 +2606,7 @@ def _run_with_dependency_closure(
         status=status,
         run_conductor=run_conductor,
         resume_mode=target_resume,
+        wait_usage_reset=wait_usage_reset,
         invocation=target_invocation,
         closure_until_phase=until_phase if target_resume else None,
         extra_output={"dependency_runs": dependency_runs},

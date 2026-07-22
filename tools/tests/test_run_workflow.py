@@ -290,6 +290,11 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertIsNone(ns.llm)
         self.assertFalse(ns.resume)
         self.assertTrue(ns.run_conductor)
+        self.assertFalse(ns.wait_usage_reset)  # opt-in, default OFF
+
+    def test_parse_args_supports_wait_usage_reset(self) -> None:
+        ns = run_workflow._parse_args(["spec/problem.md", "generate", "--wait-usage-reset"])
+        self.assertTrue(ns.wait_usage_reset)
 
     def test_parse_args_allows_omitted_positionals_for_resume(self) -> None:
         ns = run_workflow._parse_args(["--resume", "--no-run-conductor"])
@@ -564,6 +569,49 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertIn("analysis_ref", out)
             fa = repo_root / "workspace" / "orchestrations" / "orch_devfail" / "failure_analysis.json"
             self.assertTrue(fa.exists(), "conductor dev failure must write failure_analysis.json")
+
+    def test_wait_usage_reset_flag_threads_into_run_conductor(self) -> None:
+        # The opt-in flag must reach the conductor: argparse -> _run_node -> run_conductor kwarg.
+        import tools.workflow_conductor as wc
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+
+            def fake_runtime_command(root, env, args):  # type: ignore[no-untyped-def]
+                if args[0] == "init":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "ok", "orchestration_agent_run_id": "oar"},
+                        raw_stdout="{}")
+                if args[0] == "preflight":
+                    return run_workflow.RuntimeResult(
+                        payload={"status": "pass", "can_launch_step_agents": True,
+                                 "can_launch_substep_agents": True},
+                        raw_stdout="{}")
+                return run_workflow.RuntimeResult(payload={"status": "ok"}, raw_stdout="{}")
+
+            captured: dict = {}
+            orig_rt = run_workflow._runtime_command
+            orig_rc = wc.run_conductor
+            try:
+                run_workflow._runtime_command = fake_runtime_command  # type: ignore[assignment]
+
+                def _fake_rc(**kw):  # capture the conductor kwargs
+                    captured.update(kw)
+                    return "pass"
+
+                wc.run_conductor = _fake_rc  # type: ignore[assignment]
+                with redirect_stdout(io.StringIO()):
+                    run_workflow.main([
+                        "spec/problem/test.md", "build",
+                        "--repo-root", str(repo_root),
+                        "--orchestration-id", "orch_waitflag",
+                        "--llm", "claude", "--mode", "dev",
+                        "--wait-usage-reset", "--stdout-format", "jsonl",
+                    ])
+            finally:
+                run_workflow._runtime_command = orig_rt  # type: ignore[assignment]
+                wc.run_conductor = orig_rc  # type: ignore[assignment]
+            self.assertTrue(captured.get("wait_usage_reset"))
 
     def test_resume_recovers_params_and_uses_checkpoint_init(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1050,7 +1098,22 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertEqual(rec["until_phase"], "Validate")
         self.assertEqual(rec["agent_model"], "opus")
         self.assertFalse(rec["with_deps"])
+        self.assertFalse(rec["wait_usage_reset"])  # provenance stamp, default OFF
         self.assertNotIn("closure_id", rec)
+
+    def test_build_invocation_record_records_wait_usage_reset(self) -> None:
+        rec = run_workflow._build_invocation_record(
+            argv=["spec/problem/a", "validate", "--wait-usage-reset"],
+            spec_ref="spec/problem/a",
+            until_phase="Validate",
+            llm="claude",
+            llm_command="claude",
+            workflow_mode="dev",
+            agent_model="opus",
+            with_deps=False,
+            wait_usage_reset=True,
+        )
+        self.assertTrue(rec["wait_usage_reset"])
 
     def test_build_invocation_record_closure_fields_present(self) -> None:
         rec = run_workflow._build_invocation_record(
@@ -3020,6 +3083,17 @@ class StdoutFormatTests(unittest.TestCase):
             retry_line,
             "    [warn   ] transient leaf failure (llm_transport_flake) in compile.verify "
             "[attempt 1/3]: retrying in 2.0s",
+        )
+        # An opt-in usage-limit wait: the run is deliberately parked until the reset, so the wait is
+        # announced rather than left as a silent multi-hour gap the operator might kill.
+        wait_line = f({"status": "info", "event": "leaf_usage_limit_wait",
+                       "node_key": "n", "step": "generate", "substep": "generate",
+                       "reset_epoch": 1752200000, "wait_seconds": 420.0, "wait_attempt": 1,
+                       "dead_agent_run_id": "ar_dead", "orchestration_id": "o"})
+        self.assertEqual(
+            wait_line,
+            "    [warn   ] usage limit in generate.generate [wait 1]: "
+            "waiting 420.0s for the reset, then re-launching",
         )
         # Final ok / fail summaries.
         self.assertTrue(

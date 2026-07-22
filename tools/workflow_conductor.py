@@ -7304,7 +7304,8 @@ def run_conductor(*, repo_root: Path | str, orchestration_id: str,
                   orchestration_agent_run_id: str, spec_ref: str,
                   source_dependency_ref: str, until_phase: str, backend: str,
                   agent_model: str, workflow_mode: str, env: dict[str, str],
-                  llm_command: str = "", resume: bool = False) -> str:
+                  llm_command: str = "", resume: bool = False,
+                  wait_usage_reset: bool = False) -> str:
     """Conductor entrypoint used by run_workflow.py (the only orchestration driver).
     Resolves the node, allocates+reserves ids (or, on resume, reuses the checkpointed
     ids), and runs the deterministic phase loop. Returns the terminal orchestration
@@ -7321,7 +7322,7 @@ def run_conductor(*, repo_root: Path | str, orchestration_id: str,
         orchestration_agent_run_id=orchestration_agent_run_id,
         backend=backend, env=env,
         agent_model=resolved_agent_model, workflow_mode=workflow_mode,
-        llm_command=llm_command,
+        llm_command=llm_command, wait_usage_reset=wait_usage_reset,
     )
     refs = (resume_node_refs(conductor, node_key, spec_path) if resume
             else prepare_node(conductor, node_key, spec_path))

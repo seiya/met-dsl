@@ -521,9 +521,21 @@ re-run confirming Build passes on attempt 1 (operator-gated).
     only `API Error: Connection closed mid-response.`, which matched no infra pattern, fail-closed
     the run, and cost **6.8 hours** of idle wall-clock until a human `--resume`d. That message now
     classifies (`llm_transport_flake`) and self-heals.
-  - **`llm_usage_limit` remains a manual `--resume` after the quota resets. By design** — it is a
+  - **`llm_usage_limit` stays a manual `--resume` after the quota resets — by DEFAULT.** It is a
     hard stop lasting hours, so an automatic re-launch would spend the budget in seconds and only
-    delay the operator. Revisit only if scheduled resumption becomes an operational requirement.
+    delay the operator. The "revisit if scheduled resumption becomes an operational requirement"
+    trigger came due in the 2026-07 advdiff closure: a `compile.verify` usage limit fail-closed the
+    whole run, and the manual `--resume` re-ran `compile.generate` from scratch (a re-paid 491s cold
+    producer), because `--resume` only sees the phase-granular checkpoint. The response is the
+    **opt-in `--wait-usage-reset` flag** (default OFF keeps this manual behavior). When set AND the
+    dead leaf carried a **machine-form reset epoch** (a trailing `|<unix-epoch>` on its usage-limit
+    line — a human-worded "resets 6:10pm" is never guessed at), the conductor waits it out in place
+    (to the reset + a 120s margin) and re-launches the SAME substep — a same-run, substep-granular
+    resume. Bounded hard: one wait per substep (a budget distinct from the transient-retry budget),
+    at most 6h (a longer reset is a weekly limit or a misparse → fail_closed). It is NOT recovered
+    automatically on `--resume` (a per-invocation preference); re-pass the flag to keep it active.
+    Canonical: `docs/ORCHESTRATION.md` "leaf transient retry"; operator guidance:
+    `docs/RUNBOOK.md`.
 - **L6 — GUARDED (2026-06-25).** The dependency build (Model B) keys staged source filenames and
   Makefile object rules on the bare `spec_id_of(node_key)` (`_dependency_closure` /
   `_stage_dependency_sources`), dropping `kind` and `@version`. A closure containing two deps that
