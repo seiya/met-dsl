@@ -13048,22 +13048,26 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
                                 for v in violations), violations)
 
     def test_section51_stale_fortran_kind_value_rejected_at_compile(self) -> None:
-        # Integration-level pin (not only the lang_backend unit): a §5.1 fence left carrying the
-        # Fortran kind spelling `real64` (a stale pre-0.6.0 token) fails closed at Compile — the
-        # §5.1 render short-circuits with the neutral alternative named. This is the most-likely
-        # staleness the C2 neutralization exists to catch, distinct from the `selected_real_kind`
-        # expression variant above.
+        # Integration-level pin (not only the lang_backend unit): a stale pre-0.6.0 certified pair —
+        # §5.1 AND the IR both carrying the Fortran kind spelling `real64` — fails closed at Compile
+        # via the §5.1 render short-circuit (naming the neutral `float64`). BOTH sides must be stale:
+        # were only §5.1 `real64`, the independent module_parameters value-drift check (float64 vs
+        # real64) would ALSO fire and mask a reverted neutralization. With both sides `real64` the
+        # value-drift check finds them EQUAL, so ONLY the render rejection can catch it — the teeth:
+        # reverting `_require_neutral_parameter_value`'s rejection makes the gate silent here.
         struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
-        struct["module_parameters"][0]["value"] = "real64"  # stale Fortran token (dp)
+        struct["module_parameters"][0]["value"] = "real64"  # stale §5.1 token (dp)
         fence = ("### 5.1 Canonical interface block\n```yaml\n"
                  + yaml.safe_dump(struct, sort_keys=False) + "```\n")
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "cs.md").write_text(
                 self._controlled_spec(section_51=fence), encoding="utf-8")
+            api = self._full_api()
+            api["module_parameters"][0]["value"] = "real64"  # IR side ALSO stale (equal → no drift)
             _write_json(Path(tmp) / "spec.ir.yaml", {
                 "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
                          "source_refs": {"controlled_spec": "cs.md"}},
-                "public_api": self._full_api()})
+                "public_api": api})
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
             self.assertTrue(any("real64" in v and "float64" in v for v in violations), violations)

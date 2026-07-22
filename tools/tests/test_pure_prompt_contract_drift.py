@@ -85,7 +85,7 @@ _TEMPLATE_FILES = (
 # current-schema digest — so they do NOT detect a future REVERT of the template to the pre-pure-8
 # (pure-6/pure-7) contract. Revert detection holds only among versions sharing the CURRENT schema
 # (pure-8 onward); the empty-bump guard across all pinned versions is unaffected. Only the CURRENT
-# version's pin (pure-10, below) is a live equality target for `_digest()`.
+# version's pin (pure-11, below) is a live equality target for `_digest()`.
 PINNED: dict[str, str] = {
     "pure-6": "b614072bcaad7ffe61f48d54256305b89982457d2ef6c3b5126e09598e5e7067",
     "pure-7": "14c7db85579eeb5f0dd21af2a7321edfcc9bcd647bcb735f511e0d3f80aa2eda",
