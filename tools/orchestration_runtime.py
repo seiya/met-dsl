@@ -10042,7 +10042,7 @@ def _build_exemplar(request_payload: dict[str, Any]) -> str:
         f"node in the same family/kind: {node_key}):** use it as a STRUCTURAL reference for the "
         "runner plumbing and code/layout conventions this workflow expects (argv/`--cases` "
         "parsing, the case loop, JSON/snapshot/perf emission). Author THIS node's own physics "
-        "and per-test logic from ITS inlined `spec.ir.yaml` (the algorithm + `io_contract` "
+        "and per-test logic from ITS `spec.ir.yaml` (the algorithm + `io_contract` "
         "sections) and `tests.md` — do NOT "
         "copy the exemplar's physics or checks. It is orientation, never a gate and never this "
         "node's spec. It was certified under the gates in force AT ITS TIME, so it may predate "
