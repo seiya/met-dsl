@@ -49,9 +49,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unittest
 from pathlib import Path
 
+import tools.codegen_bundle as cb
 import tools.orchestration_runtime as ort
 import tools.runner_renderer as rr
 from tools.pure_leaf import PURE_PROMPT_CONTRACT_VERSION, PURE_SYSTEM_PROMPT
@@ -88,6 +90,7 @@ PINNED: dict[str, str] = {
     "pure-6": "b614072bcaad7ffe61f48d54256305b89982457d2ef6c3b5126e09598e5e7067",
     "pure-7": "14c7db85579eeb5f0dd21af2a7321edfcc9bcd647bcb735f511e0d3f80aa2eda",
     "pure-8": "1b1a9575930504226c6d6acebf7cf3ee4b64247e4146f978ee84bbe505b1e4c2",
+    "pure-9": "273f38bdbf82569ed5f7ebb7a4ce9896c6b386297f1e25ccbd74923b4f38c70a",
 }
 
 
@@ -150,6 +153,42 @@ class PurePromptContractDriftTests(unittest.TestCase):
             "contract (templates / PURE_SYSTEM_PROMPT / coupled ABI constants); do not add a new "
             "version whose digest duplicates an earlier one.",
         )
+
+
+class TemplateGateParityTests(unittest.TestCase):
+    """The `pure_generate_generate.txt` sentences S1-S3 distil constants that live in
+    `codegen_bundle.py`. If a constant moves and the prompt does not, the leaf is told to
+    emit a value the gate no longer accepts — the exact E2E#7 failure mode. These assert the
+    template's distilled surface still agrees with the gate's live constants.
+
+    The pin members are IMPORTED production constants and the template file bytes only
+    (per the drift-guard scoping above); this class adds no test-local copy of a gate value.
+    """
+
+    @staticmethod
+    def _generate_template_bytes() -> str:
+        tpl_dir = Path(ort.__file__).resolve().parent / "prompt_templates"
+        return (tpl_dir / "pure_generate_generate.txt").read_text(encoding="utf-8")
+
+    def test_template_names_every_state_residency(self) -> None:
+        template = self._generate_template_bytes()
+        for residency in cb.STATE_RESIDENCIES:
+            self.assertIn(
+                residency, template,
+                f"state_residency {residency!r} (cb.STATE_RESIDENCIES) is not named in "
+                "pure_generate_generate.txt — S2 has drifted from the gate enum.")
+
+    def test_template_capability_tokens_are_all_manifest_provided(self) -> None:
+        # Every `<name>@<version>` token the prompt shows as an example must be one the
+        # harness manifests actually provide; otherwise the prompt points the leaf at a
+        # capability the gate rejects as unavailable.
+        template = self._generate_template_bytes()
+        provided = set().union(*cb.HARNESS_CAPABILITY_MANIFESTS.values())
+        tokens = set(re.findall(r"[a-z][a-z0-9_]*@[0-9]+", template))
+        self.assertEqual(
+            tokens - provided, set(),
+            "pure_generate_generate.txt names capability tokens the harness manifests do not "
+            f"provide: {sorted(tokens - provided)} (provided: {sorted(provided)}).")
 
 
 if __name__ == "__main__":
