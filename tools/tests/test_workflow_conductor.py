@@ -3032,6 +3032,193 @@ class LeafTransientRetryTest(unittest.TestCase):
             self.assertEqual(live, "done")
 
 
+class TransportSubstepResumeTest(unittest.TestCase):
+    """Item C2: a transport-substep resume preseats the surviving producer as outcomes[0] and
+    relaunches only the deterministic mids + verify — instead of re-paying the billed producer
+    leaf. The consumer arms it defensively (any precondition miss declines to a full re-run)."""
+
+    NODE_KEY = "component/spec_x@0.1.0"
+
+    class _C(_FakeConductor):
+        procs: list = []
+        spawns: list = []
+
+        def _write_lineage(self, refs):  # type: ignore[override]
+            return []
+
+        def _write_dependency_graph(self, refs):  # type: ignore[override]
+            return None
+
+        def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+            self.spawns.append(dict(kwargs))
+            idx = len(self.spawns) - 1
+            return self.procs[min(idx, len(self.procs) - 1)]
+
+    def _conductor(self, procs: list, repo: Path, **kw) -> "_C":
+        c = self._C(repo_root=repo, orchestration_id="orch_x",
+                    orchestration_agent_run_id="ORCH", backend="claude", env={}, **kw)
+        c.calls, c.procs, c.spawns = [], procs, []
+        return c
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key=self.NODE_KEY, spec_path="spec/component/spec_x",
+            ir_id="x_1_001", pipeline_id="x_1_001", source_id="src_1_001",
+            binary_id="bin_1_001", run_id="run_1_001", source_binary_id="bin_1_001")
+
+    def _seed_row(self, repo: Path, arid: str, step: str, substep: str,
+                  status: str = "pass", **extra) -> None:
+        root = repo / "workspace" / "orchestrations" / "orch_x"
+        root.mkdir(parents=True, exist_ok=True)
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "agent_run_id": arid, "agent_role": "substep", "step": step,
+                "substep": substep, "status": status, "node_key": self.NODE_KEY, **extra,
+            }) + "\n")
+
+    def _capture_events(self, c) -> list:
+        events: list = []
+        c.emit = lambda ev, **f: events.append((ev, f))  # type: ignore[assignment]
+        return events
+
+    def test_transport_resume_preseats_producer_and_skips_relaunch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            # The surviving ir dir exists → a normal run would ROTATE the producer id
+            # (_ensure_fresh_producer_id calls reserve-phase-root); preseat suppresses that.
+            ir_dir = repo / "workspace" / "ir" / wc.node_key_safe(self.NODE_KEY) / "x_1_001"
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text("case: {}\n", encoding="utf-8")
+            c = self._conductor([wc.ProcResult(0, "ok", "")], repo=repo)
+            c._substep_resume = {"compile": {"producer_arid": "run1-producer",
+                                             "artifact_id": "x_1_001"}}
+            refs = self._refs()
+            events = self._capture_events(c)
+            oc = c.run_phase(refs, "compile")
+
+            self.assertEqual(oc.status, "pass")
+            self.assertEqual(oc.decision.action, "advance")
+            self.assertEqual(refs.ir_id, "x_1_001")  # NOT rotated
+            self.assertNotIn("reserve-phase-root", [s for s, _ in c.calls])  # rotation suppressed
+            # The producer leaf is NOT relaunched: record-launch fires only for the deterministic
+            # static substep and the verify leaf; only verify actually spawns a `claude -p`.
+            launched = [cap["--request-json"]["agent_run_id"]
+                        for s, cap in c.calls if s == "record-launch"]
+            self.assertEqual(launched, ["child-1", "child-2"])
+            self.assertEqual(len(c.spawns), 1)
+            sr = next(cap["--result-json"] for s, cap in c.calls if s == "write-step-result")
+            # step_result spans run-1 producer + the run-2 mids/verify (validator-clean:
+            # the superseded producer is vouch-exempt, the fresh rows satisfy the replacement rule).
+            self.assertEqual(sr["substep_agent_run_ids"],
+                             ["run1-producer", "child-1", "child-2"])
+            self.assertEqual(c._producer_arid["compile"], "run1-producer")
+            resumed = [f for e, f in events if e == "substep_resumed"]
+            self.assertEqual(len(resumed), 1)
+            self.assertEqual(resumed[0]["agent_run_id"], "run1-producer")
+
+    def test_transport_resume_consumer_repoints_generate_source_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._conductor([], repo=repo)
+            self._seed_row(repo, "gen-prod", "generate", "generate")
+            refs = self._refs()
+            (repo / refs.source_dir("src_recovered") / "src").mkdir(parents=True, exist_ok=True)
+            events = self._capture_events(c)
+            c._consume_transport_resume_directive(
+                refs, ["compile", "generate", "build", "validate"], {
+                    "source": wc_runtime.LEAF_TRANSPORT_RESUME_SOURCE, "node_key": self.NODE_KEY,
+                    "step": "generate", "resume_substep": "verify",
+                    "producer_agent_run_id": "gen-prod", "producer_artifact_id": "src_recovered"})
+            self.assertEqual(refs.source_id, "src_recovered")  # day-boundary default corrected
+            self.assertEqual(c._substep_resume["generate"],
+                             {"producer_arid": "gen-prod", "artifact_id": "src_recovered"})
+            self.assertIn("transport_substep_resume", [e for e, _ in events])
+
+    def _directive(self, **over) -> dict:
+        d = {"source": wc_runtime.LEAF_TRANSPORT_RESUME_SOURCE, "node_key": self.NODE_KEY,
+             "step": "compile", "resume_substep": "verify",
+             "producer_agent_run_id": "cmp-prod", "producer_artifact_id": "x_1_001"}
+        d.update(over)
+        return d
+
+    def test_transport_resume_consumer_declines_gracefully(self) -> None:
+        phases = ["compile", "generate", "build", "validate"]
+        # (setup, directive-overrides, expected decline reason)
+        cases = [
+            ("node_mismatch", {"node_key": "component/other@0.1.0"}, "node_key_mismatch"),
+            ("bad_step", {"step": "validate"}, "step_out_of_scope"),
+            ("not_verify", {"resume_substep": "static"}, "not_verify_resume"),
+            ("no_producer_row", {}, "producer_row_absent"),
+        ]
+        for label, over, reason in cases:
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                c = self._conductor([], repo=repo)
+                refs = self._refs()
+                if label != "no_producer_row":
+                    # a valid producer row + artifact so ONLY the intended check fails
+                    self._seed_row(repo, "cmp-prod", "compile", "generate")
+                    ir = repo / "workspace" / "ir" / wc.node_key_safe(self.NODE_KEY) / "x_1_001"
+                    ir.mkdir(parents=True, exist_ok=True)
+                    (ir / "spec.ir.yaml").write_text("case: {}\n", encoding="utf-8")
+                events = self._capture_events(c)
+                c._consume_transport_resume_directive(refs, phases, self._directive(**over))
+                self.assertFalse(getattr(c, "_substep_resume", {}), f"{label} must not arm")
+                declines = [f["reason"] for e, f in events if e == "transport_resume_declined"]
+                self.assertEqual(declines, [reason], f"{label}")
+
+    def test_transport_resume_consumer_declines_when_artifact_dir_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._conductor([], repo=repo)
+            self._seed_row(repo, "cmp-prod", "compile", "generate")  # row exists, no ir dir
+            refs = self._refs()
+            events = self._capture_events(c)
+            c._consume_transport_resume_directive(
+                refs, ["compile", "generate"], self._directive())
+            self.assertFalse(getattr(c, "_substep_resume", {}))
+            self.assertEqual([f["reason"] for e, f in events
+                              if e == "transport_resume_declined"], ["artifact_dir_missing"])
+
+    def test_second_transport_death_after_preseat_retombstones_idempotently(self) -> None:
+        """A C-resumed verify that transport-dies AGAIN: run_phase's transport branch supersedes
+        every outcome arid — including the already-superseded run-1 producer — which is a no-op
+        set-union, not an error, and the next derive re-fires."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            ir_dir = repo / "workspace" / "ir" / wc.node_key_safe(self.NODE_KEY) / "x_1_001"
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text("case: {}\n", encoding="utf-8")
+            # verify leaf dies of transport (nonzero exit) — static passed in-process first.
+            c = self._conductor([wc.ProcResult(1, "", "Claude AI usage limit reached")], repo=repo)
+            c._substep_resume = {"compile": {"producer_arid": "run1-producer",
+                                             "artifact_id": "x_1_001"}}
+            with redirect_stdout(io.StringIO()):
+                oc = c.run_phase(self._refs(), "compile")
+            self.assertEqual(oc.decision.action, "fail_closed")
+            self.assertTrue(oc.decision.reason.startswith("leaf_transport_error"))
+            tombstoned = [rid for s, cap in c.calls if s == "add-superseded-runs"
+                          for rid in cap["--run-ids"]]
+            # the preseated run-1 producer is re-superseded alongside the fresh static+verify.
+            self.assertIn("run1-producer", tombstoned)
+            self.assertNotIn("write-step-result", [s for s, _ in c.calls])
+
+    def test_transport_resume_is_mode_independent(self) -> None:
+        for mode in ("dev", "prod"):
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td)
+                c = self._conductor([], repo=repo, workflow_mode=mode)
+                self._seed_row(repo, "cmp-prod", "compile", "generate")
+                ir = repo / "workspace" / "ir" / wc.node_key_safe(self.NODE_KEY) / "x_1_001"
+                ir.mkdir(parents=True, exist_ok=True)
+                (ir / "spec.ir.yaml").write_text("case: {}\n", encoding="utf-8")
+                refs = self._refs()
+                with redirect_stdout(io.StringIO()):
+                    c._consume_transport_resume_directive(
+                        refs, ["compile", "generate"], self._directive())
+                self.assertIn("compile", getattr(c, "_substep_resume", {}), mode)
+
+
 class NodeAllocationTest(unittest.TestCase):
     """M5: node resolution + deterministic id allocation + reservation."""
 

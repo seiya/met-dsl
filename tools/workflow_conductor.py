@@ -6300,6 +6300,12 @@ clean:
                 self._producer_arid[phase] = producer
             return PhaseOutcome(phase, "pass", decision=RouteDecision("advance"),
                                 skipped=True)
+        # Item C: a transport-substep resume (armed by _consume_transport_resume_directive) preseats
+        # the surviving producer as outcomes[0] and relaunches only the deterministic mids + verify.
+        # Popped so it fires once; a normal run leaves it None. When set, the producer-id rotation is
+        # SUPPRESSED (refs already point at the surviving artifact) — otherwise _ensure_fresh_producer_id
+        # would allocate a new id and orphan the artifact we mean to reuse.
+        preseat = getattr(self, "_substep_resume", {}).pop(phase, None)
         # Validate dependency-DAG readiness is checked HERE, before the generic launch gate.
         # This is load-bearing: workflow_launch_check (and EVERY substep's own record-launch,
         # including pre_judge's) is itself dependency-gated (`_dependency_ready`), so a
@@ -6318,7 +6324,8 @@ clean:
                 return PhaseOutcome(phase, "fail", decision=RouteDecision(
                     "fail_closed", reason="validate_pre_judge_dag_incomplete"))
         self.workflow_launch_check(node_key, phase, child_agent_role(phase))
-        self._ensure_fresh_producer_id(refs, phase)
+        if preseat is None:
+            self._ensure_fresh_producer_id(refs, phase)
         # Author/refresh the pipeline lineage.json host-side BEFORE the substeps run:
         # generate.static's post_generate gate requires it, and the sandboxed leaf cannot
         # write it (pipeline-root file; see _write_lineage). Pipeline phases only —
@@ -6372,7 +6379,22 @@ clean:
                     reason=f"compile_dependency_graph_{err['reason']}"))
 
         outcomes: list[SubstepOutcome] = []
+        if preseat is not None:
+            # Seed the surviving run-1 producer as a synthetic pass at index 0 and start the loop at
+            # index 1. The producer arid is superseded (transport-tombstoned) but is re-vouched by
+            # this run's step_result — the completion check `continue`s superseded rows, and the
+            # re-run mids/verify supply the fresh non-superseded rows the fresh-replacement rule needs.
+            outcomes.append(SubstepOutcome(
+                preseat["producer_arid"], "pass", [], 0, None, 0.0, 1))
+            self.emit("substep_resumed", node_key=refs.node_key, phase=phase,
+                      substep=SUBSTEPS[phase][0] or "step",
+                      agent_run_id=preseat["producer_arid"])
         for i, substep in enumerate(SUBSTEPS[phase]):
+            # A preseated producer occupies outcomes[0]; skip the already-satisfied indices so the
+            # producer leaf is not re-spawned (repair=repair if i==0 is dead under preseat — index 0
+            # is skipped and a transport resume carries no pending_repair).
+            if i < len(outcomes):
+                continue
             # Surface substep activity on the host stdout event stream so an
             # operator sees per-substep progress (the phase-level emits alone
             # leave a long gap during multi-substep phases like generate). The
@@ -6866,14 +6888,22 @@ clean:
         it is read from. A reopen failure degrades to a plain resume (no repair seeded) rather
         than crashing the run; the phases then simply re-run cold from Generate.
         """
-        from tools.orchestration_runtime import DEV_VALIDATE_EXECUTE_RESUME_SOURCE
+        from tools.orchestration_runtime import (
+            DEV_VALIDATE_EXECUTE_RESUME_SOURCE, LEAF_TRANSPORT_RESUME_SOURCE)
 
         meta = _read_json(self.repo_root / "workspace" / "orchestrations"
                           / self.orchestration_id / "orchestration_meta.json") or {}
         directive = meta.get("resume_directive")
         if not isinstance(directive, dict):
             return {}
-        if directive.get("source") != DEV_VALIDATE_EXECUTE_RESUME_SOURCE:
+        source = directive.get("source")
+        # Item C: a transport-substep resume arms preseat state that run_phase consumes; it seeds
+        # NO pending_repair (a transport death has nothing to repair — the producer passed), so it
+        # returns {} either way and never routes through reopen_phase.
+        if source == LEAF_TRANSPORT_RESUME_SOURCE:
+            self._consume_transport_resume_directive(refs, phases, directive)
+            return {}
+        if source != DEV_VALIDATE_EXECUTE_RESUME_SOURCE:
             return {}
         if str(directive.get("node_key") or "").strip() != refs.node_key:
             return {}
@@ -6915,6 +6945,64 @@ clean:
                   failure_category=str(directive.get("failure_category") or ""),
                   findings=bool(payload.get("repair_findings")))
         return {"generate": payload}
+
+    def _consume_transport_resume_directive(
+            self, refs: NodeRefs, phases: list[str], directive: dict[str, Any]) -> None:
+        """Arm substep-granular preseat for a compile/generate phase that fail_closed on a leaf
+        transport error whose verify substep died (`_derive_leaf_transport_resume_directive`).
+        `run_phase` then seeds outcomes[0] with the surviving producer and relaunches only the
+        deterministic mids + verify — instead of re-paying the billed producer leaf.
+
+        Every check is defensive: any miss emits `transport_resume_declined` and returns, leaving
+        the plain full-phase resume untouched (a decline is exactly today's behavior — no new
+        failure mode, and no ref is mutated until every precondition holds)."""
+        def _decline(reason: str) -> None:
+            self.emit("transport_resume_declined", node_key=refs.node_key, reason=reason)
+
+        if str(directive.get("node_key") or "").strip() != refs.node_key:
+            return _decline("node_key_mismatch")
+        step = str(directive.get("step") or "").strip().lower()
+        if step not in ("compile", "generate") or step not in phases:
+            return _decline("step_out_of_scope")
+        if str(directive.get("resume_substep") or "").strip().lower() != "verify":
+            return _decline("not_verify_resume")
+        producer_arid = str(directive.get("producer_agent_run_id") or "").strip()
+        artifact_id = str(directive.get("producer_artifact_id") or "").strip()
+        if not producer_arid or not artifact_id:
+            return _decline("incomplete_directive")
+        # A phase already checkpointed complete is skipped by run_phase — nothing to preseat.
+        if self.check_step_completed(refs.node_key, step) is not None:
+            return _decline("phase_already_complete")
+        # The producer must be a real pass row of THIS orchestration.
+        from tools.orchestration_runtime import _load_run_records, _orchestration_root
+        runs = _load_run_records(_orchestration_root(self.repo_root, self.orchestration_id))
+        prod = runs.get(producer_arid)
+        if not (isinstance(prod, dict)
+                and str(prod.get("status") or "").strip().lower() == "pass"):
+            return _decline("producer_row_absent")
+        # Confirm the surviving artifact still exists BEFORE mutating any ref (so a decline leaves
+        # the plain-resume refs intact). compile → reserved ir dir + spec.ir.yaml; generate →
+        # source dir + src/.
+        if step == "compile":
+            deliverable = (self.repo_root / "workspace" / "ir" / refs.safe
+                           / artifact_id / "spec.ir.yaml")
+        else:
+            deliverable = self.repo_root / refs.source_dir(artifact_id) / "src"
+        if not deliverable.exists():
+            return _decline("artifact_dir_missing")
+        # All checks passed: re-point refs at the surviving artifact (compile is normally a no-op —
+        # the reservation already yields it; generate corrects the day-boundary source_id default)
+        # and arm the preseat run_phase reads.
+        if step == "compile":
+            refs.ir_id = artifact_id
+        else:
+            refs.source_id = artifact_id
+        if not hasattr(self, "_substep_resume"):
+            self._substep_resume: dict[str, dict[str, str]] = {}
+        self._substep_resume[step] = {
+            "producer_arid": producer_arid, "artifact_id": artifact_id}
+        self.emit("transport_substep_resume", node_key=refs.node_key, step=step,
+                  resume_substep="verify", producer_arid=producer_arid, artifact_id=artifact_id)
 
     def conduct(self, refs: NodeRefs, until_phase: str) -> str:
         """Drive the phases, acting on each phase's cross-phase routing decision:
