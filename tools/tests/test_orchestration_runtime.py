@@ -28883,9 +28883,10 @@ class LeafTransportResumeDirectiveTest(unittest.TestCase):
             self._reserve(root, "compile", "foo_20260101_001")
             self.assertIsNone(self._derive(repo_root, oid))
 
-    def test_enable_checkpoint_resume_writes_transport_directive_fourth_in_chain(self) -> None:
-        """The transport deriver is the FOURTH `if directive is None:` branch: the three prior
-        derivers decline for a `leaf_transport_error` fail_closed, so its directive lands in meta."""
+    def test_enable_checkpoint_resume_writes_transport_directive_last_in_chain(self) -> None:
+        """The transport deriver is the LAST deriver in the resume-directive chain (the 4th deriver
+        overall / the 3rd `if directive is None:` guard): the three prior derivers all decline for a
+        `leaf_transport_error` fail_closed, so its directive is the one that lands in meta."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             oid = "orch_transport_chain"

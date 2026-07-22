@@ -3116,6 +3116,33 @@ class TransportSubstepResumeTest(unittest.TestCase):
             self.assertEqual(len(resumed), 1)
             self.assertEqual(resumed[0]["agent_run_id"], "run1-producer")
 
+    def test_consumer_then_run_phase_end_to_end_skips_producer(self) -> None:
+        """The full seam: arm the preseat through the REAL consumer (from an agent_runs producer
+        pass row + surviving ir dir), then run the phase — the producer is not relaunched and the
+        step_result vouches the run-1 producer + the fresh re-run substeps."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._seed_row(repo, "cmp-prod", "compile", "generate")
+            ir_dir = repo / "workspace" / "ir" / wc.node_key_safe(self.NODE_KEY) / "x_1_001"
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text("case: {}\n", encoding="utf-8")
+            c = self._conductor([wc.ProcResult(0, "ok", "")], repo=repo)
+            refs = self._refs()
+            with redirect_stdout(io.StringIO()):
+                c._consume_transport_resume_directive(
+                    refs, ["compile", "generate", "build", "validate"], self._directive())
+                self.assertEqual(c._substep_resume["compile"],
+                                 {"producer_arid": "cmp-prod", "artifact_id": "x_1_001"})
+                oc = c.run_phase(refs, "compile")
+            self.assertEqual(oc.status, "pass")
+            launched = [cap["--request-json"]["agent_run_id"]
+                        for s, cap in c.calls if s == "record-launch"]
+            self.assertEqual(launched, ["child-1", "child-2"])  # producer NOT relaunched
+            sr = next(cap["--result-json"] for s, cap in c.calls if s == "write-step-result")
+            self.assertEqual(sr["substep_agent_run_ids"],
+                             ["cmp-prod", "child-1", "child-2"])
+            self.assertEqual(c._producer_arid["compile"], "cmp-prod")
+
     def test_transport_resume_consumer_repoints_generate_source_id(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -3148,6 +3175,7 @@ class TransportSubstepResumeTest(unittest.TestCase):
             ("node_mismatch", {"node_key": "component/other@0.1.0"}, "node_key_mismatch"),
             ("bad_step", {"step": "validate"}, "step_out_of_scope"),
             ("not_verify", {"resume_substep": "static"}, "not_verify_resume"),
+            ("incomplete", {"producer_agent_run_id": ""}, "incomplete_directive"),
             ("no_producer_row", {}, "producer_row_absent"),
         ]
         for label, over, reason in cases:
@@ -3166,6 +3194,25 @@ class TransportSubstepResumeTest(unittest.TestCase):
                 self.assertFalse(getattr(c, "_substep_resume", {}), f"{label} must not arm")
                 declines = [f["reason"] for e, f in events if e == "transport_resume_declined"]
                 self.assertEqual(declines, [reason], f"{label}")
+
+    def test_transport_resume_consumer_declines_when_phase_already_complete(self) -> None:
+        """A phase already checkpointed complete is skipped by run_phase, so preseating it would be
+        wrong — the consumer declines when check_step_completed reports it done."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._conductor([], repo=repo)
+            self._seed_row(repo, "cmp-prod", "compile", "generate")
+            ir = repo / "workspace" / "ir" / wc.node_key_safe(self.NODE_KEY) / "x_1_001"
+            ir.mkdir(parents=True, exist_ok=True)
+            (ir / "spec.ir.yaml").write_text("case: {}\n", encoding="utf-8")
+            c.check_step_completed = lambda nk, st: {"integrity": "ok"}  # type: ignore[assignment]
+            refs = self._refs()
+            events = self._capture_events(c)
+            c._consume_transport_resume_directive(
+                refs, ["compile", "generate"], self._directive())
+            self.assertFalse(getattr(c, "_substep_resume", {}))
+            self.assertEqual([f["reason"] for e, f in events
+                              if e == "transport_resume_declined"], ["phase_already_complete"])
 
     def test_transport_resume_consumer_declines_when_artifact_dir_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
