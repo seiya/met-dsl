@@ -133,7 +133,7 @@ An `infrastructure spec` takes the `component spec` section shape **minus sectio
 - Required statement: state the runner plumbing this harness provides (argv/`--cases` parsing, the case-loop driver, JSON/snapshot/perf/`metrics_basis` emission) and the `(language, hardware)` target it serves; state explicitly that it carries no physics.
 
 2. **input/output contract**
-- Required statement: state the runner argv it parses, and the `diagnostics.json` / `perf.json` / `raw/*` (snapshot / `metrics_basis.json`) shapes it emits, with the numeric/boolean descriptor rules (per `docs/workflow/RUNNER_OUTPUT_CONTRACT.md`). The `metrics_basis.json` index is keyed by (`test_id`, `case_id`) — one flat entry per case each test targets — so state which record component carries the `case_id`.
+- Required statement: state the runner argv it parses, and the `diagnostics.json` / `perf.json` / `raw/*` (snapshot / `metrics_basis.json`) shapes it emits, with the abstract serialization rules (a real as a round-trip-lossless exponential token, an integer as its minimal decimal, a boolean as the literal `true` / `false`; the target-language realization — e.g. the Fortran edit descriptors — is canonical in `docs/workflow/RUNNER_OUTPUT_CONTRACT.md` §4). The `metrics_basis.json` index is keyed by (`test_id`, `case_id`) — one flat entry per case each test targets — so state which record component carries the `case_id`.
 
 3. **Operation definition**
 - Required statement: state, per published `<spec_id>__*` operation, its argument roles and behavior (case-set parse, per-case snapshot/JSON writers, rank-N array emitters, perf/diagnostics/`metrics_basis` writers), and the published derived types the operations exchange.
@@ -142,7 +142,7 @@ An `infrastructure spec` takes the `component spec` section shape **minus sectio
 - Required statement: state the guard behaviors (e.g. missing `--cases` aborts) and the invariants the harness enforces.
 
 5. **Public API and compatibility**
-- Required statement: state the published `operation_id` list **exhaustively** ("the published `operation_id`s are exactly: ...") and the published derived types, each as a backtick span carrying the `<spec_id>__` prefix; plus the `major` / `minor` update rules and the backward-compatibility policy. The list must include every helper operation a consuming runner calls, including one no test exercises: `Compile` pins the `IR`'s `public_api` to this list by set equality.
+- Required statement: state the published `operation_id` list **exhaustively** ("the published `operation_id`s are exactly: ...") and the published derived types, each as a backtick span carrying the `<spec_id>__` prefix; plus the `major` / `minor` update rules and the backward-compatibility policy. Each `<spec_id>__<operation>` `operation_id` is a **language-neutral DSL identifier** — the `__` separator is a DSL convention, not a target-language one — that the language backend maps 1:1 to a symbol in the generated source, so the published-surface identity is independent of any single language's symbol spelling. The list must include every helper operation a consuming runner calls, including one no test exercises: `Compile` pins the `IR`'s `public_api` to this list by set equality.
 - The subsection `### 5.1` below is required. The section numbers are load-bearing — the `Compile` gate reads the published surface out of `## 5.` and `### 5.1` by number — so a harness that renumbers its sections fails to certify.
 
   **5.1 Canonical interface block**
