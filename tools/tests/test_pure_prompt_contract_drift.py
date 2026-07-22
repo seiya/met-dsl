@@ -92,6 +92,7 @@ PINNED: dict[str, str] = {
     "pure-8": "1b1a9575930504226c6d6acebf7cf3ee4b64247e4146f978ee84bbe505b1e4c2",
     "pure-9": "273f38bdbf82569ed5f7ebb7a4ce9896c6b386297f1e25ccbd74923b4f38c70a",
     "pure-10": "ba2da518724e26df35bae96bd69a462f96bfb9509b8785b6355ebf51e7e8cc4b",
+    "pure-11": "cec79c570b3de442677ab90d18f2064bf32e8e113d9200b862dbf6a89254b8f8",
 }
 
 
