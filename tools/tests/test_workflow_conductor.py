@@ -2496,6 +2496,29 @@ class UsageResetEpochParseTests(unittest.TestCase):
         # Nothing at all.
         self.assertIsNone(wc._parse_usage_reset_epoch(""))
 
+    def test_terminal_usage_line_epoch_wins_over_an_earlier_one(self) -> None:
+        # Multiple usage-limit records: the LAST (terminal) line governs the wait, mirroring the
+        # classifier's most-severe-then-last discipline. Returning the FIRST would wait on a stale,
+        # already-survived epoch.
+        stderr = ("Claude AI usage limit reached|1752200000\n"
+                  "the run continued...\n"
+                  "Claude AI usage limit reached|1799999999")
+        self.assertEqual(wc._parse_usage_reset_epoch(stderr), 1799999999)
+
+    def test_terminal_usage_line_without_epoch_supersedes_an_earlier_epoch(self) -> None:
+        # Codex P2: an earlier session message with an in-window epoch, then a TERMINAL weekly limit
+        # with no machine epoch -> None (do not wait on the stale epoch; the weekly limit fired).
+        stderr = ("session limit reached|1752200000\n"
+                  "Claude AI weekly limit reached; resets Monday")
+        self.assertIsNone(wc._parse_usage_reset_epoch(stderr))
+
+    def test_recovered_retry_notice_epoch_is_not_taken_as_terminal(self) -> None:
+        # A recovered `Retrying...` banner that mentions a usage limit + epoch is skipped (as the
+        # classifier skips it); only the genuine terminal line's epoch is returned.
+        stderr = ("API Error (usage limit reached|1752200000) Retrying in 1s (attempt 1/10)\n"
+                  "Claude AI usage limit reached|1799999999")
+        self.assertEqual(wc._parse_usage_reset_epoch(stderr), 1799999999)
+
 
 class LeafChildEnvTest(unittest.TestCase):
     """WI-A: the leaf's output ceiling is part of the CONDUCTOR'S leaf contract (it lives in

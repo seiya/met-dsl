@@ -1533,6 +1533,16 @@ def _parse_usage_reset_epoch(stderr: str) -> int | None:
     Only lines the `llm_usage_limit` pattern itself matches are considered (so a stray `|1234567890`
     is never mistaken for a reset time).
 
+    Selects the epoch from the TERMINAL usage-limit line — the LAST one, skipping recovered
+    retry-notice banners — so it AGREES with `_classify_leaf_infra_error`, which tags the run from
+    that same terminal line (most-severe-then-last). Returning the FIRST match instead would let a
+    stale, non-terminal message govern the wait: e.g. an earlier session message with an in-window
+    epoch followed by a terminal weekly limit would wait on the stale epoch and burn the single
+    permitted wait on a limit that is not the one that fired; the reverse ordering would decline a
+    valid session wait. When the terminal usage-limit line carries NO epoch (a human-worded weekly
+    limit) the result is None even if an earlier line had one — the wait is governed by the cause
+    that actually terminated the leaf, not by an epoch the run went on to survive.
+
     STDERR ONLY — deliberately NOT stdout. stdout is a `claude -p` leaf's OWN OUTPUT SURFACE (the
     model's result text for an agentic leaf; the JSON envelope for a pure leaf), i.e. untrusted
     content. `_classify_leaf_infra_error` may PROMOTE an `llm_usage_limit` tag out of stdout, and
@@ -1545,13 +1555,22 @@ def _parse_usage_reset_epoch(stderr: str) -> int | None:
     default. (If a real CLI emits the machine epoch only on stdout, the operator gets the current
     manual-`--resume` behavior; a follow-up would key the wait off a verified machine envelope.)"""
     usage_pattern = _LEAF_INFRA_ERROR_PATTERNS[0][1]
-    for line in (stderr or "").splitlines():
+    lines = (stderr or "").splitlines()
+    terminal_epoch: int | None = None
+    for idx, line in enumerate(lines):
+        # Skip a recovered retry-notice banner AND the line it continues from, exactly as the
+        # classifier does — a `Retrying... (attempt 1/10)` line the run survived is not terminal.
+        nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+        if (_LEAF_RETRY_NOTICE_RE.search(line.lower())
+                or _LEAF_RETRY_NOTICE_RE.search(nxt.lower())):
+            continue
         if not usage_pattern.search(line.lower()):
             continue
+        # LAST usage-limit line wins (the terminal message). Its epoch — or None when the terminal
+        # line is human-worded — supersedes any earlier line's epoch.
         match = _USAGE_RESET_EPOCH_RE.search(line)
-        if match:
-            return int(match.group(1))
-    return None
+        terminal_epoch = int(match.group(1)) if match else None
+    return terminal_epoch
 
 
 def _classify_leaf_infra_error(stderr: str, stdout: str = "") -> tuple[str, str] | None:
