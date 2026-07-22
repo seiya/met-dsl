@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 import tools.orchestration_runtime as wc_runtime
 import tools.workflow_conductor as wc
@@ -1475,9 +1476,10 @@ class TransportFailureTest(unittest.TestCase):
 
     def test_judge_transport_failure_fails_closed_and_tombstones(self) -> None:
         c = self._conductor()
-        # A usage limit is NOT retryable, so this stub also serves as the tripwire for that: adding
-        # `llm_usage_limit` to _RETRYABLE_LEAF_INFRA_TAGS would spawn 3 judge leaves and break the
-        # single-tombstone / three-arid assertions below.
+        # A usage limit is NOT retryable (and, with --wait-usage-reset OFF as here, not waited
+        # either), so this stub also serves as the tripwire for that: adding `llm_usage_limit` to
+        # _RETRYABLE_LEAF_INFRA_TAGS would spawn 3 judge leaves and break the single-tombstone /
+        # three-arid assertions below.
         # pre_judge + execute are deterministic (rc 0, pass); the judge leaf hits a session limit.
         c.spawn_leaf = lambda *a, **k: wc.ProcResult(1, "", "Claude usage limit reached")  # type: ignore[assignment]
         oc = c.run_phase(self._refs(), "validate")
@@ -2669,7 +2671,9 @@ class LeafTransientRetryTest(unittest.TestCase):
 
     def test_usage_limit_is_never_retried(self) -> None:
         """A usage limit is a HARD STOP lasting hours. Retrying it burns the budget in seconds
-        and only delays the operator's resume — it stays terminal by design."""
+        and only delays the operator's resume. With --wait-usage-reset OFF (the DEFAULT, and what
+        this conductor has) it stays terminal even though the leaf carried a machine-form reset
+        epoch — the opt-in wait is exercised by the tests below."""
         c = self._conductor([wc.ProcResult(1, "", "Claude AI usage limit reached|1752200000")])
         oc = c.run_substep(self._refs(), "compile", "verify")
         self.assertEqual(len(c.spawns), 1)
@@ -2677,6 +2681,99 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertEqual(oc.infra_error[0], "llm_usage_limit")
         self.assertEqual(c.slept, [])
         self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
+
+    def test_usage_reset_wait_recovers_when_opted_in(self) -> None:
+        """--wait-usage-reset ON + a machine-form reset epoch: the usage-limited leaf is waited out
+        in place and the substep re-launched, turning a next-day fresh run into a same-run resume.
+        The wait sleeps to the epoch + the 120s margin, the dead attempt is tombstoned under its own
+        prefix, and a `leaf_usage_limit_wait` event is emitted."""
+        now = 1_752_200_000.0
+        c = self._conductor(
+            [wc.ProcResult(1, "", f"Claude AI usage limit reached|{int(now) + 300}"),
+             wc.ProcResult(0, "done", "")],
+            wait_usage_reset=True)
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(len(c.spawns), 2)             # dead attempt + the recovered launch
+        self.assertEqual(oc.attempts, 2)               # every launch is counted honestly
+        self.assertEqual(c.slept, [420.0])             # 300s to the reset + 120s margin
+        # the dead usage attempt is tombstoned under the wait's own prefix (not the transient one)
+        sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertEqual(len(sup), 1)
+        self.assertEqual(sup[0]["--run-ids"], ["child-1"])
+        self.assertIn("leaf_usage_limit_wait_orphan", sup[0]["--reason"])
+        waits = [f for e, f in events if e == "leaf_usage_limit_wait"]
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0]["reset_epoch"], int(now) + 300)
+        self.assertEqual(waits[0]["wait_seconds"], 420.0)
+        self.assertEqual(waits[0]["wait_attempt"], 1)
+        self.assertEqual(waits[0]["dead_agent_run_id"], "child-1")
+
+    def test_usage_reset_wait_budget_is_one_then_fails_closed(self) -> None:
+        """The wait budget is MAX_USAGE_LIMIT_WAITS (=1) per substep: a second usage limit after the
+        first wait is terminal (fail_closed), with the honest launch count in the reason."""
+        now = 1_752_200_000.0
+        c = self._conductor(
+            [wc.ProcResult(1, "", f"usage limit reached|{int(now) + 200}")],
+            wait_usage_reset=True)
+        with mock.patch.object(wc.time, "time", return_value=now), redirect_stdout(io.StringIO()):
+            oc = c.run_phase(self._refs(), "compile")
+        self.assertEqual(len(c.spawns), 2)                 # one wait, then the hard stop
+        self.assertEqual(c.slept, [320.0])                 # only the single wait
+        self.assertEqual(oc.decision.action, "fail_closed")
+        self.assertIn("llm_usage_limit", oc.decision.reason)
+        self.assertIn("[attempts=2]", oc.decision.reason)
+
+    def test_usage_reset_wait_declines_without_a_machine_epoch(self) -> None:
+        """Opted in but no machine-form epoch (a human-worded reset) => no guessing: the current
+        fail_closed behavior is preserved and nothing is slept or tombstoned."""
+        c = self._conductor(
+            [wc.ProcResult(1, "", "You've hit your session limit; resets 6:10pm")],
+            wait_usage_reset=True)
+        oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(len(c.spawns), 1)
+        self.assertEqual(oc.attempts, 1)
+        self.assertEqual(oc.infra_error[0], "llm_usage_limit")
+        self.assertEqual(c.slept, [])
+        self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
+
+    def test_usage_reset_wait_declines_when_reset_exceeds_the_cap(self) -> None:
+        """A reset further out than MAX_USAGE_LIMIT_WAIT_SECONDS (6h) is a weekly limit or a
+        misparse, not a session window — do not sit on it; fall back to fail_closed."""
+        now = 1_752_200_000.0
+        c = self._conductor(
+            [wc.ProcResult(1, "", f"usage limit reached|{int(now) + 7 * 3600}")],
+            wait_usage_reset=True)
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(len(c.spawns), 1)
+        self.assertEqual(c.slept, [])
+        self.assertEqual(oc.infra_error[0], "llm_usage_limit")
+
+    def test_usage_wait_budget_is_independent_of_the_transient_budget(self) -> None:
+        """A transient flake and a usage-limit wait draw on SEPARATE budgets: a flake retried, then
+        a usage limit waited, then a success — all recovered in one substep, with both budgets
+        counted precisely in the launch total."""
+        now = 1_752_200_000.0
+        c = self._conductor(
+            [self._flake(),
+             wc.ProcResult(1, "", f"usage limit reached|{int(now) + 60}"),
+             wc.ProcResult(0, "done", "")],
+            wait_usage_reset=True)
+        with mock.patch.object(wc.time, "time", return_value=now), redirect_stdout(io.StringIO()):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(len(c.spawns), 3)
+        self.assertEqual(oc.attempts, 3)               # 1 transient retry + 1 usage wait + success
+        self.assertEqual(c.slept, [2.0, 180.0])        # transport backoff, then 60s + 120s margin
+        # both dead attempts are tombstoned, each under its own prefix
+        reasons = [cap["--reason"] for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertEqual(len(reasons), 2)
+        self.assertTrue(any("leaf_transient_retry_orphan" in r for r in reasons))
+        self.assertTrue(any("leaf_usage_limit_wait_orphan" in r for r in reasons))
 
     def test_client_error_is_never_retried(self) -> None:
         """The WI-A interlock: if the configured leaf model's output ceiling is below

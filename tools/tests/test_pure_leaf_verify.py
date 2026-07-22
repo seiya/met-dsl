@@ -15,6 +15,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", "1")
 
@@ -174,6 +175,41 @@ class PureVerifySubstepTests(unittest.TestCase):
         # A transport failure has no fixable verdict — not repaired (one attempt only).
         self.assertEqual(oc.attempts, 1)
         self.assertFalse((c.repo_root / refs.source_dir() / "source_meta.json").exists())
+
+    def test_wait_usage_reset_recovers_a_transport_usage_limit(self) -> None:
+        """--wait-usage-reset (opt-in) mirrors the producer: a reviewer transport death carrying a
+        machine-form usage-limit epoch is waited out in place and re-launched, rather than
+        fail-closing. The wait is not a repair turn (attempts stays the reviewer's repair count)."""
+        now = 1_752_200_000.0
+
+        class _C(_PureFakeConductor):
+            def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+                self._spawn = getattr(self, "_spawn", 0)
+                proc = self.procs[min(self._spawn, len(self.procs) - 1)]
+                self._spawn += 1
+                return proc
+
+            def _sleep_backoff(self, seconds):  # type: ignore[override]
+                self.slept.append(seconds)
+
+        self._tmp = tempfile.TemporaryDirectory()
+        repo = Path(self._tmp.name)
+        refs = _verify_node(repo)
+        (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
+        c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
+               backend="claude", env={}, wait_usage_reset=True)
+        c.procs = [wc.ProcResult(1, "", f"usage limit reached|{int(now) + 300}"),
+                   wc.ProcResult(0, _envelope(_verdict("pass")), "")]
+        c.slept = []
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c._run_pure_verify_substep(refs, "generate", "verify", ())
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(c._spawn, 2)
+        self.assertEqual(oc.attempts, 1)             # a wait is NOT a repair turn
+        self.assertEqual(c.slept, [420.0])           # 300s + 120s margin
+        self.assertTrue((c.repo_root / refs.source_dir() / "source_meta.json").exists())
+        reasons = [cap["--reason"] for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertTrue(any("leaf_usage_limit_wait_orphan" in r for r in reasons))
 
     def test_unencodable_valid_verdict_is_schema_violation_not_transport(self) -> None:
         # Codex review (defect 1): a schema-SOUND verdict whose last_fail_reason holds a lone

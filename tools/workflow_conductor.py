@@ -1605,6 +1605,10 @@ class Conductor:
     # The resolved backend command (may be a wrapper with flags, e.g. from
     # --llm-command); empty falls back to the bare backend name.
     llm_command: str = ""
+    # --wait-usage-reset (opt-in, default OFF): when a leaf dies of an `llm_usage_limit` that
+    # carried a MACHINE-FORM reset epoch, wait it out in place and re-launch the substep instead of
+    # fail-closing the run for a next-day manual `--resume`. Off keeps the current behavior exactly.
+    wait_usage_reset: bool = False
 
     def emit(self, event: str, **fields: Any) -> None:
         """Write one JSONL info event to stdout (the conductor runs in-process
@@ -2831,6 +2835,7 @@ clean:
         # attaching it to a repair turn would ship the payload with nothing rendering it.
         exemplar = self._resolve_exemplar(refs)
         attempt = 0
+        usage_waits = 0
         while True:
             child_arid = self.new_agent_run_id()
             warm = (resume_session_id is not None
@@ -2951,33 +2956,48 @@ clean:
             status = "pass" if category is None else "fail"
             if status != "pass":
                 last_category = category
-                # Carry the prior document into a cold-fallback repair: re-serialize the parsed
-                # bundle (even though it failed validation), else the raw reply text.
-                prior_document = (json.dumps(parsed_bundle, indent=2, ensure_ascii=False)
-                                  if parsed_bundle is not None
-                                  else (envelope.result if isinstance(envelope.result, str) else None))
-                # Both `last_excerpt` (-> the repair turn's `repair_findings` AND bundle_meta's
-                # failure_excerpt) and `prior_document` (-> the cold-fallback repair prompt) are
-                # echoed into a request/meta persisted as UTF-8. Leaf-derived text can carry an
-                # unpaired surrogate (the encodability case caught above, or a raw reply the CLI
-                # passed through), which would raise UnicodeEncodeError at that write — a crash
-                # instead of a repair turn / fail_closed. Normalize any non-encodable code point to
-                # its readable backslash escape at capture so every downstream write is safe by
-                # construction. Mirrors the verify reviewer.
-                last_excerpt = (findings.encode("utf-8", "backslashreplace").decode("utf-8")
-                                if findings is not None else None)
-                if prior_document is not None:
-                    prior_document = prior_document.encode("utf-8", "backslashreplace").decode("utf-8")
+                # A transport death ("pure_transport") has NO fixable document, so it must not
+                # overwrite the repair carriers (`prior_document` / `last_excerpt`). Today transport
+                # is terminal so this never mattered; --wait-usage-reset makes a repair turn
+                # reachable AFTER a transport wait, and a repair turn that shipped "Connection closed
+                # mid-response" as its `repair_findings` would mislead the producer. So only a
+                # CONTENT failure updates the carriers; a transport attempt leaves the prior content
+                # failure's carriers intact for the retry that follows the wait (a fresh cold launch
+                # when there was none).
+                if category != "pure_transport":
+                    # Carry the prior document into a cold-fallback repair: re-serialize the parsed
+                    # bundle (even though it failed validation), else the raw reply text.
+                    prior_document = (json.dumps(parsed_bundle, indent=2, ensure_ascii=False)
+                                      if parsed_bundle is not None
+                                      else (envelope.result if isinstance(envelope.result, str)
+                                            else None))
+                    # Both `last_excerpt` (-> the repair turn's `repair_findings` AND bundle_meta's
+                    # failure_excerpt) and `prior_document` (-> the cold-fallback repair prompt) are
+                    # echoed into a request/meta persisted as UTF-8. Leaf-derived text can carry an
+                    # unpaired surrogate (the encodability case caught above, or a raw reply the CLI
+                    # passed through), which would raise UnicodeEncodeError at that write — a crash
+                    # instead of a repair turn / fail_closed. Normalize any non-encodable code point
+                    # to its readable backslash escape at capture so every downstream write is safe
+                    # by construction. Mirrors the verify reviewer.
+                    last_excerpt = (findings.encode("utf-8", "backslashreplace").decode("utf-8")
+                                    if findings is not None else None)
+                    if prior_document is not None:
+                        prior_document = prior_document.encode(
+                            "utf-8", "backslashreplace").decode("utf-8")
                 # Record why THIS attempt failed on its own per_attempt row (observability only —
                 # ADDITIVE fields; the terminal top-level failure_excerpt stays the repair carrier
                 # `_read_repair_findings` reads). A superseded attempt is otherwise a bare
-                # arid/model/usage row that says nothing about the failure it burned a turn on.
+                # arid/model/usage row that says nothing about the failure it burned a turn on. The
+                # excerpt here is computed LOCALLY from this attempt's findings so a transport row
+                # is still labeled without touching the repair carriers above.
+                this_excerpt = (findings.encode("utf-8", "backslashreplace").decode("utf-8")
+                                if findings is not None else None)
                 attempt_record["failure_category"] = category
                 attempt_record["failure_excerpt"] = (
-                    last_excerpt[:_PURE_ATTEMPT_EXCERPT_MAX_CHARS] if last_excerpt else None)
+                    this_excerpt[:_PURE_ATTEMPT_EXCERPT_MAX_CHARS] if this_excerpt else None)
                 self.emit("pure_bundle_attempt_failed", node_key=refs.node_key,
                           substep=substep, attempt=attempt + 1, failure_category=category,
-                          detail=(last_excerpt or "")[:200])
+                          detail=(this_excerpt or "")[:200])
 
             reply = (f"status: {status}\nleaf rc={proc.returncode}\n"
                      f"category: {category or 'none'}")
@@ -3036,6 +3056,24 @@ clean:
                 return SubstepOutcome(child_arid, "pass", [], proc.returncode,
                                       None, launched_at, attempt + 1)
 
+            # --wait-usage-reset (opt-in): a transport death carrying a machine-form usage-limit
+            # reset epoch is waited out in place and the SAME turn re-launched, rather than falling
+            # to the terminal fail branch for a next-day --resume. Nothing else here treats a
+            # transport death as repairable, so the wait is its only in-loop recovery. `attempt` and
+            # `resume_session_id` are UNCHANGED (a wait is not a repair turn): a cold first attempt
+            # retries cold; an interrupted repair turn re-runs against the same carriers (which the
+            # bookkeeping guard above kept intact). The dead arid was already finalized above, so the
+            # tombstone lands outside its write window; per_attempt keeps its row.
+            if category == "pure_transport":
+                plan = self._usage_reset_wait_plan(proc, usage_waits)
+                if plan is not None:
+                    wait_seconds, reset_epoch = plan
+                    self._wait_for_usage_reset(
+                        node_key=refs.node_key, step=phase, substep=substep,
+                        dead_agent_run_id=child_arid, wait_seconds=wait_seconds,
+                        reset_epoch=reset_epoch, wait_attempt=usage_waits + 1)
+                    usage_waits += 1
+                    continue
             # A content violation within budget: warm-resume the SAME producer session for a
             # bounded repair. A transport failure ("pure_transport") is NOT bundle-repairable —
             # it has no fixable document — so it is excluded here and routed fail_closed by
@@ -3182,6 +3220,7 @@ clean:
         last_category: str | None = None
         last_excerpt: str | None = None
         attempt = 0
+        usage_waits = 0
         while True:
             child_arid = self.new_agent_run_id()
             warm = (resume_session_id is not None
@@ -3334,31 +3373,42 @@ clean:
 
             # A malformed / transport reply. Record the terminal record fields and carry the prior
             # document into a cold-fallback repair (re-serialize the parsed verdict if any, else the
-            # raw reply text).
+            # raw reply text). A transport death ("pure_transport") has NO fixable verdict, so it
+            # must not overwrite the repair carriers (`prior_document` / `last_excerpt`) — mirrors
+            # the producer, so a repair turn that follows a --wait-usage-reset wait carries the prior
+            # SCHEMA failure's findings, not the transport summary.
             last_category = category
-            prior_document = (json.dumps(parsed_verdict, indent=2, ensure_ascii=False)
-                              if parsed_verdict is not None
-                              else (envelope.result if isinstance(envelope.result, str) else None))
-            # Both `last_excerpt` (-> the repair turn's `repair_findings` AND verdict_meta's
-            # failure_excerpt) and `prior_document` (-> the cold-fallback repair prompt) are echoed
-            # into a request/meta that is persisted as UTF-8. Leaf-derived diagnostic text can carry
-            # an unpaired surrogate (the `verdict_schema_violation` case the UTF-8 check above
-            # catches), which would raise UnicodeEncodeError at that write — a crash instead of a
-            # repair turn / a fail_closed. Normalize any non-encodable code point to its readable
-            # backslash escape at capture so every downstream write is safe by construction.
-            last_excerpt = (findings.encode("utf-8", "backslashreplace").decode("utf-8")
-                            if findings is not None else None)
-            if prior_document is not None:
-                prior_document = prior_document.encode("utf-8", "backslashreplace").decode("utf-8")
+            if category != "pure_transport":
+                prior_document = (json.dumps(parsed_verdict, indent=2, ensure_ascii=False)
+                                  if parsed_verdict is not None
+                                  else (envelope.result if isinstance(envelope.result, str)
+                                        else None))
+                # Both `last_excerpt` (-> the repair turn's `repair_findings` AND verdict_meta's
+                # failure_excerpt) and `prior_document` (-> the cold-fallback repair prompt) are
+                # echoed into a request/meta that is persisted as UTF-8. Leaf-derived diagnostic text
+                # can carry an unpaired surrogate (the `verdict_schema_violation` case the UTF-8
+                # check above catches), which would raise UnicodeEncodeError at that write — a crash
+                # instead of a repair turn / a fail_closed. Normalize any non-encodable code point to
+                # its readable backslash escape at capture so every downstream write is safe by
+                # construction.
+                last_excerpt = (findings.encode("utf-8", "backslashreplace").decode("utf-8")
+                                if findings is not None else None)
+                if prior_document is not None:
+                    prior_document = prior_document.encode(
+                        "utf-8", "backslashreplace").decode("utf-8")
             # Record why THIS reviewer attempt failed on its own per_attempt row (observability only —
             # ADDITIVE fields; mirrors the producer). A schema-VALID verdict returned above already,
             # so this branch is only a malformed/transport reply, never a legitimate `fail` verdict.
+            # The excerpt is computed LOCALLY so a transport row is still labeled without touching the
+            # repair carriers above.
+            this_excerpt = (findings.encode("utf-8", "backslashreplace").decode("utf-8")
+                            if findings is not None else None)
             attempt_record["failure_category"] = category
             attempt_record["failure_excerpt"] = (
-                last_excerpt[:_PURE_ATTEMPT_EXCERPT_MAX_CHARS] if last_excerpt else None)
+                this_excerpt[:_PURE_ATTEMPT_EXCERPT_MAX_CHARS] if this_excerpt else None)
             self.emit("pure_verdict_attempt_failed", node_key=refs.node_key,
                       substep=substep, attempt=attempt + 1, failure_category=category,
-                      detail=(last_excerpt or "")[:200])
+                      detail=(this_excerpt or "")[:200])
             reply = (f"verify verdict: none\nleaf rc={proc.returncode}\n"
                      f"category: {category or 'none'}")
             result_summary = f"pure_verify_fail: {category}"
@@ -3367,6 +3417,22 @@ clean:
                 self._agent_run_json(refs, phase, substep, child_arid, "fail",
                                      [], result_summary, agent_model_override=model, pure=True))
 
+            # --wait-usage-reset (opt-in): a transport death carrying a machine-form usage-limit
+            # reset epoch is waited out in place and the SAME turn re-launched, rather than falling
+            # to the terminal fail branch. `attempt` / `resume_session_id` are UNCHANGED (a wait is
+            # not a repair turn; persona separation is preserved — the reviewer only ever resumes its
+            # OWN prior attempt). The dead arid was finalized above, so the tombstone is outside its
+            # write window. Mirrors the producer loop.
+            if category == "pure_transport":
+                plan = self._usage_reset_wait_plan(proc, usage_waits)
+                if plan is not None:
+                    wait_seconds, reset_epoch = plan
+                    self._wait_for_usage_reset(
+                        node_key=refs.node_key, step=phase, substep=substep,
+                        dead_agent_run_id=child_arid, wait_seconds=wait_seconds,
+                        reset_epoch=reset_epoch, wait_attempt=usage_waits + 1)
+                    usage_waits += 1
+                    continue
             # A schema violation within budget: warm-resume the SAME reviewer session for a bounded
             # repair. A transport failure ("pure_transport") has no fixable verdict, so it is
             # excluded and routed fail_closed by run_phase's transport branch (leaf_returncode != 0).
@@ -5248,6 +5314,7 @@ clean:
         # would corrupt it. Everything attempt-invariant (codex cache, warm-resume target,
         # exemplar) is resolved ABOVE the loop; only the launch itself repeats.
         attempt = 0
+        usage_waits = 0
         while True:
             child_arid = self.new_agent_run_id()
             request = build_launch_request(
@@ -5368,8 +5435,27 @@ clean:
                 and infra_error[0] in _RETRYABLE_LEAF_INFRA_TAGS
                 and attempt < MAX_LEAF_TRANSIENT_RETRIES)
             if not retryable:
+                # --wait-usage-reset (opt-in): a usage limit is normally terminal (fail_closed for
+                # a manual post-reset --resume). When the operator opted in AND the leaf carried a
+                # machine-form reset epoch, wait it out in place and re-launch — a same-run,
+                # substep-granular resume instead of a next-day fresh run. Bounded by
+                # MAX_USAGE_LIMIT_WAITS, a budget DISTINCT from the transient-retry budget above; a
+                # usage limit is never a transient-retry tag, so this cannot compound with it.
+                if (not deterministic and infra_error is not None
+                        and infra_error[0] == "llm_usage_limit"):
+                    plan = self._usage_reset_wait_plan(proc, usage_waits)
+                    if plan is not None:
+                        wait_seconds, reset_epoch = plan
+                        self._wait_for_usage_reset(
+                            node_key=refs.node_key, step=phase, substep=substep,
+                            dead_agent_run_id=child_arid, wait_seconds=wait_seconds,
+                            reset_epoch=reset_epoch, wait_attempt=usage_waits + 1)
+                        usage_waits += 1
+                        continue
+                # `attempts` counts EVERY launch (transient retries + usage waits + this one), so a
+                # fail_closed after a wait still reports the honest launch count in `[attempts=N]`.
                 return SubstepOutcome(child_arid, status, output_refs, proc.returncode,
-                                      infra_error, launched_at, attempt + 1)
+                                      infra_error, launched_at, attempt + usage_waits + 1)
             tag = infra_error[0]
             max_attempts = MAX_LEAF_TRANSIENT_RETRIES + 1
             # A dead attempt is never vouched by a step_result (only the surviving attempt's arid
@@ -5398,6 +5484,50 @@ clean:
         assert the schedule without waiting it out) and so a future reader can see at a glance
         that the loop does not otherwise block."""
         time.sleep(seconds)
+
+    def _usage_reset_wait_plan(self, proc: ProcResult,
+                               waits_done: int) -> tuple[float, int] | None:
+        """`(wait_seconds, reset_epoch)` when a usage-limit-killed leaf should be waited out and
+        re-launched in place, or None to keep the current fail_closed behavior.
+
+        None (fall back to fail_closed) whenever ANY precondition misses — the flag is off, the
+        per-substep wait budget is spent, the leaf carried no machine-form reset epoch (a
+        human-worded reset is not guessed at), or the reset lies further out than
+        MAX_USAGE_LIMIT_WAIT_SECONDS (a weekly limit or a misparse, not a session window). The
+        wait sleeps slightly PAST the reset (USAGE_LIMIT_WAIT_MARGIN_SECONDS) so the re-launch's
+        preflight live-probe finds the window actually open; a reset already in the past waits only
+        that margin."""
+        if not self.wait_usage_reset or waits_done >= MAX_USAGE_LIMIT_WAITS:
+            return None
+        reset_epoch = _parse_usage_reset_epoch(proc.stderr or "", proc.stdout or "")
+        if reset_epoch is None:
+            return None
+        remaining = reset_epoch - time.time()
+        if remaining > MAX_USAGE_LIMIT_WAIT_SECONDS:
+            return None
+        wait_seconds = max(0.0, remaining) + USAGE_LIMIT_WAIT_MARGIN_SECONDS
+        return (wait_seconds, reset_epoch)
+
+    def _wait_for_usage_reset(self, *, node_key: str, step: str, substep: str | None,
+                              dead_agent_run_id: str, wait_seconds: float, reset_epoch: int,
+                              wait_attempt: int) -> None:
+        """Tombstone the usage-limit-killed attempt, announce the wait, and sleep out the reset
+        before the caller re-launches the substep.
+
+        The dead attempt is finalized (terminalized) by the caller BEFORE this runs, so the
+        tombstone lands OUTSIDE the child FS-diff window (same ordering invariant the transient
+        retry and the pure loops rely on). Its orphan arid — terminalized but never vouched by a
+        step_result — would otherwise fail the completion check on the surviving pass, so it is
+        superseded here; idempotent (a set union) with the pure loop's later per-attempt tombstone.
+        The lone `_sleep_backoff` is reused so tests stub one sleep and this loop stays the
+        conductor's only block."""
+        self._add_superseded_run_ids(
+            [dead_agent_run_id],
+            reason=f"leaf_usage_limit_wait_orphan: attempt={wait_attempt}")
+        self.emit("leaf_usage_limit_wait", node_key=node_key, step=step,
+                  substep=substep, reset_epoch=reset_epoch, wait_seconds=wait_seconds,
+                  wait_attempt=wait_attempt, dead_agent_run_id=dead_agent_run_id)
+        self._sleep_backoff(wait_seconds)
 
     def _persist_leaf_output(self, child_arid: str, proc: ProcResult,
                              prefix: str = "leaf") -> None:

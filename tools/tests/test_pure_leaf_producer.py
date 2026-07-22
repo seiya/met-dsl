@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", "1")
 
@@ -1003,6 +1004,119 @@ class PureProducerSubstepTests(unittest.TestCase):
         self.assertEqual(oc.status, "fail")
         self.assertNotEqual(oc.leaf_returncode, 0)
         self.assertEqual(oc.infra_error[0], "pure_host_write_failed")
+
+
+# ======================================================================================
+# --wait-usage-reset in the pure producer loop
+# ======================================================================================
+class PureUsageLimitWaitTest(unittest.TestCase):
+    """--wait-usage-reset (opt-in) in the pure producer: a transport death (rc!=0) that carries a
+    machine-form usage-limit reset epoch is waited out IN PLACE and the SAME turn re-launched,
+    instead of falling to the terminal fail branch for a next-day --resume. The wait is NOT a repair
+    turn — it must not consume the bundle-repair budget and must not pollute the repair carriers
+    (last_excerpt / resume_session_id). Default OFF preserves the current terminal behavior."""
+
+    class _C(_PureFakeConductor):
+        def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+            self._spawn = getattr(self, "_spawn", 0)
+            proc = self.procs[min(self._spawn, len(self.procs) - 1)]
+            self._spawn += 1
+            return proc
+
+        def _sleep_backoff(self, seconds):  # type: ignore[override]
+            self.slept.append(seconds)
+
+    def _conductor(self, repo: Path, procs: list, **kw) -> "_C":
+        (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
+        c = self._C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
+                    backend="claude", env={}, **kw)
+        c.procs = procs
+        c.slept = []
+        return c
+
+    def test_transport_usage_limit_waits_then_passes(self) -> None:
+        now = 1_752_200_000.0
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            c = self._conductor(
+                repo,
+                [wc.ProcResult(1, "", f"Claude AI usage limit reached|{int(now) + 300}"),
+                 wc.ProcResult(0, _envelope(_valid_bundle()), "")],
+                wait_usage_reset=True)
+            with mock.patch.object(wc.time, "time", return_value=now):
+                oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+            self.assertEqual(oc.status, "pass")
+            self.assertEqual(c._spawn, 2)          # dead attempt + the recovered launch
+            self.assertEqual(oc.attempts, 1)       # a wait is NOT a repair turn (repair budget kept)
+            self.assertEqual(c.slept, [420.0])     # 300s to the reset + 120s margin
+            base = c.repo_root / refs.source_dir()
+            self.assertTrue((base / "codegen_bundle.json").exists())
+            meta = json.loads((base / "bundle_meta.json").read_text())
+            self.assertEqual(meta["result"], "pass")
+            self.assertEqual(meta["attempts"], 1)          # repair-turn count, not launch count
+            # both launches are visible as per_attempt rows; the dead one is labeled pure_transport
+            self.assertEqual(len(meta["per_attempt"]), 2)
+            self.assertEqual(meta["per_attempt"][0]["failure_category"], "pure_transport")
+            # the dead usage attempt is tombstoned under the wait's own prefix
+            reasons = [cap["--reason"] for s, cap in c.calls if s == "add-superseded-runs"]
+            self.assertTrue(any("leaf_usage_limit_wait_orphan" in r for r in reasons))
+
+    def test_transport_wait_does_not_pollute_the_repair_turn(self) -> None:
+        """A transport wait must leave the repair carriers clean: the launch AFTER the wait is a
+        fresh COLD attempt (no prior_document, no repair_findings carrying the transport summary),
+        and the following content violation repairs normally. Sequence: transport(usage) -> wait ->
+        cold launch that content-fails -> warm repair -> pass."""
+        now = 1_752_200_000.0
+        bad = _valid_bundle()
+        del bad["capability_requirements"]     # a content (schema) violation
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            c = self._conductor(
+                repo,
+                [wc.ProcResult(1, "", f"usage limit reached|{int(now) + 100}"),
+                 wc.ProcResult(0, _envelope(bad), ""),
+                 wc.ProcResult(0, _envelope(_valid_bundle()), "")],
+                wait_usage_reset=True)
+            captured: list[dict] = []
+            orig = c.record_launch
+
+            def _rec(child_arid, request):  # capture the per-launch request shape
+                captured.append(request)
+                return orig(child_arid, request)
+
+            c.record_launch = _rec  # type: ignore[assignment]
+            with mock.patch.object(wc.time, "time", return_value=now):
+                oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+            self.assertEqual(oc.status, "pass")
+            self.assertEqual(c._spawn, 3)
+            self.assertEqual(oc.attempts, 2)       # 1 repair turn (the wait is not counted)
+            self.assertEqual(c.slept, [220.0])     # 100s + 120s margin
+            # the post-wait launch (index 1) is a COLD retry: no prior_document carried from the
+            # transport death.
+            self.assertNotIn("prior_document", captured[1])
+            # the repair turn (index 2) carries the CONTENT failure's findings, never the transport
+            # summary ("Connection closed"/"usage limit").
+            repair_req = captured[2]
+            findings = str(repair_req.get("repair", {}).get("repair_findings", ""))
+            self.assertNotIn("usage limit", findings.lower())
+
+    def test_transport_usage_limit_is_terminal_when_flag_off(self) -> None:
+        now = 1_752_200_000.0
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            c = self._conductor(   # wait_usage_reset defaults OFF
+                repo,
+                [wc.ProcResult(1, "", f"usage limit reached|{int(now) + 300}"),
+                 wc.ProcResult(0, _envelope(_valid_bundle()), "")])
+            with mock.patch.object(wc.time, "time", return_value=now):
+                oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.leaf_returncode, 1)   # run_phase's transport fail_closed branch
+            self.assertEqual(c._spawn, 1)             # no second launch
+            self.assertEqual(c.slept, [])
 
 
 # ======================================================================================
