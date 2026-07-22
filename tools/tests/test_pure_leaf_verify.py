@@ -205,7 +205,7 @@ class PureVerifySubstepTests(unittest.TestCase):
             oc = c._run_pure_verify_substep(refs, "generate", "verify", ())
         self.assertEqual(oc.status, "pass")
         self.assertEqual(c._spawn, 2)
-        self.assertEqual(oc.attempts, 1)             # a wait is NOT a repair turn
+        self.assertEqual(oc.attempts, 2)             # launch count (the wait launch is counted)
         self.assertEqual(c.slept, [420.0])           # 300s + 120s margin
         self.assertTrue((c.repo_root / refs.source_dir() / "source_meta.json").exists())
         reasons = [cap["--reason"] for s, cap in c.calls if s == "add-superseded-runs"]

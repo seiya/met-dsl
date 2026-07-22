@@ -2807,7 +2807,6 @@ clean:
         per_attempt: list[dict[str, Any]] = []
         resume_session_id: str | None = None
         prior_document: str | None = None
-        last_category: str | None = None
         last_excerpt: str | None = None
         # An OUTER cross-phase reopen (run_phase routed a terminal bundle failure to
         # (generate, reuse)) threads the prior producer's arid + its bundle_meta findings excerpt
@@ -2955,7 +2954,6 @@ clean:
 
             status = "pass" if category is None else "fail"
             if status != "pass":
-                last_category = category
                 # A transport death ("pure_transport") has NO fixable document, so it must not
                 # overwrite the repair carriers (`prior_document` / `last_excerpt`). Today transport
                 # is terminal so this never mattered; --wait-usage-reset makes a repair turn
@@ -2996,7 +2994,7 @@ clean:
                 attempt_record["failure_excerpt"] = (
                     this_excerpt[:_PURE_ATTEMPT_EXCERPT_MAX_CHARS] if this_excerpt else None)
                 self.emit("pure_bundle_attempt_failed", node_key=refs.node_key,
-                          substep=substep, attempt=attempt + 1, failure_category=category,
+                          substep=substep, attempt=len(per_attempt), failure_category=category,
                           detail=(this_excerpt or "")[:200])
 
             reply = (f"status: {status}\nleaf rc={proc.returncode}\n"
@@ -3008,7 +3006,7 @@ clean:
             # finalize-child reject every passing pure leaf — the executor cannot complete.
             result_summary = (
                 f"pure_generate_fail: {category}" if status != "pass"
-                else f"pure_generate_pass: bundle accepted (attempts={attempt + 1})"
+                else f"pure_generate_pass: bundle accepted (attempts={len(per_attempt)})"
             )
             # Finalize the attempt FIRST (close the child FS-diff window) — the pure terminal row
             # carries an EMPTY output_refs (the host has written nothing yet). ONLY AFTER this may
@@ -3025,7 +3023,7 @@ clean:
                     self._write_pure_bundle_artifacts(refs, accepted_doc, graph)
                     self._write_bundle_meta(
                         refs, result="pass", failure_category=None, failure_excerpt=None,
-                        attempts=attempt + 1, per_attempt=per_attempt)
+                        attempts=len(per_attempt), per_attempt=per_attempt)
                 except Exception as exc:  # noqa: BLE001 — any host-write failure must recover
                     # finalize_child ALREADY recorded this attempt as a passing terminal `substep`
                     # row, but a host-side write AFTER the window closed failed (ENOSPC, a
@@ -3043,7 +3041,7 @@ clean:
                             reason=f"pure_host_write_failed_superseded: {type(exc).__name__}")
                     return SubstepOutcome(child_arid, "fail", [], 1,
                                           ("pure_host_write_failed", f"{type(exc).__name__}: {exc}"),
-                                          launched_at, attempt + 1)
+                                          launched_at, len(per_attempt))
                 # Tombstone the superseded producer attempts of a repaired pass: each earlier
                 # attempt was finalized as a terminal `substep` row, but only THIS (passing)
                 # arid goes into the step_result's substep_agent_run_ids, so the earlier arids
@@ -3052,9 +3050,9 @@ clean:
                 if attempt > 0:
                     self._add_superseded_run_ids(
                         [a["agent_run_id"] for a in per_attempt[:-1]],
-                        reason=f"pure_bundle_repair_superseded_pass: attempts={attempt + 1}")
+                        reason=f"pure_bundle_repair_superseded_pass: attempts={len(per_attempt)}")
                 return SubstepOutcome(child_arid, "pass", [], proc.returncode,
-                                      None, launched_at, attempt + 1)
+                                      None, launched_at, len(per_attempt))
 
             # --wait-usage-reset (opt-in): a transport death carrying a machine-form usage-limit
             # reset epoch is waited out in place and the SAME turn re-launched, rather than falling
@@ -3064,7 +3062,11 @@ clean:
             # retries cold; an interrupted repair turn re-runs against the same carriers (which the
             # bookkeeping guard above kept intact). The dead arid was already finalized above, so the
             # tombstone lands outside its write window; per_attempt keeps its row.
-            if category == "pure_transport":
+            # Gate on the classified tag (not merely a nonzero exit): `pure_transport` is set for ANY
+            # nonzero leaf exit, so require `llm_usage_limit` explicitly — the same guard run_substep
+            # uses — so a non-usage crash whose prose happens to match the usage pattern is not waited.
+            if (category == "pure_transport" and infra_error is not None
+                    and infra_error[0] == "llm_usage_limit"):
                 plan = self._usage_reset_wait_plan(proc, usage_waits)
                 if plan is not None:
                     wait_seconds, reset_epoch = plan
@@ -3081,18 +3083,24 @@ clean:
             can_repair = (category is not None and category != "pure_transport"
                           and attempt < MAX_BUNDLE_REPAIR_TURNS)
             if not can_repair:
-                # Terminal: record bundle_meta with the last category/excerpt for the outer
-                # route (_read_repair_findings). Tombstone the superseded producer attempts so a
-                # later completion vouch does not trip on the un-vouched arids. The bundle_meta
-                # write is the LAST host action here; it can still fail (ENOSPC, or a
-                # leaf-controlled failure_excerpt that is not UTF-8 encodable), so guard it the
-                # same way the pass path guards its writes — a host-write failure must recover as a
-                # fail_closed transport outcome, never escape run_substep uncaught and crash the
-                # conductor. Mirrors the verify reviewer's exhaustion guard.
+                # Terminal: record bundle_meta with THIS (final) attempt's category/excerpt for the
+                # outer route (_read_repair_findings). `category`/`this_excerpt` are used rather than
+                # the `last_*` repair carriers: on a transport terminal the carriers were deliberately
+                # NOT overwritten (the bookkeeping guard above), so `last_excerpt` may hold a prior
+                # content failure's text — the meta must describe the transport death that actually
+                # terminated the substep, not a stale carrier (and for a content exhaustion the two
+                # are identical). Tombstone the superseded producer attempts so a later completion
+                # vouch does not trip on the un-vouched arids (transport-dead waited attempts are
+                # already tombstoned by their wait). The bundle_meta write is the LAST host action
+                # here; it can still fail (ENOSPC, or a leaf-controlled failure_excerpt that is not
+                # UTF-8 encodable), so guard it the same way the pass path guards its writes — a
+                # host-write failure must recover as a fail_closed transport outcome, never escape
+                # run_substep uncaught and crash the conductor. Mirrors the verify reviewer.
                 try:
                     self._write_bundle_meta(
-                        refs, result="fail", failure_category=last_category,
-                        failure_excerpt=last_excerpt, attempts=attempt + 1, per_attempt=per_attempt)
+                        refs, result="fail", failure_category=category,
+                        failure_excerpt=this_excerpt, attempts=len(per_attempt),
+                        per_attempt=per_attempt)
                 except Exception as exc:  # noqa: BLE001 — any host-write failure must recover
                     if attempt > 0:
                         self._add_superseded_run_ids(
@@ -3101,13 +3109,13 @@ clean:
                     return SubstepOutcome(
                         child_arid, "fail", [], 1,
                         ("pure_host_write_failed", f"{type(exc).__name__}: {exc}"),
-                        launched_at, attempt + 1)
+                        launched_at, len(per_attempt))
                 if attempt > 0:
                     self._add_superseded_run_ids(
                         [a["agent_run_id"] for a in per_attempt[:-1]],
-                        reason=f"pure_bundle_repair_superseded: {last_category}")
+                        reason=f"pure_bundle_repair_superseded: {category}")
                 return SubstepOutcome(child_arid, "fail", [], proc.returncode,
-                                      infra_error, launched_at, attempt + 1)
+                                      infra_error, launched_at, len(per_attempt))
             # Set up the next (repair) turn: resume this attempt's session.
             resume_session_id = child_arid
             attempt += 1
@@ -3217,7 +3225,6 @@ clean:
         per_attempt: list[dict[str, Any]] = []
         resume_session_id: str | None = None
         prior_document: str | None = None
-        last_category: str | None = None
         last_excerpt: str | None = None
         attempt = 0
         usage_waits = 0
@@ -3333,7 +3340,8 @@ clean:
                 # no output_refs must explain itself" rule. See the producer's mirror above.
                 result_summary = (
                     f"pure_verify_pass: verdict {verify_status} "
-                    f"(severity={accepted_verdict['issue_severity']}, attempts={attempt + 1})"[:400]
+                    f"(severity={accepted_verdict['issue_severity']}, "
+                    f"attempts={len(per_attempt)})"[:400]
                     if verify_status == "pass"
                     else f"pure_verify_fail: {accepted_verdict['last_fail_reason']}"[:400]
                 )
@@ -3344,10 +3352,11 @@ clean:
                     self._agent_run_json(refs, phase, substep, child_arid, verify_status,
                                          [], result_summary, agent_model_override=model, pure=True))
                 try:
-                    self._write_verify_source_meta(refs, accepted_verdict, attempts=attempt + 1)
+                    self._write_verify_source_meta(
+                        refs, accepted_verdict, attempts=len(per_attempt))
                     self._write_verdict_meta(
                         refs, result="pass", failure_category=None, failure_excerpt=None,
-                        attempts=attempt + 1, per_attempt=per_attempt)
+                        attempts=len(per_attempt), per_attempt=per_attempt)
                 except Exception as exc:  # noqa: BLE001 — any host-write failure must recover
                     # A host-side write AFTER the window closed failed (ENOSPC, IO error). The
                     # attempt is already a terminal `substep` row, so without recovery it is an
@@ -3361,7 +3370,7 @@ clean:
                             reason=f"pure_verify_host_write_failed_superseded: {type(exc).__name__}")
                     return SubstepOutcome(child_arid, "fail", [], 1,
                                           ("pure_verify_host_write_failed", f"{type(exc).__name__}: {exc}"),
-                                          launched_at, attempt + 1)
+                                          launched_at, len(per_attempt))
                 # Tombstone superseded reviewer attempts of a repaired verdict (each earlier attempt
                 # was finalized as a terminal `substep` row, but only THIS arid is vouched).
                 if attempt > 0:
@@ -3369,7 +3378,7 @@ clean:
                         [a["agent_run_id"] for a in per_attempt[:-1]],
                         reason=f"pure_verdict_repair_superseded: verify_status={verify_status}")
                 return SubstepOutcome(child_arid, verify_status, [], proc.returncode,
-                                      None, launched_at, attempt + 1)
+                                      None, launched_at, len(per_attempt))
 
             # A malformed / transport reply. Record the terminal record fields and carry the prior
             # document into a cold-fallback repair (re-serialize the parsed verdict if any, else the
@@ -3377,7 +3386,6 @@ clean:
             # must not overwrite the repair carriers (`prior_document` / `last_excerpt`) — mirrors
             # the producer, so a repair turn that follows a --wait-usage-reset wait carries the prior
             # SCHEMA failure's findings, not the transport summary.
-            last_category = category
             if category != "pure_transport":
                 prior_document = (json.dumps(parsed_verdict, indent=2, ensure_ascii=False)
                                   if parsed_verdict is not None
@@ -3407,7 +3415,7 @@ clean:
             attempt_record["failure_excerpt"] = (
                 this_excerpt[:_PURE_ATTEMPT_EXCERPT_MAX_CHARS] if this_excerpt else None)
             self.emit("pure_verdict_attempt_failed", node_key=refs.node_key,
-                      substep=substep, attempt=attempt + 1, failure_category=category,
+                      substep=substep, attempt=len(per_attempt), failure_category=category,
                       detail=(this_excerpt or "")[:200])
             reply = (f"verify verdict: none\nleaf rc={proc.returncode}\n"
                      f"category: {category or 'none'}")
@@ -3422,8 +3430,11 @@ clean:
             # to the terminal fail branch. `attempt` / `resume_session_id` are UNCHANGED (a wait is
             # not a repair turn; persona separation is preserved — the reviewer only ever resumes its
             # OWN prior attempt). The dead arid was finalized above, so the tombstone is outside its
-            # write window. Mirrors the producer loop.
-            if category == "pure_transport":
+            # write window. Mirrors the producer loop — including the explicit `llm_usage_limit` tag
+            # guard (a `pure_transport` category is set for ANY nonzero exit; only a usage limit is
+            # waited, matching run_substep).
+            if (category == "pure_transport" and infra_error is not None
+                    and infra_error[0] == "llm_usage_limit"):
                 plan = self._usage_reset_wait_plan(proc, usage_waits)
                 if plan is not None:
                     wait_seconds, reset_epoch = plan
@@ -3439,17 +3450,24 @@ clean:
             can_repair = (category is not None and category != "pure_transport"
                           and attempt < MAX_BUNDLE_REPAIR_TURNS)
             if not can_repair:
-                # Terminal: record verdict_meta with the last category/excerpt for the outer route
-                # (classify_failure's verdict table). source_meta.json is intentionally NOT written
-                # (proof-of-work: no schema-valid verdict this attempt). Tombstone superseded arids.
-                # The verdict_meta write is the LAST host action here; it can still fail (ENOSPC, or
-                # a leaf-controlled failure_excerpt that is not UTF-8 encodable), so guard it the
-                # same way the accepted-verdict path guards its writes — a host-write failure must
-                # recover as a fail_closed transport outcome, never escape run_substep uncaught.
+                # Terminal: record verdict_meta with THIS (final) attempt's category/excerpt for the
+                # outer route (classify_failure's verdict table). `category`/`this_excerpt` are used
+                # rather than the `last_*` repair carriers: on a transport terminal the carriers were
+                # deliberately NOT overwritten (the bookkeeping guard above), so `last_excerpt` may
+                # hold a prior schema failure's text — the meta must describe the transport death that
+                # terminated the substep (and for a schema exhaustion the two are identical).
+                # source_meta.json is intentionally NOT written (proof-of-work: no schema-valid
+                # verdict this attempt). Tombstone superseded arids (transport-dead waited attempts
+                # are already tombstoned by their wait). The verdict_meta write is the LAST host
+                # action here; it can still fail (ENOSPC, or a leaf-controlled failure_excerpt that is
+                # not UTF-8 encodable), so guard it the same way the accepted-verdict path guards its
+                # writes — a host-write failure must recover as a fail_closed transport outcome, never
+                # escape run_substep uncaught.
                 try:
                     self._write_verdict_meta(
-                        refs, result="fail", failure_category=last_category,
-                        failure_excerpt=last_excerpt, attempts=attempt + 1, per_attempt=per_attempt)
+                        refs, result="fail", failure_category=category,
+                        failure_excerpt=this_excerpt, attempts=len(per_attempt),
+                        per_attempt=per_attempt)
                 except Exception as exc:  # noqa: BLE001 — any host-write failure must recover
                     if attempt > 0:
                         self._add_superseded_run_ids(
@@ -3458,13 +3476,13 @@ clean:
                     return SubstepOutcome(
                         child_arid, "fail", [], 1,
                         ("pure_verify_host_write_failed", f"{type(exc).__name__}: {exc}"),
-                        launched_at, attempt + 1)
+                        launched_at, len(per_attempt))
                 if attempt > 0:
                     self._add_superseded_run_ids(
                         [a["agent_run_id"] for a in per_attempt[:-1]],
-                        reason=f"pure_verdict_repair_superseded: {last_category}")
+                        reason=f"pure_verdict_repair_superseded: {category}")
                 return SubstepOutcome(child_arid, "fail", [], proc.returncode,
-                                      infra_error, launched_at, attempt + 1)
+                                      infra_error, launched_at, len(per_attempt))
             # Set up the next (repair) turn: resume this attempt's OWN reviewer session (persona
             # separation — never an external/producer arid).
             resume_session_id = child_arid

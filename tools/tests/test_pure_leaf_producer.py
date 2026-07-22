@@ -1048,13 +1048,15 @@ class PureUsageLimitWaitTest(unittest.TestCase):
                 oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
             self.assertEqual(oc.status, "pass")
             self.assertEqual(c._spawn, 2)          # dead attempt + the recovered launch
-            self.assertEqual(oc.attempts, 1)       # a wait is NOT a repair turn (repair budget kept)
+            # `attempts` is the LAUNCH count (== len(per_attempt)); the repair BUDGET is untouched
+            # (a wait is not a repair turn), but the wait's launch is still counted honestly.
+            self.assertEqual(oc.attempts, 2)
             self.assertEqual(c.slept, [420.0])     # 300s to the reset + 120s margin
             base = c.repo_root / refs.source_dir()
             self.assertTrue((base / "codegen_bundle.json").exists())
             meta = json.loads((base / "bundle_meta.json").read_text())
             self.assertEqual(meta["result"], "pass")
-            self.assertEqual(meta["attempts"], 1)          # repair-turn count, not launch count
+            self.assertEqual(meta["attempts"], 2)          # launch count == len(per_attempt)
             # both launches are visible as per_attempt rows; the dead one is labeled pure_transport
             self.assertEqual(len(meta["per_attempt"]), 2)
             self.assertEqual(meta["per_attempt"][0]["failure_category"], "pure_transport")
@@ -1091,7 +1093,9 @@ class PureUsageLimitWaitTest(unittest.TestCase):
                 oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
             self.assertEqual(oc.status, "pass")
             self.assertEqual(c._spawn, 3)
-            self.assertEqual(oc.attempts, 2)       # 1 repair turn (the wait is not counted)
+            # 3 launches: transport(waited) + cold content-fail + warm repair pass. `attempts` is the
+            # launch count; the repair budget saw only 1 turn (the wait did not consume it).
+            self.assertEqual(oc.attempts, 3)
             self.assertEqual(c.slept, [220.0])     # 100s + 120s margin
             # the post-wait launch (index 1) is a COLD retry: no prior_document carried from the
             # transport death.
@@ -1117,6 +1121,39 @@ class PureUsageLimitWaitTest(unittest.TestCase):
             self.assertEqual(oc.leaf_returncode, 1)   # run_phase's transport fail_closed branch
             self.assertEqual(c._spawn, 1)             # no second launch
             self.assertEqual(c.slept, [])
+            # Regression pin (byte-identity): the terminal bundle_meta must describe the transport
+            # DEATH that terminated the substep — the bookkeeping guard that protects the repair
+            # carriers must NOT leak an empty/stale failure_excerpt into the meta.
+            meta = json.loads(
+                (c.repo_root / refs.source_dir() / "bundle_meta.json").read_text())
+            self.assertEqual(meta["result"], "fail")
+            self.assertEqual(meta["failure_category"], "pure_transport")
+            self.assertIn("usage limit", (meta.get("failure_excerpt") or "").lower())
+            self.assertEqual(meta["attempts"], 1)     # one launch, one per_attempt row
+
+    def test_transport_terminal_after_a_content_repair_records_the_transport_excerpt(self) -> None:
+        # Finding-1 twin: attempt0 content-fails (repair carrier = schema text), attempt1 dies of a
+        # transport usage limit with the flag OFF -> terminal. The meta must pair
+        # failure_category=pure_transport with the TRANSPORT excerpt, never the stale schema carrier.
+        bad = _valid_bundle()
+        del bad["capability_requirements"]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            c = self._conductor(   # flag OFF
+                repo,
+                [wc.ProcResult(0, _envelope(bad), ""),
+                 wc.ProcResult(1, "", "Claude AI usage limit reached")])
+            oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+            self.assertEqual(oc.status, "fail")
+            self.assertEqual(oc.leaf_returncode, 1)
+            meta = json.loads(
+                (c.repo_root / refs.source_dir() / "bundle_meta.json").read_text())
+            self.assertEqual(meta["failure_category"], "pure_transport")
+            excerpt = (meta.get("failure_excerpt") or "").lower()
+            self.assertIn("usage limit", excerpt)
+            self.assertNotIn("capability_requirements", excerpt)  # not the stale schema carrier
+            self.assertEqual(meta["attempts"], 2)     # two launches
 
 
 # ======================================================================================
