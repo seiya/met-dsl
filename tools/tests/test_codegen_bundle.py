@@ -24,6 +24,7 @@ from tools import workflow_conductor as wc
 
 ADV = "problem/adv1d@0.1.0"
 FLUX = "component/adv_flux@0.1.0"
+PROFILE = "profile/adv1d_ref@0.1.0"
 HARNESS = "infrastructure/harness_fortran_cpu@0.5.0"
 
 
@@ -2337,6 +2338,108 @@ class ContractPlumbingTest(unittest.TestCase):
         doc = _minimal_bundle()
         doc["files"] = "adv1d_model.f90"
         self.assertEqual(cb.validate_bundle(doc), ["files must be a non-empty array"])
+
+
+class PromptContractedBundleShapesTest(unittest.TestCase):
+    """The bundle shapes the `pure_generate_generate.txt` sentences S1-S3 tell the leaf to
+    emit, driven verbatim through the REAL `cb.validate_bundle`.
+
+    These pin the prompt<->gate coupling that E2E#7 exposed: every generate.generate node
+    failed its first attempt on a `bundle_schema_violation` the prompt did not warn about
+    (empty `capability_requirements`, a missing residency value, or the profile-cardinality
+    ladder). A regression in either the gate OR the prompt's distilled rule surfaces here as
+    a bundle the prompt tells the leaf to build but the gate rejects (or vice versa).
+    """
+
+    @staticmethod
+    def _problem_bundle() -> dict:
+        # S1 (`capability_requirements == ["sync_single_case@1"]`), S2 (`state_residency ==
+        # "host"`), S3 (a `problem` node publishes EXACTLY ONE operation entrypoint). No
+        # `state_bindings`: the IR declares no algorithm.state_variables, so the leaf omits it.
+        return {
+            "bundle_schema_version": "1.0.0",
+            "optimization_unit": {"members": [ADV]},
+            "files": [
+                _file("adv1d_model.f90", "model", ADV),
+                _file("adv1d_checks.f90", "checks", ADV),
+            ],
+            "entrypoints": [
+                {"symbol": "adv1d__apply", "kind": "operation", "node_key": ADV,
+                 "defined_in": "adv1d_model.f90", "module": "adv1d_model"},
+            ],
+            "target_lowering_plan": {"precision": {"real_kind": "real64"},
+                                     "state_residency": "host"},
+            "capability_requirements": ["sync_single_case@1"],
+        }
+
+    @staticmethod
+    def _component_bundle() -> dict:
+        # S3: a `component` node publishes ONE OR MORE operation entrypoints.
+        return {
+            "bundle_schema_version": "1.0.0",
+            "optimization_unit": {"members": [FLUX]},
+            "files": [
+                _file("adv_flux_model.f90", "model", FLUX),
+                _file("adv_flux_checks.f90", "checks", FLUX),
+            ],
+            "entrypoints": [
+                {"symbol": "adv_flux__apply", "kind": "operation", "node_key": FLUX,
+                 "defined_in": "adv_flux_model.f90", "module": "adv_flux_model"},
+            ],
+            "target_lowering_plan": {"precision": {"real_kind": "real64"},
+                                     "state_residency": "host"},
+            "capability_requirements": ["sync_single_case@1"],
+        }
+
+    @staticmethod
+    def _profile_bundle() -> dict:
+        # S3: a `profile` node publishes EXACTLY ZERO operation entrypoints (only a
+        # `checks_interface` ABI entry), yet STILL carries a role `model` file for its member.
+        return {
+            "bundle_schema_version": "1.0.0",
+            "optimization_unit": {"members": [PROFILE]},
+            "files": [
+                _file("adv1d_ref_model.f90", "model", PROFILE),
+                _file("adv1d_ref_checks.f90", "checks", PROFILE),
+            ],
+            "entrypoints": [
+                {"symbol": "checks_compute", "kind": "checks_interface", "node_key": PROFILE,
+                 "defined_in": "adv1d_ref_checks.f90", "module": "adv1d_ref_checks"},
+            ],
+            "target_lowering_plan": {"precision": {"real_kind": "real64"},
+                                     "state_residency": "host"},
+            "capability_requirements": ["sync_single_case@1"],
+        }
+
+    def test_problem_shape_is_accepted(self) -> None:
+        self.assertEqual(cb.validate_bundle(self._problem_bundle()), [])
+
+    def test_component_shape_is_accepted(self) -> None:
+        self.assertEqual(cb.validate_bundle(self._component_bundle()), [])
+
+    def test_profile_shape_is_accepted(self) -> None:
+        self.assertEqual(cb.validate_bundle(self._profile_bundle()), [])
+
+    def test_profile_with_operation_entrypoint_is_rejected(self) -> None:
+        # The E2E#7 attempt-2 defect: the leaf added an operation entrypoint to a profile.
+        doc = self._profile_bundle()
+        doc["entrypoints"].append(
+            {"symbol": "adv1d_ref__apply", "kind": "operation", "node_key": PROFILE,
+             "defined_in": "adv1d_ref_model.f90", "module": "adv1d_ref_model"})
+        self.assertEqual(
+            cb.validate_bundle(doc),
+            ["optimization_unit member 'profile/adv1d_ref@0.1.0' is a profile and publishes "
+             "no operation, but has 1 operation entrypoint(s)"])
+
+    def test_profile_repair_dropping_model_file_is_rejected(self) -> None:
+        # The E2E#7 attempt-3 over-correction: repairing the entrypoint violation by ALSO
+        # deleting the member's model file. S3 forbids this — the model file is always required.
+        doc = self._profile_bundle()
+        doc["files"] = [f for f in doc["files"] if f["role"] != "model"]
+        self.assertEqual(
+            cb.validate_bundle(doc),
+            ["optimization_unit member 'profile/adv1d_ref@0.1.0' has no files[] entry of "
+             "role model"])
 
 
 if __name__ == "__main__":
