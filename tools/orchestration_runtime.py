@@ -2921,6 +2921,17 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _read_json_or_none(path: Path) -> Any:
+    """`_read_json` that swallows a missing/unreadable/malformed file into None.
+
+    For best-effort readers (e.g. the leaf-transport resume deriver) that must DECLINE — never
+    raise — on incomplete evidence."""
+    try:
+        return _read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _atomic_write_text(path: Path, body: str) -> None:
     """Adv-27: write `body` to `path` atomically via temp-file + os.replace.
 
@@ -12087,6 +12098,12 @@ _DEV_ROLLBACK_REASON_CODE = "dev_phase_rollback"
 _DEV_FAIL_CLOSED_REASON_CODE = "conductor_phase_fail_closed"
 # `source` marker of the directive below; the conductor's `_consume_resume_directive` keys on it.
 DEV_VALIDATE_EXECUTE_RESUME_SOURCE = "dev_validate_execute_structural"
+# Item C: a compile/generate phase that fail_closed on a leaf transport error (reason_code
+# `leaf_transport_error`) whose VERIFY substep died can be resumed at verify, reusing the
+# surviving producer artifact, instead of re-running the whole phase from its (billed LLM)
+# producer. The deriver (`_derive_leaf_transport_resume_directive`) tags such a directive with
+# this source; the conductor's `_consume_transport_resume_directive` acts on it.
+LEAF_TRANSPORT_RESUME_SOURCE = "leaf_transport_substep_resume"
 # Bound on the findings text rendered into the resumed repair prompt (matches the conductor's
 # own `_EXECUTE_EXCERPT_MAX_CHARS`; applied again here because the stderr-log fallback below
 # reads a source the conductor never bounded).
@@ -12300,6 +12317,188 @@ def _derive_dev_validate_execute_resume_directive(
     return directive
 
 
+def _recover_transport_generate_source_id(
+    pipeline_dir: Path, producer_row: dict[str, Any], producer_arid: str,
+) -> str:
+    """The source_id of the generate producer's SURVIVING artifact dir, or "" if unrecoverable.
+
+    An agentic producer's pass row lists its outputs, so parse `/source/<id>/` out of `output_refs`.
+    A pure producer's pass row publishes an EMPTY `output_refs` by contract (the host writes the
+    deliverables only after the child window closes), so fall back to scanning each
+    `source/*/bundle_meta.json` for the file whose LAST `per_attempt` arid is this producer — the
+    pure producer's terminal record keys its accepted attempt by the producing leaf's arid."""
+    refs = producer_row.get("output_refs")
+    if isinstance(refs, list):
+        for ref in refs:
+            if isinstance(ref, str) and "/source/" in ref:
+                sid = ref.split("/source/", 1)[1].split("/", 1)[0].strip()
+                if sid:
+                    return sid
+    source_root = pipeline_dir / "source"
+    if not source_root.is_dir():
+        return ""
+    for meta_path in sorted(source_root.glob("*/bundle_meta.json")):
+        meta = _read_json_or_none(meta_path)
+        if not isinstance(meta, dict):
+            continue
+        per_attempt = meta.get("per_attempt")
+        if not isinstance(per_attempt, list) or not per_attempt:
+            continue
+        last = per_attempt[-1]
+        if isinstance(last, dict) and str(last.get("agent_run_id") or "").strip() == producer_arid:
+            return meta_path.parent.name
+    return ""
+
+
+def _derive_leaf_transport_resume_directive(
+    repo_root: Path,
+    orchestration_id: str,
+    reason_code: str | None,
+) -> dict[str, Any] | None:
+    """Build a `resume_directive` that resumes a TRANSPORT-interrupted compile/generate phase at its
+    VERIFY substep — reusing the surviving producer artifact — instead of re-running the whole phase
+    from its (billed LLM) producer.
+
+    A leaf transport death (a usage limit with `--wait-usage-reset` off or an unknown/over-cap reset,
+    an `llm_client_error`, or an exhausted flake budget) terminalizes the phase `fail_closed` with
+    reason_code `leaf_transport_error`, tombstones every substep arid of the attempt, and writes NO
+    step_result (run_phase's transport branch). A plain `--resume` then re-runs the phase from substep
+    0, re-paying the producer leaf that already passed. This directive records the surviving producer
+    so the resumed conductor preseats it and relaunches only the verify leaf (the deterministic mids
+    re-run in ~30s, re-validating the artifact and supplying the completion rule's fresh rows).
+
+    Scope is structural. A transport death can only occur at an LLM substep, and the ONLY LLM substeps
+    of compile/generate are the producer (index 0) and verify (the last); everything between is
+    deterministic. A producer death saves nothing (no surviving artifact), so the directive fires ONLY
+    when the dead substep is `compile.verify` or `generate.verify` — which guarantees the whole substep
+    prefix passed. validate (its only LLM substep is judge) and build (single deterministic substep)
+    are out of scope and decline to today's full re-run.
+
+    Nothing is persisted at death time, so this works retroactively on every pre-C
+    `leaf_transport_error` orchestration; a decline (return None at any miss) is exactly today's
+    full-phase re-run — no new failure mode. Returns None whenever the reason is not a transport death,
+    the repo revision moved since the run started (the surviving artifact is not the source it was
+    produced from), the interrupted phase cannot be identified, the dead substep is not verify, the
+    producer pass row is absent, or the producer artifact dir (or its key deliverable) is gone."""
+    if (reason_code.strip() if isinstance(reason_code, str) else "") != "leaf_transport_error":
+        return None
+
+    root = _orchestration_root(repo_root, orchestration_id)
+
+    # Freshness gate (mirrors the B4 dev deriver): the surviving producer artifact must have been
+    # produced from the source now checked out. `orchestration_meta.repo_revision` is frozen at the
+    # first start; a mismatch declines to a full re-run (which rebuilds under the current source).
+    # A dirty tree compares equal to itself (same documented caveat as the dev deriver).
+    meta = _read_json_or_none(root / "orchestration_meta.json")
+    recorded_revision = meta.get("repo_revision") if isinstance(meta, dict) else None
+    current_revision = _capture_repo_revision(repo_root)
+    if not (
+        isinstance(recorded_revision, dict)
+        and isinstance(current_revision, dict)
+        and recorded_revision == current_revision
+    ):
+        return None
+
+    runs = _load_run_records(root)
+    superseded = _load_superseded_run_ids(repo_root, orchestration_id)
+    if not runs or not superseded:
+        return None
+
+    # The interrupted phase: the LAST (append-order) superseded, terminal-FAIL substep row whose
+    # (node_key, step) has NEITHER a step_result on disk NOR a completed_steps checkpoint entry. A
+    # reopened-and-repassed phase has both, so this bounds the match to a genuinely-interrupted
+    # attempt. On a transport death the producer/mids passed and only verify is a fail row, so this
+    # lands on the dead verify (a producer-only death lands on the dead producer, declined below).
+    checkpoint = _load_checkpoint(repo_root, orchestration_id) or {}
+    completed_pairs = {
+        (str(e.get("node_key") or "").strip(), str(e.get("step") or "").strip().lower())
+        for e in (checkpoint.get("completed_steps") or [])
+        if isinstance(e, dict)
+    }
+    steps_root = root / "steps"
+
+    def _phase_has_step_result(node_key: str, step: str) -> bool:
+        return any((steps_root / _node_key_to_safe(node_key) / step).glob("*/step_result.json"))
+
+    interrupted: dict[str, Any] | None = None
+    for arid, rec in runs.items():
+        if arid not in superseded or not isinstance(rec, dict):
+            continue
+        if str(rec.get("agent_role") or "").strip().lower() != "substep":
+            continue
+        status = str(rec.get("status") or "").strip().lower()
+        if status not in TERMINAL_STATUSES or status == "pass":
+            continue
+        node_key = str(rec.get("node_key") or "").strip()
+        step = str(rec.get("step") or "").strip().lower()
+        if not node_key or not step:
+            continue
+        if (node_key, step) in completed_pairs or _phase_has_step_result(node_key, step):
+            continue
+        interrupted = rec
+    if interrupted is None:
+        return None
+
+    node_key = str(interrupted.get("node_key") or "").strip()
+    step = str(interrupted.get("step") or "").strip().lower()
+    substep = str(interrupted.get("substep") or "").strip().lower()
+    failed_arid = str(interrupted.get("agent_run_id") or "").strip()
+    # Scope: only a verify death on compile/generate is resumable.
+    if step not in ("compile", "generate") or substep != "verify":
+        return None
+
+    # The producer pass row: the LAST superseded `pass` substep row for (node_key, step, "generate")
+    # — the producer substep (index 0) of both compile and generate.
+    producer_arid = ""
+    for arid, rec in runs.items():
+        if arid not in superseded or not isinstance(rec, dict):
+            continue
+        if (str(rec.get("agent_role") or "").strip().lower() == "substep"
+                and str(rec.get("node_key") or "").strip() == node_key
+                and str(rec.get("step") or "").strip().lower() == step
+                and str(rec.get("substep") or "").strip().lower() == "generate"
+                and str(rec.get("status") or "").strip().lower() == "pass"):
+            producer_arid = arid
+    if not producer_arid:
+        return None
+
+    # Producer artifact id + directory. compile: the reservation's `reserved_ir_id` always names the
+    # LIVE ir dir (`_ensure_fresh_producer_id` re-reserves on every rotation). generate: recover the
+    # source_id (the pure pass row publishes an empty output_refs; the agentic one carries it).
+    safe = _node_key_to_safe(node_key)
+    if step == "compile":
+        reservation = _read_json_or_none(root / "reservations" / safe / "compile.json")
+        artifact_id = str((reservation or {}).get("reserved_ir_id") or "").strip()
+        if not artifact_id:
+            return None
+        artifact_dir = repo_root / "workspace" / "ir" / safe / artifact_id
+        if not (artifact_dir / "spec.ir.yaml").exists():
+            return None
+    else:
+        reservation = _read_json_or_none(root / "reservations" / safe / "generate.json")
+        pipeline_id = str((reservation or {}).get("reserved_ir_id") or "").strip()
+        if not pipeline_id:
+            return None
+        pipeline_dir = repo_root / "workspace" / "pipelines" / safe / pipeline_id
+        artifact_id = _recover_transport_generate_source_id(
+            pipeline_dir, runs.get(producer_arid) or {}, producer_arid)
+        if not artifact_id:
+            return None
+        artifact_dir = pipeline_dir / "source" / artifact_id
+        if not (artifact_dir / "src").exists():
+            return None
+
+    return {
+        "source": LEAF_TRANSPORT_RESUME_SOURCE,
+        "node_key": node_key,
+        "step": step,
+        "resume_substep": "verify",
+        "producer_agent_run_id": producer_arid,
+        "producer_artifact_id": artifact_id,
+        "failed_agent_run_id": failed_arid,
+    }
+
+
 def enable_checkpoint_resume(
     repo_root: Path,
     orchestration_id: str,
@@ -12436,6 +12635,17 @@ def enable_checkpoint_resume(
                 orchestration_id,
                 prior_reason_code if isinstance(prior_reason_code, str) else None,
                 prior_reason_detail if isinstance(prior_reason_detail, str) else None,
+            )
+        # Item C: a compile/generate phase that fail_closed on a leaf transport error whose VERIFY
+        # substep died resumes at verify, reusing the surviving producer artifact, instead of
+        # re-running the whole phase from its billed LLM producer. Purely additive: the conductor
+        # ignores an unknown source (C1 is inert until C2 wires the consumer), and every precondition
+        # miss declines to today's full re-run.
+        if directive is None:
+            directive = _derive_leaf_transport_resume_directive(
+                repo_root,
+                orchestration_id,
+                prior_reason_code if isinstance(prior_reason_code, str) else None,
             )
         if directive is not None:
             meta["resume_directive"] = directive

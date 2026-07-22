@@ -75,6 +75,8 @@ from tools.orchestration_runtime import (
     _load_invalid_run_records,
     _derive_unauthorized_write_resume_directive,
     _derive_dev_validate_execute_resume_directive,
+    _derive_leaf_transport_resume_directive,
+    LEAF_TRANSPORT_RESUME_SOURCE,
     DEV_VALIDATE_EXECUTE_RESUME_SOURCE,
     _DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES,
     _DEV_VALIDATE_EXECUTE_VERDICT_CATEGORIES,
@@ -28655,6 +28657,252 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
         self.assertIn(_DEV_ROLLBACK_REASON_CODE, FAIL_CLOSED_REASON_CODES)
 
 
+class LeafTransportResumeDirectiveTest(unittest.TestCase):
+    """Item C: a compile/generate phase that fail_closed on a leaf transport error whose VERIFY
+    substep died derives a directive that resumes at verify, reusing the surviving producer
+    artifact. Every precondition miss declines (returns None) to today's full re-run."""
+
+    NODE_KEY = "component/foo@0.1.0"
+    REVISION = {"commit": "c" * 40, "dirty": False}
+
+    def setUp(self) -> None:
+        # tmp fixture dirs are not git checkouts; pin the "current" revision so init records it
+        # and the deriver's freshness gate compares equal.
+        p = patch("tools.orchestration_runtime._capture_repo_revision",
+                  return_value=dict(self.REVISION))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _init(self, repo_root: Path, oid: str) -> Path:
+        init_orchestration(repo_root=repo_root, orchestration_id=oid)
+        return repo_root / "workspace" / "orchestrations" / oid
+
+    def _write_rows(self, root: Path, rows: list[dict]) -> None:
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def _supersede(self, root: Path, oid: str, arids: list[str]) -> None:
+        (root / "reopen").mkdir(exist_ok=True)
+        (root / "reopen" / "superseded_runs.json").write_text(
+            json.dumps({"orchestration_id": oid, "superseded_agent_run_ids": arids}),
+            encoding="utf-8")
+
+    def _reserve(self, root: Path, step: str, reserved_id: str) -> None:
+        d = root / "reservations" / _node_key_to_safe(self.NODE_KEY)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{step}.json").write_text(
+            json.dumps({"reserved_ir_id": reserved_id}), encoding="utf-8")
+
+    def _row(self, arid: str, step: str, substep: str, status: str, **extra) -> dict:
+        r = {"agent_run_id": arid, "agent_role": "substep", "step": step,
+             "substep": substep, "status": status, "node_key": self.NODE_KEY}
+        r.update(extra)
+        return r
+
+    def _seed_compile(self, repo_root: Path, root: Path, oid: str,
+                      ir_id: str = "foo_20260101_001", *, with_ir: bool = True) -> None:
+        """An interrupted compile: producer(pass)+static(pass)+verify(fail), all tombstoned,
+        a compile reservation, and the surviving ir dir with spec.ir.yaml."""
+        self._write_rows(root, [
+            self._row("cmp-gen-1", "compile", "generate", "pass"),
+            self._row("cmp-static-1", "compile", "static", "pass"),
+            self._row("cmp-verify-1", "compile", "verify", "fail"),
+        ])
+        self._supersede(root, oid, ["cmp-gen-1", "cmp-static-1", "cmp-verify-1"])
+        self._reserve(root, "compile", ir_id)
+        if with_ir:
+            ir_dir = repo_root / "workspace" / "ir" / _node_key_to_safe(self.NODE_KEY) / ir_id
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            (ir_dir / "spec.ir.yaml").write_text("case: {}\n", encoding="utf-8")
+
+    def _derive(self, repo_root: Path, oid: str,
+                reason_code: str = "leaf_transport_error"):
+        return _derive_leaf_transport_resume_directive(repo_root, oid, reason_code)
+
+    def test_directive_for_interrupted_compile_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_compile"
+            root = self._init(repo_root, oid)
+            self._seed_compile(repo_root, root, oid)
+            directive = self._derive(repo_root, oid)
+            self.assertEqual(directive, {
+                "source": LEAF_TRANSPORT_RESUME_SOURCE,
+                "node_key": self.NODE_KEY,
+                "step": "compile",
+                "resume_substep": "verify",
+                "producer_agent_run_id": "cmp-gen-1",
+                "producer_artifact_id": "foo_20260101_001",
+                "failed_agent_run_id": "cmp-verify-1",
+            })
+
+    def test_recovers_pure_generate_source_id_from_bundle_meta(self) -> None:
+        """A pure producer's pass row publishes an EMPTY output_refs, so the source_id is recovered
+        by matching the last bundle_meta per_attempt arid to the producer."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_gen_pure"
+            root = self._init(repo_root, oid)
+            self._write_rows(root, [
+                self._row("gen-gen-1", "generate", "generate", "pass", output_refs=[]),
+                self._row("gen-lint-1", "generate", "lint", "pass"),
+                self._row("gen-syntax-1", "generate", "syntax", "pass"),
+                self._row("gen-static-1", "generate", "static", "pass"),
+                self._row("gen-verify-1", "generate", "verify", "fail"),
+            ])
+            self._supersede(root, oid, ["gen-gen-1", "gen-lint-1", "gen-syntax-1",
+                                        "gen-static-1", "gen-verify-1"])
+            pipeline_id = "foo_20260101_001"
+            self._reserve(root, "generate", pipeline_id)
+            src_id = "src_20260101_003"
+            src_dir = (repo_root / "workspace" / "pipelines"
+                       / _node_key_to_safe(self.NODE_KEY) / pipeline_id / "source" / src_id)
+            (src_dir / "src").mkdir(parents=True, exist_ok=True)
+            (src_dir / "bundle_meta.json").write_text(json.dumps({
+                "result": "pass",
+                "per_attempt": [{"agent_run_id": "gen-gen-1", "model": "m", "usage": None}],
+            }), encoding="utf-8")
+            directive = self._derive(repo_root, oid)
+            self.assertEqual(directive["step"], "generate")
+            self.assertEqual(directive["producer_agent_run_id"], "gen-gen-1")
+            self.assertEqual(directive["producer_artifact_id"], src_id)
+            self.assertEqual(directive["failed_agent_run_id"], "gen-verify-1")
+
+    def test_recovers_agentic_generate_source_id_from_output_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_gen_agentic"
+            root = self._init(repo_root, oid)
+            pipeline_id = "foo_20260101_001"
+            src_id = "src_20260101_002"
+            base = f"workspace/pipelines/{_node_key_to_safe(self.NODE_KEY)}/{pipeline_id}"
+            self._write_rows(root, [
+                self._row("gen-gen-1", "generate", "generate", "pass",
+                          output_refs=[f"{base}/source/{src_id}/src/foo.f90"]),
+                self._row("gen-static-1", "generate", "static", "pass"),
+                self._row("gen-verify-1", "generate", "verify", "fail"),
+            ])
+            self._supersede(root, oid, ["gen-gen-1", "gen-static-1", "gen-verify-1"])
+            self._reserve(root, "generate", pipeline_id)
+            (repo_root / base / "source" / src_id / "src").mkdir(parents=True, exist_ok=True)
+            directive = self._derive(repo_root, oid)
+            self.assertEqual(directive["producer_artifact_id"], src_id)
+
+    def test_declines_on_repo_revision_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_stale_rev"
+            root = self._init(repo_root, oid)
+            self._seed_compile(repo_root, root, oid)
+            meta_path = root / "orchestration_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["repo_revision"] = {"commit": "d" * 40, "dirty": False}
+            meta_path.write_text(json.dumps(meta), encoding="utf-8")
+            self.assertIsNone(self._derive(repo_root, oid))
+
+    def test_declines_when_producer_substep_died(self) -> None:
+        """A compile.generate death saves nothing (no surviving artifact) — decline."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_producer_death"
+            root = self._init(repo_root, oid)
+            self._write_rows(root, [self._row("cmp-gen-1", "compile", "generate", "fail")])
+            self._supersede(root, oid, ["cmp-gen-1"])
+            self._reserve(root, "compile", "foo_20260101_001")
+            self.assertIsNone(self._derive(repo_root, oid))
+
+    def test_declines_for_validate_judge_death(self) -> None:
+        """validate's only LLM substep is judge; its upstream is deterministic, so there is no
+        producer to reuse — out of scope."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_validate"
+            root = self._init(repo_root, oid)
+            self._write_rows(root, [
+                self._row("v-exec-1", "validate", "execute", "pass"),
+                self._row("v-judge-1", "validate", "judge", "fail"),
+            ])
+            self._supersede(root, oid, ["v-exec-1", "v-judge-1"])
+            self.assertIsNone(self._derive(repo_root, oid))
+
+    def test_declines_when_step_result_already_written(self) -> None:
+        """A phase whose step_result is on disk is not the interrupted one — decline."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_has_result"
+            root = self._init(repo_root, oid)
+            self._seed_compile(repo_root, root, oid)
+            sr = (root / "steps" / _node_key_to_safe(self.NODE_KEY) / "compile"
+                  / "some-exec" / "step_result.json")
+            sr.parent.mkdir(parents=True, exist_ok=True)
+            sr.write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+            self.assertIsNone(self._derive(repo_root, oid))
+
+    def test_declines_when_checkpoint_marks_phase_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_checkpointed"
+            root = self._init(repo_root, oid)
+            self._seed_compile(repo_root, root, oid)
+            (root / "orchestration_checkpoint.json").write_text(json.dumps({
+                "orchestration_id": oid, "schema_version": "1",
+                "completed_steps": [{"node_key": self.NODE_KEY, "step": "compile",
+                                     "agent_run_id": "x"}],
+            }), encoding="utf-8")
+            self.assertIsNone(self._derive(repo_root, oid))
+
+    def test_declines_when_artifact_dir_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_no_ir"
+            root = self._init(repo_root, oid)
+            self._seed_compile(repo_root, root, oid, with_ir=False)
+            self.assertIsNone(self._derive(repo_root, oid))
+
+    def test_declines_for_other_reason_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_other_reason"
+            root = self._init(repo_root, oid)
+            self._seed_compile(repo_root, root, oid)
+            for code in ("conductor_phase_fail_closed", "retry_budget_exhausted",
+                         "dev_phase_rollback", None, ""):
+                self.assertIsNone(self._derive(repo_root, oid, reason_code=code),
+                                  f"reason_code={code!r} must not emit a transport directive")
+
+    def test_declines_when_nothing_superseded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_no_supersede"
+            root = self._init(repo_root, oid)
+            self._write_rows(root, [
+                self._row("cmp-gen-1", "compile", "generate", "pass"),
+                self._row("cmp-verify-1", "compile", "verify", "fail"),
+            ])
+            self._reserve(root, "compile", "foo_20260101_001")
+            self.assertIsNone(self._derive(repo_root, oid))
+
+    def test_enable_checkpoint_resume_writes_transport_directive_fourth_in_chain(self) -> None:
+        """The transport deriver is the FOURTH `if directive is None:` branch: the three prior
+        derivers decline for a `leaf_transport_error` fail_closed, so its directive lands in meta."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_transport_chain"
+            root = self._init(repo_root, oid)
+            self._seed_compile(repo_root, root, oid)
+            update_orchestration_status(
+                repo_root=repo_root, orchestration_id=oid, status="fail_closed",
+                reason_code="leaf_transport_error",
+                reason_detail="leaf_transport_error: leaf_exit=1 (tag: llm_usage_limit; ...)")
+            enable_checkpoint_resume(repo_root, oid)
+            meta = json.loads((root / "orchestration_meta.json").read_text(encoding="utf-8"))
+            directive = meta.get("resume_directive")
+            self.assertIsNotNone(directive)
+            self.assertEqual(directive["source"], LEAF_TRANSPORT_RESUME_SOURCE)
+            self.assertEqual(directive["producer_agent_run_id"], "cmp-gen-1")
+
+
 class CompletionValidatorSupersededTest(unittest.TestCase):
     """Superseded runs are exempt from the pass-completion vouch requirement, but a
     reopened phase still needs a fresh replacement run before pass."""
@@ -28796,6 +29044,83 @@ class CompletionValidatorSupersededTest(unittest.TestCase):
             self._add_fresh_compile_substep(root, orch_arid, "fresh-compile-substep")
             self._add_invalid_log_trigger(root, orch_arid, "unauth-not-consumed", superseded=False)
             with self.assertRaisesRegex(RuntimeError, "child_agent_run_id missing from agent_runs.jsonl"):
+                _validate_orchestration_completion_for_pass(repo_root, oid)
+
+    def _launch_refs(self, root: Path, oid: str, arid: str) -> dict:
+        launches = root / "launches"
+        launches.mkdir(exist_ok=True)
+        (launches / f"{arid}.request.json").write_text("{}", encoding="utf-8")
+        (launches / f"{arid}.response.json").write_text("{}", encoding="utf-8")
+        (launches / f"{arid}.prompt.txt").write_text("p", encoding="utf-8")
+        (launches / f"{arid}.reply.txt").write_text("r", encoding="utf-8")
+        base = f"workspace/orchestrations/{oid}/launches/{arid}"
+        return {"launch_request_ref": f"{base}.request.json",
+                "launch_response_ref": f"{base}.response.json",
+                "launch_prompt_ref": f"{base}.prompt.txt",
+                "launch_reply_ref": f"{base}.reply.txt"}
+
+    def _seed_transport_revouch(self, repo_root: Path, oid: str, *, with_fresh: bool
+                                ) -> None:
+        """Item C record shape: a resumed compile step_result re-vouches the SUPERSEDED run-1
+        producer arid alongside the fresh (non-superseded) re-run substeps. `with_fresh` toggles
+        whether ANY fresh re-run row exists — with none, the reopened compile phase has no fresh
+        vouch and the fresh-replacement rule must raise."""
+        init_orchestration(repo_root=repo_root, orchestration_id=oid)
+        root = repo_root / "workspace" / "orchestrations" / oid
+        orch_arid = json.loads(
+            (root / "orchestration_meta.json").read_text(encoding="utf-8")
+        )["orchestration_agent_run_id"]
+        node_safe = _node_key_to_safe(self.NODE_KEY)
+        fresh_rows = [("run2-static", "static"), ("run2-verify", "verify")] if with_fresh else []
+        with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+            # run-1 producer: superseded (transport-tombstoned), re-vouched by the step_result.
+            f.write(json.dumps({
+                "agent_run_id": "run1-producer", "agent_role": "substep", "step": "compile",
+                "substep": "generate", "status": "pass", "node_key": self.NODE_KEY,
+            }) + "\n")
+            for arid, substep in fresh_rows:
+                f.write(json.dumps({
+                    "agent_run_id": arid, "agent_role": "substep", "step": "compile",
+                    "substep": substep, "status": "pass", "node_key": self.NODE_KEY,
+                    **self._launch_refs(root, oid, arid),
+                }) + "\n")
+        (root / "reopen").mkdir(exist_ok=True)
+        (root / "reopen" / "superseded_runs.json").write_text(
+            json.dumps({"orchestration_id": oid,
+                        "superseded_agent_run_ids": ["run1-producer"]}),
+            encoding="utf-8")
+        sr = root / "steps" / node_safe / "compile" / orch_arid / "step_result.json"
+        sr.parent.mkdir(parents=True, exist_ok=True)
+        sr.write_text(json.dumps({
+            "status": "pass", "executor_agent_run_id": orch_arid,
+            "substep_agent_run_ids": ["run1-producer"] + [a for a, _ in fresh_rows],
+        }), encoding="utf-8")
+        (root / "agent_graph.json").write_text(json.dumps({"edges": [
+            {"parent_agent_run_id": orch_arid, "child_agent_run_id": arid,
+             "relation_type": "launch"}
+            # The run-1 producer's own launch edge survives (it is still in agent_runs.jsonl);
+            # the completion check tolerates it because the run is superseded.
+            for arid in ["run1-producer"] + [a for a, _ in fresh_rows]
+        ]}), encoding="utf-8")
+
+    def test_completion_check_accepts_step_result_vouching_a_superseded_producer(self) -> None:
+        """Item C §2: the resumed step_result may LIST the superseded run-1 producer arid; the
+        completion check `continue`s superseded rows before the vouch check, so it never raises,
+        and the fresh re-run substeps satisfy the reopened phase's fresh-replacement rule."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_completion_revouch_ok"
+            self._seed_transport_revouch(repo_root, oid, with_fresh=True)
+            _validate_orchestration_completion_for_pass(repo_root, oid)  # no raise
+
+    def test_completion_check_still_requires_a_fresh_replacement_row(self) -> None:
+        """Twin: with NO fresh re-run row, the only compile evidence is the superseded producer —
+        the fresh-replacement rule must still raise (the re-vouch is not a shortcut)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_completion_revouch_missing"
+            self._seed_transport_revouch(repo_root, oid, with_fresh=False)
+            with self.assertRaisesRegex(RuntimeError, "no fresh"):
                 _validate_orchestration_completion_for_pass(repo_root, oid)
 
 
