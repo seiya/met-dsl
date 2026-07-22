@@ -10042,7 +10042,8 @@ def _build_exemplar(request_payload: dict[str, Any]) -> str:
         f"node in the same family/kind: {node_key}):** use it as a STRUCTURAL reference for the "
         "runner plumbing and code/layout conventions this workflow expects (argv/`--cases` "
         "parsing, the case loop, JSON/snapshot/perf emission). Author THIS node's own physics "
-        "and per-test logic from ITS `controlled_spec.md` / `tests.md` / `io_contract` — do NOT "
+        "and per-test logic from ITS inlined `spec.ir.yaml` (the algorithm + `io_contract` "
+        "sections) and `tests.md` — do NOT "
         "copy the exemplar's physics or checks. It is orientation, never a gate and never this "
         "node's spec. It was certified under the gates in force AT ITS TIME, so it may predate "
         "a rule now in your contracts: where the exemplar and a contract disagree, the contract "
@@ -10390,7 +10391,7 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
 # (`_validate_launch_request_payload`); a missing context key on a cold launch is rejected too.
 PURE_CONTEXT_REQUIRED_KEYS: dict[tuple[str, str], tuple[str, ...]] = {
     ("generate", "generate"): ("harness_capabilities", "target_profile",
-                               "controlled_spec_document", "ir_document",
+                               "ir_document",
                                "tests_document", "runner_document"),
     ("generate", "verify"): ("controlled_spec_document", "tests_document", "ir_document",
                              "bundle_document"),
