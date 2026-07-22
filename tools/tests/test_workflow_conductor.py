@@ -2459,6 +2459,41 @@ class TransportFailureTest(unittest.TestCase):
         self.assertEqual(sup[0]["--run-ids"], ["child-1"])  # the build step agent
 
 
+class UsageResetEpochParseTests(unittest.TestCase):
+    """`_parse_usage_reset_epoch` reads the MACHINE-FORM reset epoch a usage-limit leaf may carry
+    as a trailing `|<10-digit>`. It is a separate scan from the classifier (whose evidence is
+    clipped) and it only trusts an epoch on a line the `llm_usage_limit` pattern itself matches, so
+    a stray `|<number>` in the leaf's own prose is never mistaken for a reset time."""
+
+    def test_machine_form_reset_yields_the_epoch(self) -> None:
+        self.assertEqual(
+            wc._parse_usage_reset_epoch("Claude AI usage limit reached|1752200000", ""),
+            1752200000)
+
+    def test_human_worded_reset_has_no_epoch(self) -> None:
+        # The CLI's human form ("resets 6:10pm") carries no machine time -> the caller must not wait.
+        self.assertIsNone(
+            wc._parse_usage_reset_epoch("You've hit your session limit; resets 6:10pm", ""))
+
+    def test_stderr_is_authoritative_over_stdout(self) -> None:
+        # Both streams carry a usage-limit epoch: stderr wins (mirrors the classifier's discipline).
+        self.assertEqual(
+            wc._parse_usage_reset_epoch(
+                "usage limit reached|1752200000", "usage limit reached|1799999999"),
+            1752200000)
+        # stderr silent, stdout carries it (the E2E #4 incident shape) -> stdout is consulted.
+        self.assertEqual(
+            wc._parse_usage_reset_epoch("", "usage limit reached|1799999999"), 1799999999)
+
+    def test_pipe_epoch_on_a_non_usage_line_is_ignored(self) -> None:
+        # A `|<10-digit>` that is NOT on a usage-limit line (here the leaf's own numerical prose)
+        # must not be read as a reset time.
+        self.assertIsNone(
+            wc._parse_usage_reset_epoch("the solver step is |1752200000 in code units", ""))
+        # Nothing at all.
+        self.assertIsNone(wc._parse_usage_reset_epoch("", ""))
+
+
 class LeafChildEnvTest(unittest.TestCase):
     """WI-A: the leaf's output ceiling is part of the CONDUCTOR'S leaf contract (it lives in
     _child_env, not in `.claude/settings.json`, so it cannot leak into the operator's own

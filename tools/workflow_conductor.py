@@ -1503,6 +1503,46 @@ _CROSS_STREAM_PROMOTING_TAGS = frozenset({"llm_usage_limit", "llm_client_error"}
 # `exceeded retry limit, last status: 429 Too Many Requests`) and must stay classifiable.
 _LEAF_RETRY_NOTICE_RE = re.compile(r"\bretrying\b|attempt \d+/\d+")
 
+# --wait-usage-reset (opt-in): a usage limit is a multi-hour HARD STOP, so the conductor's DEFAULT
+# stays fail_closed (a manual `--resume` after the reset — see deterministic_followups L5). When the
+# operator opts in AND the dead leaf carried a MACHINE-FORM reset time (a trailing `|<unix-epoch>`
+# on its usage-limit error line), the conductor waits it out IN PLACE and re-launches the same
+# substep — a same-run, substep-granular resume instead of a next-day fresh run. A human-worded
+# reset ("resets 6:10pm...") carries no epoch, so it is NOT waited (guessing the reset instant would
+# either burn the budget early or oversleep). All three bounds are hard:
+MAX_USAGE_LIMIT_WAITS = 1  # per substep; a distinct budget from the transient-retry retries above
+# The session window is 5h; a reset further out than this is a weekly limit or a misparsed epoch,
+# neither of which the in-place wait should sit on — fall back to fail_closed.
+MAX_USAGE_LIMIT_WAIT_SECONDS = 6 * 3600
+# Sleep slightly PAST the reset instant: the re-launch's record-launch runs a preflight live-probe
+# (TTL-driven), and waking a hair early would find the window still shut and fail the probe.
+USAGE_LIMIT_WAIT_MARGIN_SECONDS = 120
+# The machine-form reset suffix a usage-limit leaf may carry: `...usage limit reached|1752200000`.
+# Ten digits pins it to a plausible unix-second epoch (through year 2286) and keeps an ordinary
+# `|<number>` in the model's own prose from being read as a reset time.
+_USAGE_RESET_EPOCH_RE = re.compile(r"\|(\d{10})\s*$")
+
+
+def _parse_usage_reset_epoch(stderr: str, stdout: str = "") -> int | None:
+    """The unix-second reset epoch a usage-limit leaf carried as a trailing `|<10-digit>`, or None
+    when absent (a human-worded reset, or none at all).
+
+    Deliberately a SEPARATE scan from `_classify_leaf_infra_error`, over the RAW streams: the
+    classifier returns a 2-tuple whose evidence line is clipped to 160 chars, which can fall short
+    of a trailing epoch, and widening that tuple would ripple through its three positional consumers.
+    Only lines the `llm_usage_limit` pattern itself matches are considered (so a stray `|1234567890`
+    in the leaf's Fortran prose is never mistaken for a reset time), and stderr is authoritative
+    (consulted before stdout), mirroring the classifier's stream discipline."""
+    usage_pattern = _LEAF_INFRA_ERROR_PATTERNS[0][1]
+    for stream in (stderr, stdout):
+        for line in (stream or "").splitlines():
+            if not usage_pattern.search(line.lower()):
+                continue
+            match = _USAGE_RESET_EPOCH_RE.search(line)
+            if match:
+                return int(match.group(1))
+    return None
+
 
 def _classify_leaf_infra_error(stderr: str, stdout: str = "") -> tuple[str, str] | None:
     """(tag, evidence_line) when a failed leaf's captured output names an LLM-infrastructure
