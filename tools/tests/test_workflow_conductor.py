@@ -3195,6 +3195,35 @@ class TransportSubstepResumeTest(unittest.TestCase):
                 declines = [f["reason"] for e, f in events if e == "transport_resume_declined"]
                 self.assertEqual(declines, [reason], f"{label}")
 
+    def test_transport_resume_consumer_requires_pure_bundle(self) -> None:
+        """A PURE generate.verify reviewer's input is the producer's codegen_bundle.json; reusing a
+        source dir whose bundle is gone would certify blind (empty bundle_document + the re-run
+        post_generate gate skips a missing bundle). The consumer must decline when only src/ survives
+        and arm once the bundle is present."""
+        directive = {"source": wc_runtime.LEAF_TRANSPORT_RESUME_SOURCE, "node_key": self.NODE_KEY,
+                     "step": "generate", "resume_substep": "verify",
+                     "producer_agent_run_id": "gen-prod", "producer_artifact_id": "src_x"}
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            c = self._conductor([], repo=repo)
+            c._pure_leaf_substep = lambda refs, phase, substep: True  # force the pure branch
+            self._seed_row(repo, "gen-prod", "generate", "generate")
+            refs = self._refs()
+            src_root = repo / refs.source_dir("src_x")
+            (src_root / "src").mkdir(parents=True, exist_ok=True)  # src/ present, bundle absent
+            events = self._capture_events(c)
+            c._consume_transport_resume_directive(refs, ["compile", "generate"], directive)
+            self.assertFalse(getattr(c, "_substep_resume", {}))
+            self.assertEqual([f["reason"] for e, f in events
+                              if e == "transport_resume_declined"], ["artifact_dir_missing"])
+            self.assertEqual(refs.source_id, "src_1_001")  # ref NOT mutated on decline
+            # With the canonical bundle present, the same directive arms.
+            (src_root / "codegen_bundle.json").write_text("{}", encoding="utf-8")
+            self._capture_events(c)
+            c._consume_transport_resume_directive(refs, ["compile", "generate"], directive)
+            self.assertEqual(c._substep_resume["generate"],
+                             {"producer_arid": "gen-prod", "artifact_id": "src_x"})
+
     def test_transport_resume_consumer_declines_when_phase_already_complete(self) -> None:
         """A phase already checkpointed complete is skipped by run_phase, so preseating it would be
         wrong — the consumer declines when check_step_completed reports it done."""

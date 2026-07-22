@@ -6981,13 +6981,23 @@ clean:
                 and str(prod.get("status") or "").strip().lower() == "pass"):
             return _decline("producer_row_absent")
         # Confirm the surviving artifact still exists BEFORE mutating any ref (so a decline leaves
-        # the plain-resume refs intact). compile → reserved ir dir + spec.ir.yaml; generate →
-        # source dir + src/.
+        # the plain-resume refs intact). compile → reserved ir dir + spec.ir.yaml; generate → the
+        # deliverable the reused verify substep actually consumes.
         if step == "compile":
             deliverable = (self.repo_root / "workspace" / "ir" / refs.safe
                            / artifact_id / "spec.ir.yaml")
         else:
-            deliverable = self.repo_root / refs.source_dir(artifact_id) / "src"
+            src_root = self.repo_root / refs.source_dir(artifact_id)
+            # A PURE `generate.verify` reviewer's input is the producer's `codegen_bundle.json`, and
+            # an absent file is NOT caught downstream: `_build_pure_verify_context` supplies an EMPTY
+            # `bundle_document`, and the re-run `post_generate` gate (`_validate_post_generate_bundle`)
+            # SKIPS bundle re-validation when the file is missing. Reusing a source dir without it
+            # would let the reviewer certify blind, so require it — the mid re-run of post_generate
+            # then re-validates the whole bundle (incl. every `files[]` entry byte-for-byte), so this
+            # one check backstops the reuse. An agentic node has no bundle, so require `src/` as before.
+            deliverable = (src_root / "codegen_bundle.json"
+                           if self._pure_leaf_substep(refs, "generate", "verify")
+                           else src_root / "src")
         if not deliverable.exists():
             return _decline("artifact_dir_missing")
         # All checks passed: re-point refs at the surviving artifact (compile is normally a no-op —
