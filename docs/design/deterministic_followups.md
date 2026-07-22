@@ -528,12 +528,14 @@ re-run confirming Build passes on attempt 1 (operator-gated).
     whole run, and the manual `--resume` re-ran `compile.generate` from scratch (a re-paid 491s cold
     producer), because `--resume` only sees the phase-granular checkpoint. The response is the
     **opt-in `--wait-usage-reset` flag** (default OFF keeps this manual behavior). When set AND the
-    dead leaf carried a **machine-form reset epoch** (a trailing `|<unix-epoch>` on its usage-limit
-    line — a human-worded "resets 6:10pm" is never guessed at), the conductor waits it out in place
-    (to the reset + a 120s margin) and re-launches the SAME substep — a same-run, substep-granular
-    resume. Bounded hard: one wait per substep (a budget distinct from the transient-retry budget),
-    at most 6h (a longer reset is a weekly limit or a misparse → fail_closed). It is NOT recovered
-    automatically on `--resume` (a per-invocation preference); re-pass the flag to keep it active.
+    dead leaf carried a **machine-form reset epoch on STDERR** (a trailing `|<unix-epoch>` on its
+    usage-limit line — a human-worded "resets 6:10pm" is never guessed at, and a usage limit on the
+    leaf's untrusted stdout does not arm the wait), the conductor waits it out in place (to the reset
+    + a 120s margin) and re-launches the SAME substep — a same-run, substep-granular resume. Bounded
+    hard: one wait per substep (a budget distinct from the transient-retry budget), at most 6h (a
+    longer reset is a weekly limit or a misparse → fail_closed). It is NOT recovered automatically on
+    `--resume` (a per-invocation preference recorded on the invocation block and refreshed to the
+    effective value on resume); re-pass the flag to keep it active.
     Canonical: `docs/ORCHESTRATION.md` "leaf transient retry"; operator guidance:
     `docs/RUNBOOK.md`.
 - **L6 — GUARDED (2026-06-25).** The dependency build (Model B) keys staged source filenames and

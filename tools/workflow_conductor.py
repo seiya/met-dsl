@@ -1523,24 +1523,34 @@ USAGE_LIMIT_WAIT_MARGIN_SECONDS = 120
 _USAGE_RESET_EPOCH_RE = re.compile(r"\|(\d{10})\s*$")
 
 
-def _parse_usage_reset_epoch(stderr: str, stdout: str = "") -> int | None:
+def _parse_usage_reset_epoch(stderr: str) -> int | None:
     """The unix-second reset epoch a usage-limit leaf carried as a trailing `|<10-digit>`, or None
     when absent (a human-worded reset, or none at all).
 
-    Deliberately a SEPARATE scan from `_classify_leaf_infra_error`, over the RAW streams: the
+    Deliberately a SEPARATE scan from `_classify_leaf_infra_error`, over the RAW stream: the
     classifier returns a 2-tuple whose evidence line is clipped to 160 chars, which can fall short
     of a trailing epoch, and widening that tuple would ripple through its three positional consumers.
     Only lines the `llm_usage_limit` pattern itself matches are considered (so a stray `|1234567890`
-    in the leaf's Fortran prose is never mistaken for a reset time), and stderr is authoritative
-    (consulted before stdout), mirroring the classifier's stream discipline."""
+    is never mistaken for a reset time).
+
+    STDERR ONLY — deliberately NOT stdout. stdout is a `claude -p` leaf's OWN OUTPUT SURFACE (the
+    model's result text for an agentic leaf; the JSON envelope for a pure leaf), i.e. untrusted
+    content. `_classify_leaf_infra_error` may PROMOTE an `llm_usage_limit` tag out of stdout, and
+    that promotion was documented-safe only because a usage limit was terminal — promoting it could
+    only ever REMOVE a re-launch (see `_CROSS_STREAM_PROMOTING_TAGS`). The wait ADDS one (a multi-hour
+    sleep + relaunch), so arming it from stdout would let a leaf that crashed for an unrelated reason,
+    but whose prose happens to contain `usage limit reached|<future epoch>`, park an opted-in run for
+    hours. Only the trusted CLI error channel (stderr) may arm the wait; a usage limit seen only on
+    stdout still classifies (fail_closed labelled `llm_usage_limit`) but declines the wait — the safe
+    default. (If a real CLI emits the machine epoch only on stdout, the operator gets the current
+    manual-`--resume` behavior; a follow-up would key the wait off a verified machine envelope.)"""
     usage_pattern = _LEAF_INFRA_ERROR_PATTERNS[0][1]
-    for stream in (stderr, stdout):
-        for line in (stream or "").splitlines():
-            if not usage_pattern.search(line.lower()):
-                continue
-            match = _USAGE_RESET_EPOCH_RE.search(line)
-            if match:
-                return int(match.group(1))
+    for line in (stderr or "").splitlines():
+        if not usage_pattern.search(line.lower()):
+            continue
+        match = _USAGE_RESET_EPOCH_RE.search(line)
+        if match:
+            return int(match.group(1))
     return None
 
 
@@ -5509,15 +5519,16 @@ clean:
         re-launched in place, or None to keep the current fail_closed behavior.
 
         None (fall back to fail_closed) whenever ANY precondition misses — the flag is off, the
-        per-substep wait budget is spent, the leaf carried no machine-form reset epoch (a
-        human-worded reset is not guessed at), or the reset lies further out than
-        MAX_USAGE_LIMIT_WAIT_SECONDS (a weekly limit or a misparse, not a session window). The
+        per-substep wait budget is spent, the leaf carried no machine-form reset epoch ON STDERR (a
+        human-worded reset is not guessed at, and a usage limit seen only on the leaf's untrusted
+        stdout does not arm the wait — see `_parse_usage_reset_epoch`), or the reset lies further out
+        than MAX_USAGE_LIMIT_WAIT_SECONDS (a weekly limit or a misparse, not a session window). The
         wait sleeps slightly PAST the reset (USAGE_LIMIT_WAIT_MARGIN_SECONDS) so the re-launch's
         preflight live-probe finds the window actually open; a reset already in the past waits only
         that margin."""
         if not self.wait_usage_reset or waits_done >= MAX_USAGE_LIMIT_WAITS:
             return None
-        reset_epoch = _parse_usage_reset_epoch(proc.stderr or "", proc.stdout or "")
+        reset_epoch = _parse_usage_reset_epoch(proc.stderr or "")
         if reset_epoch is None:
             return None
         remaining = reset_epoch - time.time()

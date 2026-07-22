@@ -2464,36 +2464,37 @@ class TransportFailureTest(unittest.TestCase):
 class UsageResetEpochParseTests(unittest.TestCase):
     """`_parse_usage_reset_epoch` reads the MACHINE-FORM reset epoch a usage-limit leaf may carry
     as a trailing `|<10-digit>`. It is a separate scan from the classifier (whose evidence is
-    clipped) and it only trusts an epoch on a line the `llm_usage_limit` pattern itself matches, so
-    a stray `|<number>` in the leaf's own prose is never mistaken for a reset time."""
+    clipped), it only trusts an epoch on a line the `llm_usage_limit` pattern itself matches (so a
+    stray `|<number>` is never mistaken for a reset time), and it reads ONLY stderr — the trusted CLI
+    error channel — never the leaf's untrusted stdout output surface."""
 
     def test_machine_form_reset_yields_the_epoch(self) -> None:
         self.assertEqual(
-            wc._parse_usage_reset_epoch("Claude AI usage limit reached|1752200000", ""),
+            wc._parse_usage_reset_epoch("Claude AI usage limit reached|1752200000"),
             1752200000)
 
     def test_human_worded_reset_has_no_epoch(self) -> None:
         # The CLI's human form ("resets 6:10pm") carries no machine time -> the caller must not wait.
         self.assertIsNone(
-            wc._parse_usage_reset_epoch("You've hit your session limit; resets 6:10pm", ""))
+            wc._parse_usage_reset_epoch("You've hit your session limit; resets 6:10pm"))
 
-    def test_stderr_is_authoritative_over_stdout(self) -> None:
-        # Both streams carry a usage-limit epoch: stderr wins (mirrors the classifier's discipline).
-        self.assertEqual(
-            wc._parse_usage_reset_epoch(
-                "usage limit reached|1752200000", "usage limit reached|1799999999"),
-            1752200000)
-        # stderr silent, stdout carries it (the E2E #4 incident shape) -> stdout is consulted.
-        self.assertEqual(
-            wc._parse_usage_reset_epoch("", "usage limit reached|1799999999"), 1799999999)
+    def test_stdout_is_never_trusted_to_arm_a_wait(self) -> None:
+        # SECURITY: stdout is the leaf's own output surface (untrusted). The wait ADDS a multi-hour
+        # sleep+relaunch, so a usage-limit epoch that appears only on stdout — whether the real CLI's
+        # result text or a crashed leaf's prose containing `usage limit reached|<epoch>` — must NOT
+        # arm the wait. `_parse_usage_reset_epoch` takes stderr ONLY, so there is no stdout argument
+        # a caller could pass to arm it.
+        import inspect
+        params = list(inspect.signature(wc._parse_usage_reset_epoch).parameters)
+        self.assertEqual(params, ["stderr"])  # no stdout parameter at all
 
     def test_pipe_epoch_on_a_non_usage_line_is_ignored(self) -> None:
         # A `|<10-digit>` that is NOT on a usage-limit line (here the leaf's own numerical prose)
         # must not be read as a reset time.
         self.assertIsNone(
-            wc._parse_usage_reset_epoch("the solver step is |1752200000 in code units", ""))
+            wc._parse_usage_reset_epoch("the solver step is |1752200000 in code units"))
         # Nothing at all.
-        self.assertIsNone(wc._parse_usage_reset_epoch("", ""))
+        self.assertIsNone(wc._parse_usage_reset_epoch(""))
 
 
 class LeafChildEnvTest(unittest.TestCase):
@@ -2726,6 +2727,24 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertEqual(oc.decision.action, "fail_closed")
         self.assertIn("llm_usage_limit", oc.decision.reason)
         self.assertIn("[attempts=2]", oc.decision.reason)
+
+    def test_usage_limit_on_stdout_only_does_not_arm_the_wait(self) -> None:
+        """SECURITY (Codex P2): the classifier PROMOTES an `llm_usage_limit` tag out of stdout, but
+        stdout is the leaf's own untrusted output surface. A usage-limit epoch seen ONLY on stdout —
+        e.g. a leaf that crashed for an unrelated reason whose prose contains
+        `usage limit reached|<future epoch>` — must NOT arm the (multi-hour) wait, even opted in. It
+        is still classified/fail_closed as `llm_usage_limit`, but the wait declines (no sleep, no
+        relaunch)."""
+        now = 1_752_200_000.0
+        c = self._conductor(
+            [wc.ProcResult(1, f"Claude AI usage limit reached|{int(now) + 300}", "")],
+            wait_usage_reset=True)
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(len(c.spawns), 1)                 # no relaunch
+        self.assertEqual(c.slept, [])                      # no wait
+        self.assertEqual(oc.infra_error[0], "llm_usage_limit")  # still classified (fail_closed)
+        self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
 
     def test_usage_reset_wait_declines_without_a_machine_epoch(self) -> None:
         """Opted in but no machine-form epoch (a human-worded reset) => no guessing: the current

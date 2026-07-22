@@ -149,7 +149,10 @@ def _build_invocation_record(
         "with_deps": bool(with_deps),
         # --wait-usage-reset is recorded for provenance/observability only. It is a PER-INVOCATION
         # runtime preference, NOT auto-recovered on --resume (that decision is intentional — see the
-        # flag help and RUNBOOK); a resume must re-pass the flag to keep the wait active.
+        # flag help and RUNBOOK); a resume must re-pass the flag to keep the wait active. On resume
+        # the field is REFRESHED to the effective re-passed value by enable_checkpoint_resume (this
+        # cold-init value is the original run's), so the recorded field always matches the behavior
+        # of the run that produced the current result rather than going stale.
         "wait_usage_reset": bool(wait_usage_reset),
         # Z2 executor provenance. Since M-F the generate-executor is always `pure` (legacy removed),
         # so this is a hardcoded provenance stamp rather than a per-run choice. It is still the value
@@ -1826,6 +1829,12 @@ def _run_node(
             # nodes themselves (durable even if the target orchestration never starts).
             if closure_until_phase:
                 init_args += ["--closure-until-phase", closure_until_phase]
+            # Refresh invocation.wait_usage_reset to the effective (re-passed) flag so the
+            # recorded provenance matches THIS resumed run's behavior (the flag is not recovered
+            # from the record — it is re-passed per invocation). Omitting it records False, which
+            # correctly resets a run that was started WITH the flag but is now resumed without it.
+            if wait_usage_reset:
+                init_args += ["--wait-usage-reset"]
         else:
             init_args = [
                 "init",

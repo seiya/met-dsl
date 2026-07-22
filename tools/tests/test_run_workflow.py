@@ -645,6 +645,37 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(init_calls[0][idx + 1], "spec/problem/test.md")
 
 
+    def test_resume_with_wait_usage_reset_refreshes_it_in_init(self) -> None:
+        """A resume that re-passes --wait-usage-reset forwards it to the resume init, so
+        enable_checkpoint_resume refreshes invocation.wait_usage_reset to the effective value (the
+        flag is not recovered from the record). Omitting it forwards nothing (records False)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa",
+                spec_ref="spec/problem/test.md", until_phase="Build", mode="dev", backend="claude")
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor",
+                 "--wait-usage-reset"])
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            self.assertIn("--resume-from-checkpoint", init_calls[0])
+            self.assertIn("--wait-usage-reset", init_calls[0])
+
+    def test_resume_without_wait_usage_reset_omits_it_from_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._seed_spec_tree(repo_root)
+            self._seed_resumable_orchestration(
+                repo_root, "orch_20260101T000000Z_aaaaaaaa",
+                spec_ref="spec/problem/test.md", until_phase="Build", mode="dev", backend="claude")
+            code, out, calls = self._run_main_with_fake_runtime(
+                ["--resume", "--repo-root", str(repo_root), "--no-run-conductor"])
+            self.assertEqual(code, 0, out)
+            init_calls = [c for c in calls if c and c[0] == "init"]
+            self.assertNotIn("--wait-usage-reset", init_calls[0])
+
     def test_resume_forwards_explicit_agent_model(self) -> None:
         """An explicit --agent-model on --resume reaches the resume init (and thus
         repair-agent-runs), so an operator can fix a needs_manual row on resume."""

@@ -12307,6 +12307,7 @@ def enable_checkpoint_resume(
     spec_ref: str | None = None,
     source_dependency_ref: str | None = None,
     closure_until_phase: str | None = None,
+    wait_usage_reset: bool = False,
 ) -> dict[str, Any]:
     """Set resume_enabled=true in orchestration_meta.json.
 
@@ -12375,6 +12376,15 @@ def enable_checkpoint_resume(
         and invocation_block.get("closure_id")
     ):
         invocation_block["closure_until_phase"] = closure_until_phase.strip()
+    # `wait_usage_reset` is a PER-INVOCATION preference that is NOT recovered from the record (the
+    # operator re-passes `--wait-usage-reset` on resume; see run_workflow). The conductor's actual
+    # behavior on this resume is driven by the RE-PASSED flag, so refresh the recorded field to that
+    # effective value — otherwise a run started without the flag and resumed WITH it (or vice-versa)
+    # would leave the provenance reporting the opposite of the behavior that produced the resumed
+    # result. Mirrors the closure_until_phase refresh above (a per-invocation override made durable).
+    # Always written (not gated on truthiness) so a resume that DROPS the flag also resets it.
+    if isinstance(invocation_block, dict):
+        invocation_block["wait_usage_reset"] = bool(wait_usage_reset)
     prior_status = meta.get("status")
     terminal_reset = (
         isinstance(prior_status, str) and prior_status in IDEMPOTENT_TERMINAL_STATUSES
@@ -18904,6 +18914,16 @@ def main(argv: list[str] | None = None) -> int:
             "(recoverable by a later plain --resume even if the target never started)."
         ),
     )
+    init_parser.add_argument(
+        "--wait-usage-reset",
+        action="store_true",
+        help=(
+            "On --resume-from-checkpoint, refresh invocation.wait_usage_reset to the "
+            "effective (re-passed) value of the opt-in usage-limit wait, so the recorded "
+            "provenance matches the behavior of THIS resumed run (the flag is not recovered "
+            "from the record — it is re-passed per invocation). Absent on resume records False."
+        ),
+    )
 
     preflight_parser = subparsers.add_parser("preflight")
     preflight_parser.add_argument("--repo-root", required=True)
@@ -19451,6 +19471,7 @@ def main(argv: list[str] | None = None) -> int:
                 spec_ref=args.spec_ref,
                 source_dependency_ref=args.source_dependency_ref,
                 closure_until_phase=getattr(args, "closure_until_phase", None),
+                wait_usage_reset=bool(getattr(args, "wait_usage_reset", False)),
             )
             # Self-heal any step_result.json whose executor arid is a verify-substep
             # arid instead of the orchestration arid (the

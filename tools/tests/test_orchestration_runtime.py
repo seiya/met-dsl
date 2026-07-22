@@ -12024,7 +12024,33 @@ class CheckpointResumeRuntimeTests(unittest.TestCase):
             meta = self._read_meta(repo, "o1")
             self.assertTrue(meta.get("resume_enabled"))
             self.assertEqual(meta.get("spec_ref"), "new-spec")
-            self.assertEqual(meta["invocation"], {"closure_id": "orch_target"})
+            # The block is preserved; the only refresh is wait_usage_reset -> the effective (here
+            # default False) value of this resumed invocation.
+            self.assertEqual(meta["invocation"],
+                             {"closure_id": "orch_target", "wait_usage_reset": False})
+
+    def test_resume_refreshes_wait_usage_reset_to_effective_value(self) -> None:
+        # A run started WITHOUT the flag then resumed WITH it must record wait_usage_reset=True
+        # (the resumed run actually waits); the reverse resume must reset it to False. The flag is
+        # not recovered from the record, so the field must track the effective re-passed value —
+        # otherwise provenance reports the opposite of the behavior that produced the result.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1",
+                               invocation={"spec_ref": "s", "wait_usage_reset": False})
+            enable_checkpoint_resume(repo, "o1", spec_ref="s", wait_usage_reset=True)
+            self.assertIs(self._read_meta(repo, "o1")["invocation"]["wait_usage_reset"], True)
+            # Now resume again WITHOUT the flag -> reset to False.
+            enable_checkpoint_resume(repo, "o1", spec_ref="s", wait_usage_reset=False)
+            self.assertIs(self._read_meta(repo, "o1")["invocation"]["wait_usage_reset"], False)
+
+    def test_resume_does_not_add_wait_usage_reset_without_invocation_block(self) -> None:
+        # An older orchestration with no invocation block must not gain one on resume.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_orchestration(repo_root=repo, orchestration_id="o1")
+            enable_checkpoint_resume(repo, "o1", wait_usage_reset=True)
+            self.assertNotIn("invocation", self._read_meta(repo, "o1"))
 
     def test_resume_retarget_drops_stale_closure_link(self) -> None:
         # Escape hatch: resuming a closure node with a DIFFERENT spec retargets the
