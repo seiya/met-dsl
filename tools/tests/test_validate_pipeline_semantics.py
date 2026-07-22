@@ -13047,6 +13047,51 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             self.assertTrue(any("no neutral form" in v or "has no neutral form" in v
                                 for v in violations), violations)
 
+    def test_section51_stale_fortran_kind_value_rejected_at_compile(self) -> None:
+        # Integration-level pin (not only the lang_backend unit): a §5.1 fence left carrying the
+        # Fortran kind spelling `real64` (a stale pre-0.6.0 token) fails closed at Compile — the
+        # §5.1 render short-circuits with the neutral alternative named. This is the most-likely
+        # staleness the C2 neutralization exists to catch, distinct from the `selected_real_kind`
+        # expression variant above.
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        struct["module_parameters"][0]["value"] = "real64"  # stale Fortran token (dp)
+        fence = ("### 5.1 Canonical interface block\n```yaml\n"
+                 + yaml.safe_dump(struct, sort_keys=False) + "```\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=fence), encoding="utf-8")
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": self._full_api()})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("real64" in v and "float64" in v for v in violations), violations)
+
+    def test_section51_stale_fortran_len_token_rejected_at_compile(self) -> None:
+        # The string-length counterpart: a §5.1 fence carrying the Fortran length token `:` (a stale
+        # pre-0.6.0 token) fails closed at Compile, naming the neutral `deferred`.
+        struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
+        mutated = False
+        for p in struct["procedures"]:
+            res = p.get("result")
+            if res and res["spec"].get("type") == "string":
+                res["spec"]["len"] = ":"  # stale Fortran token
+                mutated = True
+        self.assertTrue(mutated, "fixture has no string result to mutate")
+        fence = ("### 5.1 Canonical interface block\n```yaml\n"
+                 + yaml.safe_dump(struct, sort_keys=False) + "```\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs.md").write_text(
+                self._controlled_spec(section_51=fence), encoding="utf-8")
+            _write_json(Path(tmp) / "spec.ir.yaml", {
+                "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
+                         "source_refs": {"controlled_spec": "cs.md"}},
+                "public_api": self._full_api()})
+            violations: list[str] = []
+            _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
+            self.assertTrue(any("deferred" in v for v in violations), violations)
+
     def test_module_parameters_value_normalization_equivalence_passes(self) -> None:
         # Values compare normalized (str().strip().lower()): a YAML int 64 == "64" and
         # FLOAT64 == float64. This pins that behavior — a regression to a plain str() compare (or

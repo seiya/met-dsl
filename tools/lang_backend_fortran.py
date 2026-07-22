@@ -79,6 +79,14 @@ from tools.validate_pipeline_semantics import (
 # The two closed vocabularies the renderer lowers to Fortran and the parser lifts back to neutral.
 # A closed grammar (fail-closed on anything else) is what removes the residual Fortran spellings
 # from the neutral IR: a stale ``len: ':'`` / ``value: real64`` no longer passes through silently.
+#
+# ``deferred`` / ``assumed`` (and the value tokens ``float64`` / ``float32``) are RESERVED words of
+# this vocabulary, matched case-INSENSITIVELY (Fortran identifiers are case-insensitive, and the
+# module-parameter value pin folds case) with lowercase as the canonical form. A consequence of a
+# reserved vocabulary: a ``string`` length symbol may NOT be named ``deferred`` / ``assumed`` — such
+# a ``len`` is read as the reserved token (rendering ``character(len=:)`` / ``(len=*)``), not a
+# symbol reference. No Fortran symbol on the real harness surface collides, but a future spec must
+# not name a length parameter ``deferred`` / ``assumed``.
 _NEUTRAL_LEN_TO_FORTRAN = {"deferred": ":", "assumed": "*"}   # string length token
 _FORTRAN_LEN_TO_NEUTRAL = {v: k for k, v in _NEUTRAL_LEN_TO_FORTRAN.items()}
 _NEUTRAL_KIND_VALUES = {"float64": "real64", "float32": "real32"}   # module-parameter kind value
@@ -369,11 +377,14 @@ def _require_len_token(value: Any, ctx: str) -> str:
     spec's ``len``: ``deferred`` (Fortran ``character(len=:)``), ``assumed`` (``character(len=*)``),
     a fixed decimal width (``4``), or a symbol identifier (``case_id_len``). The old Fortran tokens
     ``:`` / ``*`` fail closed with the neutral alternative named, so a stale §5.1 cannot pass
-    through. Every admitted form is structurally safe (no ``)`` / ``,`` / newline / ``!`` to smuggle
-    a declaration), so this both fixes the vocabulary and subsumes the injection guard."""
+    through. ``deferred`` / ``assumed`` are RESERVED (matched case-insensitively, lowercase-canonical)
+    and take precedence over the symbol-identifier branch, so a length symbol may not be named that
+    (see the token-map note above). Every admitted form is structurally safe (no ``)`` / ``,`` /
+    newline / ``!`` to smuggle a declaration), so this both fixes the vocabulary and subsumes the
+    injection guard."""
     _require_nonempty_str(value, ctx)
     s = value.strip()
-    if s.lower() in _NEUTRAL_LEN_TO_FORTRAN:
+    if s.lower() in _NEUTRAL_LEN_TO_FORTRAN:  # reserved token, case-insensitive (render lowercases)
         return s
     if s in _FORTRAN_LEN_TO_NEUTRAL:  # ":" / "*": the removed Fortran spelling
         raise SignatureParseError(

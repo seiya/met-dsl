@@ -5155,9 +5155,15 @@ def _section51_parameter_lines(controlled_spec_path: Path) -> list[str]:
     parameter :: dp = real64``). §5.1 carries the NEUTRAL value (``dp = float64``); the Fortran
     backend lowers it to the language the generated source is written in via the single
     ``render_module_parameter_to_fortran`` — so the Generate.static source pin deterministically
-    demands the Fortran spelling (``dp = real64``) from a neutral §5.1 ``float64``. The upstream
-    stale-IR guard has already pinned §5.1 == the certified IR by normalized value, so every entry
-    reaching here is neutral-valid and the render cannot fail closed."""
+    demands the Fortran spelling (``dp = real64``) from a neutral §5.1 ``float64``.
+
+    ``render_module_parameter_to_fortran`` validates each parameter and can raise
+    ``SignatureParseError`` on a malformed / stale-token §5.1 value; this helper lets it propagate,
+    and the ONE gate that renders it (``_validate_infrastructure_generated_signatures``) both calls
+    this only AFTER ``_parse_canonical_interface_from_controlled_spec`` — which renders the whole
+    §5.1 struct first and short-circuits with a violation on any unrenderable parameter — and wraps
+    this call in ``except SignatureParseError`` as defense-in-depth, so a malformed §5.1 fails closed
+    with a clear violation, never an uncaught gate crash."""
     from tools.lang_backend_fortran import render_module_parameter_to_fortran
 
     return [
@@ -10525,11 +10531,14 @@ def _validate_ir_module_parameters_against_section51(
     def _norm(value: Any) -> str:
         # Case-fold (Fortran identifiers are case-insensitive, so the neutral `float64` == `FLOAT64`)
         # and remove ALL whitespace, matching the Generate.static source pin (_stanza_atoms strips
-        # every space). Neutral module-parameter values are numbers or the `float64`/`float32` kind
-        # tokens — no internal whitespace or expression survives — so the whitespace fold is
-        # defensive; the fold is SOUND because `_require_neutral_parameter_value` admits ONLY those
-        # numeric/token forms (no character literal, whose case/whitespace-folded value would be
-        # unsound).
+        # every space). Applied to BOTH sides of the compare below (the IR value and the raw §5.1
+        # value). The fold cannot make two DIFFERENT ABI values compare equal: the IR side is
+        # validated by `_require_neutral_parameter_value` (via `_validate_module_parameter`) to be a
+        # number or a `float64`/`float32` token — no internal whitespace, expression, or character
+        # literal whose folded value would be ambiguous — so a §5.1 value that folds to match it must
+        # be that same neutral value; a §5.1 value that is NOT neutral (a stray character literal,
+        # `float 64`) either differs after folding (→ a value-drift violation) or is caught first by
+        # the render-check (`_parse_canonical_interface_from_controlled_spec`) that also renders §5.1.
         return "".join(str(value).split()).lower()
 
     def _norm_name(name: str) -> str:
@@ -10779,7 +10788,21 @@ def _validate_infrastructure_generated_signatures(
     all_src_atoms = frozenset(
         atom for line in _fortran_logical_lines(combined) for atom in _stanza_atoms([line])
     )
-    for pline in _section51_parameter_lines(cs_path):
+    # Defense-in-depth: `_parse_canonical_interface_from_controlled_spec` above already renders the
+    # whole §5.1 struct and short-circuits (iface_err → return) on any parameter the backend cannot
+    # lower, so a raise here is not reachable in the current gate order. Guard it anyway — this is
+    # the lone backend render not already inside an `except SignatureParseError`, so a future reorder
+    # or a new caller must fail closed with a clear violation, never crash the gate.
+    from tools.lang_backend_fortran import SignatureParseError
+    try:
+        param_lines = _section51_parameter_lines(cs_path)
+    except SignatureParseError as exc:
+        violations.append(
+            f"{target}: controlled_spec §5.1 declares a module parameter the language backend "
+            f"cannot lower ({exc}) — re-certify the harness so §5.1 carries a neutral parameter "
+            "value the generated source can be pinned against")
+        param_lines = []
+    for pline in param_lines:
         missing_atoms = [a for a in _stanza_atoms([pline]) if a not in all_src_atoms]
         if missing_atoms:
             violations.append(
