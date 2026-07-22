@@ -752,6 +752,32 @@ class SummarizePureLeafMetasTest(unittest.TestCase):
         self.assertEqual(row["attempts"], 0)
         self.assertEqual(row["repair_turns"], 0)
 
+    def test_usage_wait_rows_are_not_counted_as_repair_turns(self) -> None:
+        # --wait-usage-reset: a non-terminal `pure_transport` row is a WAIT (re-launch in place),
+        # not a repair turn. `attempts` counts every launch, so repair_turns must subtract the waits.
+        # wait -> pass: 2 launches, 0 repairs.
+        row = diag._summarize_one_pure_meta({
+            "result": "pass", "attempts": 2,
+            "per_attempt": [{"failure_category": "pure_transport"}, {}]})
+        self.assertEqual(row["attempts"], 2)
+        self.assertEqual(row["repair_turns"], 0)
+        # wait -> content-fail -> repair -> pass: 3 launches, 1 repair.
+        row = diag._summarize_one_pure_meta({
+            "result": "pass", "attempts": 3,
+            "per_attempt": [{"failure_category": "pure_transport"},
+                            {"failure_category": "bundle_schema_violation"}, {}]})
+        self.assertEqual(row["repair_turns"], 1)
+        # A genuine TERMINAL transport death (the last row) is NOT a wait — 1 launch, 0 repairs.
+        row = diag._summarize_one_pure_meta({
+            "result": "fail", "attempts": 1,
+            "per_attempt": [{"failure_category": "pure_transport"}]})
+        self.assertEqual(row["repair_turns"], 0)
+        # A pure content repair with no waits is unchanged: 2 launches, 1 repair.
+        row = diag._summarize_one_pure_meta({
+            "result": "pass", "attempts": 2,
+            "per_attempt": [{"failure_category": "bundle_schema_violation"}, {}]})
+        self.assertEqual(row["repair_turns"], 1)
+
     def test_foreign_json_without_payload_key_is_not_a_pure_meta(self) -> None:
         # A stale/hand-edited document carrying only common keys must NOT be
         # reported as a pure-leaf row of all-zero metrics: `per_attempt` (the

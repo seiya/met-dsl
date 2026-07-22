@@ -771,10 +771,16 @@ def _summarize_one_pure_meta(meta: dict[str, Any] | None) -> dict[str, Any]:
     `bundle_meta.json` (producer) and `verdict_meta.json` (reviewer) share a
     schema: `{result, failure_category, attempts, prompt_contract_version,
     per_attempt[], failure_excerpt?}`. `result` is `pass`/`fail`; `attempts`
-    counts turns, so `repair_turns = attempts - 1` is the bounded-repair count.
-    `found=False` when the file is absent, unparseable, or not a pure-leaf meta
-    envelope (see `_PURE_META_PAYLOAD_KEY`). When `attempts` is absent or corrupt
-    it falls back to the count of structurally valid (dict) attempt entries.
+    counts every LAUNCH (== len(per_attempt)). Not every launch is a repair turn:
+    an opt-in `--wait-usage-reset` WAIT re-launches the same substep in place
+    without advancing the repair budget, so `repair_turns = attempts - 1 - waits`.
+    The wait count is recovered from `per_attempt` (no separate counter is
+    persisted): a `pure_transport` attempt that is NOT the terminating (last) row
+    is necessarily a wait — a transport death that is not waited is terminal, hence
+    always the last row. `found=False` when the file is absent, unparseable, or not
+    a pure-leaf meta envelope (see `_PURE_META_PAYLOAD_KEY`). When `attempts` is
+    absent or corrupt it falls back to the count of structurally valid (dict)
+    attempt entries.
     """
     if not isinstance(meta, dict) or _PURE_META_PAYLOAD_KEY not in meta:
         return {"found": False}
@@ -785,11 +791,18 @@ def _summarize_one_pure_meta(meta: dict[str, Any] | None) -> dict[str, Any]:
     attempts = _nonneg_int_or_none(meta.get("attempts"))
     if attempts is None:
         attempts = valid_attempt_count
+    # A non-terminal `pure_transport` row is a waited-and-relaunched usage limit, not a repair
+    # turn: exclude it from the repair count so a substep that only waited (never repaired) reads
+    # `repair_turns=0`. per_attempt[:-1] drops the terminating attempt (the only row a genuine
+    # terminal transport death would occupy).
+    usage_wait_rows = sum(
+        1 for a in per_attempt[:-1]
+        if isinstance(a, dict) and a.get("failure_category") == "pure_transport")
     return {
         "found": True,
         "result": meta.get("result"),
         "attempts": attempts,
-        "repair_turns": max(attempts - 1, 0),
+        "repair_turns": max(attempts - 1 - usage_wait_rows, 0),
         "failure_category": meta.get("failure_category"),
         "prompt_contract_version": meta.get("prompt_contract_version"),
         "usage_total": usage_total,
