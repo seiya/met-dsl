@@ -2,11 +2,11 @@
 
 ## 0. Meta information
 - `test_profile_id`: `harness_fortran_cpu_l0`
-- `test_profile_version`: `0.3.0`
+- `test_profile_version`: `0.3.1`
 - `status`: `draft`
 - `spec_ref.spec_kind`: `infrastructure`
 - `spec_ref.spec_id`: `harness_fortran_cpu`
-- `spec_ref.spec_version`: `0.5.0`
+- `spec_ref.spec_version`: `0.6.0`
 - `spec_ref.controlled_spec_path`: `spec/infrastructure/infra/harness/harness_fortran_cpu/controlled_spec.md`
 
 ## 1. Test purpose
@@ -40,7 +40,7 @@ Because `raw/metrics_basis.json` carries one entry per (`test_id`, target `case_
   - `operation_id`: `harness_fortran_cpu__emit_bool`
   - `expected_outcome`: `pass`
   - `required_raw_variables`: `bool_match` (scalar)
-  - `judgment`: `.true.` and `.false.` emit the exact JSON literals `true` / `false` (no `L`-descriptor `T`/`F`), so `bool_match == 1.0`, and `checks.boolean_literal.status == pass`.
+  - `judgment`: a `true` and a `false` boolean emit the exact JSON literals `true` / `false` (no language-specific boolean token), so `bool_match == 1.0`, and `checks.boolean_literal.status == pass`.
 - `test_id`: `l0_array_emit_pass`
   - `level`: `L0`
   - `operation_id`: `harness_fortran_cpu__emit_array_r2` (representative; the case exercises `__emit_array_r1..r4`)
@@ -65,7 +65,7 @@ Because `raw/metrics_basis.json` carries one entry per (`test_id`, target `case_
   - `expected_outcome`: `xfail`
   - `required_raw_variables`: `guard_fired` (scalar)
   - `xfail_condition`: a `--cases` flag is absent from the token list passed to `__parse_cases`
-  - `pass_when`: `per_case.l0_missing_cases_xfail.verdict.overall == fail` and `per_case.l0_missing_cases_xfail.verdict.failed_checks includes 'input_guard'` (calling `__parse_cases` on a length-0 token array returns `ok=.false.`, so `guard_fired == 1.0` and the guard fires).
+  - `pass_when`: `per_case.l0_missing_cases_xfail.verdict.overall == fail` and `per_case.l0_missing_cases_xfail.verdict.failed_checks includes 'input_guard'` (calling `__parse_cases` on a length-0 token array returns `ok = false`, so `guard_fired == 1.0` and the guard fires).
 - `test_id`: `l0_multi_case_evidence_pass`
   - `level`: `L0`
   - `operation_id`: `harness_fortran_cpu__write_metrics_basis`

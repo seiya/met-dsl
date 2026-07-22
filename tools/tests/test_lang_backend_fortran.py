@@ -21,6 +21,7 @@ from tools.lang_backend_fortran import (
     load_structured_signatures,
     normalized_stanza_index,
     parse_signatures_from_fortran,
+    render_module_parameter_to_fortran,
     render_signatures_to_fortran,
     render_symbol_to_fortran,
 )
@@ -216,7 +217,7 @@ class MalformedStructFailClosedTest(unittest.TestCase):
             "args": [{"name": "x", "rank": 0, "intent": "in",
                       "spec": {"type": "real", "kind": "dp"}}],
             "result": {"name": "s", "rank": 0,
-                       "spec": {"type": "string", "len": ":", "alloc": True}},
+                       "spec": {"type": "string", "len": "deferred", "alloc": True}},
         }
 
     def test_valid_baseline_renders(self) -> None:
@@ -376,20 +377,20 @@ class Round2HardeningTest(unittest.TestCase):
         with self.assertRaisesRegex(SignatureParseError, "alloc"):
             render_symbol_to_fortran(
                 {"kind": "subroutine", "name": "hx__f",
-                 "args": [{"name": "x", "spec": {"type": "string", "len": ":", "alloc": 1}}]})
+                 "args": [{"name": "x", "spec": {"type": "string", "len": "deferred", "alloc": 1}}]})
 
     def test_integer_parameter_value_accepted(self) -> None:
         render_signatures_to_fortran(
             {"module_parameters": [{"name": "case_id_len", "value": 64}],
              "types": [], "procedures": []})  # must not raise
 
-    def test_parenthesized_kind_parameter_value_accepted(self) -> None:
-        # A module-parameter value renders OUTSIDE parens, so the portable-kind idiom must not
-        # false-reject (and it round-trips from parse).
+    def test_fortran_expression_parameter_value_rejected(self) -> None:
+        # The Fortran-expression pass-through was removed: a module-parameter value has a neutral
+        # form only as a number or the float64/float32 kind tokens, so the portable-kind idiom
+        # `selected_real_kind(15, 307)` now fails closed on parse (no neutral form).
         block = "integer, parameter :: dp = selected_real_kind(15, 307)\n"
-        struct = parse_signatures_from_fortran(block)
-        self.assertEqual(struct["module_parameters"][0]["value"], "selected_real_kind(15, 307)")
-        render_signatures_to_fortran(struct)  # must not raise
+        with self.assertRaisesRegex(SignatureParseError, "no neutral form"):
+            parse_signatures_from_fortran(block)
 
     def test_parameter_value_with_double_colon_rejected(self) -> None:
         with self.assertRaises(SignatureParseError):
@@ -505,6 +506,90 @@ class Round2HardeningTest(unittest.TestCase):
             {"kind": "subroutine", "name": "hx__f", "args": [
                 {"name": "x", "rank": 0, "intent": "in",
                  "spec": {"type": "real", "kind": "dp", "len": None, "name": None, "alloc": False}}]})
+
+
+class NeutralVocabularyTest(unittest.TestCase):
+    """C2: the §5.1 / IR leaf vocabulary is language-neutral — string lengths are
+    `deferred`/`assumed` (not the Fortran `:`/`*`) and kind values are `float64`/`float32`
+    (not `real64`/`real32`). The old Fortran tokens fail closed; the neutral tokens render to
+    their Fortran spelling. Driven by the REAL harness §5.1 to avoid fixture fiction."""
+
+    def test_real_section51_struct_carries_only_neutral_tokens(self) -> None:
+        # (#1/#4) The real §5.1 loads to a struct whose string lengths are neutral tokens and
+        # whose module-parameter values are neutral — never a raw Fortran `:`/`*`/`real64`.
+        struct = _real_section51_struct()
+        lens = [
+            c["spec"].get("len")
+            for t in struct["types"] for c in t["components"]
+            if c["spec"].get("type") == "string"
+        ]
+        lens += [
+            e["spec"].get("len")
+            for p in struct["procedures"]
+            for e in [*p.get("args", []), *([p["result"]] if p.get("result") else [])]
+            if e["spec"].get("type") == "string"
+        ]
+        self.assertIn("deferred", lens)
+        self.assertIn("assumed", lens)
+        self.assertNotIn(":", lens)
+        self.assertNotIn("*", lens)
+        values = {mp["name"]: mp["value"] for mp in struct["module_parameters"]}
+        self.assertEqual(str(values["dp"]).lower(), "float64")
+        self.assertNotIn("real64", [str(v).lower() for v in values.values()])
+
+    def test_old_fortran_len_token_fails_closed_with_neutral_alternative(self) -> None:
+        # (#2) `len: ':'` / `len: '*'` in a neutral struct fail closed, naming the neutral token.
+        for bad, alt in ((":", "deferred"), ("*", "assumed")):
+            with self.assertRaisesRegex(SignatureParseError, alt):
+                render_symbol_to_fortran(
+                    {"kind": "subroutine", "name": "hx__f",
+                     "args": [{"name": "x", "spec": {"type": "string", "len": bad}}]})
+
+    def test_old_fortran_kind_value_fails_closed_with_neutral_alternative(self) -> None:
+        # (#2) `value: real64` / `real32` fail closed, naming `float64` / `float32`.
+        for bad, alt in (("real64", "float64"), ("real32", "float32")):
+            with self.assertRaisesRegex(SignatureParseError, alt):
+                render_signatures_to_fortran(
+                    {"module_parameters": [{"name": "dp", "value": bad}],
+                     "types": [], "procedures": []})
+
+    def test_module_parameter_render_matches_the_renderer_pin(self) -> None:
+        # (#3) The neutral `dp = float64` lowers to the exact Fortran the renderer pin expects.
+        line = render_module_parameter_to_fortran({"name": "dp", "value": "float64"})
+        self.assertEqual(line, "integer, parameter :: dp = real64")
+        self.assertEqual(line, _HARNESS_V3_PARAMETERS[0])
+        self.assertEqual(
+            render_module_parameter_to_fortran({"name": "float32_kind", "value": "float32"}),
+            "integer, parameter :: float32_kind = real32")
+        self.assertEqual(
+            render_module_parameter_to_fortran({"name": "case_id_len", "value": 64}),
+            "integer, parameter :: case_id_len = 64")
+
+    def test_neutral_len_tokens_render_to_fortran(self) -> None:
+        # `deferred` -> `character(len=:)`, `assumed` -> `character(len=*)`.
+        out = render_symbol_to_fortran(
+            {"kind": "subroutine", "name": "hx__f", "args": [
+                {"name": "a", "intent": "in", "spec": {"type": "string", "len": "deferred"}},
+                {"name": "b", "intent": "in", "spec": {"type": "string", "len": "assumed"}}]})
+        self.assertIn("character(len=:), intent(in) :: a", out)
+        self.assertIn("character(len=*), intent(in) :: b", out)
+        self.assertNotIn("deferred", out)
+        self.assertNotIn("assumed", out)
+
+    def test_real_section51_fence_text_has_no_fortran_tokens(self) -> None:
+        # (#5) A hand-edit that reintroduces a Fortran token into the real §5.1 fence is caught:
+        # the fenced block text must carry no `len: ':'` / `len: '*'` / `value: real64`.
+        md = HARNESS_SPEC.read_text(encoding="utf-8")
+        fence = md.split("### 5.1", 1)[1]
+        m = _FENCED_BLOCK_RE.search(fence)
+        assert m, "harness §5.1 fenced block not found"
+        block = m.group(1)
+        self.assertNotIn("len: ':'", block)
+        self.assertNotIn("len: '*'", block)
+        self.assertNotIn("value: real64", block)
+        self.assertIn("len: deferred", block)
+        self.assertIn("len: assumed", block)
+        self.assertIn("value: float64", block)
 
 
 if __name__ == "__main__":

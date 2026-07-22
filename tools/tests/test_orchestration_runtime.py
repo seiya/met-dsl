@@ -27385,7 +27385,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # Bumped 35200->35500: the module-parameter declarations are now IR-driven — each
         # `public_api.module_parameters[]` entry rendered `integer, parameter :: <name> = <value>`
         # (values from the IR, Generate.static value-pins them) instead of the hardcoded dp/case_id_len.
-        "skills/workflow-generate-generate/SKILL.md": 35500,
+        # Bumped 35500->35700: C2 spec-neutrality — the render map now states the neutral->Fortran
+        # lowering the doc-reading leaf must apply (string `len` deferred->`:` / assumed->`*`, kind
+        # value `float64`->`real64`), without which a doc-blind leaf false-starts by emitting the
+        # neutral token verbatim into the generated source.
+        "skills/workflow-generate-generate/SKILL.md": 35700,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare

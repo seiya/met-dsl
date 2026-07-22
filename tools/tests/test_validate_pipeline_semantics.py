@@ -12747,7 +12747,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             api = self._full_api()
             signature = api["signatures"][2]["signature"]
             signature["args"][0]["spec"] = {
-                "type": "string", "kind": None, "len": "*", "name": None,
+                "type": "string", "kind": None, "len": "assumed", "name": None,
                 "alloc": False,
             }
             ir_dir = self._seed(Path(tmp), public_api=api)
@@ -12886,10 +12886,10 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
                             violations)
 
     def test_module_parameters_value_drift_flagged(self) -> None:
-        # dp = real64 in §5.1 but real32 in the IR — a silent ABI change.
+        # dp = float64 in §5.1 but float32 in the IR — a silent ABI change.
         with tempfile.TemporaryDirectory() as tmp:
             api = self._full_api()
-            api["module_parameters"][0]["value"] = "real32"
+            api["module_parameters"][0]["value"] = "float32"
             ir_dir = self._seed(Path(tmp), public_api=api)
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
@@ -12923,7 +12923,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             api = self._full_api()
             api["module_parameters"].append(
-                {"name": "dp", "base": "integer", "value": "real64"})
+                {"name": "dp", "base": "integer", "value": "float64"})
             ir_dir = self._seed(Path(tmp), public_api=api)
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
@@ -12969,7 +12969,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
         # contradictory/unsatisfiable contract wedge Generate.static.
         struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
         struct["module_parameters"].append(
-            {"name": "dp", "base": "integer", "value": "real32"})  # dp declared twice, diverging
+            {"name": "dp", "base": "integer", "value": "float32"})  # dp declared twice, diverging
         dup_fence = (
             "### 5.1 Canonical interface block\n```yaml\n"
             + yaml.safe_dump(struct, sort_keys=False) + "```\n")
@@ -12977,7 +12977,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             (Path(tmp) / "cs.md").write_text(
                 self._controlled_spec(section_51=dup_fence), encoding="utf-8")
             api = self._full_api()
-            api["module_parameters"] = [{"name": "dp", "base": "integer", "value": "real32"}]
+            api["module_parameters"] = [{"name": "dp", "base": "integer", "value": "float32"}]
             _write_json(Path(tmp) / "spec.ir.yaml", {
                 "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
                          "source_refs": {"controlled_spec": "cs.md"}},
@@ -12993,7 +12993,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
         # contradictory `integer, parameter :: dp/DP` declarations for one Fortran symbol.
         struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
         struct["module_parameters"].append(
-            {"name": "DP", "base": "integer", "value": "real32"})  # same symbol as dp, diverging
+            {"name": "DP", "base": "integer", "value": "float32"})  # same symbol as dp, diverging
         dup_fence = (
             "### 5.1 Canonical interface block\n```yaml\n"
             + yaml.safe_dump(struct, sort_keys=False) + "```\n")
@@ -13001,7 +13001,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             (Path(tmp) / "cs.md").write_text(
                 self._controlled_spec(section_51=dup_fence), encoding="utf-8")
             api = self._full_api()
-            api["module_parameters"] = [{"name": "dp", "base": "integer", "value": "real64"}]
+            api["module_parameters"] = [{"name": "dp", "base": "integer", "value": "float64"}]
             _write_json(Path(tmp) / "spec.ir.yaml", {
                 "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
                          "source_refs": {"controlled_spec": "cs.md"}},
@@ -13022,10 +13022,10 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             _validate_infrastructure_public_api(Path(tmp), ir_dir, violations)
             self.assertEqual(violations, [])
 
-    def test_module_parameters_value_internal_whitespace_equivalence_passes(self) -> None:
-        # A schema-valid expression value with internal whitespace (`selected_real_kind(15, 307)`)
-        # must compare equal to the equivalent `SELECTED_REAL_KIND(15,307)` — the Generate.static
-        # source pin strips all whitespace, so the Compile pin must not false-reject the IR form.
+    def test_module_parameters_fortran_expression_value_rejected(self) -> None:
+        # The Fortran-expression pass-through (`selected_real_kind(15, 307)`) was removed: a neutral
+        # module-parameter value admits only a number or the `float64`/`float32` kind tokens, so a
+        # §5.1 carrying a Fortran expression fails closed (render-unrenderable) at Compile.
         struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
         struct["module_parameters"].append(
             {"name": "wp", "base": "integer", "value": "selected_real_kind(15, 307)"})
@@ -13037,18 +13037,19 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
                 self._controlled_spec(section_51=fence), encoding="utf-8")
             api = self._full_api()
             api["module_parameters"].append(
-                {"name": "wp", "base": "integer", "value": "SELECTED_REAL_KIND(15,307)"})
+                {"name": "wp", "base": "integer", "value": "selected_real_kind(15, 307)"})
             _write_json(Path(tmp) / "spec.ir.yaml", {
                 "meta": {"spec_kind": "infrastructure", "spec_id": self._SPEC_ID,
                          "source_refs": {"controlled_spec": "cs.md"}},
                 "public_api": api})
             violations: list[str] = []
             _validate_infrastructure_public_api(Path(tmp), Path(tmp), violations)
-            self.assertEqual(violations, [])
+            self.assertTrue(any("no neutral form" in v or "has no neutral form" in v
+                                for v in violations), violations)
 
     def test_module_parameters_value_normalization_equivalence_passes(self) -> None:
         # Values compare normalized (str().strip().lower()): a YAML int 64 == "64" and
-        # REAL64 == real64. This pins that behavior — a regression to a plain str() compare (or
+        # FLOAT64 == float64. This pins that behavior — a regression to a plain str() compare (or
         # dropping the normalization) would flag a drift here and fail this test.
         struct = parse_signatures_from_fortran(self._SECTION_51_FORTRAN)
         struct["module_parameters"].append(
@@ -13060,7 +13061,7 @@ class InfrastructurePublicApiGateTests(unittest.TestCase):
             (Path(tmp) / "cs.md").write_text(
                 self._controlled_spec(section_51=fence), encoding="utf-8")
             api = self._full_api()
-            api["module_parameters"][0]["value"] = "REAL64"        # vs §5.1 "real64" (case differs)
+            api["module_parameters"][0]["value"] = "FLOAT64"       # vs §5.1 "float64" (case differs)
             api["module_parameters"].append(
                 {"name": "case_id_len", "base": "integer", "value": 64})  # int vs §5.1 "64" string
             _write_json(Path(tmp) / "spec.ir.yaml", {
@@ -13148,9 +13149,9 @@ class CanonicalInterfaceParserTests(unittest.TestCase):
         dup = (
             "```yaml\nprocedures:\n"
             "- kind: function\n  name: hx__dup\n  args: []\n"
-            "  result: {name: s, spec: {type: string, len: ':', alloc: true}}\n"
+            "  result: {name: s, spec: {type: string, len: deferred, alloc: true}}\n"
             "- kind: function\n  name: hx__dup\n  args: []\n"
-            "  result: {name: s, spec: {type: string, len: ':', alloc: true}}\n```\n")
+            "  result: {name: s, spec: {type: string, len: deferred, alloc: true}}\n```\n")
         _, _, err = vps._parse_canonical_interface_from_controlled_spec(self._cs(dup))
         self.assertIsNotNone(err)
         self.assertIn("duplicate", err.lower())
@@ -14146,7 +14147,7 @@ class LocalOperationLoweringGateTests(unittest.TestCase):
         ir = self._ir(
             steps=[{"step_id": "s1", "operation_ref": "mystery_op",
                     "inputs": ["u"], "outputs": ["y"]}],
-            node_key="infrastructure/harness_fortran_cpu@0.5.0",
+            node_key="infrastructure/harness_fortran_cpu@0.6.0",
         )
         self.assertEqual(self._run(ir), [])
 

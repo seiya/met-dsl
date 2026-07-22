@@ -5151,12 +5151,17 @@ def _section51_module_parameters(controlled_spec_path: Path) -> list[dict]:
 
 
 def _section51_parameter_lines(controlled_spec_path: Path) -> list[str]:
-    """The §5.1 module-level ``parameter`` declaration lines (e.g. ``integer, parameter :: dp =
-    real64``). These are part of the published ABI a consuming node sees; the Fortran-language
-    backend renders them from the structured block's ``module_parameters`` so they can be pinned
-    (by value) against the generated source in the language the source is written in."""
+    """The §5.1 module-level ``parameter`` declaration lines in the target language (e.g. ``integer,
+    parameter :: dp = real64``). §5.1 carries the NEUTRAL value (``dp = float64``); the Fortran
+    backend lowers it to the language the generated source is written in via the single
+    ``render_module_parameter_to_fortran`` — so the Generate.static source pin deterministically
+    demands the Fortran spelling (``dp = real64``) from a neutral §5.1 ``float64``. The upstream
+    stale-IR guard has already pinned §5.1 == the certified IR by normalized value, so every entry
+    reaching here is neutral-valid and the render cannot fail closed."""
+    from tools.lang_backend_fortran import render_module_parameter_to_fortran
+
     return [
-        f"integer, parameter :: {mp['name']} = {mp['value']}"
+        render_module_parameter_to_fortran(mp)
         for mp in _section51_module_parameters(controlled_spec_path)
     ]
 
@@ -10495,7 +10500,7 @@ def _validate_ir_module_parameters_against_section51(
     violations: list[str],
 ) -> None:
     """Pin the IR's ``public_api.module_parameters`` == the controlled_spec §5.1 module-level
-    parameters (``dp = real64`` / ``case_id_len = 64``), by name AND value. These are part of the
+    parameters (``dp = float64`` / ``case_id_len = 64``), by name AND value. These are part of the
     published ABI, and the Generate.static gate value-pins them against the GENERATED source — but
     the Generate.generate leaf is walled off from controlled_spec.md (phase_02 §2-1), so the IR is
     the only carrier that gets the values to the leaf. A drop / extra / value drift here becomes a
@@ -10512,19 +10517,19 @@ def _validate_ir_module_parameters_against_section51(
     rule). Each IR entry must be a well-formed module parameter (``_validate_module_parameter``);
     a duplicate name, an omitted §5.1 name, an extra name, or a value drift is a violation. Values
     compare whitespace-and-case-insensitively (all whitespace removed, then case-folded — matching
-    the Generate.static source pin), so YAML int ``64`` == string ``"64"``, ``real64`` == ``REAL64``,
-    and ``selected_real_kind(15, 307)`` == ``SELECTED_REAL_KIND(15,307)``; ``base`` is not compared
-    (the validator constrains it to integer/absent and the renderer fixes it)."""
+    the Generate.static source pin), so YAML int ``64`` == string ``"64"`` and the neutral kind
+    token ``float64`` == ``FLOAT64`` (both §5.1 and IR carry the neutral value); ``base`` is not
+    compared (the validator constrains it to integer/absent and the renderer fixes it)."""
     from tools.lang_backend_fortran import SignatureParseError, _validate_module_parameter
 
     def _norm(value: Any) -> str:
-        # Remove ALL whitespace (not just surrounding) and case-fold, matching the Generate.static
-        # source pin (_stanza_atoms strips every space), so a schema-valid expression value like
-        # `selected_real_kind(15, 307)` compares equal to the equivalent `SELECTED_REAL_KIND(15,307)`
-        # — Fortran ignores that internal whitespace and the source pin does too, so the Compile pin
-        # must not false-reject an IR that renders to the identical declaration. Case/whitespace
-        # folding is SOUND here because `_require_parameter_value` forbids character literals (a
-        # quote), the only values whose meaning that folding would change (`iachar('A')` vs `('a')`).
+        # Case-fold (Fortran identifiers are case-insensitive, so the neutral `float64` == `FLOAT64`)
+        # and remove ALL whitespace, matching the Generate.static source pin (_stanza_atoms strips
+        # every space). Neutral module-parameter values are numbers or the `float64`/`float32` kind
+        # tokens — no internal whitespace or expression survives — so the whitespace fold is
+        # defensive; the fold is SOUND because `_require_neutral_parameter_value` admits ONLY those
+        # numeric/token forms (no character literal, whose case/whitespace-folded value would be
+        # unsound).
         return "".join(str(value).split()).lower()
 
     def _norm_name(name: str) -> str:
@@ -10538,8 +10543,8 @@ def _validate_ir_module_parameters_against_section51(
     # Build the §5.1 name->value map (keyed by case-folded name), but FAIL CLOSED on a duplicate name
     # rather than collapsing it (a plain dict comprehension keeps the last value). A repeated §5.1
     # module parameter cannot be pinned coherently: an identical duplicate would be accepted against a
-    # single IR/source declaration, and a differing duplicate (`dp = real64` and `dp = real32`, or the
-    # case-only `dp`/`DP`) would pass this map yet require BOTH contradictory `integer, parameter`
+    # single IR/source declaration, and a differing duplicate (`dp = float64` and `dp = float32`, or
+    # the case-only `dp`/`DP`) would pass this map yet require BOTH contradictory `integer, parameter`
     # lines in the source at Generate.static (which renders the full list, un-deduped) — an
     # unsatisfiable contract that wedges Generate. Catch it here at Compile with a clear message.
     spec_params: dict[str, Any] = {}

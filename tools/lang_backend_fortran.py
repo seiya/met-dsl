@@ -23,9 +23,11 @@ As long as that holds, switching §5.1 / the IR to the structured form leaves ev
 signature comparison byte-for-byte unchanged — the gate renders the structured form back to the exact
 Fortran lines it already knows how to compare against a generated ``.f90``.
 
-The struct vocabulary is language-neutral (``real`` / ``integer`` / ``logical`` / ``string`` /
-``derived`` — not ``character`` / ``type(...)``); the Fortran spellings are produced only by the
-renderer here.
+The struct vocabulary is language-neutral throughout: the neutral ``type`` names (``real`` /
+``integer`` / ``logical`` / ``string`` / ``derived`` — not ``character`` / ``type(...)``), the
+string-length tokens (``deferred`` / ``assumed`` — not ``:`` / ``*``), and the module-parameter
+kind values (``float64`` / ``float32`` — not ``real64`` / ``real32``). The Fortran spellings are
+produced only by the renderer here; the old Fortran tokens fail closed in the neutral form.
 """
 
 from __future__ import annotations
@@ -45,7 +47,8 @@ from tools.validate_pipeline_semantics import (
 # A ``spec`` (the type of an argument / result / component) is a mapping:
 #   {"type": "real"|"integer"|"logical"|"string"|"derived",
 #    "kind":  <str|None>,     # numeric KIND for real/integer/logical, e.g. "dp"; None = default kind
-#    "len":   <str|None>,     # character length token for string: "*", ":", "4", "case_id_len", ...
+#    "len":   <str|None>,     # NEUTRAL string length token: "deferred", "assumed", "4",
+#                             #   "case_id_len", ...  (NOT the Fortran ":" / "*")
 #    "name":  <str|None>,     # derived-type name for "derived"
 #    "alloc": <bool>}         # the ALLOCATABLE attribute
 #
@@ -63,12 +66,23 @@ from tools.validate_pipeline_semantics import (
 #   {"name": <str>, "components": [entity, ...]}   # each entity has intent None
 #
 # A ``module_parameter`` (value-pinned integer parameter referenced by the signatures):
-#   {"name": <str>, "base": "integer", "value": <str>}   # e.g. dp = real64, case_id_len = 64
+#   {"name": <str>, "base": "integer", "value": <str|int>}   # e.g. dp = float64, case_id_len = 64
+#   The VALUE is a NEUTRAL token: a number, or the neutral kind tokens "float64" / "float32"
+#   (NOT the Fortran "real64" / "real32", and NOT a Fortran expression like selected_real_kind(...)).
 #
 # The whole signature block:
 #   {"module_parameters": [module_parameter, ...],
 #    "types": [type, ...],
 #    "procedures": [procedure, ...]}
+#
+# --- neutral <-> Fortran token maps --------------------------------------------------------------
+# The two closed vocabularies the renderer lowers to Fortran and the parser lifts back to neutral.
+# A closed grammar (fail-closed on anything else) is what removes the residual Fortran spellings
+# from the neutral IR: a stale ``len: ':'`` / ``value: real64`` no longer passes through silently.
+_NEUTRAL_LEN_TO_FORTRAN = {"deferred": ":", "assumed": "*"}   # string length token
+_FORTRAN_LEN_TO_NEUTRAL = {v: k for k, v in _NEUTRAL_LEN_TO_FORTRAN.items()}
+_NEUTRAL_KIND_VALUES = {"float64": "real64", "float32": "real32"}   # module-parameter kind value
+_FORTRAN_KIND_VALUES = {v: k for k, v in _NEUTRAL_KIND_VALUES.items()}
 
 _INTENT_RE = re.compile(r"^intent\(\s*(in|out|inout)\s*\)$", re.IGNORECASE)
 _MODULE_PARAM_RE = re.compile(
@@ -104,6 +118,10 @@ def _parse_type_spec(head: str) -> dict[str, Any]:
     if low.startswith("character"):
         m = re.search(r"\(\s*(?:len\s*=\s*)?([^)]*?)\s*\)", head, re.IGNORECASE)
         length = m.group(1).strip() if m else "1"
+        # Lift the Fortran length token back to its neutral form (":" -> "deferred",
+        # "*" -> "assumed"); a fixed width / symbol passes through unchanged. The parse thus
+        # produces a neutral struct, symmetric with what render/validate accept.
+        length = _FORTRAN_LEN_TO_NEUTRAL.get(length, length)
         return {"type": "string", "kind": None, "len": length, "name": None, "alloc": False}
     if low.startswith("type") and "(" in head:
         m = re.search(r"\(\s*([A-Za-z0-9_]+)\s*\)", head)
@@ -241,7 +259,8 @@ def parse_signatures_from_fortran(block_body: str) -> dict[str, Any]:
         mp = _MODULE_PARAM_RE.match(logical)
         if mp:
             module_parameters.append(
-                {"name": mp.group(1), "base": "integer", "value": mp.group(2).strip()}
+                {"name": mp.group(1), "base": "integer",
+                 "value": _fortran_param_value_to_neutral(mp.group(2).strip())}
             )
 
     procedures = [
@@ -250,11 +269,32 @@ def parse_signatures_from_fortran(block_body: str) -> dict[str, Any]:
     types = [
         _parse_type(lines[0], lines[1:-1]) for lines in type_stanzas.values()
     ]
-    return {
+    struct = {
         "module_parameters": module_parameters,
         "types": types,
         "procedures": procedures,
     }
+    # Parse must not emit a struct that render/validate would reject (the "parse-accepts /
+    # validate-rejects asymmetry" — closed at the root here): a Fortran block the backend lifts
+    # must lower back cleanly, so validate the neutral struct before returning it.
+    _validate_struct(struct)
+    return struct
+
+
+def _fortran_param_value_to_neutral(value: str) -> str:
+    """Lift a Fortran module-parameter VALUE to its neutral token: ``real64`` -> ``float64``,
+    ``real32`` -> ``float32``, a plain integer literal passes through. Any other Fortran spelling
+    (a kind expression such as ``selected_real_kind(15, 307)``, an identifier) has no neutral form —
+    the pass-through was removed on purpose — so it fails closed."""
+    low = value.strip().lower()
+    if low in _FORTRAN_KIND_VALUES:
+        return _FORTRAN_KIND_VALUES[low]
+    if value.strip().isdigit():
+        return value.strip()
+    raise SignatureParseError(
+        f"module-parameter value {value!r} has no neutral form; the neutral IR admits only a "
+        "number or the kind tokens 'float64'/'float32' (the Fortran-expression pass-through, e.g. "
+        "selected_real_kind(...), was removed)")
 
 
 # --- validation: fail-closed on any malformed struct ---------------------------------------------
@@ -324,24 +364,53 @@ def _require_safe_token(value: Any, ctx: str) -> str:
     return value
 
 
-def _require_parameter_value(value: str, ctx: str) -> str:
-    """A module-parameter VALUE renders OUTSIDE parentheses (``parameter :: <name> = <value>``), so —
-    unlike the inside-parens tokens above — it may carry balanced parens (the portable-kind idiom
-    ``selected_real_kind(15, 307)``). It must still not carry a ``::`` / ``;`` (statement separator —
-    ``real64; integer evil`` would emit a second declaration) / newline / comment ``!`` that would
-    break or smuggle a declaration on the parameter line.
-
-    It must also carry no character literal (a ``'`` / ``"`` quote). The value pin (both the Compile
-    gate and the Generate.static source pin) compares values case- and whitespace-INSENSITIVELY, so
-    ``iachar('A')`` and ``iachar('a')`` — different integer values — would compare equal, letting the
-    ABI drift silently. A published module parameter that needs a character literal is unsupported;
-    fail closed rather than pin it unsoundly."""
+def _require_len_token(value: Any, ctx: str) -> str:
+    """A NEUTRAL string-length token — the closed grammar the neutral IR admits for a ``string``
+    spec's ``len``: ``deferred`` (Fortran ``character(len=:)``), ``assumed`` (``character(len=*)``),
+    a fixed decimal width (``4``), or a symbol identifier (``case_id_len``). The old Fortran tokens
+    ``:`` / ``*`` fail closed with the neutral alternative named, so a stale §5.1 cannot pass
+    through. Every admitted form is structurally safe (no ``)`` / ``,`` / newline / ``!`` to smuggle
+    a declaration), so this both fixes the vocabulary and subsumes the injection guard."""
     _require_nonempty_str(value, ctx)
-    if "::" in value or any(ch in value for ch in "\n\r!;\"'"):
+    s = value.strip()
+    if s.lower() in _NEUTRAL_LEN_TO_FORTRAN:
+        return s
+    if s in _FORTRAN_LEN_TO_NEUTRAL:  # ":" / "*": the removed Fortran spelling
         raise SignatureParseError(
-            f"{ctx} must not contain '::', ';', a quote (a character literal cannot be pinned "
-            f"case/whitespace-insensitively), a newline, or '!'; got {value!r}")
-    return value
+            f"{ctx} uses the Fortran length token {s!r}; use the neutral "
+            f"'{_FORTRAN_LEN_TO_NEUTRAL[s]}' instead")
+    if s.isdigit() or _IDENTIFIER_RE.match(s):
+        return s
+    raise SignatureParseError(
+        f"{ctx} must be a neutral length token ('deferred'/'assumed'), a fixed decimal width, or a "
+        f"symbol identifier (got {value!r})")
+
+
+def _require_neutral_parameter_value(value: str, ctx: str) -> str:
+    """A NEUTRAL module-parameter VALUE — the closed grammar the neutral IR admits: a decimal
+    integer string, or the neutral kind tokens ``float64`` / ``float32``. The Fortran-expression
+    pass-through (``selected_real_kind(15, 307)``) and the raw Fortran kind spellings
+    (``real64`` / ``real32``) are removed — those are exactly the residual Fortran the neutral IR
+    must not carry — and fail closed, naming the neutral alternative for the kind spellings.
+
+    A closed numeric/token grammar also forecloses the older hazards for free: no ``::`` / ``;`` /
+    newline / comment can smuggle a second declaration, and no character literal (whose case/
+    whitespace-insensitive value pin would be unsound) can appear."""
+    _require_nonempty_str(value, ctx)
+    s = value.strip()
+    low = s.lower()
+    if low in _NEUTRAL_KIND_VALUES:
+        return s
+    if s.isdigit():
+        return s
+    if low in _FORTRAN_KIND_VALUES:  # real64 / real32: the removed Fortran spelling
+        raise SignatureParseError(
+            f"{ctx} is the Fortran kind '{s}'; use the neutral "
+            f"'{_FORTRAN_KIND_VALUES[low]}' instead")
+    raise SignatureParseError(
+        f"{ctx} must be a number or a neutral kind token ('float64'/'float32'); a Fortran "
+        f"expression (e.g. selected_real_kind(...)) has no neutral form and was removed (got "
+        f"{value!r})")
 
 
 def _validate_spec(spec: Any, ctx: str) -> None:
@@ -369,7 +438,7 @@ def _validate_spec(spec: Any, ctx: str) -> None:
                 f"{ctx}.spec.{bad} is not applicable to type '{t}' (it would be silently dropped at "
                 "render, letting §5.1 and the IR differ yet compare equal)")
     if t == "string":
-        _require_safe_token(spec.get("len"), f"{ctx}.spec.len (string length is required)")
+        _require_len_token(spec.get("len"), f"{ctx}.spec.len (string length is required)")
     elif t == "derived":
         _require_identifier(spec.get("name"), f"{ctx}.spec.name (derived type name is required)")
     else:  # real / integer / logical: kind optional but a safe token when present
@@ -472,7 +541,7 @@ def _validate_module_parameter(mp: Any, ctx: str) -> None:
         raise SignatureParseError(f"{ctx}.value must be a number or symbol, not a boolean")
     if isinstance(value, int):
         return  # rendered as its decimal string
-    _require_parameter_value(value, f"{ctx}.value")
+    _require_neutral_parameter_value(value, f"{ctx}.value")
 
 
 def _validate_symbol(sig: Any, ctx: str = "signature") -> None:
@@ -499,12 +568,37 @@ def _validate_struct(struct: dict[str, Any]) -> None:
 
 # --- render: structured signatures -> Fortran interface block ------------------------------------
 
+def _map_neutral_len_to_fortran(length: str) -> str:
+    """Lower a validated neutral string-length token to its Fortran spelling: ``deferred`` -> ``:``,
+    ``assumed`` -> ``*``; a fixed width / symbol passes through unchanged (case preserved)."""
+    return _NEUTRAL_LEN_TO_FORTRAN.get(length.strip().lower(), length)
+
+
+def _map_neutral_param_value_to_fortran(value: Any) -> str:
+    """Lower a validated neutral module-parameter value to its Fortran spelling: ``float64`` ->
+    ``real64``, ``float32`` -> ``real32``; a number passes through as its decimal string."""
+    if isinstance(value, int):  # bool already rejected by validation
+        return str(value)
+    return _NEUTRAL_KIND_VALUES.get(value.strip().lower(), value.strip())
+
+
+def render_module_parameter_to_fortran(mp: dict[str, Any]) -> str:
+    """Render ONE neutral module parameter to its Fortran declaration line
+    (``integer, parameter :: <name> = <value>``), lowering the neutral kind value to its Fortran
+    spelling. Fail-closed (``SignatureParseError``) on a malformed parameter. This is the single
+    source both ``render_signatures_to_fortran`` and the deterministic Generate.static source pin
+    (``validate_pipeline_semantics._section51_parameter_lines``) render through, so a §5.1
+    ``float64`` deterministically demands ``dp = real64`` in the generated source."""
+    _validate_module_parameter(mp, "module_parameter")
+    return f"integer, parameter :: {mp['name']} = {_map_neutral_param_value_to_fortran(mp['value'])}"
+
+
 def _render_spec(spec: dict[str, Any]) -> str:
     # Callers render only AFTER validation, so required fields (string `len`, derived `name`) are
     # known present; the accesses below cannot KeyError on a validated struct.
     t = spec["type"]
     if t == "string":
-        base = f"character(len={spec['len']})"
+        base = f"character(len={_map_neutral_len_to_fortran(spec['len'])})"
     elif t == "derived":
         base = f"type({spec['name']})"
     elif t in ("real", "integer", "logical"):
@@ -570,7 +664,7 @@ def render_signatures_to_fortran(struct: dict[str, Any]) -> str:
     _validate_struct(struct)
     blocks: list[str] = []
     for mp in struct.get("module_parameters", []):
-        blocks.append(f"integer, parameter :: {mp['name']} = {mp['value']}")
+        blocks.append(render_module_parameter_to_fortran(mp))
     for t in struct.get("types", []):
         blocks.append("\n".join(_render_type(t)))
     for proc in struct.get("procedures", []):

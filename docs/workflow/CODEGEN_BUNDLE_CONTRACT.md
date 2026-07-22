@@ -316,12 +316,12 @@ in generated behavior. When the harness spec is next re-specified on content gro
 becomes its projection.
 
 ```
-"infrastructure/harness_fortran_cpu@0.5.0": {"sync_single_case@1"}
+"infrastructure/harness_fortran_cpu@0.6.0": {"sync_single_case@1"}
 ```
 
 `sync_single_case@1` is defined as exactly the canonical interface block of
-`harness_fortran_cpu@0.5.0` §5.1 (13 operations, 5 published types, `dp = real64`,
-`case_id_len = 64`). The mechanical enforcer of that definition remains
+`harness_fortran_cpu@0.6.0` §5.1 (13 operations, 5 published types, `dp = float64`
+rendered `real64`, `case_id_len = 64`). The mechanical enforcer of that definition remains
 `tools/runner_renderer.py:assert_harness_pin`, which compares §5.1 against the certified
 harness IR's `public_api.signatures` and the generated harness source; this contract
 adds a name for the ABI, not a second checker of it.

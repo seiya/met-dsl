@@ -1204,6 +1204,21 @@ class HarnessPinTest(unittest.TestCase):
         with self.assertRaises(RenderError):
             assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, bad, self.src)
 
+    def test_old_vocab_ir_signatures_fail_closed_not_crash(self) -> None:
+        # C2: a stale IR that still carries the OLD Fortran length token (`len: ':'`) in a string
+        # spec is unrenderable through the neutral backend; assert_harness_pin must fail closed with
+        # a re-certify RenderError (the entry is skipped as unusable), NEVER an uncaught
+        # SignatureParseError that crashes the conductor.
+        stale = copy.deepcopy(self.sigs)
+        for e in stale:
+            for ent in [*e["signature"].get("args", []),
+                        *([e["signature"]["result"]] if e["signature"].get("result") else []),
+                        *e["signature"].get("components", [])]:
+                if ent.get("spec", {}).get("type") == "string":
+                    ent["spec"]["len"] = ":"  # revert to the removed Fortran token
+        with self.assertRaises(RenderError):
+            assert_harness_pin(self.ir, BOUNDARY_SID, HARNESS, stale, self.src)
+
     def test_case_id_len_value_drift_is_caught(self) -> None:
         # The interface stanzas name the SYMBOL `case_id_len`, never its value, so a harness
         # recert lowering the width leaves the signature pin green — while this renderer keeps
