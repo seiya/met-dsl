@@ -3126,6 +3126,26 @@ class StdoutFormatTests(unittest.TestCase):
             "    [warn   ] usage limit in generate.generate [wait 1]: "
             "waiting 420.0s for the reset, then re-launching",
         )
+        # Item C: a transport-substep resume announces the producer reuse, the skipped producer
+        # substep, and (when it declines) the fallback to a full phase re-run.
+        self.assertEqual(
+            f({"status": "info", "event": "transport_substep_resume", "node_key": "n",
+               "step": "compile", "resume_substep": "verify", "producer_arid": "ar_prod",
+               "artifact_id": "ir_x_001", "orchestration_id": "o"}),
+            "    [resume ] compile resumes at verify — producer ar_prod / ir_x_001 reused",
+        )
+        self.assertEqual(
+            f({"status": "info", "event": "substep_resumed", "node_key": "n",
+               "phase": "compile", "substep": "generate", "agent_run_id": "ar_prod",
+               "orchestration_id": "o"}),
+            "    [substep] compile.generate reused (resumed)",
+        )
+        self.assertEqual(
+            f({"status": "info", "event": "transport_resume_declined", "node_key": "n",
+               "reason": "artifact_dir_missing", "orchestration_id": "o"}),
+            "    [warn   ] transport substep resume declined: artifact_dir_missing "
+            "— full phase re-run",
+        )
         # Final ok / fail summaries.
         self.assertTrue(
             (f({"status": "ok", "orchestration_id": "orch_1",

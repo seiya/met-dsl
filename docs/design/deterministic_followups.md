@@ -538,6 +538,22 @@ re-run confirming Build passes on attempt 1 (operator-gated).
     effective value on resume); re-pass the flag to keep it active.
     Canonical: `docs/ORCHESTRATION.md` "leaf transient retry"; operator guidance:
     `docs/RUNBOOK.md`.
+  - **The manual-`--resume` fallback is also substep-granular now (default-on, C).** The wait above
+    only helps while the run is still alive; the flag-off / unknown-epoch / over-cap / `llm_client_error`
+    / exhausted-flake cases still terminalize `fail_closed`, and the same advdiff closure showed the
+    plain `--resume` re-paying the passed `compile.generate` producer (690s → a fresh 491s) because the
+    checkpoint is phase-granular. C closes that: a `leaf_transport_error` fail_closed on a `Compile` /
+    `Generate` phase **whose `verify` substep died** resumes at `verify` with the surviving producer
+    reused, derived on `--resume` by `_derive_leaf_transport_resume_directive`
+    (`source=leaf_transport_substep_resume`) and preseated by `run_phase`. It is structurally safe
+    (a transport death after the producer passed can only be at `verify` — the phase's only other LLM
+    substep), **default-on with no flag** (pure optimization), and — because nothing is persisted at
+    death time — applies **retroactively** to every pre-existing `leaf_transport_error` orchestration.
+    A revision-equality gate (`orchestration_meta.repo_revision` vs current `HEAD`+dirty, mirroring B4)
+    and every other precondition miss decline to the prior full-phase re-run (`transport_resume_declined`),
+    so no new failure mode. The resumed `step_result` re-vouches the superseded run-1 producer, which the
+    completion check permits (superseded rows are vouch-exempt). Canonical: `docs/ORCHESTRATION.md`
+    item 51; operator guidance: `docs/RUNBOOK.md` §3-1.
 - **L6 — GUARDED (2026-06-25).** The dependency build (Model B) keys staged source filenames and
   Makefile object rules on the bare `spec_id_of(node_key)` (`_dependency_closure` /
   `_stage_dependency_sources`), dropping `kind` and `@version`. A closure containing two deps that
