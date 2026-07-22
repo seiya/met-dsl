@@ -9679,6 +9679,7 @@ def _validate_compile_stage_impl(
     _validate_ir_meta_json(ir_dir, violations)
     _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
     _validate_component_dep_operations(repo_root, ir_dir, violations)
+    _validate_local_operation_lowering(repo_root, ir_dir, violations)
     _validate_test_predicates(repo_root, ir_dir, violations)
     _validate_case_ids(ir_dir, violations)
     _validate_infrastructure_public_api(repo_root, ir_dir, violations)
@@ -9825,6 +9826,183 @@ def _validate_component_dep_operations(
             "<dependency_facts> while the calls are still required, so the leaf cannot "
             "converge (its retry budget exhausts)"
         )
+
+
+_LOWERING_STEP_STRUCTURAL_KEYS = frozenset(
+    {"step_id", "step_kind", "operation_ref", "inputs", "outputs"}
+)
+
+
+def _validate_local_operation_lowering(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """Deterministic compile gate (presence floor): every LOCAL operation an algorithm invokes
+    must carry SOME lowering signal in the IR — it may not be a bare, unelaborated
+    ``operation_ref`` string with nothing behind it.
+
+    A LOCAL op is one that ``algorithm.steps[].operation_ref`` names but that is NOT resolved
+    through a direct dependency (no ``dependency.direct_deps[].operations[]`` entry matches the
+    same ``<dep_spec_id>__<op>`` ABI string — the same exact-string flavour
+    ``_validate_component_dep_operations`` uses; the ABI name is identical on both sides, so no
+    normalization is needed). A dependency-resolved op is lowered by the callee, not here.
+
+    The failure this pins is a name-only Compile authoring wobble: the IR lists a LOCAL op as a
+    step's ``operation_ref`` but supplies no formula, no derived-field rule, no elaboration —
+    the ``p0_interface_reconstruct`` shape a from-scratch component author can emit. The pure
+    (tool-less) Generate leaf has only the IR to work from, so a name with no lowering behind it
+    forces it to INVENT the physics — a divergence the completeness of the numerics cannot be
+    checked against at Compile. Catching the *absence of any signal* here routes (via
+    ``classify_compile_static_failure`` -> ``COMPILE_STATIC_FAILURE_ROUTING``, the existing
+    ``compile.generate`` warm-reopen wiring — this is one check inside the existing compile
+    stage, NOT a new substep) back for a re-author.
+
+    This is a PRESENCE FLOOR only: it never inspects the CONTENT of a formula for correctness or
+    completeness. A present-but-wrong or present-but-incomplete formula is out of scope here and
+    remains the province of ``Compile.verify`` V2 (the ``major`` remand for name-only /
+    under-specified lowering). A false reject is always avoidable by Compile writing the op name
+    into a derived-field rule / invariant, or a one-line ``description`` on the step — the same
+    thing the verify remand asks for.
+
+    Lowering signal (op passes if ANY of the three holds):
+      1. Some step that references the op carries a non-empty string value under a key OTHER than
+         the structural set ``{step_id, step_kind, operation_ref, inputs, outputs}`` (e.g. a
+         ``description``).
+      2. Some referencing step's ``inputs ∪ outputs`` intersects the ``derived_field_rules[].name``
+         set — the real advdiff flux/boundary shape, where the formula lives in a dfr entry keyed
+         by the step's output (or, for the input guard, its ``guard_pass`` input) rather than by
+         the op name.
+      3. The op name — full, or the bare tail after stripping a ``<spec_id>__`` prefix — appears
+         as a substring anywhere in the concatenation of every string value of every
+         ``derived_field_rules`` entry (keys vary: ``rule`` / ``definition`` / ``constraint`` /
+         ``notes`` …) plus every ``invariants[]`` entry — the real euler/harness shape.
+
+    ``infrastructure/`` nodes (the harness) are EXEMPT as a whole: their ops are the runner glue
+    governed by the §5 ``public_api`` gate family, not the physics lowering surface. When the
+    node_key is absent the gate applies (default-on). No-op on a missing / unparseable IR or a
+    node with no LOCAL op."""
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return
+    try:
+        ir = _read_yaml(derived_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return
+    if not isinstance(ir, dict):
+        return
+
+    node_key = _plan_dependency_node_key(ir_dir)
+    if isinstance(node_key, str) and node_key.startswith("infrastructure/"):
+        return  # harness ops are governed by the §5 public_api gate family
+
+    algorithm = ir.get("algorithm")
+    if not isinstance(algorithm, dict):
+        return
+    steps = algorithm.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return
+
+    # Ops resolved through a direct dependency are lowered by the callee, not here.
+    dep = ir.get("dependency")
+    direct_deps = dep.get("direct_deps") if isinstance(dep, dict) else None
+    dep_ops: set[str] = set()
+    if isinstance(direct_deps, list):
+        for entry in direct_deps:
+            if isinstance(entry, dict):
+                for op in entry.get("operations") or []:
+                    if isinstance(op, str) and op.strip():
+                        dep_ops.add(op.strip())
+
+    # derived_field_rules: name set (signal 2) + a blob of every string value (signal 3),
+    # joined with invariants[].
+    dfr = algorithm.get("derived_field_rules")
+    dfr_names: set[str] = set()
+    text_parts: list[str] = []
+    if isinstance(dfr, list):
+        for item in dfr:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if isinstance(name, str) and name.strip():
+                dfr_names.add(name.strip())
+            for value in item.values():
+                if isinstance(value, str):
+                    text_parts.append(value)
+    for inv in algorithm.get("invariants") or []:
+        if isinstance(inv, str):
+            text_parts.append(inv)
+    lowering_blob = "\n".join(text_parts)
+
+    # Group the referencing steps per LOCAL op, in first-appearance order, keeping each op's
+    # first step index/id for the message.
+    local_ops: list[str] = []
+    op_steps: dict[str, list[dict]] = {}
+    op_first: dict[str, tuple[int, str]] = {}
+    for idx, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        op_ref = step.get("operation_ref")
+        if not isinstance(op_ref, str) or not op_ref.strip():
+            continue
+        op = op_ref.strip()
+        if op in dep_ops:
+            continue  # dependency-resolved: lowered by the callee
+        if op not in op_steps:
+            local_ops.append(op)
+            op_steps[op] = []
+            sid = step.get("step_id")
+            op_first[op] = (idx, sid.strip() if isinstance(sid, str) and sid.strip() else "")
+        op_steps[op].append(step)
+
+    for op in local_ops:
+        if _op_has_lowering_signal(op, op_steps[op], dfr_names, lowering_blob):
+            continue
+        first_idx, first_sid = op_first[op]
+        where = f"steps[{first_idx}]"
+        if first_sid:
+            where += f" (step_id {first_sid!r})"
+        violations.append(
+            f"{derived_path}: local operation {op!r} (first referenced at {where}) carries no "
+            "lowering signal in the IR — no per-step elaboration (a non-structural field such as "
+            "`description`), no `derived_field_rules` entry keyed by a step input/output, and no "
+            "mention of the op name in any derived_field_rules / invariants text. A LOCAL "
+            "operation (one not resolved through a `dependency.direct_deps[].operations[]` entry) "
+            "must be lowered in the IR so the pure Generate leaf need not invent the physics from "
+            "a bare name. This is a presence floor: adding the op name to a derived_field_rule / "
+            "invariant, or a one-line step `description`, satisfies it. Judging whether a "
+            "present formula is COMPLETE remains the province of Compile.verify V2 (the `major` "
+            "remand for under-specified lowering)."
+        )
+
+
+def _op_has_lowering_signal(
+    op: str, steps: list[dict], dfr_names: set[str], lowering_blob: str
+) -> bool:
+    """True when the LOCAL ``op`` carries any of the three lowering signals (see
+    ``_validate_local_operation_lowering``). Presence-only: never inspects formula content."""
+    for step in steps:
+        # Signal 1: a non-structural, non-empty string field on a referencing step.
+        for key, value in step.items():
+            if key in _LOWERING_STEP_STRUCTURAL_KEYS:
+                continue
+            if isinstance(value, str) and value.strip():
+                return True
+        # Signal 2: a referencing step's inputs ∪ outputs names a derived_field_rules entry.
+        io_tokens: set[str] = set()
+        for field_name in ("inputs", "outputs"):
+            values = step.get(field_name)
+            if isinstance(values, list):
+                for token in values:
+                    if isinstance(token, str) and token.strip():
+                        io_tokens.add(token.strip())
+        if io_tokens & dfr_names:
+            return True
+    # Signal 3: the op name (full or bare `<spec_id>__` tail) is mentioned in the lowering text.
+    bare_tail = op.split("__", 1)[1] if "__" in op else op
+    if op in lowering_blob:
+        return True
+    if bare_tail and bare_tail in lowering_blob:
+        return True
+    return False
 
 
 def _validate_harness_dependency_consistency(

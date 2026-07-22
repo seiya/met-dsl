@@ -27235,7 +27235,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # obligation, and the Verification-tools list gains the gate. Fixes the closure fail_closed
         # where an empty `operations` starved the injected <dependency_facts> while the Generate
         # gate still required use/call — a Compile-failing rule that must live in the force-read doc.
-        "docs/workflow/phases/phase_01_compile.md": 39600,
+        # Bumped 39600->39900: V2's IR-self-sufficiency bullet now names the deterministic
+        # zero-signal presence floor (`_validate_local_operation_lowering`, a `Compile.static` gate
+        # routing to compile.generate) and scopes the `major` to the present-but-incomplete band
+        # above it — a Compile-failing rule that must live in the force-read doc.
+        "docs/workflow/phases/phase_01_compile.md": 39900,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -27305,7 +27309,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # lowered as a name only, with the math solely in controlled_spec.md, is a major remand) —
         # the semantic counterpart to the compile-generate lowering rule; not deterministically
         # gatable, so it is a verify-leaf checklist item.
-        "skills/workflow-compile-verify/SKILL.md": 14900,
+        # Bumped 14900->15200: that checklist item now notes its deterministic floor — the
+        # zero-signal end (a bare op name with no lowering signal at all) is caught by the
+        # `Compile.static` gate `_validate_local_operation_lowering`, so this `major` covers only
+        # the present-but-incomplete band above the floor.
+        "skills/workflow-compile-verify/SKILL.md": 15200,
         # Bumped 22000->22400: inlined the leaf-actionable C003 directive placement
         # + the f2008 63-char identifier limit (previously only in phase_02, which
         # generate.generate no longer force-reads) to avoid a lint/build round-trip.

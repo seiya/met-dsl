@@ -14057,6 +14057,199 @@ class ComponentDepOperationsGateTests(unittest.TestCase):
                 any("component dependency" in x and "empty `operations: []`" in x for x in v), v)
 
 
+class LocalOperationLoweringGateTests(unittest.TestCase):
+    """`_validate_local_operation_lowering` (compile stage): a LOCAL op (one an
+    `algorithm.steps[].operation_ref` names but no `dependency.direct_deps[].operations[]`
+    resolves) must carry SOME lowering signal in the IR — it may not be a bare name with nothing
+    behind it. Presence floor only: content completeness stays a Compile.verify V2 `major`.
+    Signals: (1) a non-structural step field, (2) a step input/output naming a dfr entry,
+    (3) the op name mentioned in dfr/invariants text. `infrastructure/` nodes are exempt."""
+
+    def _run(self, ir: dict) -> list[str]:
+        with tempfile.TemporaryDirectory() as t:
+            ir_dir = Path(t)
+            (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(ir))
+            v: list[str] = []
+            vps._validate_local_operation_lowering(ir_dir.parent, ir_dir, v)
+            return v
+
+    def _ir(self, *, steps, dfr=None, invariants=None, direct_deps=None,
+            node_key="component/dep_base@0.1.0") -> dict:
+        algo: dict = {"steps": steps}
+        if dfr is not None:
+            algo["derived_field_rules"] = dfr
+        if invariants is not None:
+            algo["invariants"] = invariants
+        ir: dict = {"algorithm": algo, "dependency": {"node_key": node_key}}
+        if direct_deps is not None:
+            ir["dependency"]["direct_deps"] = direct_deps
+        return ir
+
+    def test_dependency_resolved_op_passes(self) -> None:
+        # An op resolved through a direct dep is lowered by the callee — never gated here even
+        # with zero local signal.
+        ir = self._ir(
+            steps=[{"step_id": "s1", "operation_ref": "dep_base__scale",
+                    "inputs": ["u"], "outputs": ["y"]}],
+            direct_deps=[{"node_key": "component/dep_base@0.1.0",
+                          "operations": ["dep_base__scale"]}],
+        )
+        self.assertEqual(self._run(ir), [])
+
+    def test_local_op_with_no_signal_flagged(self) -> None:
+        ir = self._ir(steps=[{"step_id": "s1", "operation_ref": "mystery_op",
+                              "inputs": ["u"], "outputs": ["y"]}])
+        v = self._run(ir)
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("'mystery_op'", v[0])
+        self.assertIn("steps[0]", v[0])
+        self.assertIn("step_id 's1'", v[0])
+        self.assertIn("presence floor", v[0])
+
+    def test_signal1_step_description_passes(self) -> None:
+        ir = self._ir(steps=[{"step_id": "s1", "operation_ref": "mystery_op",
+                              "inputs": ["u"], "outputs": ["y"],
+                              "description": "y = 2*u elementwise"}])
+        self.assertEqual(self._run(ir), [])
+
+    def test_signal2_dfr_rule_plus_output_link_passes(self) -> None:
+        # Real advdiff flux shape: the formula lives in a dfr entry keyed by the step's OUTPUT,
+        # not by the op name; the op ref carries no other elaboration.
+        ir = self._ir(
+            steps=[{"step_id": "s1", "operation_ref": "advective_flux_upwind",
+                    "inputs": ["u", "a"], "outputs": ["flux_adv"]}],
+            dfr=[{"name": "flux_adv", "rule": "F_adv(i+1/2) = a * u_i (first-order upwind)."}],
+        )
+        self.assertEqual(self._run(ir), [])
+
+    def test_signal2_input_side_link_passes(self) -> None:
+        # Real boundary/input-guard shape: the dfr is keyed by the guard's INPUT-side token.
+        ir = self._ir(
+            steps=[{"step_id": "s1", "operation_ref": "input_guard",
+                    "inputs": ["guard_pass"], "outputs": ["ok"]}],
+            dfr=[{"name": "guard_pass", "rule": "guard_pass = (a > 0) .and. (dx > 0)."}],
+        )
+        self.assertEqual(self._run(ir), [])
+
+    def test_signal3_bare_tail_mention_passes(self) -> None:
+        # Real euler/harness shape: the op name (bare tail after `<spec_id>__`) is mentioned in
+        # an invariant / dfr text rather than keyed by a step token.
+        ir = self._ir(
+            steps=[{"step_id": "s1",
+                    "operation_ref": "dynamics_time_update_1d_euler1__advance",
+                    "inputs": ["u"], "outputs": ["u_next"]}],
+            invariants=["The advance step applies u_next = u + dt * rhs (explicit Euler)."],
+        )
+        self.assertEqual(self._run(ir), [])
+
+    def test_infrastructure_node_key_exempt(self) -> None:
+        ir = self._ir(
+            steps=[{"step_id": "s1", "operation_ref": "mystery_op",
+                    "inputs": ["u"], "outputs": ["y"]}],
+            node_key="infrastructure/harness_fortran_cpu@0.5.0",
+        )
+        self.assertEqual(self._run(ir), [])
+
+    def test_missing_node_key_gate_applies(self) -> None:
+        # Default-on: no node_key means the gate still fires (not exempt).
+        ir = {"algorithm": {"steps": [{"step_id": "s1", "operation_ref": "mystery_op",
+                                       "inputs": ["u"], "outputs": ["y"]}]}}
+        v = self._run(ir)
+        self.assertEqual(len(v), 1, v)
+
+    def test_malformed_ir_no_crash_no_violation(self) -> None:
+        for bad in ({"algorithm": "not-a-dict"},
+                    {"algorithm": {"steps": "not-a-list"}},
+                    {"algorithm": {"steps": [42, None]}},
+                    {"algorithm": {"steps": []}}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._run(bad), [])
+
+    def test_missing_ir_no_crash_no_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            ir_dir = Path(t)
+            v: list[str] = []
+            vps._validate_local_operation_lowering(ir_dir.parent, ir_dir, v)
+            self.assertEqual(v, [])
+
+    def test_same_op_two_steps_one_signal_passes(self) -> None:
+        # The op is invoked twice; only the second step carries a signal — one signal anywhere
+        # among the referencing steps suffices, so no violation.
+        ir = self._ir(steps=[
+            {"step_id": "s1", "operation_ref": "shared_op", "inputs": ["u"], "outputs": ["y"]},
+            {"step_id": "s2", "operation_ref": "shared_op", "inputs": ["u"], "outputs": ["z"],
+             "description": "second application"},
+        ])
+        self.assertEqual(self._run(ir), [])
+
+    def test_same_op_two_steps_no_signal_single_violation(self) -> None:
+        # The op is invoked twice with no signal on either step — exactly ONE violation for the
+        # op (not one per step).
+        ir = self._ir(steps=[
+            {"step_id": "s1", "operation_ref": "shared_op", "inputs": ["u"], "outputs": ["y"]},
+            {"step_id": "s2", "operation_ref": "shared_op", "inputs": ["u"], "outputs": ["z"]},
+        ])
+        v = self._run(ir)
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("'shared_op'", v[0])
+        self.assertIn("steps[0]", v[0])  # first referencing step is named
+
+    def test_end_to_end_through_validate_compile_stage(self) -> None:
+        # Wiring: a name-only LOCAL op must be rejected THROUGH the full compile stage
+        # (`_validate_local_operation_lowering` is called from `_validate_compile_stage_impl`).
+        # Other gates may add unrelated violations for this minimal tree; the assertion only
+        # requires the lowering violation is present.
+        dep_spec_id = "dynamics_shallow_water_flux_2d_rusanov_p0"
+        # Full contract: the dependency-resolved `compute_flux` step passes (callee-lowered),
+        # while the added `p0_interface_reconstruct` is a LOCAL op with no lowering signal —
+        # no dfr link (dfr empty), no step description, no op mention in the invariant.
+        algorithm_contract = {
+            "algorithm_id": "shallow_water2d_test_algorithm",
+            "execution_mode": "sequence",
+            "steps": [
+                {"step_id": "compute_flux", "step_kind": "flux_compute",
+                 "operation_ref": f"{dep_spec_id}__compute_flux",
+                 "inputs": ["h", "hu", "hv"], "outputs": ["h", "hu", "hv"]},
+                {"step_id": "reconstruct", "step_kind": "flux_compute",
+                 "operation_ref": "p0_interface_reconstruct",
+                 "inputs": ["h"], "outputs": ["h"]},
+            ],
+            "ordering": ["compute_flux", "reconstruct"],
+            "control_condition": [],
+            "iteration_contract": {"kind": "none"},
+            "update_semantics": {"mode": "in_place"},
+            "temporaries": [],
+            "derived_field_rules": [],
+            "invariants": ["placeholder invariant with no op mention"],
+            "splitting_policy": {"kind": "none"},
+            "state_variables": [
+                {"name": "h", "shape_expr": "[2,2]"},
+                {"name": "hu", "shape_expr": "[2,2]"},
+                {"name": "hv", "shape_expr": "[2,2]"},
+            ],
+            "required_update_paths": ["h", "hu", "hv"],
+            "diagnostics_from_state": True,
+            "fallback_policy": "fail_closed",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _seed_shape_expr_schema_into(repo_root)
+            _create_minimal_execution_tree(
+                repo_root,
+                dep_spec_id=dep_spec_id,
+                model_text="module m\nimplicit none\nend module m\n",
+                runner_text="program r\nimplicit none\nend program r\n",
+                run_command=["x", "y"],
+                algorithm_contract=algorithm_contract,
+            )
+            v = validate_compile_stage(
+                repo_root, "workspace",
+                "workspace/ir/problem__shallow_water2d__0.3.0/shallow-water2d_20260415_001")
+            self.assertTrue(
+                any("local operation 'p0_interface_reconstruct'" in x
+                    and "no lowering signal" in x for x in v), v)
+
+
 class CaseIdGrammarGateTests(unittest.TestCase):
     """`_validate_case_ids` (compile stage): a case_id becomes the per-case snapshot PATH
     (`raw/state_snapshots/<case_id>.json`) for EVERY node kind, so a `/` or `..` lets the run
