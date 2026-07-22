@@ -2925,10 +2925,12 @@ def _read_json_or_none(path: Path) -> Any:
     """`_read_json` that swallows a missing/unreadable/malformed file into None.
 
     For best-effort readers (e.g. the leaf-transport resume deriver) that must DECLINE — never
-    raise — on incomplete evidence."""
+    raise — on incomplete evidence. `ValueError` covers both `json.JSONDecodeError` (malformed
+    JSON) and `UnicodeDecodeError` (a non-UTF-8 file that `read_text` chokes on), so no decode
+    failure escapes."""
     try:
         return _read_json(path)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
 
 
@@ -12374,9 +12376,14 @@ def _derive_leaf_transport_resume_directive(
     prefix passed. validate (its only LLM substep is judge) and build (single deterministic substep)
     are out of scope and decline to today's full re-run.
 
-    Nothing is persisted at death time, so this works retroactively on every pre-C
-    `leaf_transport_error` orchestration; a decline (return None at any miss) is exactly today's
-    full-phase re-run — no new failure mode. Returns None whenever the reason is not a transport death,
+    Nothing is persisted at death time, so the deriver is not gated on anything a pre-C run failed
+    to record — it reconstructs the directive purely from `agent_runs.jsonl` + the reservation. But
+    it is NOT unconditionally retroactive: the revision-equality gate below still requires the repo
+    revision to be unchanged since the run started, so a pre-C `leaf_transport_error` run whose
+    resume happens on a NEWER checkout (e.g. after obtaining this very code) fails that gate and
+    declines to a full re-run. In practice it fires for a transport failure resumed on the same
+    checkout; a decline (return None at any miss) is exactly today's full-phase re-run — no new
+    failure mode. Returns None whenever the reason is not a transport death,
     the repo revision moved since the run started (the surviving artifact is not the source it was
     produced from), the interrupted phase cannot be identified, the dead substep is not verify, the
     producer pass row is absent, or the producer artifact dir (or its key deliverable) is gone."""

@@ -547,11 +547,12 @@ re-run confirming Build passes on attempt 1 (operator-gated).
     reused, derived on `--resume` by `_derive_leaf_transport_resume_directive`
     (`source=leaf_transport_substep_resume`) and preseated by `run_phase`. It is structurally safe
     (a transport death after the producer passed can only be at `verify` — the phase's only other LLM
-    substep), **default-on with no flag** (pure optimization), and — because nothing is persisted at
-    death time — applies **retroactively** to every pre-existing `leaf_transport_error` orchestration.
-    A revision-equality gate (`orchestration_meta.repo_revision` vs current `HEAD`+dirty, mirroring B4)
-    and every other precondition miss decline to the prior full-phase re-run (`transport_resume_declined`),
-    so no new failure mode. The resumed `step_result` re-vouches the superseded run-1 producer, which the
+    substep), **default-on with no flag** (pure optimization). Because nothing is persisted at death
+    time, the deriver needs nothing the failed run recorded — but it is not unconditionally retroactive:
+    a revision-equality gate (`orchestration_meta.repo_revision` vs current `HEAD`+dirty, mirroring B4)
+    means a pre-C `leaf_transport_error` run only resumes on its exact original checkout (obtaining the C
+    code advances/dirties `HEAD`, so it declines). That gate and every other precondition miss decline to
+    the prior full-phase re-run (`transport_resume_declined`), so no new failure mode. The resumed `step_result` re-vouches the superseded run-1 producer, which the
     completion check permits (superseded rows are vouch-exempt). Canonical: `docs/ORCHESTRATION.md`
     item 51; operator guidance: `docs/RUNBOOK.md` §3-1.
 - **L6 — GUARDED (2026-06-25).** The dependency build (Model B) keys staged source filenames and

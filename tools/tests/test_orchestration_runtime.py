@@ -76,6 +76,7 @@ from tools.orchestration_runtime import (
     _derive_unauthorized_write_resume_directive,
     _derive_dev_validate_execute_resume_directive,
     _derive_leaf_transport_resume_directive,
+    _read_json_or_none,
     LEAF_TRANSPORT_RESUME_SOURCE,
     DEV_VALIDATE_EXECUTE_RESUME_SOURCE,
     _DEV_VALIDATE_EXECUTE_REUSE_CATEGORIES,
@@ -28655,6 +28656,25 @@ class DevValidateExecuteResumeDirectiveTest(unittest.TestCase):
         # The reason_code literals mirror `conduct`'s fail_closed mapping / the F1 guard.
         self.assertIn(_DEV_FAIL_CLOSED_REASON_CODE, FAIL_CLOSED_REASON_CODES)
         self.assertIn(_DEV_ROLLBACK_REASON_CODE, FAIL_CLOSED_REASON_CODES)
+
+
+class ReadJsonOrNoneTest(unittest.TestCase):
+    """`_read_json_or_none` must DECLINE (return None), never raise, on any unreadable file —
+    including the non-UTF-8 case that raises UnicodeDecodeError (a ValueError, not OSError)."""
+
+    def test_missing_malformed_and_non_utf8_all_return_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(_read_json_or_none(root / "does_not_exist.json"))
+            bad = root / "malformed.json"
+            bad.write_text("{not valid json", encoding="utf-8")
+            self.assertIsNone(_read_json_or_none(bad))
+            non_utf8 = root / "binary.json"
+            non_utf8.write_bytes(b"\xff\xfe\x00\x01")  # invalid UTF-8 -> UnicodeDecodeError
+            self.assertIsNone(_read_json_or_none(non_utf8))
+            good = root / "ok.json"
+            good.write_text(json.dumps({"a": 1}), encoding="utf-8")
+            self.assertEqual(_read_json_or_none(good), {"a": 1})
 
 
 class LeafTransportResumeDirectiveTest(unittest.TestCase):
