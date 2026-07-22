@@ -14157,6 +14157,16 @@ class LocalOperationLoweringGateTests(unittest.TestCase):
         v = self._run(ir)
         self.assertEqual(len(v), 1, v)
 
+    def test_signal3_full_op_name_mention_passes(self) -> None:
+        # The op name has no `__`, so the bare-tail == full-name; exercise the `op in blob` path
+        # directly with a full-name mention (the real euler/harness `input_guard` shape).
+        ir = self._ir(
+            steps=[{"step_id": "s1", "operation_ref": "input_guard",
+                    "inputs": ["a"], "outputs": ["ok"]}],
+            invariants=["The input_guard rejects a <= 0 before any flux is computed."],
+        )
+        self.assertEqual(self._run(ir), [])
+
     def test_malformed_ir_no_crash_no_violation(self) -> None:
         for bad in ({"algorithm": "not-a-dict"},
                     {"algorithm": {"steps": "not-a-list"}},
@@ -14164,6 +14174,25 @@ class LocalOperationLoweringGateTests(unittest.TestCase):
                     {"algorithm": {"steps": []}}):
             with self.subTest(bad=bad):
                 self.assertEqual(self._run(bad), [])
+
+    def test_malformed_scalar_invariants_and_operations_no_crash(self) -> None:
+        # A truthy non-list scalar under `invariants` / a dep's `operations` must NOT crash the
+        # gate (an `or []` guard would only catch a FALSY value). The contract gate flags the
+        # shape; this gate stays no-crash per its own docstring.
+        scalar_inv = {"algorithm": {
+            "steps": [{"step_id": "s1", "operation_ref": "foo",
+                       "inputs": ["u"], "outputs": ["y"]}],
+            "invariants": 5}}
+        v = self._run(scalar_inv)
+        self.assertEqual(len(v), 1, v)  # `foo` still flagged (no signal); no crash
+        scalar_ops = {
+            "algorithm": {"steps": [{"step_id": "s1", "operation_ref": "foo",
+                                     "inputs": ["u"], "outputs": ["y"]}]},
+            "dependency": {"node_key": "component/x@0.1.0",
+                           "direct_deps": [{"node_key": "component/d@0.1.0",
+                                            "operations": 5}]}}
+        v2 = self._run(scalar_ops)
+        self.assertEqual(len(v2), 1, v2)  # `foo` is not excluded by a scalar operations; no crash
 
     def test_missing_ir_no_crash_no_violation(self) -> None:
         with tempfile.TemporaryDirectory() as t:

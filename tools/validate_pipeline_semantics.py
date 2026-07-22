@@ -9908,9 +9908,15 @@ def _validate_local_operation_lowering(
     if isinstance(direct_deps, list):
         for entry in direct_deps:
             if isinstance(entry, dict):
-                for op in entry.get("operations") or []:
-                    if isinstance(op, str) and op.strip():
-                        dep_ops.add(op.strip())
+                # `or []` would only guard a FALSY value; a truthy non-list scalar
+                # (`operations: 5`) still crashes the loop. isinstance-guard like the sibling
+                # `_validate_component_dep_operations` — a malformed shape is flagged there, not
+                # crashed here (this gate's contract is no-op / no-crash on a malformed IR).
+                ops = entry.get("operations")
+                if isinstance(ops, list):
+                    for op in ops:
+                        if isinstance(op, str) and op.strip():
+                            dep_ops.add(op.strip())
 
     # derived_field_rules: name set (signal 2) + a blob of every string value (signal 3),
     # joined with invariants[].
@@ -9927,9 +9933,11 @@ def _validate_local_operation_lowering(
             for value in item.values():
                 if isinstance(value, str):
                     text_parts.append(value)
-    for inv in algorithm.get("invariants") or []:
-        if isinstance(inv, str):
-            text_parts.append(inv)
+    invariants = algorithm.get("invariants")
+    if isinstance(invariants, list):  # a scalar `invariants:` is flagged by the contract gate
+        for inv in invariants:
+            if isinstance(inv, str):
+                text_parts.append(inv)
     lowering_blob = "\n".join(text_parts)
 
     # Group the referencing steps per LOCAL op, in first-appearance order, keeping each op's
