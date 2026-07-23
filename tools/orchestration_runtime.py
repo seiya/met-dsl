@@ -10096,6 +10096,53 @@ def _build_task_card(request_payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_dependency_surface_facts(surface: Any) -> str:
+    """Render the L2 ``compile.generate`` dependency-surface catalog: for each COMPONENT
+    dependency, its published operation NAMES (conductor-resolved into
+    ``<ir_ref>/dependency_surface.json`` at compile-phase start). Op names only — the argument ABI
+    is derived from the certified source later, never authored into the IR.
+
+    This is the authoring leaf's ONLY source of the real dependency op names. It must copy each
+    listed name VERBATIM into that dependency's ``direct_deps[].operations``; a name NOT in this
+    catalog is rejected by the deterministic L3 compile gate. For a dependency shown as
+    ``unresolved`` (its surface could not be resolved), the leaf uses the operation_id(s) that
+    dependency's controlled_spec §5 declares. Returns ``""`` when no surface was injected."""
+    if not isinstance(surface, list) or not surface:
+        return ""
+    lines = [
+        "**Published dependency operations (conductor-resolved from each COMPONENT dependency's "
+        "certified public API — the AUTHORITATIVE op-name catalog):** these are the ONLY valid "
+        "operation names for your component dependencies. Copy each listed name VERBATIM into that "
+        "dependency's `dependency.direct_deps[].operations`; a name NOT in this catalog is rejected "
+        "by a deterministic compile gate (never invent one). SEPARATELY, author your OWN "
+        "`public_api.published_operations` by transcribing YOUR controlled_spec §5 operation_id(s) "
+        "verbatim (this is a component node's published surface — names only, no signatures). For a "
+        "dependency shown as `unresolved` below, use the operation_id(s) that dependency's "
+        "controlled_spec §5 declares, verbatim.",
+    ]
+    for entry in surface:
+        if not isinstance(entry, dict):
+            continue
+        node_key = str(entry.get("node_key", "")).strip()
+        if not node_key:
+            continue
+        source = str(entry.get("source", "")).strip() or "unknown"
+        ops = entry.get("published_operations")
+        names = (
+            [str(o).strip() for o in ops if isinstance(o, str) and o.strip()]
+            if isinstance(ops, list) else []
+        )
+        if source == "unresolved" or not names:
+            lines.append(
+                f"- {node_key}: (surface unresolved — use the operation_id(s) this dependency's "
+                "controlled_spec §5 declares, verbatim)")
+        else:
+            lines.append(f"- {node_key}: {', '.join(names)} (source: {source})")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
 def _build_dependency_facts(request_payload: dict[str, Any]) -> str:
     """Return a conductor-resolved "Dependency facts" block listing the on-disk
     pipeline / run / aggregate_verdict each direct dependency was certified to.
@@ -10107,11 +10154,21 @@ def _build_dependency_facts(request_payload: dict[str, Any]) -> str:
     ``pre_judge`` is already scoped to the leaf's own pipeline and each dependency's PASS
     is resolved from the leaf's lineage — these facts are NOT a gate argument.
 
+    For ``compile.generate`` the block is DIFFERENT: the consumer IR does not exist yet, so there
+    is no ``resolved_dependencies``. Instead the conductor injects ``dependency_surface`` — the
+    L2 published-operation NAME catalog of the node's component dependencies — and this renderer
+    formats that (op names only, an AUTHORING input: the deterministic L3 gate rejects any dep
+    ``operations`` name not in it).
+
     Returns ``""`` for deterministic requests and when no dependency facts are present
     (a leaf node, or a phase the conductor does not inject them for).
     """
     if request_payload.get("deterministic"):
         return ""
+    step = str(request_payload.get("step", "")).strip().lower()
+    substep = str(request_payload.get("substep", "")).strip().lower()
+    if step == "compile" and substep == "generate":
+        return _build_dependency_surface_facts(request_payload.get("dependency_surface"))
     deps = request_payload.get("resolved_dependencies")
     if not isinstance(deps, list) or not deps:
         return ""

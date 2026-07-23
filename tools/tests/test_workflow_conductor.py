@@ -211,6 +211,28 @@ class BuildLaunchRequestTest(unittest.TestCase):
         self.assertNotIn("warm_resume", req)
         self.assertNotEqual(req["skill_must_read_refs"], "")
 
+    def test_dependency_surface_attached_only_for_compile_generate(self) -> None:
+        # L2: the dependency_surface catalog rides ONLY on the compile.generate payload — not
+        # compile.verify (frozen IR), not any other step.
+        surface = ({"node_key": "component/base@0.1.0",
+                    "published_operations": ["base__scale"], "source": "ir_public_api"},)
+        refs = self._generate_refs()
+        cg = wc.build_launch_request(
+            refs, step="compile", substep="generate", orchestration_id="o",
+            orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+            workflow_mode="dev", dependency_surface=surface)
+        self.assertEqual(cg["dependency_surface"], list(surface))
+        cv = wc.build_launch_request(
+            refs, step="compile", substep="verify", orchestration_id="o",
+            orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+            workflow_mode="dev", dependency_surface=surface)
+        self.assertNotIn("dependency_surface", cv)
+        gg = wc.build_launch_request(
+            refs, step="generate", substep="generate", orchestration_id="o",
+            orchestration_agent_run_id="p", child_agent_run_id="c", agent_model="m",
+            workflow_mode="dev", dependency_surface=surface)
+        self.assertNotIn("dependency_surface", gg)
+
     def test_m3d_runner_contract_narrowing_survives_record_launch(self) -> None:
         # M3d node-aware must-read: an M3c physics generate leaf (runner host-rendered)
         # drops RUNNER_OUTPUT_CONTRACT and keeps the checks ABI; a non-M3c leaf keeps
@@ -4238,6 +4260,92 @@ class WriteDependencyGraphTest(unittest.TestCase):
             self.assertIsInstance(err, dict)
             self.assertEqual(err["reason"], "dependency_deps_unreadable")
             self.assertFalse((repo / refs.ir_ref / "dependency_graph.json").exists())
+
+
+class WriteDependencySurfaceTest(unittest.TestCase):
+    """L2: the conductor authors <ir_ref>/dependency_surface.json host-side at Compile start,
+    resolving each COMPONENT dep's published op NAMES from the dependency_graph it just wrote."""
+
+    def _conductor(self, repo: Path) -> _FakeConductor:
+        return _FakeConductor(
+            repo_root=repo, orchestration_id="o",
+            orchestration_agent_run_id="ORCH", backend="claude", env={})
+
+    def _seed(self, repo: Path) -> None:
+        from tools.orchestration_runtime import _load_spec_catalog
+        _load_spec_catalog.cache_clear()
+        (repo / "spec" / "registry").mkdir(parents=True, exist_ok=True)
+        (repo / "spec" / "registry" / "spec_catalog.yaml").write_text(
+            "catalog_version: 0.2.0\nupdated_at: 2026-06-18\nspecs:\n"
+            "  - spec_kind: component\n    spec_id: top\n    spec_version: \"0.1.0\"\n"
+            "    deps_path: spec/component/top/deps.yaml\n"
+            "  - spec_kind: component\n    spec_id: base\n    spec_version: \"0.1.0\"\n"
+            "    deps_path: spec/component/base/deps.yaml\n", encoding="utf-8")
+        (repo / "spec" / "component" / "top").mkdir(parents=True, exist_ok=True)
+        (repo / "spec" / "component" / "top" / "deps.yaml").write_text(
+            "spec_id: top\nspec_kind: component\ndependencies:\n"
+            "  components:\n    - component_id: base\n      version_constraint: \">=0.1.0 <1.0.0\"\n"
+            "  profiles: []\n", encoding="utf-8")
+        (repo / "spec" / "component" / "base").mkdir(parents=True, exist_ok=True)
+        (repo / "spec" / "component" / "base" / "deps.yaml").write_text(
+            "spec_id: base\nspec_kind: component\ndependencies:\n"
+            "  components: []\n  profiles: []\n", encoding="utf-8")
+
+    def _seed_base_ir(self, repo: Path, *, public_api: dict | None) -> None:
+        d = repo / "workspace" / "ir" / "component__base__0.1.0" / "ir_20260601_001"
+        d.mkdir(parents=True)
+        doc: dict = {"meta": {"spec_kind": "component"}}
+        if public_api is not None:
+            doc["public_api"] = public_api
+        # JSON is valid YAML — avoids a yaml import in this test module.
+        (d / "spec.ir.yaml").write_text(json.dumps(doc), encoding="utf-8")
+        (d / "ir_meta.json").write_text(
+            json.dumps({"verification_status": "pass"}), encoding="utf-8")
+
+    def _refs(self) -> "wc.NodeRefs":
+        return wc.NodeRefs(node_key="component/top@0.1.0", spec_path="spec/component/top",
+                           ir_id="i", pipeline_id="p", source_id="s", binary_id="b")
+
+    def test_authors_surface_from_ir_public_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._seed(repo)
+            self._seed_base_ir(repo, public_api={
+                "published_operations": [{"operation_id": "base__scale"}]})
+            refs = self._refs()
+            c = self._conductor(repo)
+            # Real graph writer first (the fake no-ops it), then the real surface writer.
+            self.assertIsNone(wc.Conductor._write_dependency_graph(c, refs))
+            surface = wc.Conductor._write_dependency_surface(c, refs)
+            self.assertEqual(surface, [
+                {"node_key": "component/base@0.1.0",
+                 "published_operations": ["base__scale"], "source": "ir_public_api"}])
+            doc = json.loads(
+                (repo / refs.ir_ref / "dependency_surface.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["consumer_node_key"], "component/top@0.1.0")
+            self.assertEqual(doc["dependencies"], surface)
+
+    def test_unresolved_when_no_dep_ir_or_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._seed(repo)
+            refs = self._refs()
+            c = self._conductor(repo)
+            self.assertIsNone(wc.Conductor._write_dependency_graph(c, refs))
+            surface = wc.Conductor._write_dependency_surface(c, refs)
+            self.assertEqual(surface, [
+                {"node_key": "component/base@0.1.0",
+                 "published_operations": [], "source": "unresolved"}])
+
+    def test_empty_when_no_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = self._refs()
+            c = self._conductor(repo)
+            # No dependency_graph.json → best-effort empty, no sidecar written.
+            self.assertEqual(wc.Conductor._write_dependency_surface(c, refs), [])
+            self.assertFalse(
+                (repo / refs.ir_ref / "dependency_surface.json").exists())
 
 
 class WriteLineageTest(unittest.TestCase):

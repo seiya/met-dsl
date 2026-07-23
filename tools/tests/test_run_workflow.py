@@ -3205,7 +3205,7 @@ class SubstepEventTests(unittest.TestCase):
                 return None
 
             def run_substep(self, refs, phase, substep, repair=None,
-                            resolved_dependencies=()):
+                            resolved_dependencies=(), dependency_surface=()):
                 return wc.SubstepOutcome(
                     agent_run_id=f"ar_{phase}_{substep or 'step'}",
                     status="pass", output_refs=[], leaf_returncode=0,
@@ -3277,7 +3277,7 @@ class SubstepEventTests(unittest.TestCase):
                 return False
 
             def run_substep(self, refs, phase, substep, repair=None,
-                            resolved_dependencies=()):
+                            resolved_dependencies=(), dependency_surface=()):
                 return wc.SubstepOutcome(
                     agent_run_id="ar_build", status="pass",
                     output_refs=[], leaf_returncode=0,

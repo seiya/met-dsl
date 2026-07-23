@@ -960,6 +960,7 @@ def build_launch_request(
     runner_host_authored: bool = False,
     repair: dict[str, str] | None = None,
     resolved_dependencies: tuple[dict[str, str], ...] = (),
+    dependency_surface: tuple[dict[str, Any], ...] = (),
     exemplar: dict[str, Any] | None = None,
     warm_resume: bool = False,
     pure_leaf: bool = False,
@@ -1240,6 +1241,13 @@ def build_launch_request(
     # are omitted there. The `<dependency_facts>` renderer drops them when empty.
     if resolved_dependencies and not deterministic and step in ("generate", "validate"):
         req["resolved_dependencies"] = list(resolved_dependencies)
+    # L2: the component-dep published-surface catalog (op names only), injected ONLY into the
+    # compile.generate leaf so it transcribes real dependency op names into its public_api + dep
+    # operations. Rendered through the same `<dependency_facts>` placeholder (compile branch of
+    # `_build_dependency_facts`). compile.verify sees the frozen IR, not this, so it is scoped to
+    # the authoring substep.
+    if dependency_surface and step == "compile" and substep == "generate":
+        req["dependency_surface"] = list(dependency_surface)
     # R5: a conductor-resolved certified sibling exemplar, injected ONLY for the sole authoring
     # leaf (generate.generate). Prior art to raise first-attempt pass rate; the `<exemplar>`
     # renderer drops it for any other (step, substep). Not attached to warm-resume slim prompts
@@ -2029,6 +2037,43 @@ class Conductor:
         path.write_text(
             json.dumps(graph, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return None
+
+    def _write_dependency_surface(self, refs: NodeRefs) -> list[dict[str, Any]]:
+        """Author `<ir_ref>/dependency_surface.json` host-side at Compile start: for each COMPONENT
+        direct dependency, its published operation NAME surface (`published_operations` + a `source`
+        tag), resolved from the dep's certified IR public_api (the L1 pin) else its certified source.
+
+        The consumer IR does not exist yet at compile start, so the direct-dep set is read from the
+        just-authored `dependency_graph.json` (a pure function of deps.yaml + spec_catalog.yaml),
+        NOT from a not-yet-existing consumer IR. Two consumers read this ONE snapshot: the
+        compile.generate leaf is SHOWN the catalog (so it transcribes real op names into its
+        public_api + dep operations), and the deterministic L3 membership gate
+        (`_validate_component_dep_operations_membership`) checks the authored dep operations against
+        the SAME file — pinning prompt and gate to one snapshot, TOCTOU-free across a mid-phase dep
+        re-cert. Sibling of `_write_dependency_graph`; the sidecar lives under `<ir_ref>/` (a
+        leaf-non-writable managed path). Overwritten each compile attempt, so it never stales.
+
+        Returns the resolved surface list (also written) so run_phase can thread it into the
+        compile.generate launch payload without re-reading. Best-effort: a missing/unreadable graph
+        yields `[]` and writes no sidecar (L3 then inert); an unresolvable dep yields an
+        `unresolved` entry. Called only for the compile phase (whose producer is the IR)."""
+        from tools.orchestration_runtime import _resolve_component_dep_surface
+        graph_path = self.repo_root / refs.ir_ref / "dependency_graph.json"
+        try:
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        surface = _resolve_component_dep_surface(self.repo_root, refs.node_key, graph)
+        doc = {
+            "generated_by": "workflow_conductor._write_dependency_surface",
+            "consumer_node_key": refs.node_key,
+            "dependencies": surface,
+        }
+        path = self.repo_root / refs.ir_ref / "dependency_surface.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return surface
 
     def _is_leaf_node(self, refs: NodeRefs) -> bool:
         """A node whose `dependency.direct_deps` is explicitly present and empty. An absent
@@ -5349,7 +5394,8 @@ clean:
 
     def run_substep(self, refs: NodeRefs, phase: str, substep: str | None,
                     repair: dict[str, str] | None = None,
-                    resolved_dependencies: tuple[dict[str, str], ...] = ()) -> SubstepOutcome:
+                    resolved_dependencies: tuple[dict[str, str], ...] = (),
+                    dependency_surface: tuple[dict[str, Any], ...] = ()) -> SubstepOutcome:
         # Certify the codex hooks feature BEFORE record_launch: this can fail closed
         # (SandboxEnforcementError) when the feature is uncertified, and doing it here —
         # ahead of allocating an arid / recording a durable launch — avoids orphaning a
@@ -5423,6 +5469,7 @@ clean:
                     phase == "generate" and self._conductor_authors_runner(refs)),
                 repair=repair,
                 resolved_dependencies=resolved_dependencies,
+                dependency_surface=dependency_surface,
                 exemplar=exemplar,
                 warm_resume=warm_resume,
             )
@@ -6364,6 +6411,7 @@ clean:
         # write it (pipeline-root file; see _write_lineage). Pipeline phases only —
         # compile writes under workspace/ir/, not the pipeline root.
         dep_facts: tuple[dict[str, str], ...] = ()
+        dep_surface: tuple[dict[str, Any], ...] = ()
         if phase in ("generate", "build", "validate"):
             dep_facts = tuple(self._write_lineage(refs))
         # The conductor authors src/Makefile deterministically (runtime-owned, like
@@ -6410,6 +6458,11 @@ clean:
                 return PhaseOutcome(phase, "fail", decision=RouteDecision(
                     "fail_closed",
                     reason=f"compile_dependency_graph_{err['reason']}"))
+            # Author the component-dep published-surface sidecar (L2) from the graph just written,
+            # and thread it into the compile.generate launch so the leaf is SHOWN the real op-name
+            # catalog. Best-effort: a resolution gap yields `unresolved` entries; the L3 gate is
+            # inert where the surface is unresolved.
+            dep_surface = tuple(self._write_dependency_surface(refs))
 
         outcomes: list[SubstepOutcome] = []
         if preseat is not None:
@@ -6438,7 +6491,8 @@ clean:
             self.emit("substep_start", node_key=refs.node_key, phase=phase,
                       substep=substep_label, attempt=i + 1)
             oc = self.run_substep(refs, phase, substep, repair=repair if i == 0 else None,
-                                  resolved_dependencies=dep_facts)
+                                  resolved_dependencies=dep_facts,
+                                  dependency_surface=dep_surface)
             self.emit("substep_complete", node_key=refs.node_key, phase=phase,
                       substep=substep_label, result=oc.status,
                       agent_run_id=oc.agent_run_id,

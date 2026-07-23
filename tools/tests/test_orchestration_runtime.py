@@ -17762,6 +17762,37 @@ class DependencyFactsRenderTests(unittest.TestCase):
         self.assertIn("WARNING", block)
         self.assertIn("demo_dep_base__apply", block)
 
+    def test_compile_generate_renders_surface_catalog(self) -> None:
+        # L2: compile.generate renders the dependency_surface op-name catalog (not verdict facts).
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        payload = dict(
+            self.BASE, step="compile", substep="generate",
+            dependency_surface=[
+                {"node_key": "component/flux@0.1.0",
+                 "published_operations": ["flux__compute_flux"], "source": "ir_public_api"},
+                {"node_key": "component/bnd@0.1.0",
+                 "published_operations": [], "source": "unresolved"},
+            ])
+        block = _build_dependency_facts(payload)
+        self.assertIn("AUTHORITATIVE op-name catalog", block)
+        self.assertIn("VERBATIM", block)
+        self.assertIn("- component/flux@0.1.0: flux__compute_flux (source: ir_public_api)", block)
+        # An unresolved dep points at its own §5, and its (empty) surface is not listed as real.
+        self.assertIn("component/bnd@0.1.0", block)
+        self.assertIn("surface unresolved", block)
+
+    def test_compile_generate_empty_surface_renders_nothing(self) -> None:
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        payload = dict(self.BASE, step="compile", substep="generate", dependency_surface=[])
+        self.assertEqual(_build_dependency_facts(payload), "")
+        # deterministic compile.generate never renders it either.
+        det = dict(payload, deterministic=True, dependency_surface=[
+            {"node_key": "component/flux@0.1.0",
+             "published_operations": ["flux__compute_flux"], "source": "ir_public_api"}])
+        self.assertEqual(_build_dependency_facts(det), "")
+
     def test_render_judge_carries_verdict_path_and_no_dep_does_not(self) -> None:
         from tools.orchestration_runtime import (
             prepare_launch_request_payload,
