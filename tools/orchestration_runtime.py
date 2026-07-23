@@ -10114,9 +10114,10 @@ def _build_dependency_surface_facts(surface: Any) -> str:
         "certified public API — the AUTHORITATIVE op-name catalog):** these are the ONLY valid "
         "operation names for your component dependencies. Copy each listed name VERBATIM into that "
         "dependency's `dependency.direct_deps[].operations`; a name NOT in this catalog is rejected "
-        "by a deterministic compile gate (never invent one). SEPARATELY, author your OWN "
-        "`public_api.published_operations` by transcribing YOUR controlled_spec §5 operation_id(s) "
-        "verbatim (this is a component node's published surface — names only, no signatures). For a "
+        "by a deterministic compile gate (never invent one). SEPARATELY, IF YOUR node is a "
+        "`component`, author your OWN `public_api.published_operations` by transcribing YOUR "
+        "controlled_spec §5 operation_id(s) verbatim (names only, no signatures); a "
+        "`profile`/`problem` node OMITS `public_api`. For a "
         "dependency shown as `unresolved` below, use the operation_id(s) that dependency's "
         "controlled_spec §5 declares, verbatim.",
     ]

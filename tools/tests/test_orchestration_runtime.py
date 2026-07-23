@@ -17777,6 +17777,10 @@ class DependencyFactsRenderTests(unittest.TestCase):
         block = _build_dependency_facts(payload)
         self.assertIn("AUTHORITATIVE op-name catalog", block)
         self.assertIn("VERBATIM", block)
+        # The "author your own public_api" guidance is scoped to component consumers (a profile
+        # consumer — the common case — must omit public_api).
+        self.assertIn("IF YOUR node is a `component`", block)
+        self.assertIn("`profile`/`problem` node OMITS `public_api`", block)
         self.assertIn("- component/flux@0.1.0: flux__compute_flux (source: ir_public_api)", block)
         # An unresolved dep points at its own §5, and its (empty) surface is not listed as real.
         self.assertIn("component/bnd@0.1.0", block)
