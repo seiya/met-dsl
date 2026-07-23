@@ -1369,7 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
     base_env["METDSL_WORKFLOW_EXEC_MODE"] = workflow_mode
     base_env["METDSL_MISSING_ORCHESTRATION_ID_POLICY"] = "strict"
     # Warm-resume minor-fix repairs are ALWAYS active (claude only; no env gate): a
-    # generate.lint / generate.static / compile.static finding (and the build->generate reuse
+    # generate.gate / compile.static finding (and the build->generate reuse
     # repairs) re-run the phase's producer substep (generate.generate / compile.generate) by
     # resuming the prior leaf's session with context intact, instead of a cold restart —
     # avoiding the cold-start re-read cost. `restart` repairs stay cold (anchoring avoidance).

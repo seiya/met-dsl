@@ -301,7 +301,7 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
         repair = {"repair_strategy": "reuse", "repair_target_agent_run_id": "none"}
         self.assertIsNone(c._resolve_reuse_resume(repair, "generate", "generate"))
 
-    def test_read_repair_findings_reads_lint_excerpt(self) -> None:
+    def test_read_repair_findings_reads_gate_excerpt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             refs = wc.NodeRefs(node_key="component/spec_x@0.1.0",
@@ -309,12 +309,16 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
                                ir_id="x_1", pipeline_id="x_1", source_id="src_1")
             meta_dir = repo / refs.source_dir()
             meta_dir.mkdir(parents=True)
-            (meta_dir / "lint_meta.json").write_text(
-                json.dumps({"failure_excerpt": "C061 argument 'u_l'"}), encoding="utf-8")
+            # The gate union verdict: gate_meta.json#failure_excerpt (composed per-checker
+            # sections). Any `gate_*` reason reads it.
+            (meta_dir / "gate_meta.json").write_text(
+                json.dumps({"failure_excerpt": "[syntax]\nErr\n[lint]\nC061 argument 'u_l'"}),
+                encoding="utf-8")
             c = _FakeConductor(repo_root=repo, orchestration_id="o",
                                orchestration_agent_run_id="ORCH", backend="claude", env={})
             self.assertEqual(
-                c._read_repair_findings(refs, "lint_lint_findings"), "C061 argument 'u_l'")
+                c._read_repair_findings(refs, "gate_syntax_error+lint_findings"),
+                "[syntax]\nErr\n[lint]\nC061 argument 'u_l'")
             # verify_* reason -> reads the phase's verify meta last_fail_reason. Absent -> None;
             # present -> returned (generate phase reads source_meta.json).
             self.assertIsNone(c._read_repair_findings(refs, "verify_minor", "generate"))
@@ -337,7 +341,7 @@ class ReuseResumeAndFindingsTest(unittest.TestCase):
             refs2 = wc.NodeRefs(node_key="component/spec_x@0.1.0",
                                 spec_path="spec/component/spec_x",
                                 ir_id="x_1", pipeline_id="x_1", source_id="src_missing")
-            self.assertIsNone(c._read_repair_findings(refs2, "static_post_generate_violation"))
+            self.assertIsNone(c._read_repair_findings(refs2, "gate_post_generate_violation"))
 
     def test_read_repair_findings_reads_execute_trial_meta_excerpt(self) -> None:
         # B1: a structural validate.execute failure keeps its excerpt in the failed RUN's
@@ -379,7 +383,7 @@ class PhaseStructureTest(unittest.TestCase):
     def test_substeps_and_roles(self) -> None:
         self.assertEqual(wc.SUBSTEPS["compile"], ("generate", "static", "verify"))
         self.assertEqual(wc.SUBSTEPS["generate"],
-                         ("generate", "lint", "syntax", "static", "verify"))
+                         ("generate", "gate", "verify"))
         self.assertEqual(wc.SUBSTEPS["build"], (None,))
         self.assertEqual(wc.SUBSTEPS["validate"],
                          ("pre_judge", "execute", "judge", "post_judge"))
@@ -400,15 +404,32 @@ class DecisionTableTest(unittest.TestCase):
         self.assertEqual(wc.classify_build_failure("weird").action, "escalate")
         self.assertEqual(wc.classify_build_failure(None).action, "escalate")
 
-    def test_static_failure_routing(self) -> None:
-        # Ordinary content violations warm-retry generate.generate.
-        d = wc.classify_static_failure("post_generate_violation")
-        self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))
-        # A stale certified dependency IR is TERMINAL — the leaf cannot repair it, so no warm retry.
-        d = wc.classify_static_failure("stale_dependency_ir")
+    def test_gate_failure_routing(self) -> None:
+        # Ordinary content violations warm-retry generate.generate. Every known non-terminal
+        # gate category (lint/syntax/static family) routes ("retry","generate","reuse").
+        for cat in ("post_generate_violation", "workspace_root_violation",
+                    "lint_findings", "syntax_error"):
+            d = wc.classify_gate_failure([cat])
+            self.assertEqual((d.action, d.target_phase, d.repair_strategy),
+                             ("retry", "generate", "reuse"), cat)
+        # A UNION of several known categories -> one warm reuse; reason lists them canonically.
+        d = wc.classify_gate_failure(["lint_findings", "syntax_error"])
+        self.assertEqual((d.action, d.target_phase, d.repair_strategy),
+                         ("retry", "generate", "reuse"))
+        self.assertEqual(d.reason, "gate_syntax_error+lint_findings")
+        # A stale certified dependency IR is TERMINAL — the leaf cannot repair it, so no warm
+        # retry, and it DOMINATES a co-occurring warm category (reachability note: static runs
+        # only when lint+syntax passed, so this multi-category input cannot arise in practice —
+        # the test defends the classifier's totality).
+        d = wc.classify_gate_failure(["stale_dependency_ir"])
         self.assertEqual(d.action, "fail_closed")
-        self.assertIn("stale_dependency_ir", wc.STATIC_FAILURE_TERMINAL)
-        self.assertEqual(wc.classify_static_failure(None).action, "escalate")
+        d = wc.classify_gate_failure(["lint_findings", "stale_dependency_ir"])
+        self.assertEqual(d.action, "fail_closed")
+        self.assertIn("stale_dependency_ir", wc.GATE_FAILURE_TERMINAL)
+        # An unknown category escalates; an empty list escalates with the no-category reason.
+        self.assertEqual(wc.classify_gate_failure(["mystery"]).action, "escalate")
+        self.assertEqual(wc.classify_gate_failure([]).reason, "gate_fail_no_category")
+        self.assertEqual(wc.classify_gate_failure(None).reason, "gate_fail_no_category")
 
     def test_validate_judge_routing(self) -> None:
         self.assertEqual(wc.classify_validate_judge("pass", None).action, "advance")
@@ -581,11 +602,9 @@ class ConductHappyPathTest(unittest.TestCase):
              "write-step-result"]  # compile (2 leaf + 1 deterministic substep)
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "finalize-child",  # generate.generate (leaf)
-               "record-launch", "record-child-return", "finalize-child",  # generate.lint (deterministic)
-               "record-launch", "record-child-return", "finalize-child",  # generate.syntax (deterministic)
-               "record-launch", "record-child-return", "finalize-child",  # generate.static (deterministic)
+               "record-launch", "record-child-return", "finalize-child",  # generate.gate (deterministic)
                "record-launch", "finalize-child",  # generate.verify (leaf)
-               "write-step-result"]  # generate (2 leaf + 3 deterministic substeps)
+               "write-step-result"]  # generate (2 leaf + 1 deterministic substep)
             + ["check-step-completed", "workflow-launch-check",
                "record-launch", "record-child-return", "finalize-child",
                "write-step-result"]  # build (1 deterministic step)
@@ -604,9 +623,9 @@ class ConductHappyPathTest(unittest.TestCase):
         by_step = {cap["--step"]: cap for cap in wsr}
         for substep_aware in ("compile", "generate", "validate"):
             self.assertEqual(by_step[substep_aware]["--agent-run-id"], "ORCH")
-            # generate has 5 substeps (generate, lint, syntax, static, verify); compile has 3
+            # generate has 3 substeps (generate, gate, verify); compile has 3
             # (generate, static, verify); validate has 4 (pre_judge, execute, judge, post_judge).
-            expected_substeps = {"generate": 5, "compile": 3, "validate": 4}[substep_aware]
+            expected_substeps = {"generate": 3, "compile": 3, "validate": 4}[substep_aware]
             self.assertEqual(
                 len(by_step[substep_aware]["--result-json"]["substep_agent_run_ids"]),
                 expected_substeps)
@@ -1044,32 +1063,32 @@ class ConductRoutingTest(unittest.TestCase):
                            if s == "write-step-result" and cap["--step"] == "validate"]
         self.assertEqual(len(validate_writes), 2)
 
-    def test_lint_finding_warm_reopens_generate_same_phase(self) -> None:
-        # A generate.lint finding routes retry/generate/reuse(lint_*); conduct must do a
+    def test_gate_finding_warm_reopens_generate_same_phase(self) -> None:
+        # A generate.gate finding routes retry/generate/reuse(gate_*); conduct must do a
         # SAME-PHASE warm reopen (reopen-phase --from-phase generate) and re-run generate,
         # not terminalize like the generic same/downstream branch.
         c = self._conductor()
-        state = {"lint_failed": False}
+        state = {"gate_failed": False}
 
         def status_fn(phase, substep, n):
-            if phase == "generate" and substep == "lint" and not state["lint_failed"]:
-                state["lint_failed"] = True
+            if phase == "generate" and substep == "gate" and not state["gate_failed"]:
+                state["gate_failed"] = True
                 return "fail"
             return "pass"
 
         c.status_fn = status_fn
         c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
             "retry", target_phase="generate", repair_strategy="reuse",
-            reason="lint_lint_findings")
+            reason="gate_syntax_error+lint_findings")
         # Stub the on-disk excerpt read so the threading assertion does not need a real
-        # lint_meta.json (the disk read itself is covered by ReuseResumeAndFindingsTest).
+        # gate_meta.json (the disk read itself is covered by ReuseResumeAndFindingsTest).
         c._read_repair_findings = lambda refs, reason, phase=None: "C061 argument 'u_l'"  # type: ignore[assignment]
         status = c.conduct(self._refs(), "generate")
         self.assertEqual(status, "pass")
         reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
         self.assertEqual(len(reopens), 1)
         self.assertEqual(reopens[0]["--from-phase"], "generate")
-        self.assertEqual(reopens[0]["--reason"], "lint_lint_findings")
+        self.assertEqual(reopens[0]["--reason"], "gate_syntax_error+lint_findings")
         # generate ran twice (lint-fail attempt, then clean attempt)
         gen_writes = [cap for s, cap in c.calls
                       if s == "write-step-result" and cap["--step"] == "generate"]
@@ -1156,34 +1175,6 @@ class ConductRoutingTest(unittest.TestCase):
         self.assertEqual(ss["--reason-code"], "dev_phase_rollback")
         self.assertEqual(ss["--reason-detail"], "validate_execute_post_execute_violation")
         self.assertEqual([s for s, _ in c.calls if s == "reopen-phase"], [])
-
-    def test_static_finding_warm_reopens_generate_same_phase(self) -> None:
-        # A generate.static finding routes retry/generate/reuse(static_*); conduct must do a
-        # SAME-PHASE warm reopen exactly like a lint finding (same-phase target + reuse),
-        # not terminalize like the generic same/downstream branch.
-        c = self._conductor()
-        state = {"static_failed": False}
-
-        def status_fn(phase, substep, n):
-            if phase == "generate" and substep == "static" and not state["static_failed"]:
-                state["static_failed"] = True
-                return "fail"
-            return "pass"
-
-        c.status_fn = status_fn
-        c.decision_fn = lambda phase, outcomes: wc.RouteDecision(
-            "retry", target_phase="generate", repair_strategy="reuse",
-            reason="static_post_generate_violation")
-        status = c.conduct(self._refs(), "generate")
-        self.assertEqual(status, "pass")
-        reopens = [cap for s, cap in c.calls if s == "reopen-phase"]
-        self.assertEqual(len(reopens), 1)
-        self.assertEqual(reopens[0]["--from-phase"], "generate")
-        self.assertEqual(reopens[0]["--reason"], "static_post_generate_violation")
-        # generate ran twice (static-fail attempt, then clean attempt)
-        gen_writes = [cap for s, cap in c.calls
-                      if s == "write-step-result" and cap["--step"] == "generate"]
-        self.assertEqual(len(gen_writes), 2)
 
     def test_compile_static_finding_warm_reopens_compile_same_phase(self) -> None:
         # A compile.static finding routes retry/compile/reuse (same-phase); conduct
@@ -4462,26 +4453,21 @@ class BuildLaunchRequestResolvedDependenciesTest(unittest.TestCase):
             "resolved_dependencies", self._build("validate", "execute", (self.DEP,)))
         self.assertNotIn(
             "resolved_dependencies", self._build("build", None, (self.DEP,)))
-        # generate.lint is deterministic too: no resolved_dependencies / skill, and the
-        # deterministic flag is set with lint-only allowed_output_paths.
-        lint_req = self._build("generate", "lint", (self.DEP,))
-        self.assertNotIn("resolved_dependencies", lint_req)
-        self.assertNotIn("skill_name", lint_req)
-        self.assertTrue(lint_req["deterministic"])
-        outs = lint_req["allowed_output_paths"]
-        self.assertTrue(any(p.endswith("/lint_meta.json") for p in outs))
-        # lint does not author model/runner sources
+        # generate.gate is deterministic too: no resolved_dependencies / skill, and the
+        # deterministic flag is set with gate-only allowed_output_paths (gate_meta.json plus the
+        # canonical command_log.jsonl the lint/syntax checkers append to).
+        gate_req = self._build("generate", "gate", (self.DEP,))
+        self.assertNotIn("resolved_dependencies", gate_req)
+        self.assertNotIn("skill_name", gate_req)
+        self.assertTrue(gate_req["deterministic"])
+        outs = gate_req["allowed_output_paths"]
+        self.assertTrue(any(p.endswith("/gate_meta.json") for p in outs))
+        self.assertTrue(any(p.endswith("/src/command_log.jsonl") for p in outs))
+        # gate does not author model/runner sources
         self.assertFalse(any(p.endswith("_model.f90") for p in outs))
-        # generate.static is deterministic too: no resolved_dependencies / skill, and its
-        # only allowed output is static_meta.json (no sources, no command_log).
-        static_req = self._build("generate", "static", (self.DEP,))
-        self.assertNotIn("resolved_dependencies", static_req)
-        self.assertNotIn("skill_name", static_req)
-        self.assertTrue(static_req["deterministic"])
-        static_outs = static_req["allowed_output_paths"]
-        self.assertEqual(
-            [p for p in static_outs if p.endswith("/static_meta.json")], static_outs)
-        self.assertFalse(any(p.endswith("_model.f90") for p in static_outs))
+        # no retired per-checker meta names are emitted
+        self.assertFalse(any(p.endswith(("/lint_meta.json", "/syntax_meta.json",
+                                         "/static_meta.json")) for p in outs))
 
     def test_omitted_for_compile(self) -> None:
         self.assertNotIn(
@@ -6609,8 +6595,9 @@ class DeterministicBuildTest(unittest.TestCase):
 
 
 class DeterministicLintTest(unittest.TestCase):
-    """generate.lint runs in-process (no leaf): conductor authors lint_meta.json + the
-    host-side lint evidence; findings are a content failure routed to generate.generate."""
+    """The generate.gate lint checker (_gate_lint_check) runs in-process: it returns the `lint`
+    section of gate_meta and writes the host-side lint evidence (even on a content fail). The
+    unioned gate_meta.json + routing is exercised by DeterministicGateTest."""
 
     def _conductor(self, repo: Path) -> "wc.Conductor":
         return wc.Conductor(repo_root=repo, orchestration_id="t",
@@ -6647,10 +6634,10 @@ class DeterministicLintTest(unittest.TestCase):
             with self._patch_linter(
                 lambda args: {"ok": True, "return_code": 0, "command_id": "cid",
                               "preset": "fortitude"}):
-                out = c._lint_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)
-            meta = json.loads((repo / refs.source_dir() / "lint_meta.json").read_text())
-            self.assertEqual(meta["lint_status"], "pass")
+                out = c._gate_lint_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "pass")
+            meta = out
+            self.assertEqual(meta["status"], "pass")
             self.assertEqual(meta["preset"], "fortitude")
             self.assertIsNone(meta["failure_category"])
             ev = read_lint_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
@@ -6671,10 +6658,10 @@ class DeterministicLintTest(unittest.TestCase):
             with self._patch_linter(
                 lambda args: {"ok": False, "return_code": 1, "command_id": "cid",
                               "preset": "fortitude", "stdout": "S001 line too long"}):
-                out = c._lint_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)  # content fail, not transport
-            meta = json.loads((repo / refs.source_dir() / "lint_meta.json").read_text())
-            self.assertEqual(meta["lint_status"], "fail")
+                out = c._gate_lint_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "fail")
+            meta = out
+            self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "lint_findings")
             self.assertIn("S001", meta["failure_excerpt"])
             ev = read_lint_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
@@ -6697,7 +6684,7 @@ class DeterministicLintTest(unittest.TestCase):
                 ],
             }
             with self._patch_linter(lambda args: mixed):
-                c._lint_inproc(refs, "child-1", "captok")
+                c._gate_lint_check(refs, "child-1", "captok")
             ev = read_lint_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
             assert ev is not None
             self.assertEqual(ev["preset"], "mixed")
@@ -6711,47 +6698,15 @@ class DeterministicLintTest(unittest.TestCase):
             self._seed(repo, refs, language="brainfuck")
             c = self._conductor(repo)
             with self.assertRaises(RuntimeError):
-                c._lint_inproc(refs, "child-1", "captok")
-
-    def test_determine_substep_status_lint_branch(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo = Path(td)
-            refs = self._refs()
-            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
-            c = self._conductor(repo)
-            meta_path = repo / refs.source_dir() / "lint_meta.json"
-            paths = [refs.source_dir() + "/lint_meta.json"]
-            meta_path.write_text(json.dumps({"lint_status": "pass"}), encoding="utf-8")
-            self.assertEqual(
-                c.determine_substep_status(refs, "generate", "lint", paths)[0], "pass")
-            meta_path.write_text(json.dumps({"lint_status": "fail"}), encoding="utf-8")
-            self.assertEqual(
-                c.determine_substep_status(refs, "generate", "lint", paths)[0], "fail")
-
-    def test_classify_failure_routes_lint_findings_to_generate_reuse(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo = Path(td)
-            refs = self._refs()
-            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
-            (repo / refs.source_dir() / "lint_meta.json").write_text(
-                json.dumps({"failure_category": "lint_findings"}), encoding="utf-8")
-            c = self._conductor(repo)
-            # outcomes models generate.generate(pass), generate.lint(fail) — lint is index 1.
-            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
-                        wc.SubstepOutcome("l", "fail", [], 0)]
-            d = c.classify_failure(refs, "generate", outcomes)
-            self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))
-            self.assertTrue(d.reason.startswith("lint_"))
+                c._gate_lint_check(refs, "child-1", "captok")
 
 
 class DeterministicSyntaxTest(unittest.TestCase):
-    """generate.syntax runs in-process (no leaf): the conductor stages the node (+ dep
-    closure) sources, runs the MCP run_syntax_check compiler gate (mandatory gfortran,
-    optional METDSL_SYNTAX_COMPILERS stages), and authors syntax_meta.json + the
-    host-side syntax evidence; compiler findings are a content failure routed to
-    generate.generate."""
+    """The generate.gate syntax checker (_gate_syntax_check) runs in-process: it stages the node
+    (+ dep closure) sources, runs the MCP run_syntax_check compiler gate (mandatory gfortran,
+    optional METDSL_SYNTAX_COMPILERS stages), returns the `syntax` section of gate_meta and
+    writes the host-side syntax evidence. An unfixable attribution raises (transport
+    fail_closed); the unioned gate_meta.json is exercised by DeterministicGateTest."""
 
     def _conductor(self, repo: Path, env: dict[str, str] | None = None) -> "wc.Conductor":
         return wc.Conductor(repo_root=repo, orchestration_id="t",
@@ -6801,8 +6756,8 @@ class DeterministicSyntaxTest(unittest.TestCase):
                         "skipped": False}
 
             with self._patch_syntax(fake):
-                out = c._syntax_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)
+                out = c._gate_syntax_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "pass")
             self.assertEqual(seen_args[0]["compiler"], "gfortran")
             self.assertEqual(seen_args[0]["std"], "f2008")
             self.assertTrue(seen_args[0]["openmp"])  # target.backend: openmp
@@ -6811,8 +6766,8 @@ class DeterministicSyntaxTest(unittest.TestCase):
             # the log still lands at the canonical <src>/command_log.jsonl placement
             self.assertTrue(
                 seen_args[0]["command_log_path"].endswith("/src/command_log.jsonl"))
-            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
-            self.assertEqual(meta["syntax_status"], "pass")
+            meta = out
+            self.assertEqual(meta["status"], "pass")
             self.assertIsNone(meta["failure_category"])
             ev = read_syntax_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
             assert ev is not None
@@ -6840,10 +6795,10 @@ class DeterministicSyntaxTest(unittest.TestCase):
                         "stderr": "Error: IMPLICIT NONE with spec list"}
 
             with self._patch_syntax(fake):
-                out = c._syntax_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)  # content fail, not transport
-            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
-            self.assertEqual(meta["syntax_status"], "fail")
+                out = c._gate_syntax_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "fail")
+            meta = out
+            self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "syntax_error")
             self.assertIn("IMPLICIT NONE", meta["failure_excerpt"])
             ev = read_syntax_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
@@ -6864,10 +6819,10 @@ class DeterministicSyntaxTest(unittest.TestCase):
                 raise AssertionError("run_syntax_check must not run for language=cpp")
 
             with self._patch_syntax(fake):
-                out = c._syntax_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)
-            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
-            self.assertEqual(meta["syntax_status"], "pass")
+                out = c._gate_syntax_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "pass")
+            meta = out
+            self.assertEqual(meta["status"], "pass")
             self.assertIn("language=cpp", meta["skipped_reason"])
             self.assertEqual(meta["stages"], [])
             self.assertFalse(
@@ -6882,10 +6837,10 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self._seed(repo, refs, sources={})
             c = self._conductor(repo)
             with self._patch_syntax(lambda args: {"ok": True, "skipped": False}):
-                out = c._syntax_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)
-            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
-            self.assertEqual(meta["syntax_status"], "fail")
+                out = c._gate_syntax_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "fail")  # content fail (no source to check)
+            meta = out
+            self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "syntax_error")
 
     def test_syntax_inproc_missing_gfortran_is_transport_fail(self) -> None:
@@ -6899,7 +6854,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
                 lambda args: {"ok": True, "skipped": True,
                               "reason": "compiler not available: gfortran"}):
                 with self.assertRaises(RuntimeError):
-                    c._syntax_inproc(refs, "child-1", "captok")
+                    c._gate_syntax_check(refs, "child-1", "captok")
 
     def test_syntax_inproc_optional_stage_skipped_records_and_passes(self) -> None:
         import sys
@@ -6928,10 +6883,10 @@ class DeterministicSyntaxTest(unittest.TestCase):
             with mock.patch.object(
                     build_runtime_server, "_SYNTAX_COMPILER_ADAPTERS", registry), \
                     self._patch_syntax(fake):
-                out = c._syntax_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)
-            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
-            self.assertEqual(meta["syntax_status"], "pass")
+                out = c._gate_syntax_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "pass")
+            meta = out
+            self.assertEqual(meta["status"], "pass")
             ev = read_syntax_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
             assert ev is not None
             by_compiler = {s["compiler"]: s for s in ev["stages"]}
@@ -6958,7 +6913,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
                                       return_value=["component/dep@0.1.0"]):
                 with self._patch_syntax(lambda args: {"ok": True, "skipped": False}):
                     with self.assertRaises(RuntimeError):
-                        c._syntax_inproc(refs, "child-1", "captok")
+                        c._gate_syntax_check(refs, "child-1", "captok")
 
     DEP_REF = "workspace/pipelines/component__dep__0.1.0/p_1/source/s_1/src/dep_model.f90"
 
@@ -7023,7 +6978,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             stage_p, closure_p = self._with_dep(c)
             with stage_p, closure_p, self._patch_syntax(fake):
                 with self.assertRaises(RuntimeError) as ctx:
-                    c._syntax_inproc(refs, "child-1", "captok")
+                    c._gate_syntax_check(refs, "child-1", "captok")
             self.assertIn(self.DEP_REF, str(ctx.exception))
             self.assertIn("Unused dummy argument", str(ctx.exception))
             # no content-fail deliverable is authored on a transport fail_closed
@@ -7049,10 +7004,10 @@ class DeterministicSyntaxTest(unittest.TestCase):
 
             stage_p, closure_p = self._with_dep(c)
             with stage_p, closure_p, self._patch_syntax(fake):
-                out = c._syntax_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)  # content fail, routed to generate
-            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
-            self.assertEqual(meta["syntax_status"], "fail")
+                out = c._gate_syntax_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "fail")
+            meta = out
+            self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "syntax_error")
 
     def test_syntax_inproc_unviable_invocation_fails_closed_not_blaming_deps(self) -> None:
@@ -7076,7 +7031,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             stage_p, closure_p = self._with_dep(c)
             with stage_p, closure_p, self._patch_syntax(lambda args: unviable):
                 with self.assertRaises(RuntimeError) as ctx:
-                    c._syntax_inproc(refs, "child-1", "captok")
+                    c._gate_syntax_check(refs, "child-1", "captok")
             msg = str(ctx.exception)
             self.assertIn("not viable", msg)
             self.assertIn("toolchain.standard", msg)
@@ -7110,7 +7065,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             stage_p, closure_p = self._with_dep(c)
             with stage_p, closure_p, self._patch_syntax(fake):
                 with self.assertRaises(RuntimeError) as ctx:
-                    c._syntax_inproc(refs, "child-1", "captok")
+                    c._gate_syntax_check(refs, "child-1", "captok")
             msg = str(ctx.exception)
             self.assertIn("re-certify", msg)          # cause 1: a defective dependency
             self.assertIn("toolchain.standard", msg)  # cause 2: this node's standard
@@ -7148,10 +7103,10 @@ class DeterministicSyntaxTest(unittest.TestCase):
 
             stage_p, closure_p = self._with_dep(c)
             with stage_p, closure_p, self._patch_syntax(fake):
-                out = c._syntax_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)  # content fail, routed to generate
-            meta = json.loads((repo / refs.source_dir() / "syntax_meta.json").read_text())
-            self.assertEqual(meta["syntax_status"], "fail")
+                out = c._gate_syntax_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "fail")
+            meta = out
+            self.assertEqual(meta["status"], "fail")
             self.assertIn("no IMPLICIT type", meta["failure_excerpt"])
 
     def test_syntax_inproc_unregistered_optional_compiler_skipped(self) -> None:
@@ -7173,8 +7128,8 @@ class DeterministicSyntaxTest(unittest.TestCase):
                         "compiler_version": "GNU Fortran 13", "skipped": False}
 
             with self._patch_syntax(fake):
-                out = c._syntax_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)
+                out = c._gate_syntax_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "pass")
             ev = read_syntax_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
             assert ev is not None
             by_compiler = {s["compiler"]: s for s in ev["stages"]}
@@ -7182,59 +7137,13 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertEqual(by_compiler["frtxx"]["status"], "skipped")
             self.assertIn("no registered", by_compiler["frtxx"]["reason"])
 
-    def test_determine_substep_status_syntax_branch(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo = Path(td)
-            refs = self._refs()
-            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
-            c = self._conductor(repo)
-            meta_path = repo / refs.source_dir() / "syntax_meta.json"
-            paths = [refs.source_dir() + "/syntax_meta.json"]
-            meta_path.write_text(json.dumps({"syntax_status": "pass"}), encoding="utf-8")
-            self.assertEqual(
-                c.determine_substep_status(refs, "generate", "syntax", paths)[0], "pass")
-            meta_path.write_text(json.dumps({"syntax_status": "fail"}), encoding="utf-8")
-            self.assertEqual(
-                c.determine_substep_status(refs, "generate", "syntax", paths)[0], "fail")
-
-    def test_classify_failure_routes_syntax_error_to_generate_reuse(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo = Path(td)
-            refs = self._refs()
-            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
-            (repo / refs.source_dir() / "syntax_meta.json").write_text(
-                json.dumps({"failure_category": "syntax_error"}), encoding="utf-8")
-            c = self._conductor(repo)
-            # outcomes models generate(pass), lint(pass), syntax(fail) — syntax is index 2.
-            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
-                        wc.SubstepOutcome("l", "pass", [], 0),
-                        wc.SubstepOutcome("x", "fail", [], 0)]
-            d = c.classify_failure(refs, "generate", outcomes)
-            self.assertEqual((d.action, d.target_phase, d.repair_strategy),
-                             ("retry", "generate", "reuse"))
-            self.assertTrue(d.reason.startswith("syntax_"))
-
-    def test_read_repair_findings_reads_syntax_excerpt(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo = Path(td)
-            refs = self._refs()
-            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
-            (repo / refs.source_dir() / "syntax_meta.json").write_text(
-                json.dumps({"failure_excerpt": "[gfortran f2008 syntax check fail]\nError: x"}),
-                encoding="utf-8")
-            c = self._conductor(repo)
-            found = c._read_repair_findings(refs, "syntax_syntax_error", phase="generate")
-            self.assertIsNotNone(found)
-            self.assertIn("Error: x", found)
-
 
 class DeterministicStaticTest(unittest.TestCase):
-    """generate.static runs in-process (no leaf): the conductor runs validate_workspace_root +
-    validate_pipeline_semantics --stage post_generate and authors static_meta.json; a violation
-    is a content failure routed to generate.generate (warm resume)."""
+    """The generate.gate static checker (_gate_static_check) runs in-process: it runs
+    validate_workspace_root + validate_pipeline_semantics --stage post_generate and returns the
+    `static` section of gate_meta; a violation is a content failure the gate routes to
+    generate.generate (warm resume). The unioned gate_meta.json + skip-when-dirty behavior is
+    exercised by DeterministicGateTest."""
 
     def _conductor(self, repo: Path) -> "wc.Conductor":
         return wc.Conductor(repo_root=repo, orchestration_id="t",
@@ -7271,9 +7180,9 @@ class DeterministicStaticTest(unittest.TestCase):
             self._seed(repo, refs)
             c = self._conductor(repo)
             with self._patch_run(self._fake_run(0, 0)):
-                out = c._static_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)
-            meta = json.loads((repo / refs.source_dir() / "static_meta.json").read_text())
+                out = c._gate_static_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "pass")
+            meta = out
             self.assertEqual(meta["status"], "pass")
             self.assertIsNone(meta["failure_category"])
 
@@ -7285,9 +7194,9 @@ class DeterministicStaticTest(unittest.TestCase):
             self._seed(repo, refs)
             c = self._conductor(repo)
             with self._patch_run(self._fake_run(0, 1)):
-                out = c._static_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)  # content fail, not transport
-            meta = json.loads((repo / refs.source_dir() / "static_meta.json").read_text())
+                out = c._gate_static_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "fail")
+            meta = out
             self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "post_generate_violation")
             self.assertIn("pg-out", meta["failure_excerpt"])
@@ -7302,66 +7211,11 @@ class DeterministicStaticTest(unittest.TestCase):
             # workspace_root fails first; post_generate must NOT run (pg_rc would also fail,
             # but the category proves the short-circuit picked workspace_root).
             with self._patch_run(self._fake_run(1, 1)):
-                out = c._static_inproc(refs, "child-1", "captok")
-            self.assertEqual(out["returncode"], 0)
-            meta = json.loads((repo / refs.source_dir() / "static_meta.json").read_text())
+                out = c._gate_static_check(refs, "child-1", "captok")
+            self.assertEqual(out["status"], "fail")  # workspace_root short-circuit
+            meta = out
             self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "workspace_root_violation")
-
-    def test_static_inproc_exception_is_transport_fail(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo = Path(td)
-            refs = self._refs()
-            self._seed(repo, refs)
-            c = self._conductor(repo)
-
-            def boom(cmd, **kwargs):
-                raise OSError("python3 not found")
-
-            # Routed through _run_deterministic_substep, an unexpected error becomes a
-            # transport failure (rc != 0), NOT a content failure.
-            request = {"step": "generate", "substep": "static"}
-            with self._patch_run(boom), \
-                    __import__("unittest").mock.patch.object(
-                        c, "_capability_token", lambda arid: "captok"):
-                proc = c._run_deterministic_substep(refs, "generate", "static", "child-1", request)
-            self.assertNotEqual(proc.returncode, 0)
-
-    def test_determine_substep_status_static_branch(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo = Path(td)
-            refs = self._refs()
-            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
-            c = self._conductor(repo)
-            meta_path = repo / refs.source_dir() / "static_meta.json"
-            paths = [refs.source_dir() + "/static_meta.json"]
-            meta_path.write_text(json.dumps({"status": "pass"}), encoding="utf-8")
-            self.assertEqual(
-                c.determine_substep_status(refs, "generate", "static", paths)[0], "pass")
-            meta_path.write_text(json.dumps({"status": "fail"}), encoding="utf-8")
-            self.assertEqual(
-                c.determine_substep_status(refs, "generate", "static", paths)[0], "fail")
-
-    def test_classify_failure_routes_static_violation_to_generate_reuse(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            repo = Path(td)
-            refs = self._refs()
-            (repo / refs.source_dir()).mkdir(parents=True, exist_ok=True)
-            (repo / refs.source_dir() / "static_meta.json").write_text(
-                json.dumps({"failure_category": "post_generate_violation"}), encoding="utf-8")
-            c = self._conductor(repo)
-            # outcomes models generate(pass), lint(pass), syntax(pass), static(fail) —
-            # static is index 3.
-            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
-                        wc.SubstepOutcome("l", "pass", [], 0),
-                        wc.SubstepOutcome("x", "pass", [], 0),
-                        wc.SubstepOutcome("s", "fail", [], 0)]
-            d = c.classify_failure(refs, "generate", outcomes)
-            self.assertEqual((d.action, d.target_phase, d.repair_strategy), ("retry", "generate", "reuse"))
-            self.assertTrue(d.reason.startswith("static_"))
 
     def test_generate_verify_requires_fresh_source_meta_scoped(self) -> None:
         # generate.verify (pure semantic pass post-G1) must RE-AUTHOR source_meta.json this
@@ -7396,6 +7250,192 @@ class DeterministicStaticTest(unittest.TestCase):
             self.assertEqual(
                 c.determine_substep_status(refs, "generate", "verify", allowed,
                                            min_mtime=mtime + 100)[0], "fail")
+
+
+class DeterministicGateTest(unittest.TestCase):
+    """generate.gate unions the lint / syntax / static checkers into ONE gate_meta.json
+    (_gate_inproc). These tests drive the REAL writer (mocking only the underlying tools /
+    validators, never hand-authoring gate_meta) so the on-disk verdict is the production shape,
+    then run it through determine_substep_status -> classify_failure -> _read_repair_findings."""
+
+    def _conductor(self, repo: Path, env: dict[str, str] | None = None) -> "wc.Conductor":
+        return wc.Conductor(repo_root=repo, orchestration_id="t",
+                            orchestration_agent_run_id="x", backend="claude", env=env or {})
+
+    def _refs(self) -> wc.NodeRefs:
+        return wc.NodeRefs(
+            node_key="component/spec_x@0.1.0", spec_path="spec/component/spec_x",
+            ir_id="x_1", pipeline_id="x_1", source_id="src_1", binary_id="bin_1")
+
+    def _seed(self, repo: Path, refs: wc.NodeRefs, language: str = "fortran") -> None:
+        src = repo / refs.source_dir() / "src"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "spec_x_model.f90").write_text(
+            "module spec_x_model\nend module spec_x_model\n", encoding="utf-8")
+        ir_dir = repo / refs.ir_ref
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        (ir_dir / "spec.ir.yaml").write_text(
+            f"impl_defaults:\n  toolchain:\n    language: {language}\n"
+            f"    standard: f2008\n  target:\n    backend: openmp\n", encoding="utf-8")
+
+    def _patches(self, linter, syntax, run=None):
+        import sys
+        from unittest import mock
+        sys.path.insert(0, str(Path("mcp_servers").resolve()))
+        import build_runtime_server  # type: ignore
+        ps = [
+            mock.patch.object(build_runtime_server, "tool_run_linter", linter),
+            mock.patch.object(build_runtime_server, "tool_run_syntax_check", syntax),
+        ]
+        if run is not None:
+            ps.append(mock.patch.object(wc.subprocess, "run", run))
+        return ps
+
+    @staticmethod
+    def _syntax_fail(args):
+        # main stage fails; the invocation canary passes (isolates the failure to the source).
+        if str(args.get("project_dir", "")).endswith("_canary"):
+            return {"ok": True, "skipped": False, "command_id": "canary"}
+        return {"ok": False, "return_code": 1, "command_id": "sid", "skipped": False,
+                "stderr": "Error: IMPLICIT NONE with spec list"}
+
+    @staticmethod
+    def _syntax_pass(args):
+        return {"ok": True, "return_code": 0, "command_id": "sid",
+                "compiler": args["compiler"], "compiler_version": "GNU Fortran 13",
+                "skipped": False}
+
+    def test_union_verdict_lint_and_syntax_fail_static_skipped(self) -> None:
+        """New test 1 + 3: lint fail + syntax fail -> one gate_meta with failure_categories
+        [syntax_error, lint_findings], sectioned excerpt, static skipped; the on-disk verdict
+        flows determine -> classify -> read_repair as a single union warm reuse."""
+        import contextlib
+        import tempfile
+        from tools.hooks.lint_evidence import read_lint_evidence
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            ran_static = {"called": False}
+
+            def linter(args):
+                return {"ok": False, "return_code": 1, "command_id": "cid",
+                        "preset": "fortitude", "stdout": "S001 line too long"}
+
+            def run(cmd, **kwargs):  # static must NOT run when lint/syntax failed
+                ran_static["called"] = True
+                raise AssertionError("static checker must be skipped on a dirty source")
+
+            with contextlib.ExitStack() as stack:
+                for p in self._patches(linter, self._syntax_fail, run):
+                    stack.enter_context(p)
+                out = c._gate_inproc(refs, "child-1", "captok")
+
+            self.assertEqual(out["returncode"], 0)  # content fail, not transport
+            self.assertFalse(ran_static["called"])
+            meta = json.loads((repo / refs.source_dir() / "gate_meta.json").read_text())
+            self.assertEqual(meta["gate_status"], "fail")
+            self.assertEqual(meta["failure_categories"], ["syntax_error", "lint_findings"])
+            # Canonical excerpt section order: syntax before lint.
+            self.assertLess(meta["failure_excerpt"].index("[syntax]"),
+                            meta["failure_excerpt"].index("[lint]"))
+            self.assertIn("IMPLICIT NONE", meta["failure_excerpt"])
+            self.assertIn("S001", meta["failure_excerpt"])
+            self.assertEqual(meta["checkers"]["static"]["status"], "skipped")
+            self.assertEqual(meta["checkers"]["static"]["skipped_reason"],
+                             "lint_or_syntax_failed")
+            # New test 6: evidence written even on a content fail (ok=false).
+            ev = read_lint_evidence(pipeline_root=repo / refs.pipeline_ref, source_id="src_1")
+            assert ev is not None
+            self.assertFalse(ev["ok"])
+
+            # Same on-disk verdict flows the deterministic pipeline as ONE union.
+            paths = [refs.source_dir() + "/gate_meta.json"]
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "gate", paths)[0], "fail")
+            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
+                        wc.SubstepOutcome("gate", "fail", [], 0)]
+            d = c.classify_failure(refs, "generate", outcomes)
+            self.assertEqual((d.action, d.target_phase, d.repair_strategy),
+                             ("retry", "generate", "reuse"))
+            self.assertEqual(d.reason, "gate_syntax_error+lint_findings")
+            findings = c._read_repair_findings(refs, d.reason, "generate")
+            self.assertIn("[syntax]", findings)
+            self.assertIn("[lint]", findings)
+
+    def test_all_clean_runs_static_and_passes(self) -> None:
+        """New test 3 (pass path): lint+syntax pass -> static runs; all clean -> gate pass."""
+        import contextlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+            static_calls: list[str] = []
+
+            def linter(args):
+                return {"ok": True, "return_code": 0, "command_id": "cid", "preset": "fortitude"}
+
+            def run(cmd, **kwargs):
+                script = next((x for x in cmd if str(x).endswith(".py")), "")
+                static_calls.append(script)
+                return wc.subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+            with contextlib.ExitStack() as stack:
+                for p in self._patches(linter, self._syntax_pass, run):
+                    stack.enter_context(p)
+                out = c._gate_inproc(refs, "child-1", "captok")
+
+            self.assertEqual(out["returncode"], 0)
+            meta = json.loads((repo / refs.source_dir() / "gate_meta.json").read_text())
+            self.assertEqual(meta["gate_status"], "pass")
+            self.assertEqual(meta["failure_categories"], [])
+            self.assertIsNone(meta["failure_excerpt"])
+            self.assertEqual(meta["checkers"]["static"]["status"], "pass")
+            # static actually ran the post_generate + workspace_root validators.
+            self.assertTrue(any(s.endswith("validate_workspace_root.py") for s in static_calls))
+            self.assertTrue(
+                any(s.endswith("validate_pipeline_semantics.py") for s in static_calls))
+            paths = [refs.source_dir() + "/gate_meta.json"]
+            self.assertEqual(
+                c.determine_substep_status(refs, "generate", "gate", paths)[0], "pass")
+
+    def test_syntax_runtimeerror_suppresses_gate_meta_and_is_transport_fail(self) -> None:
+        """New test 5: a syntax attribution RuntimeError (fail_closed) dominates a co-occurring
+        lint content-fail — it propagates, so NO gate_meta is written and the substep is a
+        transport failure (rc != 0), routed through _run_deterministic_substep."""
+        import contextlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+
+            def linter(args):  # lint content-fails, but fail_closed must win
+                return {"ok": False, "return_code": 1, "command_id": "cid",
+                        "preset": "fortitude", "stdout": "S001 line too long"}
+
+            def syntax(args):
+                # The invocation canary itself fails -> _gate_syntax_check raises RuntimeError.
+                if str(args.get("project_dir", "")).endswith("_canary"):
+                    return {"ok": False, "skipped": False, "stderr": "bad -std"}
+                return {"ok": False, "return_code": 1, "command_id": "sid", "skipped": False,
+                        "stderr": "Error"}
+
+            from unittest import mock
+            with contextlib.ExitStack() as stack:
+                for p in self._patches(linter, syntax):
+                    stack.enter_context(p)
+                stack.enter_context(
+                    mock.patch.object(c, "_capability_token", lambda arid: "captok"))
+                proc = c._run_deterministic_substep(
+                    refs, "generate", "gate", "child-1",
+                    {"step": "generate", "substep": "gate"})
+            self.assertNotEqual(proc.returncode, 0)  # transport fail_closed
+            self.assertFalse((repo / refs.source_dir() / "gate_meta.json").exists())
 
 
 class DeterministicCompileStaticTest(unittest.TestCase):
@@ -8686,8 +8726,10 @@ class VerifyMetaSchemaWarmResumeTests(unittest.TestCase):
                 "fail", last_fail_reason=_INCIDENT_DICT_REASON, last_fail_severity="minor"))
             c = wc.Conductor(repo_root=repo, orchestration_id="o",
                              orchestration_agent_run_id="ORCH", backend="claude", env={})
-            outcomes = [wc.SubstepOutcome(f"c{i}", "pass", [], 0) for i in range(4)]
-            outcomes.append(wc.SubstepOutcome("v", "fail", [], 0))
+            # SUBSTEPS["generate"] == ("generate","gate","verify"); verify is index 2.
+            outcomes = [wc.SubstepOutcome("g", "pass", [], 0),
+                        wc.SubstepOutcome("gate", "pass", [], 0),
+                        wc.SubstepOutcome("v", "fail", [], 0)]
             d = c.classify_failure(refs, "generate", outcomes)
             self.assertEqual((d.action, d.reason), ("escalate", "generate_fail_meta_schema"))
 

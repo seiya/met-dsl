@@ -5649,7 +5649,7 @@ def _validate_generate_lint_command_logs(
     leaf-non-writable evidence (`<pipeline_root>/lint_evidence/<source_id>.json`).
 
     Static lint is no longer run by the leaf (it is the deterministic `generate.lint`
-    substep run in-process by the conductor — Conductor._lint_inproc). The evidence
+    substep run in-process by the conductor — Conductor._gate_lint_check). The evidence
     certificate cannot be forged by the leaf (the pipeline root is read-only inside the
     sandbox), so this validates against it rather than the former leaf-written
     `source_meta.lint_command_ref` (which is now ignored)."""
@@ -5826,7 +5826,7 @@ def _validate_generate_syntax_command_logs(
     (`<pipeline_root>/syntax_evidence/<source_id>.json`).
 
     The syntax gate is the deterministic `generate.syntax` substep run in-process by the
-    conductor (Conductor._syntax_inproc -> MCP run_syntax_check). Mirrors
+    conductor (Conductor._gate_syntax_check -> MCP run_syntax_check). Mirrors
     `_validate_generate_lint_command_logs`: the certificate cannot be forged by the leaf
     (the pipeline root is read-only inside the sandbox). Required only for
     toolchain.language=fortran (the only language with a syntax-check adapter); the
@@ -10622,7 +10622,7 @@ def _validate_ir_module_parameters_against_section51(
 # Sentinel embedded in the Generate.static stale-IR violation so the conductor can route it as a
 # TERMINAL failure (fail_closed) rather than a warm Generate.generate retry: the leaf cannot mutate
 # the certified IR, so retrying Generate is futile — the fix is a re-certification, not a re-author.
-# workflow_conductor._static_inproc keys on this exact string.
+# workflow_conductor.Conductor._gate_static_check keys on this exact string.
 STALE_DEPENDENCY_IR_MARKER = "[stale-dependency-ir]"
 
 

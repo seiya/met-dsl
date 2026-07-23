@@ -21,7 +21,7 @@ The rendered runner ``use``s two modules: ``harness_fortran_cpu_model`` (the
 certified plumbing) and ``<spec_id>_checks`` (the leaf's fixed-ABI callbacks,
 see ``docs/workflow/CHECKS_MODULE_CONTRACT.md``). It is authored lint-clean
 (``use only:``, ``! allow(C003)``, ≤100-column lines) so the deterministic
-Generate.lint substep — which lints the whole ``src/`` tree — stays green.
+Generate.gate's lint checker — which lints the whole ``src/`` tree — stays green.
 
 ``render_runner`` raises ``RenderError`` (→ transport fail_closed, NOT a Generate
 retry) for any IR it cannot faithfully render: an unparseable ``shape_expr``, a
@@ -109,7 +109,7 @@ def spec_id_length_violation(spec_id: Any) -> str | None:
     return None
 
 
-# The deterministic Generate.lint column limit (fortitude S001). The rendered runner must stay
+# The deterministic Generate.gate lint-checker column limit (fortitude S001). The rendered runner must stay
 # within it because it is host-authored (a leaf cannot edit it to fix an overlong line).
 MAX_RENDERED_LINE = 100
 
@@ -349,7 +349,7 @@ def _checks(ir: dict[str, Any]) -> list[str]:
             raise RenderError(
                 f"check id {sid!r} renders a {width}-column `case_checks(...)%id` assignment "
                 f"(>= the {MAX_RENDERED_LINE}-column S001 lint limit) after Fortran apostrophe "
-                "escaping; the host-authored runner line would fail Generate.lint unrepairably. "
+                "escaping; the host-authored runner line would fail Generate.gate's lint check unrepairably. "
                 "Declare a shorter check id (or one with fewer apostrophes).")
     return ids
 
@@ -877,7 +877,7 @@ def render_runner(ir: dict[str, Any], spec_id: str, harness_spec_id: str) -> str
     a("")
     a(f"end program {spec_id}_runner")
     # Safety net: the runner is host-rendered (NOT in the leaf's allowed_output_paths), so a
-    # line over the deterministic Generate.lint column limit (fortitude S001, 100 cols) would
+    # line over the deterministic Generate.gate lint-checker column limit (fortitude S001, 100 cols) would
     # be an UNREPAIRABLE wedge (no leaf can edit a host file). The hot lines above are wrapped,
     # but an extreme IR-sourced name (a very long metric address / case_id / variable) could
     # still overflow a line we did not wrap — fail closed HERE (a clean RenderError → transport

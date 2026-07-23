@@ -307,10 +307,10 @@ class PureVerifySubstepTests(unittest.TestCase):
 # ======================================================================================
 class PureVerifyRoutingTests(unittest.TestCase):
     def _outcomes(self, status: str) -> list:
-        # SUBSTEPS["generate"] has 5 entries; a verify failure is index 4 => 5 outcomes.
+        # SUBSTEPS["generate"] == ("generate","gate","verify"); a verify failure is index 2.
         oc_pass = wc.SubstepOutcome("a", "pass", [])
         oc_last = wc.SubstepOutcome("v", status, [])
-        return [oc_pass, oc_pass, oc_pass, oc_pass, oc_last]
+        return [oc_pass, oc_pass, oc_last]
 
     def test_schema_exhaustion_routes_cold_generate_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -421,8 +421,8 @@ class PureVerifyMetaWarmResumeTests(unittest.TestCase):
             repo = Path(tmp)
             refs = _verify_node(repo)
             c = _conductor(repo)
-            # A failed verify outcome list (verify is the last generate substep).
-            outcomes = [wc.SubstepOutcome("a", "pass", [])] * 4 + [
+            # A failed verify outcome list (verify is the last generate substep, index 2).
+            outcomes = [wc.SubstepOutcome("a", "pass", [])] * 2 + [
                 wc.SubstepOutcome("v", "fail", [])]
             # Would otherwise inspect/repair the meta; for pure it must return unchanged, untouched.
             called = {"stage_meta": False}

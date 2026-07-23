@@ -2,7 +2,7 @@
 """Host-owned, leaf-unwritable lint evidence for the conductor-run static lint.
 
 Static lint is a deterministic `generate.lint` substep run in-process by the conductor
-(`Conductor._lint_inproc`), NOT by the leaf. The `post_generate` validator certifies that
+(`Conductor._gate_inproc -> _gate_lint_check`), NOT by the leaf. The `post_generate` validator certifies that
 lint actually ran with the correct preset and succeeded. That certificate must NOT be
 forgeable by the leaf, so it lives at the **pipeline root**
 (`workspace/pipelines/<safe>/<pipeline_id>/lint_evidence/<source_id>.json`) — the same

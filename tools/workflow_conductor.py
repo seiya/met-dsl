@@ -71,23 +71,32 @@ SUBSTEPS: dict[str, tuple[str | None, ...]] = {
     #     leaf no longer invokes them, so compile.verify is a pure LLM semantic pass (the
     #     spec-cross-reference invariants V1/V3/V5) reached only on a deterministically-clean
     #     IR. A finding routes back to compile.generate via a warm-resume reopen
-    #     (COMPILE_STATIC_FAILURE_ROUTING). Mirrors generate.static.
+    #     (COMPILE_STATIC_FAILURE_ROUTING). Mirrors the static checker of generate.gate.
     "compile": ("generate", "static", "verify"),
-    # generate.lint, generate.syntax and generate.static are deterministic in-process
-    # substeps run by the conductor AFTER generate.generate produces source/<id>/src/ and
-    # BEFORE generate.verify:
-    #   - lint   (Conductor._lint_inproc):   runs run_linter; the leaf no longer invokes it.
-    #   - syntax (Conductor._syntax_inproc): runs the MCP run_syntax_check compiler
+    # generate.gate is a single deterministic in-process substep run by the conductor AFTER
+    # generate.generate produces source/<id>/src/ and BEFORE generate.verify. It UNIONS the
+    # three source checkers into ONE verdict (gate_meta.json), so a source with defects in
+    # several classes gets ONE warm repair turn carrying all findings, not one repair turn +
+    # one attempt per class:
+    #   - lint   (Conductor._gate_lint_check):   runs run_linter. Always runs.
+    #   - syntax (Conductor._gate_syntax_check): runs the MCP run_syntax_check compiler
     #     front-end gate (gfortran -fsyntax-only, plus optional target-compiler stages from
     #     METDSL_SYNTAX_COMPILERS) over the staged node + dependency-closure sources, so the
     #     whole class of syntax / standard-conformance compile_errors surfaces here instead
-    #     of at Build (fortran-language nodes only; non-fortran passes through).
-    #   - static (Conductor._static_inproc): runs validate_pipeline_semantics --stage
+    #     of at Build (fortran-language nodes only; non-fortran passes through). Always runs
+    #     (independent of lint); an unfixable-by-leaf attribution (canary / dependency-closure)
+    #     raises and surfaces as a transport fail_closed, suppressing gate_meta (fail_closed
+    #     dominates a co-occurring lint content-fail — the same order as today, only sooner).
+    #   - static (Conductor._gate_static_check): runs validate_pipeline_semantics --stage
     #     post_generate + validate_workspace_root; the verify leaf no longer invokes them, so
     #     verify is a pure LLM semantic (G1-G7) pass reached only on a deterministically-clean
-    #     source. All three substeps route findings back to generate.generate via a warm-resume
-    #     reopen (LINT_FAILURE_ROUTING / SYNTAX_FAILURE_ROUTING / STATIC_FAILURE_ROUTING).
-    "generate": ("generate", "lint", "syntax", "static", "verify"),
+    #     source. Runs ONLY when lint AND syntax both pass — the post_generate certifier
+    #     hard-fails on lint/syntax evidence whose ok flag is not true, so running static over a
+    #     dirty source would double-report the same defect (recorded
+    #     checkers.static.status="skipped", skipped_reason="lint_or_syntax_failed"). The gate
+    #     routes its unioned findings back to generate.generate via a warm-resume reopen
+    #     (GATE_FAILURE_ROUTING).
+    "generate": ("generate", "gate", "verify"),
     "build": (None,),
     # validate wraps the LLM judge in two deterministic conductor-in-process gates,
     # mirroring the compile/generate deterministic-interleave model:
@@ -157,45 +166,60 @@ BUILD_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     "validate_post_build_violation": ("generate", "restart"),
 }
 
-# Lint failure_category -> (retry_target_phase, repair_strategy). Lint findings re-run
-# generate.generate with a warm resume (reuse) so the same leaf fixes its own source with
-# context intact, avoiding a cold restart. This is a SAME-PHASE reopen (target==generate
-# while the failing substep is generate.lint); conduct() handles that case specially.
-LINT_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
-    "lint_findings": ("generate", "reuse"),
-}
-
-# Compiler syntax-gate (generate.syntax) failure_category -> (retry_target_phase,
-# repair_strategy). The deterministic run_syntax_check gate (gfortran -fsyntax-only over
-# the staged node + dependency-closure sources) runs AFTER generate.lint and BEFORE
-# generate.static; a compiler finding re-runs generate.generate with a warm resume (reuse)
-# exactly like a lint finding — a SAME-PHASE reopen handled specially by conduct().
-SYNTAX_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+# Generate.gate failure_category -> (retry_target_phase, repair_strategy). The single
+# deterministic gate substep unions the lint / syntax / static checkers; each per-checker
+# category re-runs generate.generate with a warm resume (reuse) so the same leaf fixes its own
+# source with context intact, avoiding a cold restart. This is a SAME-PHASE reopen
+# (target==generate while the failing substep is generate.gate); conduct() handles that case
+# specially. The table is the union of the three former per-checker tables (lint_findings /
+# syntax_error / post_generate_violation / workspace_root_violation) — every non-terminal
+# category routes to ("generate", "reuse"), so a union of several categories in one attempt
+# routes as one warm reuse carrying all findings.
+GATE_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
     "syntax_error": ("generate", "reuse"),
-}
-
-# Static-gate (generate.static) failure_category -> (retry_target_phase, repair_strategy).
-# The deterministic post_generate / workspace_root gates run AFTER generate.lint and BEFORE
-# generate.verify; a structural violation re-runs generate.generate with a warm resume
-# (reuse) exactly like a lint finding, so the same leaf fixes its own source with context
-# intact. Like lint, this is a SAME-PHASE reopen handled specially by conduct().
-STATIC_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
+    "lint_findings": ("generate", "reuse"),
     "post_generate_violation": ("generate", "reuse"),
     "workspace_root_violation": ("generate", "reuse"),
 }
 
-# Static-gate categories that are TERMINAL (fail_closed), NOT a warm Generate.generate retry: the
+# Gate categories that are TERMINAL (fail_closed), NOT a warm Generate.generate retry: the
 # failing condition is one the Generate leaf cannot repair by re-authoring its source, so retrying is
 # futile. `stale_dependency_ir` — a certified dependency IR predating a carrier contract (e.g. the
-# harness's public_api.module_parameters) reached Generate.static on a resume that skipped Compile;
+# harness's public_api.module_parameters) reached Generate.gate on a resume that skipped Compile;
 # the fix is a re-certification (a version bump makes dependency freshness re-run it), not a re-author.
-STATIC_FAILURE_TERMINAL: frozenset[str] = frozenset({"stale_dependency_ir"})
+# A terminal category dominates any co-occurring warm-retry category in classify_gate_failure.
+GATE_FAILURE_TERMINAL: frozenset[str] = frozenset({"stale_dependency_ir"})
+
+# Canonical ordering of gate failure categories in the route reason and the composed excerpt
+# sections: syntax_error -> lint_findings -> static-family categories. `_gate_inproc` records
+# gate_meta.failure_categories in this order (static categories only ever appear alone, since
+# static runs only when lint AND syntax passed); classify_gate_failure re-sorts defensively so
+# the reason is deterministic even for a synthetic multi-category input.
+_GATE_CATEGORY_CANON_ORDER: tuple[str, ...] = (
+    "syntax_error",
+    "lint_findings",
+    "workspace_root_violation",
+    "post_generate_violation",
+    "stale_dependency_ir",
+)
+
+
+def _gate_categories_canonical(categories: list[str]) -> list[str]:
+    """Dedupe + canonical-order a gate failure_categories list. Unknown categories keep their
+    first-seen order after the known ones, so a novel category still reaches the escalate path."""
+    seen: list[str] = []
+    for c in categories:
+        if c and c not in seen:
+            seen.append(c)
+    known = [c for c in _GATE_CATEGORY_CANON_ORDER if c in seen]
+    unknown = [c for c in seen if c not in _GATE_CATEGORY_CANON_ORDER]
+    return known + unknown
 
 # Compile static-gate (compile.static) failure_category -> (retry_target_phase, repair_strategy).
 # The deterministic workspace_root / check_artifact_syntax / --stage compile gates run AFTER
 # compile.generate and BEFORE compile.verify; a structural IR violation re-runs
-# compile.generate with a warm resume (reuse), exactly like a generate.static finding, so the
-# same leaf fixes its own IR with context intact. Like lint/static this is a SAME-PHASE reopen
+# compile.generate with a warm resume (reuse), exactly like a generate.gate finding, so the
+# same leaf fixes its own IR with context intact. Like the generate gate this is a SAME-PHASE reopen
 # handled specially by conduct(). Compile is the first phase, so the target is necessarily the
 # current phase.
 COMPILE_STATIC_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
@@ -503,41 +527,37 @@ def classify_build_failure(failure_category: str | None) -> RouteDecision:
                          reason=f"build_{failure_category}")
 
 
-def classify_lint_failure(failure_category: str | None) -> RouteDecision:
-    if not failure_category:
-        return RouteDecision("escalate", reason="lint_fail_no_category")
-    routed = LINT_FAILURE_ROUTING.get(failure_category)
-    if routed is None:
-        return RouteDecision("escalate", reason=f"lint_unknown_category:{failure_category}")
-    target, strategy = routed
-    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
-                         reason=f"lint_{failure_category}")
+def classify_gate_failure(categories: list[str] | None) -> RouteDecision:
+    """Route a Generate.gate union verdict from its list of per-checker failure categories.
 
-
-def classify_syntax_failure(failure_category: str | None) -> RouteDecision:
-    if not failure_category:
-        return RouteDecision("escalate", reason="syntax_fail_no_category")
-    routed = SYNTAX_FAILURE_ROUTING.get(failure_category)
-    if routed is None:
-        return RouteDecision("escalate", reason=f"syntax_unknown_category:{failure_category}")
-    target, strategy = routed
-    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
-                         reason=f"syntax_{failure_category}")
-
-
-def classify_static_failure(failure_category: str | None) -> RouteDecision:
-    if not failure_category:
-        return RouteDecision("escalate", reason="static_fail_no_category")
-    if failure_category in STATIC_FAILURE_TERMINAL:
-        # No warm retry: the leaf cannot repair a stale certified dependency IR by re-authoring
-        # source. Fail closed so the operator re-certifies instead of exhausting Generate retries.
-        return RouteDecision("fail_closed", reason=f"static_{failure_category}")
-    routed = STATIC_FAILURE_ROUTING.get(failure_category)
-    if routed is None:
-        return RouteDecision("escalate", reason=f"static_unknown_category:{failure_category}")
-    target, strategy = routed
-    return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
-                         reason=f"static_{failure_category}")
+    Precedence is strict and total:
+      - empty (a FAIL with no parseable category) -> escalate("gate_fail_no_category")
+      - any TERMINAL category present             -> fail_closed (dominates a co-occurring warm
+                                                     category; the leaf cannot re-author its way
+                                                     out of a stale certified dependency IR)
+      - any UNKNOWN category present              -> escalate (a novel category the tables do not
+                                                     cover; the diagnostician decides)
+      - all categories known + non-terminal       -> retry ("generate", "reuse")
+    The reason is `gate_<c1>+<c2>+...` in canonical order (`_gate_categories_canonical`), so
+    `_read_repair_findings` (prefix `gate_`) threads gate_meta.json#failure_excerpt through the
+    warm repair, and the reopen carve-out (trigger substep == "gate") accepts it."""
+    ordered = _gate_categories_canonical(list(categories or []))
+    if not ordered:
+        return RouteDecision("escalate", reason="gate_fail_no_category")
+    reason = "gate_" + "+".join(ordered)
+    if any(c in GATE_FAILURE_TERMINAL for c in ordered):
+        # No warm retry: a stale certified dependency IR (or any terminal category) is not
+        # repairable by re-authoring source. Fail closed so the operator re-certifies instead of
+        # exhausting Generate retries. Terminal dominates any co-occurring warm category.
+        return RouteDecision("fail_closed", reason=reason)
+    unknown = [c for c in ordered if c not in GATE_FAILURE_ROUTING]
+    if unknown:
+        return RouteDecision("escalate",
+                             reason=f"gate_unknown_category:{'+'.join(unknown)}")
+    # Every category is a known, non-terminal warm-retry category -> one warm reuse carrying the
+    # unioned findings. All GATE_FAILURE_ROUTING entries share the ("generate","reuse") target.
+    return RouteDecision("retry", target_phase="generate", repair_strategy="reuse",
+                         reason=reason)
 
 
 def classify_compile_static_failure(failure_category: str | None) -> RouteDecision:
@@ -635,7 +655,9 @@ _MIN_ARTIFACT_BUDGET = 400
 # them the large slices.
 _PHASE_PRIMARY_ARTIFACTS: dict[str, tuple[str, ...]] = {
     "compile": ("ir_meta.json",),
-    "generate": ("source_meta.json",),
+    # gate_meta.json leads so a `gate_unknown_category:` escalate reasons over the union verdict
+    # first; source_meta.json (the verify verdict) is not authored until the gate has passed.
+    "generate": ("gate_meta.json", "source_meta.json"),
     "build": ("binary_meta.json",),
     "validate": ("verdict.json", "semantic_review.json", "aggregate_verdict.json",
                  "post_judge_meta.json", "pre_judge_meta.json"),
@@ -959,12 +981,11 @@ def build_launch_request(
     spec = refs.spec_path
     skill = _skill_name(step, substep)
     role = child_agent_role(step)
-    # Build, Validate.execute, Generate.lint, Generate.syntax and Generate.static run
-    # in-process (no leaf), so they carry no skill / leaf prompt — only the bookkeeping the
-    # capability/phase_state need.
+    # Build, Validate.execute and Generate.gate run in-process (no leaf), so they carry no
+    # skill / leaf prompt — only the bookkeeping the capability/phase_state need.
     deterministic = (step == "build"
                      or (step == "validate" and substep in ("pre_judge", "execute", "post_judge"))
-                     or (step == "generate" and substep in ("lint", "syntax", "static"))
+                     or (step == "generate" and substep == "gate")
                      or (step == "compile" and substep == "static"))
     rep = {
         "issue_severity": "none",
@@ -1089,32 +1110,18 @@ def build_launch_request(
                 f"{src}/src/command_log.jsonl",
                 f"{src}/source_meta.json",
             ]
-        elif substep == "lint":
-            # Deterministic in-process lint: the conductor authors lint_meta.json (the
-            # freshness-gated deliverable) and appends to the canonical src/command_log.jsonl.
-            # The host-authored lint evidence (pipeline-root, leaf-non-writable) is NOT a
-            # leaf output and is intentionally omitted from allowed_output_paths.
+        elif substep == "gate":
+            # Deterministic in-process gate: the conductor authors gate_meta.json (the single
+            # freshness-gated deliverable, unioning the lint / syntax / static checkers). The
+            # lint and syntax checkers both append to the canonical src/command_log.jsonl, so it
+            # MUST be listed — otherwise the gate child's FS-diff write-attribution would flag
+            # those appends as unauthorized writes. The host-authored lint / syntax evidence
+            # (pipeline-root, leaf-non-writable) is NOT a leaf output and is intentionally
+            # omitted from allowed_output_paths. The static checker (validate_pipeline_semantics
+            # --stage post_generate + validate_workspace_root) writes nothing beyond gate_meta.
             req["allowed_output_paths"] = [
-                f"{src}/lint_meta.json",
+                f"{src}/gate_meta.json",
                 f"{src}/src/command_log.jsonl",
-            ]
-        elif substep == "syntax":
-            # Deterministic in-process compiler syntax gate: the conductor authors
-            # syntax_meta.json (the freshness-gated deliverable) and run_syntax_check
-            # appends to the canonical src/command_log.jsonl. The host-authored syntax
-            # evidence (pipeline-root, leaf-non-writable) is NOT a leaf output and is
-            # intentionally omitted from allowed_output_paths (mirrors lint).
-            req["allowed_output_paths"] = [
-                f"{src}/syntax_meta.json",
-                f"{src}/src/command_log.jsonl",
-            ]
-        elif substep == "static":
-            # Deterministic in-process static gate: the conductor authors static_meta.json
-            # (the only freshness-gated deliverable) from validate_pipeline_semantics
-            # --stage post_generate + validate_workspace_root. Those validators do not append
-            # to command_log.jsonl, so it is not listed here.
-            req["allowed_output_paths"] = [
-                f"{src}/static_meta.json",
             ]
         else:  # verify
             must_read += [
@@ -2586,7 +2593,7 @@ clean:
         catch it before any file is written.
 
         The ABI layer makes a mis-authored checks module a BOUNDED in-conversation repair instead
-        of what it was before: a `Generate.syntax` failure that reopened the whole phase, and that
+        of what it was before: a `Generate.gate` syntax-checker failure that reopened the whole phase, and that
         the producer could only answer by re-guessing an ABI it had never been shown.
 
         The layers themselves live in `codegen_bundle.pure_bundle_contract_violation` (the SINGLE
@@ -3828,32 +3835,17 @@ clean:
             meta = _read_json(self.repo_root / refs.binary_dir() / "binary_meta.json") or {}
             status = "pass" if (meta.get("verification_status") == "pass"
                                 and _fresh_deliverables_written(allowed_output_paths)) else "fail"
-        elif phase == "generate" and substep == "lint":
-            # Deterministic lint: the conductor-authored lint_meta records the run_linter
-            # verdict. Lint findings are lint_status=fail with rc 0, so the substep fails
-            # here and classify_lint_failure routes back to generate.generate (warm resume),
-            # not transport fail_closed. lint_meta.json is the only freshness-gated
-            # deliverable (command_log.jsonl is an optional basename).
-            meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
-            status = "pass" if (meta.get("lint_status") == "pass"
-                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
-        elif phase == "generate" and substep == "syntax":
-            # Deterministic compiler syntax gate: the conductor-authored syntax_meta records
-            # the run_syntax_check verdict. Compiler findings are syntax_status=fail with
-            # rc 0, so the substep fails here and classify_syntax_failure routes back to
-            # generate.generate (warm resume), not transport fail_closed. syntax_meta.json is
-            # the only freshness-gated deliverable (command_log.jsonl is an optional basename).
-            meta = _read_json(self.repo_root / refs.source_dir() / "syntax_meta.json") or {}
-            status = "pass" if (meta.get("syntax_status") == "pass"
-                                and _fresh_deliverables_written(allowed_output_paths)) else "fail"
-        elif phase == "generate" and substep == "static":
-            # Deterministic static gate: the conductor-authored static_meta records the
-            # post_generate + workspace_root verdict. A violation is status=fail with rc 0, so
-            # the substep fails here and classify_static_failure routes back to
-            # generate.generate (warm resume), not transport fail_closed. static_meta.json is
-            # the only freshness-gated deliverable.
-            meta = _read_json(self.repo_root / refs.source_dir() / "static_meta.json") or {}
-            status = "pass" if (meta.get("status") == "pass"
+        elif phase == "generate" and substep == "gate":
+            # Deterministic union gate: the conductor-authored gate_meta records the unioned
+            # lint / syntax / static verdict under a single gate_status. Any checker finding is
+            # gate_status=fail with rc 0, so the substep fails here and classify_gate_failure
+            # routes back to generate.generate (warm resume), not transport fail_closed.
+            # gate_meta.json is the only freshness-gated deliverable (command_log.jsonl is an
+            # optional basename). A syntax attribution RuntimeError writes NO gate_meta and
+            # returns rc 1 upstream (transport fail_closed), so gate_meta is absent -> fail here
+            # too, but the rc 1 path already terminalized before reaching this read.
+            meta = _read_json(self.repo_root / refs.source_dir() / "gate_meta.json") or {}
+            status = "pass" if (meta.get("gate_status") == "pass"
                                 and _fresh_deliverables_written(allowed_output_paths)) else "fail"
         elif phase == "validate" and substep == "execute":
             # Deterministic execute: trial_meta.status reflects run_program +
@@ -3954,7 +3946,7 @@ clean:
     def _is_deterministic_substep(phase: str, substep: str | None) -> bool:
         return (phase == "build"
                 or (phase == "validate" and substep in ("pre_judge", "execute", "post_judge"))
-                or (phase == "generate" and substep in ("lint", "syntax", "static"))
+                or (phase == "generate" and substep == "gate")
                 or (phase == "compile" and substep == "static"))
 
     def _capability_token(self, child_arid: str) -> str:
@@ -4026,12 +4018,8 @@ clean:
                 out = self._post_judge_inproc(refs, child_arid, cap_token)
             elif phase == "validate" and substep == "execute":
                 out = self._execute_inproc(refs, child_arid, cap_token)
-            elif phase == "generate" and substep == "lint":
-                out = self._lint_inproc(refs, child_arid, cap_token)
-            elif phase == "generate" and substep == "syntax":
-                out = self._syntax_inproc(refs, child_arid, cap_token)
-            elif phase == "generate" and substep == "static":
-                out = self._static_inproc(refs, child_arid, cap_token)
+            elif phase == "generate" and substep == "gate":
+                out = self._gate_inproc(refs, child_arid, cap_token)
             elif phase == "compile" and substep == "static":
                 out = self._compile_static_inproc(refs, child_arid, cap_token)
             else:
@@ -4280,12 +4268,108 @@ clean:
                 stderr += "\n[post_build gate fail]\n" + gate.stdout + gate.stderr
         return {"returncode": 0, "stdout": stdout, "stderr": stderr}
 
-    def _lint_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
-        """Deterministic Generate.lint: in-process run_linter over source/<id>/src/ + a
-        conductor-authored lint_meta.json and a host-side (leaf-non-writable) lint evidence
-        certificate. Lint findings are a CONTENT failure (lint_status=fail, rc 0) routed by
-        classify_lint_failure back to generate.generate via a warm-resume reopen; a genuine
-        tool/infra error raises and surfaces as a transport fail_closed."""
+    def _gate_inproc(self, refs: NodeRefs, child_arid: str,
+                     cap_token: str) -> dict[str, str]:
+        """Deterministic Generate.gate: run the three source checkers (lint, syntax, static) as
+        a single unioned substep and author ONE gate_meta.json. Replaces the former
+        lint/syntax/static substeps so a source with defects in several classes gets ONE warm
+        repair turn carrying every finding (1 attempt = 1 union verdict = 1 warm repair turn),
+        instead of one repair turn + one Generate attempt per class.
+
+        Order and semantics:
+          - lint   (_gate_lint_check):   always runs; writes lint_evidence (even on fail).
+          - syntax (_gate_syntax_check): always runs (independent of lint); writes
+            syntax_evidence. An attribution error (canary / dependency closure) raises out of
+            here, so gate_meta is NOT written and the substep returns rc 1 (transport
+            fail_closed) — fail_closed dominates a co-occurring lint content-fail, the same order
+            as the pre-merge sequential substeps, only surfaced sooner.
+          - static (_gate_static_check): runs ONLY when lint AND syntax both pass. The
+            post_generate certifier hard-fails on lint/syntax evidence whose ok flag is not true,
+            so running it over a dirty source would double-report the same defect; skip is
+            recorded as checkers.static.status="skipped", skipped_reason="lint_or_syntax_failed".
+
+        gate_status = pass iff every checker passed (static counted as pass only when it actually
+        ran and passed). failure_categories / the composed excerpt are in canonical order
+        (syntax_error -> lint_findings -> static family). A content failure returns rc 0 so
+        run_phase routes it via classify_gate_failure -> generate.generate (warm resume);
+        determine_substep_status reads gate_meta.gate_status. The DRIFT GUARD
+        (test_mcp_grant_table_matches_conductor_call_sites) walks the `self._gate_*_check(` calls
+        BELOW to derive this substep's gated-tool set, so keep them as explicit method calls."""
+        lint = self._gate_lint_check(refs, child_arid, cap_token)
+        syntax = self._gate_syntax_check(refs, child_arid, cap_token)
+        lint_ok = lint.get("status") == "pass"
+        syntax_ok = syntax.get("status") == "pass"
+        if lint_ok and syntax_ok:
+            static = self._gate_static_check(refs, child_arid, cap_token)
+        else:
+            # Skip static: its post_generate certifier hard-fails on non-ok lint/syntax evidence,
+            # so it could only echo the failure already recorded above.
+            static = {
+                "status": "skipped",
+                "skipped_reason": "lint_or_syntax_failed",
+                "failure_category": None,
+                "failure_excerpt": None,
+            }
+        static_ran = static.get("status") in ("pass", "fail")
+        static_ok = static.get("status") == "pass"
+        gate_ok = lint_ok and syntax_ok and static_ok
+
+        # Canonical order: syntax_error -> lint_findings -> static family. static categories only
+        # ever appear alone (static runs only when lint AND syntax passed).
+        categories: list[str] = []
+        if not syntax_ok and syntax.get("failure_category"):
+            categories.append(str(syntax["failure_category"]))
+        if not lint_ok and lint.get("failure_category"):
+            categories.append(str(lint["failure_category"]))
+        if static_ran and not static_ok and static.get("failure_category"):
+            categories.append(str(static["failure_category"]))
+        categories = _gate_categories_canonical(categories)
+
+        # Composed excerpt: per-checker sections in the same canonical order, each tagged so the
+        # repair leaf can tell which checker reported what. Per-checker caps were already applied
+        # inside each helper (lint 50-line / syntax 80-line / static 50-line tails), so the worst
+        # case (~130-210 lines) still fits the slim repair prompt.
+        sections: list[str] = []
+        if not syntax_ok and syntax.get("failure_excerpt"):
+            sections.append("[syntax]\n" + str(syntax["failure_excerpt"]))
+        if not lint_ok and lint.get("failure_excerpt"):
+            sections.append("[lint]\n" + str(lint["failure_excerpt"]))
+        if static_ran and not static_ok and static.get("failure_excerpt"):
+            sections.append("[static]\n" + str(static["failure_excerpt"]))
+        failure_excerpt = "\n".join(sections) if sections else None
+
+        gate_meta: dict[str, Any] = {
+            "source_id": refs.source_id,
+            "node_key": refs.node_key,
+            "pipeline_id": refs.pipeline_id,
+            "attempt_count": 1,
+            "gate_status": "pass" if gate_ok else "fail",
+            "verification_status": "pass" if gate_ok else "fail",
+            "status": "pass" if gate_ok else "fail",
+            "checkers": {"lint": lint, "syntax": syntax, "static": static},
+            "failure_categories": categories,
+            "failure_excerpt": failure_excerpt,
+        }
+        meta_path = self.repo_root / refs.source_dir() / "gate_meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(gate_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        # A content failure returns rc 0 so run_phase routes it via classify_gate_failure ->
+        # generate.generate (warm resume), NOT transport fail_closed.
+        return {"returncode": 0,
+                "stdout": "",
+                "stderr": "" if gate_ok else (failure_excerpt or "")}
+
+    def _gate_lint_check(self, refs: NodeRefs, child_arid: str,
+                         cap_token: str) -> dict[str, Any]:
+        """Generate.gate lint checker: in-process run_linter over source/<id>/src/, plus a
+        host-side (leaf-non-writable) lint evidence certificate. Returns the `lint` section of
+        gate_meta (status / preset / language / run_linter / failure_category / failure_excerpt);
+        `_gate_inproc` composes the single gate_meta.json verdict. Lint findings are a CONTENT
+        failure (status="fail") the gate routes to generate.generate via a warm-resume reopen; a
+        genuine tool/infra error raises and surfaces as a transport fail_closed. The evidence is
+        written even on a content fail (ok=false), which the post_generate certifier depends on."""
         import sys as _sys
         mcp_dir = str(self.repo_root / "mcp_servers")
         if mcp_dir not in _sys.path:
@@ -4349,29 +4433,11 @@ clean:
         if not ok:
             failure_excerpt = "\n".join("\n".join(e.splitlines()[-50:]) for e in excerpts)
 
-        lint_meta: dict[str, Any] = {
-            "source_id": refs.source_id,
-            "node_key": refs.node_key,
-            "pipeline_id": refs.pipeline_id,
-            "attempt_count": 1,
-            "lint_status": "pass" if ok else "fail",
-            "verification_status": "pass" if ok else "fail",
-            "status": "pass" if ok else "fail",
-            "preset": preset,
-            "language": language,
-            "run_linter": run_entries,
-            "failure_category": None if ok else "lint_findings",
-            "failure_excerpt": failure_excerpt,
-        }
-        meta_path = self.repo_root / refs.source_dir() / "lint_meta.json"
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(
-            json.dumps(lint_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
         # Host-side, leaf-non-writable certificate the post_generate validator certifies
         # against. The evidence keys (preset/command_id/command_log_ref) are exactly what
         # _validate_generate_lint_command_logs needs; the leaf cannot forge it (pipeline
-        # root is read-only inside the sandbox, like lineage.json).
+        # root is read-only inside the sandbox, like lineage.json). Written even on a content
+        # fail (ok=false) — the certifier reads the evidence regardless, so it must exist.
         write_lint_evidence(
             pipeline_root=self.repo_root / refs.pipeline_ref,
             source_id=refs.source_id or "",
@@ -4384,24 +4450,30 @@ clean:
             } for e in run_entries],
         )
 
-        # A content failure (lint findings) returns rc 0 so run_phase routes it via
-        # classify_lint_failure -> generate.generate (warm resume), NOT transport
-        # fail_closed. determine_substep_status reads lint_meta.lint_status.
-        return {"returncode": 0,
-                "stdout": "",
-                "stderr": "" if ok else (failure_excerpt or "")}
+        # Return the `lint` section of gate_meta; _gate_inproc composes the single verdict.
+        return {
+            "status": "pass" if ok else "fail",
+            "preset": preset,
+            "language": language,
+            "run_linter": run_entries,
+            "failure_category": None if ok else "lint_findings",
+            "failure_excerpt": failure_excerpt,
+        }
 
-    def _syntax_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
-        """Deterministic Generate.syntax: in-process run_syntax_check (a real compiler
+    def _gate_syntax_check(self, refs: NodeRefs, child_arid: str,
+                           cap_token: str) -> dict[str, Any]:
+        """Generate.gate syntax checker: in-process run_syntax_check (a real compiler
         front-end, gfortran -fsyntax-only) over the staged node + dependency-closure
-        sources, plus a conductor-authored syntax_meta.json and a host-side
-        (leaf-non-writable) syntax evidence certificate. This catches the whole class of
-        syntax / standard-conformance compile_errors BEFORE Build (where they would force
-        the expensive regenerate->rebuild loop) — replacing the retired post_generate text
-        heuristics that could only mimic gfortran one observed failure at a time.
+        sources, plus a host-side (leaf-non-writable) syntax evidence certificate. Returns the
+        `syntax` section of gate_meta (status / language / stages / skipped_reason /
+        failure_category / failure_excerpt); `_gate_inproc` composes the single gate_meta.json
+        verdict. This catches the whole class of syntax / standard-conformance compile_errors
+        BEFORE Build (where they would force the expensive regenerate->rebuild loop) — replacing
+        the retired post_generate text heuristics that could only mimic gfortran one observed
+        failure at a time.
 
-        Compiler findings are a CONTENT failure (syntax_status=fail, rc 0) routed by
-        classify_syntax_failure back to generate.generate via a warm-resume reopen — UNLESS
+        Compiler findings are a CONTENT failure (status="fail") the gate routes to
+        generate.generate via a warm-resume reopen — UNLESS
         the failure is one the leaf cannot fix. A failing stage is attributed by re-running
         the compiler over isolated source sets and reading its VERDICT (never the diagnostics
         text): a canary valid under every standard (fails => the invocation itself is
@@ -4684,25 +4756,6 @@ clean:
                         else failure_excerpt
                         + f"\n[{compiler} {tc['standard']} syntax check fail]\n{tail}")
 
-        syntax_meta: dict[str, Any] = {
-            "source_id": refs.source_id,
-            "node_key": refs.node_key,
-            "pipeline_id": refs.pipeline_id,
-            "attempt_count": 1,
-            "syntax_status": "pass" if ok else "fail",
-            "verification_status": "pass" if ok else "fail",
-            "status": "pass" if ok else "fail",
-            "language": language,
-            "stages": stages,
-            "skipped_reason": skipped_reason,
-            "failure_category": failure_category,
-            "failure_excerpt": failure_excerpt,
-        }
-        meta_path = self.repo_root / refs.source_dir() / "syntax_meta.json"
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(
-            json.dumps(syntax_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
         # Host-side, leaf-non-writable certificate the post_generate validator certifies
         # against (mirrors write_lint_evidence). Only written when the gate actually ran
         # stages (fortran nodes); certification requires it for language=fortran only.
@@ -4714,24 +4767,31 @@ clean:
                 stages=stages,
             )
 
-        # A content failure (compiler findings) returns rc 0 so run_phase routes it via
-        # classify_syntax_failure -> generate.generate (warm resume), NOT transport
-        # fail_closed. determine_substep_status reads syntax_meta.syntax_status.
-        return {"returncode": 0,
-                "stdout": "",
-                "stderr": "" if ok else (failure_excerpt or "")}
+        # Return the `syntax` section of gate_meta; _gate_inproc composes the single verdict.
+        return {
+            "status": "pass" if ok else "fail",
+            "language": language,
+            "stages": stages,
+            "skipped_reason": skipped_reason,
+            "failure_category": failure_category,
+            "failure_excerpt": failure_excerpt,
+        }
 
-    def _static_inproc(self, refs: NodeRefs, child_arid: str, cap_token: str) -> dict[str, str]:
-        """Deterministic Generate.static: run the purely-static post_generate gates that the
+    def _gate_static_check(self, refs: NodeRefs, child_arid: str,
+                           cap_token: str) -> dict[str, Any]:
+        """Generate.gate static checker: run the purely-static post_generate gates that the
         verify leaf used to own (so verify is now a pure LLM semantic G1-G7 pass reached only
-        on a deterministically-clean source). Runs validate_workspace_root.py (bare, as the
-        leaf did - no --write-scope-baseline) and validate_pipeline_semantics --stage
-        post_generate, in the same order/idiom as the post_build gate in _build_inproc. A
-        violation is a CONTENT failure (status=fail + failure_category, rc 0) routed by
-        classify_static_failure back to generate.generate via a warm-resume reopen; only an
+        on a deterministically-clean source). Returns the `static` section of gate_meta (status /
+        failure_category / failure_excerpt); `_gate_inproc` composes the single gate_meta.json
+        verdict and only calls this when lint AND syntax both passed. Runs
+        validate_workspace_root.py (bare, as the leaf did - no --write-scope-baseline) and
+        validate_pipeline_semantics --stage post_generate, in the same order/idiom as the
+        post_build gate in _build_inproc. A violation is a CONTENT failure (status="fail" +
+        failure_category) the gate routes to generate.generate via a warm-resume reopen; only an
         unexpected error surfaces as a transport fail_closed (caught in
-        _run_deterministic_substep). The conductor wrote lint_evidence earlier this attempt
-        (_lint_inproc), so the post_generate certification certifies conductor-owned evidence.
+        _run_deterministic_substep). The gate wrote lint_evidence + syntax_evidence earlier this
+        attempt (both ok, since this runs only on their pass), so the post_generate certification
+        certifies conductor-owned evidence.
         """
         status = "pass"
         failure_category: str | None = None
@@ -4756,31 +4816,24 @@ clean:
                 from tools.validate_pipeline_semantics import STALE_DEPENDENCY_IR_MARKER
                 status = "fail"
                 # A stale-dependency-IR violation is TERMINAL, not a warm Generate retry (the leaf
-                # cannot repair a certified dependency IR); classify_static_failure fail_closes it.
+                # cannot repair a certified dependency IR); classify_gate_failure fail_closes any
+                # union verdict that carries this category (GATE_FAILURE_TERMINAL).
                 failure_category = ("stale_dependency_ir"
                                     if STALE_DEPENDENCY_IR_MARKER in (pg.stdout + pg.stderr)
                                     else "post_generate_violation")
                 failure_excerpt = "\n".join((pg.stdout + pg.stderr).splitlines()[-50:])
                 stderr = "[post_generate gate fail]\n" + pg.stdout + pg.stderr
 
-        static_meta: dict[str, Any] = {
-            "source_id": refs.source_id,
-            "node_key": refs.node_key,
-            "pipeline_id": refs.pipeline_id,
-            "attempt_count": 1,
+        # Return the `static` section of gate_meta; _gate_inproc composes the single verdict.
+        # `stderr` (the tagged gate-fail block) is retained for parity with the other checkers
+        # but is not consumed by _gate_inproc — the composed excerpt drives the repair.
+        del stderr
+        return {
             "status": status,
-            "verification_status": status,
             "failure_category": failure_category,
             "failure_excerpt": failure_excerpt,
+            "skipped_reason": None,
         }
-        meta_path = self.repo_root / refs.source_dir() / "static_meta.json"
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(
-            json.dumps(static_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-        # Content failure returns rc 0 so run_phase routes it via classify_static_failure ->
-        # generate.generate (warm resume). determine_substep_status reads static_meta.status.
-        return {"returncode": 0, "stdout": "", "stderr": stderr}
 
     def _compile_static_inproc(self, refs: NodeRefs, child_arid: str,
                                cap_token: str) -> dict[str, str]:
@@ -5651,9 +5704,7 @@ clean:
                               phase: str | None = None) -> str | None:
         """The failing artifact's finding text to inject into the (warm/slim) repair, selected
         by the route reason:
-          `lint_*`           -> source/lint_meta.json#failure_excerpt
-          `syntax_*`         -> source/syntax_meta.json#failure_excerpt
-          `static_*`         -> source/static_meta.json#failure_excerpt
+          `gate_*`           -> source/gate_meta.json#failure_excerpt (unioned checker findings)
           `compile_static_*` -> ir/compile_static_meta.json#failure_excerpt
           `verify_*`         -> the phase's verify meta #last_fail_reason
                                 (compile -> ir/ir_meta.json, generate -> source/source_meta.json)
@@ -5664,16 +5715,14 @@ clean:
         None when unavailable so the repair simply falls back to the full prompt."""
         r = (reason or "")
         field = "failure_excerpt"
-        # compile_static_ is checked before static_ for clarity; the two share no prefix
-        # ("compile_static_..." does not start with "static_"), so order is not load-bearing.
+        # compile_static_ is checked before gate_ for clarity; the two share no prefix, so order
+        # is not load-bearing.
         if r.startswith("compile_static_"):
             meta_path = self.repo_root / refs.ir_ref / "compile_static_meta.json"
-        elif r.startswith("lint_"):
-            meta_path = self.repo_root / refs.source_dir() / "lint_meta.json"
-        elif r.startswith("syntax_"):
-            meta_path = self.repo_root / refs.source_dir() / "syntax_meta.json"
-        elif r.startswith("static_"):
-            meta_path = self.repo_root / refs.source_dir() / "static_meta.json"
+        elif r.startswith("gate_"):
+            # The Generate.gate union verdict: gate_meta.json#failure_excerpt already composes
+            # the per-checker sections ([syntax]/[lint]/[static]) in canonical order.
+            meta_path = self.repo_root / refs.source_dir() / "gate_meta.json"
         elif r.startswith(GENERATE_BUNDLE_REASON_PREFIX):
             # Z2 pure producer: the exhausted bundle repair's terminal category/excerpt.
             meta_path = self.repo_root / refs.source_dir() / "bundle_meta.json"
@@ -6309,7 +6358,7 @@ clean:
         if preseat is None:
             self._ensure_fresh_producer_id(refs, phase)
         # Author/refresh the pipeline lineage.json host-side BEFORE the substeps run:
-        # generate.static's post_generate gate requires it, and the sandboxed leaf cannot
+        # generate.gate's static (post_generate) checker requires it, and the sandboxed leaf cannot
         # write it (pipeline-root file; see _write_lineage). Pipeline phases only —
         # compile writes under workspace/ir/, not the pipeline root.
         dep_facts: tuple[dict[str, str], ...] = ()
@@ -6317,7 +6366,7 @@ clean:
             dep_facts = tuple(self._write_lineage(refs))
         # The conductor authors src/Makefile deterministically (runtime-owned, like
         # lineage.json) for every make+fortran node BEFORE the substeps run: the generate leaf
-        # must not author it, and generate.static's post_generate gate inspects it. The
+        # must not author it, and generate.gate's static (post_generate) checker inspects it. The
         # template encodes the fixed runner->model use-graph and, for a dependency node, the
         # closure object rules (Model B); the dep sources are staged at build (see
         # _stage_dependency_sources). c/cpp/mixed keep LLM authoring (see _write_makefile).
@@ -6595,6 +6644,10 @@ clean:
             "binary_meta.json": f"{refs.binary_dir()}/binary_meta.json",
             "ir_meta.json": f"{refs.ir_ref}/ir_meta.json",
             "source_meta.json": f"{refs.source_dir()}/source_meta.json",
+            # The Generate.gate union verdict: its failure_categories / composed excerpt are the
+            # diagnostic material for a `gate_unknown_category:` escalate (an unclassifiable
+            # per-checker category the deterministic table did not cover).
+            "gate_meta.json": f"{refs.source_dir()}/gate_meta.json",
         }
         primary = _PHASE_PRIMARY_ARTIFACTS.get(phase, ())
         ordered = [name for name in primary if name in candidates]
@@ -6650,9 +6703,9 @@ clean:
             return classify_build_failure(meta.get("failure_category"))
         if phase == "generate" and outcomes and outcomes[-1].status != "pass":
             # The substep that failed is the last one the run_phase loop ran (it breaks on
-            # first failure), so it maps to SUBSTEPS["generate"][len(outcomes)-1]. A lint or
-            # static failure routes via its deterministic table (warm resume); generate.generate
-            # / generate.verify fall through to the verify-severity gate below.
+            # first failure), so it maps to SUBSTEPS["generate"][len(outcomes)-1]. A gate failure
+            # routes via its deterministic union table (warm resume); generate.generate /
+            # generate.verify fall through to the verify-severity gate below.
             failed_substep = SUBSTEPS["generate"][len(outcomes) - 1]
             if failed_substep == "generate" and self._pure_leaf_substep(refs, "generate", "generate"):
                 # Z2 pure producer exhausted its bounded in-conversation repair budget. Route on
@@ -6688,15 +6741,10 @@ clean:
                     return RouteDecision("retry", target_phase=target, repair_strategy=strategy,
                                          reason=f"{GENERATE_VERDICT_REASON_PREFIX}{category}")
                 # No routed category -> a valid `fail` verdict; fall through to the severity gate.
-            if failed_substep == "lint":
-                meta = _read_json(self.repo_root / refs.source_dir() / "lint_meta.json") or {}
-                return classify_lint_failure(meta.get("failure_category"))
-            if failed_substep == "syntax":
-                meta = _read_json(self.repo_root / refs.source_dir() / "syntax_meta.json") or {}
-                return classify_syntax_failure(meta.get("failure_category"))
-            if failed_substep == "static":
-                meta = _read_json(self.repo_root / refs.source_dir() / "static_meta.json") or {}
-                return classify_static_failure(meta.get("failure_category"))
+            if failed_substep == "gate":
+                meta = _read_json(self.repo_root / refs.source_dir() / "gate_meta.json") or {}
+                cats = meta.get("failure_categories")
+                return classify_gate_failure(cats if isinstance(cats, list) else [])
         if phase == "compile" and outcomes and outcomes[-1].status != "pass":
             # Mirror of the generate branch: SUBSTEPS["compile"] == ("generate","static","verify")
             # and run_phase breaks on first failure, so the failed substep is index len-1. A
@@ -7128,7 +7176,7 @@ clean:
             # Same-phase producer reopen: re-run the SAME phase's producer substep
             # (compile.generate / generate.generate) to fix a finding, instead of terminalizing.
             # This is the canonical recovery for any decision that targets the current phase with
-            # a concrete repair_strategy — the deterministic gates (generate.lint/static,
+            # a concrete repair_strategy — the deterministic gates (generate.gate,
             # compile.static) and verify-minor (all `reuse` -> warm), AND the escalate
             # diagnostician when it judges the right level is "this phase's own producer"
             # (`reuse` -> warm / `restart` -> cold, e.g. a major IR defect regenerated from
@@ -7148,9 +7196,9 @@ clean:
                                     reason_detail="same_phase_reopen_no_trigger")
                     return "fail"
                 # Read the findings excerpt BEFORE reopen_phase/rotation while refs still names
-                # the failed artifact (its {lint,static,compile_static}_meta.json failure_excerpt,
-                # or the verify meta last_fail_reason). None for a diagnostician reason -> the
-                # repair falls back to the full prompt (a cold restart re-derives anyway).
+                # the failed artifact (its {gate,compile_static}_meta.json failure_excerpt, or the
+                # verify meta last_fail_reason). None for a diagnostician reason -> the repair
+                # falls back to the full prompt (a cold restart re-derives anyway).
                 findings = self._read_repair_findings(refs, decision.reason, phase)
                 self.reopen_phase(refs.node_key, from_phase=phase, trigger_arid=trigger,
                                   reason=decision.reason or "same_phase_reopen")

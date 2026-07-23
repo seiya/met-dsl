@@ -1359,7 +1359,7 @@ def _list_prefixed_subroutines(source_text: str, prefix: str) -> list[str]:
     ``<dep_spec_id>__`` prefix IS the published-surface convention (this selects by prefix,
     not by a Fortran ``private``/``public`` attribute — same as the pre-existing extractor),
     so surfacing them all lets the pure leaf build its ``call``s against real symbol names /
-    argument orders instead of inventing ones ``Generate.syntax`` rejects. Surfacing an extra
+    argument orders instead of inventing ones ``Generate.gate`` rejects. Surfacing an extra
     interface fact never forces a call, so an over-broad match is orientation-only, not a gate.
     De-duplicates repeat declarations (a subroutine also declared in an ``interface``
     block appears twice). NEVER raises (``[]`` on any error)."""
@@ -1831,7 +1831,7 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, An
     authors ``operations: []`` legitimately and must not be called, so its prefixed
     subroutines are never surfaced (matching the ``_validate_component_dep_operations`` scope). Without this, the ``use``/``call`` the generate-side gate
     unconditionally requires for a component dep has no facts to build against, and the
-    pure (tool-less) leaf must invent symbol names / argument orders that ``Generate.syntax``
+    pure (tool-less) leaf must invent symbol names / argument orders that ``Generate.gate``
     rejects every retry — the closure fail_closed this fallback closes. The fallback is
     empty-list-only: when the IR DOES enumerate operations, only that enumerated surface is
     injected (IR is the sole carrier; never union in the fallback set).
@@ -2013,7 +2013,7 @@ def _exemplar_contract_version_matches(model_src: Path) -> bool:
     ``checks_compute(case_id, ncheck, chk_ids, chk_status)``), an older-vintage sibling carries the
     RETIRED signature. Injecting it as concrete prior art can steer the doc-blind leaf into a bundle
     the acceptance gate — which checks only procedure name/kind, not arity — admits, and which then
-    fails ``Generate.syntax`` against the current host-rendered runner (an unrepairable-until-
+    fails ``Generate.gate`` against the current host-rendered runner (an unrepairable-until-
     reroll waste). The bundle gate cannot see the arity, so gate the exemplar HERE on the vintage.
 
     Fail-SAFE polarity: any missing / unreadable / mismatched version returns ``False`` (the
@@ -2144,7 +2144,7 @@ def _resolve_exemplar_source(repo_root: Path, ir_ref: Any) -> dict[str, Any] | N
                     continue
                 # R5 ABI-drift guard (M3c only): the checks exemplar must be authored under the
                 # CURRENT contract, else its `<id>_checks.f90` may carry a retired checks ABI the
-                # acceptance gate (name/kind only) admits but Generate.syntax then rejects. The
+                # acceptance gate (name/kind only) admits but Generate.gate then rejects. The
                 # non-M3c model+runner exemplar carries no checks module, so it is not gated here.
                 if target_is_m3c and not _exemplar_contract_version_matches(model_src):
                     continue
@@ -4020,25 +4020,28 @@ def _parse_iso_z_expiry(raw: str) -> datetime | None:
 
 
 # Least-privilege MCP grants, keyed by the exact (step, substep) whose conductor
-# in-process body actually invokes a gated build-runtime tool. Only four bodies do:
+# in-process body actually invokes a gated build-runtime tool. Only three bodies do:
 #   build            -> tool_compile_project      (_build_inproc)
-#   generate.lint    -> tool_run_linter           (_lint_inproc)
-#   generate.syntax  -> tool_run_syntax_check      (_syntax_inproc)
+#   generate.gate    -> tool_run_linter + tool_run_syntax_check
+#                       (_gate_inproc -> _gate_lint_check + _gate_syntax_check; the static
+#                        checker invokes no MCP tool, running validators via direct subprocess)
 #   validate.execute -> tool_run_program + tool_run_quality_checks (_execute_inproc)
 # `build` is the only substep-less phase (role "step", no substep key), so its key is
 # ("build", ""). Every other (step, substep) — all LLM leaves (compile/generate.generate,
 # compile/generate.verify, validate.judge, which are forbidden from calling any MCP tool by
-# their SKILLs) and all other deterministic in-process validators (generate.static,
-# compile.static, validate.pre_judge / post_judge) which never import a build-runtime handler —
-# falls through to the fail-closed `[]` default. This is strictly per-substep least-privilege:
-# a read-only reviewer leaf holds no build-tool grant.
+# their SKILLs) and the deterministic in-process validators that never import a build-runtime
+# handler (compile.static, validate.pre_judge / post_judge) — falls through to the fail-closed
+# `[]` default. This is strictly per-substep least-privilege: a read-only reviewer leaf holds no
+# build-tool grant.
 #
-# A drift guard (test_mcp_grant_table_matches_conductor_call_sites) introspects the four
-# conductor bodies above (matching the CALL shape, not the import) and fails CI if a body's
-# gated tool set stops matching this table. It also pins its notion of "which tools are gated"
-# to build_runtime_server's actual gate-enforcing handlers (those calling
-# _maybe_enforce_orchestration_mcp_gate), so a newly-added gated tool cannot enter production
-# while silently absent from this table (it would fail-closed at the runtime authz gate).
+# A drift guard (test_mcp_grant_table_matches_conductor_call_sites) introspects the conductor
+# bodies above (matching the CALL shape, not the import) and fails CI if a body's gated tool set
+# stops matching this table. For generate.gate it walks the `_gate_inproc` body to the
+# `self._gate_*_check(` helper calls and UNIONS the gated tools each helper invokes, so removing a
+# helper call (dropping a checker) drops that checker's grant and reds the test. It also pins its
+# notion of "which tools are gated" to build_runtime_server's actual gate-enforcing handlers
+# (those calling _maybe_enforce_orchestration_mcp_gate), so a newly-added gated tool cannot enter
+# production while silently absent from this table (it would fail-closed at the runtime authz gate).
 #
 # Read-only mapping proxy: the grant table is security-sensitive, so freeze it against
 # accidental in-process mutation (a stray test or import doing `.clear()` / key reassignment
@@ -4046,8 +4049,7 @@ def _parse_iso_z_expiry(raw: str) -> datetime | None:
 _MCP_TOOL_GRANTS_BY_SUBSTEP: types.MappingProxyType[tuple[str, str], tuple[str, ...]] = (
     types.MappingProxyType({
         ("build", ""): ("compile_project",),
-        ("generate", "lint"): ("run_linter",),
-        ("generate", "syntax"): ("run_syntax_check",),
+        ("generate", "gate"): ("run_linter", "run_syntax_check"),
         ("validate", "execute"): ("run_program", "run_quality_checks"),
     })
 )
@@ -6055,12 +6057,12 @@ def _allowed_output_paths_for_launch(
             # Compile.static deliverable: the conductor-authored, freshness-gated
             # compile_static_meta.json sits at the IR root (<ir_ref>/compile_static_meta.json),
             # a sibling of spec.ir.yaml / ir_meta.json. Gated to the deterministic Compile.static
-            # substep ONLY (same rationale as generate's lint_meta/static_meta above: a
+            # substep ONLY (same rationale as generate's gate_meta above: a
             # Compile.generate / Compile.verify leaf launch must NOT be able to list a
             # conductor-authored verdict as its own output). The --stage compile validator is
             # read-only on the IR; only this meta is written, inside the substep's own write_root.
             # Compile.static's ONLY deliverable is compile_static_meta.json (exhaustive, like
-            # the generate.static branch — a static request listing any other compile path is
+            # the generate.gate branch — a compile.static request listing any other compile path is
             # rejected, not silently accepted via the compile_required fall-through).
             # NOTE: the dependency-graph sidecar <ir_ref>/dependency_graph.json is
             # conductor-authored (workflow_conductor._write_dependency_graph) and NOT a leaf
@@ -6085,31 +6087,18 @@ def _allowed_output_paths_for_launch(
                     return True
                 if path.endswith("/source_meta.json"):
                     return True
-                # Generate.lint deliverable: the conductor-authored, freshness-gated
-                # lint_meta.json sits at the source root (source/<source_id>/lint_meta.json),
-                # a sibling of source_meta.json — not under src/. See
-                # workflow_conductor._lint_inproc and docs/workflow/phases/phase_02_generate.md.
-                # Gated to the deterministic Generate.lint substep ONLY: it is
-                # conductor-authored and leaf-non-writable, so a Generate.generate /
-                # Generate.verify leaf launch must NOT be able to list it as an output
-                # (which would auto-authorize the leaf to overwrite the lint verdict via
-                # _allowed_file_tool_paths_for_launch). Belt-and-suspenders: that helper
-                # also excludes lint_meta.json from the auto-derived file-tool set.
-                if substep_token == "lint" and path.endswith("/lint_meta.json"):
-                    return True
-                # Generate.syntax deliverable: the conductor-authored, freshness-gated
-                # syntax_meta.json sits at the source root (source/<source_id>/syntax_meta.json),
-                # a sibling of source_meta.json. Gated to the deterministic Generate.syntax
-                # substep ONLY (same rationale as lint_meta.json above: leaf launches must not
-                # be able to list a conductor-authored verdict as their own output).
-                if substep_token == "syntax" and path.endswith("/syntax_meta.json"):
-                    return True
-                # Generate.static deliverable: the conductor-authored, freshness-gated
-                # static_meta.json sits at the source root (source/<source_id>/static_meta.json),
-                # a sibling of source_meta.json. Gated to the deterministic Generate.static
-                # substep ONLY (same rationale as lint_meta.json above: leaf launches must not
-                # be able to list a conductor-authored verdict as their own output).
-                if substep_token == "static" and path.endswith("/static_meta.json"):
+                # Generate.gate deliverable: the conductor-authored, freshness-gated
+                # gate_meta.json (the single unioned lint/syntax/static verdict) sits at the
+                # source root (source/<source_id>/gate_meta.json), a sibling of source_meta.json
+                # — not under src/. See workflow_conductor._gate_inproc and
+                # docs/workflow/phases/phase_02_generate.md. Gated to the deterministic
+                # Generate.gate substep ONLY: it is conductor-authored and leaf-non-writable, so a
+                # Generate.generate / Generate.verify leaf launch must NOT be able to list it as an
+                # output (which would auto-authorize the leaf to overwrite the gate verdict via
+                # _allowed_file_tool_paths_for_launch). Belt-and-suspenders: that helper also
+                # excludes gate_meta.json from the auto-derived file-tool set, and still rejects the
+                # retired lint/syntax/static_meta.json names outright.
+                if substep_token == "gate" and path.endswith("/gate_meta.json"):
                     return True
             return False
         if step_token == "build":
@@ -6684,24 +6673,17 @@ def _allowed_file_tool_paths_for_launch(
             for path in allowed_set
             if path
             and path not in canonical_log_set
-            # The Generate.lint deliverable is the source-ROOT lint_meta.json
-            # (source/<source_id>/lint_meta.json — NOT under src/), conductor-authored
-            # in-process (workflow_conductor._lint_inproc, raw host write) and documented
-            # leaf-non-writable. Keep it out of the auto-derived file-tool set so no leaf
-            # can Edit/Write it, mirroring the canonical-audit-log exclusion above. The
-            # "/src/" guard scopes this to the conductor-owned placement: a legitimately
-            # generated source-tree file that happens to be named lint_meta.json (under
-            # .../src/) is an ordinary leaf output and stays writable (and _matches_phase_
-            # contract already accepts it via its /src/ rule, checked first).
-            and not (path.endswith("/lint_meta.json") and "/src/" not in path)
-            # Same treatment for the Generate.syntax deliverable syntax_meta.json
-            # (source/<source_id>/syntax_meta.json, conductor-authored in-process by
-            # workflow_conductor._syntax_inproc): never leaf-writable.
-            and not (path.endswith("/syntax_meta.json") and "/src/" not in path)
-            # Same treatment for the Generate.static deliverable static_meta.json
-            # (source/<source_id>/static_meta.json, conductor-authored in-process by
-            # workflow_conductor._static_inproc): never leaf-writable.
-            and not (path.endswith("/static_meta.json") and "/src/" not in path)
+            # The Generate.gate deliverable is the source-ROOT gate_meta.json
+            # (source/<source_id>/gate_meta.json — NOT under src/), the single unioned
+            # lint/syntax/static verdict, conductor-authored in-process
+            # (workflow_conductor._gate_inproc, raw host write) and documented leaf-non-writable.
+            # Keep it out of the auto-derived file-tool set so no leaf can Edit/Write it,
+            # mirroring the canonical-audit-log exclusion above. The "/src/" guard scopes this to
+            # the conductor-owned placement: a legitimately generated source-tree file that
+            # happens to be named gate_meta.json (under .../src/) is an ordinary leaf output and
+            # stays writable (and _matches_phase_contract already accepts it via its /src/ rule,
+            # checked first).
+            and not (path.endswith("/gate_meta.json") and "/src/" not in path)
             # And for the Compile.static deliverable compile_static_meta.json
             # (<ir_ref>/compile_static_meta.json, conductor-authored in-process by
             # workflow_conductor._compile_static_inproc): never leaf-writable. Defense-in-depth
@@ -6712,7 +6694,7 @@ def _allowed_file_tool_paths_for_launch(
             # workflow_conductor._write_dependency_graph): the derived closure/topo graph is a
             # pure function of deps.yaml + spec_catalog.yaml, so no compile leaf may write it.
             # Scoped to the IR-root placement (NOT under a source "/src/" tree), mirroring the
-            # lint_meta/static_meta guards: a generate leaf could legitimately emit a source
+            # gate_meta guard: a generate leaf could legitimately emit a source
             # file happening to be named dependency_graph.json under source/<id>/src/, which
             # stays writable. Defense-in-depth (the sidecar is already absent from every compile
             # leaf's allowed_output_paths — compile.generate lists only spec.ir.yaml+ir_meta.json).
@@ -6754,25 +6736,25 @@ def _allowed_file_tool_paths_for_launch(
                 f"allowed_file_tool_paths[{idx}] must not include canonical MCP audit "
                 f"log path: {path!r} (written exclusively by MCP tooling)"
             )
-        # Source-ROOT lint_meta.json only (see auto-derive branch above): a
-        # legitimately generated .../src/lint_meta.json stays writable.
-        if path.endswith("/lint_meta.json") and "/src/" not in path:
+        # Source-ROOT gate_meta.json only (see auto-derive branch above): a legitimately
+        # generated .../src/gate_meta.json stays writable. This is the single unioned
+        # lint/syntax/static verdict (Generate.gate in-process deliverable).
+        if path.endswith("/gate_meta.json") and "/src/" not in path:
             raise ValueError(
                 f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
-                f"lint deliverable: {path!r} (written exclusively by Generate.lint in-process)"
+                f"gate deliverable: {path!r} (written exclusively by Generate.gate in-process)"
             )
-        # Same for the source-ROOT syntax_meta.json (Generate.syntax in-process deliverable).
-        if path.endswith("/syntax_meta.json") and "/src/" not in path:
-            raise ValueError(
-                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
-                f"syntax deliverable: {path!r} (written exclusively by Generate.syntax in-process)"
-            )
-        # Same for the source-ROOT static_meta.json (Generate.static in-process deliverable).
-        if path.endswith("/static_meta.json") and "/src/" not in path:
-            raise ValueError(
-                f"allowed_file_tool_paths[{idx}] must not include the conductor-authored "
-                f"static deliverable: {path!r} (written exclusively by Generate.static in-process)"
-            )
+        # Retired per-checker verdict names (lint_meta/syntax_meta/static_meta.json), superseded
+        # by gate_meta.json. Kept as explicit rejects so a leaf cannot mint a forged verdict under
+        # a stale name that a downstream reader might still honor. Safe to REMOVE once no workspace
+        # on any supported --resume path can still carry the old names.
+        for _retired in ("/lint_meta.json", "/syntax_meta.json", "/static_meta.json"):
+            if path.endswith(_retired) and "/src/" not in path:
+                raise ValueError(
+                    f"allowed_file_tool_paths[{idx}] must not include the retired per-checker "
+                    f"deliverable: {path!r} (superseded by the conductor-authored Generate.gate "
+                    "gate_meta.json)"
+                )
         # Same for the IR-ROOT compile_static_meta.json (Compile.static in-process deliverable).
         if path.endswith("/compile_static_meta.json"):
             raise ValueError(
@@ -6854,9 +6836,9 @@ def _mandatory_file_tool_pins_for_launch(
     # substep inspects src/ and writes source_meta.json — granting it Makefile
     # (build-control) write authority would let the verifier mutate the very
     # artifact it is supposed to judge, so it must be excluded. The deterministic
-    # Generate.lint / Generate.syntax / Generate.static substeps (conductor-run, no leaf)
-    # write no Makefile either (static writes only static_meta.json).
-    if step_token != "generate" or substep_token in ("verify", "lint", "syntax", "static") or not pipeline_ref:
+    # Generate.gate substep (conductor-run, no leaf) writes no Makefile either (only
+    # gate_meta.json).
+    if step_token != "generate" or substep_token in ("verify", "gate") or not pipeline_ref:
         return []
     # When the conductor authors src/Makefile host-side (_write_makefile: make AND fortran,
     # leaf OR dependency) it is NOT a leaf deliverable and must not be pinned (the file already
@@ -6923,7 +6905,7 @@ def _mandatory_phase_outputs_for_launch(
     # Phase-2: the pipeline ``lineage.json`` is no longer a leaf output — it sits at the
     # pipeline root, which must stay non-writable to the sandboxed leaf (the Edit/Write
     # tools' atomic temp-sibling+rename would need the whole root writable). The conductor
-    # authors it host-side (workflow_conductor._write_lineage) before generate.static's
+    # authors it host-side (workflow_conductor._write_lineage) before generate.gate's static
     # post_generate gate runs, so it is NOT injected into the generate child's
     # allowed_output_paths (historical audit: orch_20260615T095217Z_74450292 predates this).
     if step_token != "validate" or substep_token != "execute" or not pipeline_ref:
@@ -8773,9 +8755,11 @@ def _expected_host_evidence_rel_path(
     substep: str,
     evidence_dirname: str,
 ) -> str | None:
-    """The single host-authored generate.<substep> certificate path that is exempt from
+    """The single host-authored generate.gate certificate path that is exempt from
     write-attribution: ``<pipeline_ref>/<evidence_dirname>/<source_id>.json``
-    (``lint_evidence/`` for generate.lint, ``syntax_evidence/`` for generate.syntax).
+    (``lint_evidence/`` for the gate's lint checker, ``syntax_evidence/`` for its syntax
+    checker; the merged Generate.gate substep writes BOTH, so ``substep`` is ``"gate"`` for
+    each).
 
     Returns None (no exemption -> the write is flagged, fail-closed) unless the actor is the
     matching deterministic generate substep AND both the pipeline root and a safe bare
@@ -8828,7 +8812,7 @@ def _expected_lint_evidence_rel_path(
     return _expected_host_evidence_rel_path(
         repo_root, orchestration_id,
         agent_run_id=agent_run_id, cap_doc=cap_doc, write_roots=write_roots,
-        substep="lint", evidence_dirname="lint_evidence",
+        substep="gate", evidence_dirname="lint_evidence",
     )
 
 
@@ -8843,7 +8827,7 @@ def _expected_syntax_evidence_rel_path(
     return _expected_host_evidence_rel_path(
         repo_root, orchestration_id,
         agent_run_id=agent_run_id, cap_doc=cap_doc, write_roots=write_roots,
-        substep="syntax", evidence_dirname="syntax_evidence",
+        substep="gate", evidence_dirname="syntax_evidence",
     )
 
 
@@ -8972,14 +8956,14 @@ def _validate_actual_write_paths(
         roots_obj = cap_doc.get("write_roots")
         write_roots = _load_write_roots_from_cap(roots_obj)
 
-    # generate.lint writes a host-authored, leaf-non-writable certificate at the EXACT
+    # generate.gate writes a host-authored, leaf-non-writable lint certificate at the EXACT
     # path <pipeline_ref>/lint_evidence/<source_id>.json, deliberately OUTSIDE the substep's
     # source/ write_root (same non-forgeability placement as lineage.json). It is a conductor
     # host write made during the in-process substep window (workflow_conductor.Conductor.
-    # _lint_inproc -> write_lint_evidence), not a leaf write, so it lands in the FS-diff and
-    # would otherwise be misattributed as an unauthorized write. Exempt ONLY that one exact
-    # certificate (not the whole lint_evidence/ dir) so an unexpected/stale sibling under
-    # lint_evidence/ is still flagged. Scoped to the lint substep so the sandboxed
+    # _gate_inproc -> _gate_lint_check -> write_lint_evidence), not a leaf write, so it lands in
+    # the FS-diff and would otherwise be misattributed as an unauthorized write. Exempt ONLY that
+    # one exact certificate (not the whole lint_evidence/ dir) so an unexpected/stale sibling
+    # under lint_evidence/ is still flagged. Scoped to the gate substep so the sandboxed
     # generate.generate leaf is never exempted (and bwrap blocks that leaf from the pipeline
     # root regardless). write_roots stays minimal — like lineage.json, the certificate is NOT
     # a capability write_root.
@@ -8993,9 +8977,10 @@ def _validate_actual_write_paths(
             cap_doc=cap_doc,
             write_roots=write_roots,
         )
-        # generate.syntax writes the analogous host-authored certificate at
+        # generate.gate also writes the analogous host-authored syntax certificate at
         # <pipeline_ref>/syntax_evidence/<source_id>.json (workflow_conductor.Conductor.
-        # _syntax_inproc -> write_syntax_evidence); same exact-file scoping as lint above.
+        # _gate_inproc -> _gate_syntax_check -> write_syntax_evidence); same exact-file scoping
+        # as lint above (both certificates come from the one gate substep window).
         syntax_evidence_expected_path = _expected_syntax_evidence_rel_path(
             repo_root,
             orchestration_id,
@@ -9130,10 +9115,10 @@ def _validate_actual_write_paths(
             # file the MCP tool produced.
             continue
         if lint_evidence_expected_path is not None and path == lint_evidence_expected_path:
-            # Conductor host write of the exact generate.lint certificate (see above).
+            # Conductor host write of the exact generate.gate lint certificate (see above).
             continue
         if syntax_evidence_expected_path is not None and path == syntax_evidence_expected_path:
-            # Conductor host write of the exact generate.syntax certificate (see above).
+            # Conductor host write of the exact generate.gate syntax certificate (see above).
             continue
         if write_roots and not _path_under_any_write_root(path, write_roots):
             unauthorized.append(path)
@@ -9802,8 +9787,8 @@ def _build_gate_runbook(request_payload: dict[str, Any]) -> str:
             "python3 tools/validate_workspace_root.py",
         ]
     # generate.verify emits NO gate runbook: the post_generate + workspace_root gates it used
-    # to run now execute deterministically in the conductor's generate.static substep
-    # (Conductor._static_inproc) BEFORE verify, so verify is reached only on a
+    # to run now execute deterministically in the conductor's generate.gate static checker
+    # (Conductor._gate_static_check) BEFORE verify, so verify is reached only on a
     # deterministically-clean source and is a pure LLM semantic (G1-G7) pass. It therefore
     # falls through to the `else` branch below and returns "" (no runbook).
     # validate.judge emits NO gate runbook: the `--stage pre_judge` gate it used to run as its
@@ -10047,7 +10032,7 @@ def _build_exemplar(request_payload: dict[str, Any]) -> str:
         "copy the exemplar's physics or checks. It is orientation, never a gate and never this "
         "node's spec. It was certified under the gates in force AT ITS TIME, so it may predate "
         "a rule now in your contracts: where the exemplar and a contract disagree, the contract "
-        "wins. In particular, an exemplar certified before the `Generate.syntax` gate promoted "
+        "wins. In particular, an exemplar certified before the `Generate.gate` gate promoted "
         "`-Werror=unused-dummy-argument` / `-Werror=unused-variable` can show an ABI-fixed dummy "
         "(`name` / `case_id`) left unreferenced — that shape now fails the gate; bind it with "
         "`associate (unused_<name> => <name>); end associate` per "
@@ -10327,7 +10312,7 @@ def _render_slim_repair_launch_prompt(request_payload: dict[str, Any]) -> str:
     # List only the LEAF-WRITABLE deliverables — the same `allowed_file_tool_paths` the
     # output_manifest grants — NOT the raw `allowed_output_paths`. The raw set includes
     # MCP-owned, integrity-protected artifacts (canonical `command_log.jsonl`) and the
-    # conductor-authored in-process metas (`lint_meta.json` / `static_meta.json`): telling
+    # conductor-authored in-process meta (`gate_meta.json`): telling
     # the resumed leaf to "re-write the deliverables below" with those listed would have it
     # Edit/Write the command log and trip the write guard / corrupt the MCP audit artifact
     # (the full prompt avoids this via the same file-tool-path derivation + boilerplate).
@@ -10546,8 +10531,8 @@ def _pure_authoring_rules_text(request_payload: dict[str, Any]) -> str:
 
     A cold-fallback repair re-states them for the same reason it re-states the output contract:
     the producer is re-authoring the whole document with no prior turn to carry the rules, and a
-    bundle repaired into schema conformance still has to clear `Generate.lint` / `Generate.syntax`
-    / `Generate.static` afterwards."""
+    bundle repaired into schema conformance still has to clear the `Generate.gate` union
+    (lint / syntax / static checkers) afterwards."""
     blocks = []
     for prefix in PURE_REPAIR_STATIC_PARAGRAPH_PREFIXES:
         text = _pure_template_paragraph(request_payload, prefix)
@@ -10749,7 +10734,7 @@ def leaf_contract_doc_refs(step: str | None, *, is_m3c_physics: bool = False) ->
       Its §1-4 are the checks-module ABI an M3c physics node's leaf authors
       `<spec_id>_checks.f90` against (R1/M3c-β; the SKILL branches on whether the node
       is M3c), but its §5 (Fortran legality and gate guards — the `associate` binding of
-      an intentionally-unused dummy the deterministic Generate.syntax gate rejects) binds
+      an intentionally-unused dummy the deterministic Generate.gate gate rejects) binds
       every leaf-authored Fortran source of any node, and the non-M3c leaf that
       hand-authors its own runner is the one with ABI-fixed unused dummies. Do NOT gate
       this injection on `is_m3c_physics`. validate.judge never sees the checks source, so
@@ -11228,15 +11213,13 @@ ALLOWED_VALIDATE_PIPELINE_STAGES: dict[tuple[str, str], frozenset[str]] = {
     ("compile", "static"): frozenset(),
     ("compile", "verify"): frozenset(),
     ("generate", "generate"): frozenset(),
-    # generate.lint, generate.syntax and generate.static are deterministic in-process
-    # substeps (no leaf, no validate_pipeline_semantics invocation); the empty sets keep the
-    # table total so a lookup for them never KeyErrors. The post_generate gate that
-    # generate.verify used to own now runs in the conductor's generate.static substep
-    # (Conductor._static_inproc), so generate.verify is a pure LLM semantic pass that
+    # generate.gate is a deterministic in-process substep (no leaf, no validate_pipeline_semantics
+    # leaf invocation — its static checker runs the gates via direct subprocess); the empty set
+    # keeps the table total so a lookup for it never KeyErrors. The post_generate gate that
+    # generate.verify used to own now runs in the conductor's generate.gate static checker
+    # (Conductor._gate_static_check), so generate.verify is a pure LLM semantic pass that
     # invokes no validator gate.
-    ("generate", "lint"): frozenset(),
-    ("generate", "syntax"): frozenset(),
-    ("generate", "static"): frozenset(),
+    ("generate", "gate"): frozenset(),
     ("generate", "verify"): frozenset(),
     ("build", ""): frozenset({"post_build"}),
     ("validate", "execute"): frozenset({"post_execute"}),
@@ -13351,21 +13334,22 @@ def _validate_launch_request_payload(request_payload: dict[str, Any]) -> None:
         raise ValueError("launch request must include non-empty step")
     # Defense-in-depth: `deterministic` (in-process, skill-/constraint-line-exempt) is
     # only legitimate for the non-LLM substeps Build, Validate.pre_judge, Validate.execute,
-    # Validate.post_judge, Generate.lint, Generate.static and Compile.static. Reject the flag
-    # on any other step so a forged/buggy payload cannot claim the reduced launch-prompt guards
-    # while being a leaf step. (The flag is host-set by the conductor today; this makes the
-    # invariant explicit at the validation chokepoint.)
+    # Validate.post_judge, Generate.gate and Compile.static. Reject the flag on any other step so
+    # a forged/buggy payload cannot claim the reduced launch-prompt guards while being a leaf
+    # step. (The flag is host-set by the conductor today; this makes the invariant explicit at
+    # the validation chokepoint.) The retired Generate substep names lint/syntax/static are
+    # deliberately NOT accepted here — a legacy resume that still emits them fails closed loudly.
     if request_payload.get("deterministic"):
         step_l = step.strip().lower()
         substep_l = str(substep).strip().lower() if isinstance(substep, str) else ""
         if not (step_l == "build"
                 or (step_l == "validate" and substep_l in ("pre_judge", "execute", "post_judge"))
-                or (step_l == "generate" and substep_l in ("lint", "syntax", "static"))
+                or (step_l == "generate" and substep_l == "gate")
                 or (step_l == "compile" and substep_l == "static")):
             raise ValueError(
                 "launch request: deterministic=True is only valid for step=build, "
                 "step=validate substep=pre_judge|execute|post_judge, "
-                "step=generate substep=lint|syntax|static, or "
+                "step=generate substep=gate, or "
                 f"step=compile substep=static (got step={step!r} substep={substep!r})"
             )
     # agent_model identifies the LLM that produced the child's artifacts. At launch
@@ -18030,17 +18014,19 @@ def reopen_phase(
     trig_substep = str(trigger.get("substep") or "").strip().lower()
     # Same-phase carve-out: a finding reopens its own phase (from_phase == trigger phase) to
     # re-run that phase's producer substep (`generate` = compile.generate / generate.generate):
-    #   - generate.lint / generate.static / compile.static  -> deterministic-gate finding
+    #   - generate.gate / compile.static                    -> deterministic-gate finding
     #   - compile.verify / generate.verify                  -> a `minor` verify finding (warm), and
     #   - the producer substep itself (`generate`)          -> the escalate diagnostician routing a
     #     same-phase producer re-run (e.g. a producer rc=0 content-fail, or "regenerate the IR").
     # i.e. ANY substep of the current phase may be the trigger. Anti-abuse is carried entirely by
     # the terminal-NON-PASS status check below (a PASSING run can never trigger a reopen, so a
     # passing pipeline can never be erased); the substep whitelist is just "belongs to this phase".
+    # The retired lint/syntax/static tokens are dropped: a legacy resume whose in-flight trigger
+    # still carries one fails the strictly-downstream check below (loud fail-closed), as intended.
     # Every other (cross-phase) trigger must be strictly downstream.
     same_phase_det = (
         (trig_step == from_token == "generate"
-         and trig_substep in ("generate", "lint", "syntax", "static", "verify"))
+         and trig_substep in ("generate", "gate", "verify"))
         or (trig_step == from_token == "compile" and trig_substep in ("generate", "static", "verify"))
     )
     if trig_step not in STEP_KEYS_FOR_NODE_STATE or (

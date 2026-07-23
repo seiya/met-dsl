@@ -1558,38 +1558,39 @@ shell_tool                       stable             true
         with self.assertRaisesRegex(ValueError, "agent_model"):
             _validate_launch_request_payload(req)
 
-    def test_validate_launch_request_payload_accepts_deterministic_generate_lint(self) -> None:
+    def test_validate_launch_request_payload_accepts_deterministic_generate_gate(self) -> None:
         """The record-launch validation chokepoint's deterministic-flag allowlist must
-        include generate.lint (else every generate node fails at the lint substep's
-        record-launch), and a non-lint deterministic generate substep is still rejected.
+        include generate.gate (else every generate node fails at the gate substep's
+        record-launch), and a non-gate deterministic generate substep is still rejected.
 
-        The deterministic-flag check runs before the agent_model/ref checks, so a lint
+        The deterministic-flag check runs before the agent_model/ref checks, so a gate
         payload that passes it falls through to the agent_model error (proving the
         deterministic gate did NOT reject it)."""
         from tools.orchestration_runtime import _validate_launch_request_payload
 
-        lint = {"node_key": "component/spec_x@0.1.0", "step": "generate",
-                "substep": "lint", "deterministic": True}
+        gate = {"node_key": "component/spec_x@0.1.0", "step": "generate",
+                "substep": "gate", "deterministic": True}
         # Passes the deterministic allowlist -> fails later on the missing agent_model.
         with self.assertRaisesRegex(ValueError, "agent_model"):
-            _validate_launch_request_payload(lint)
+            _validate_launch_request_payload(gate)
 
-        # A deterministic flag on a non-lint/static generate substep IS rejected.
+        # A deterministic flag on the producer generate substep IS rejected.
         forged = {"node_key": "component/spec_x@0.1.0", "step": "generate",
                   "substep": "generate", "deterministic": True}
         with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
             _validate_launch_request_payload(forged)
 
-    def test_validate_launch_request_payload_accepts_deterministic_generate_static(self) -> None:
-        """The deterministic-flag allowlist must also include generate.static (else every
-        generate node fails at the static substep's record-launch). Like lint, a static payload
-        that passes the allowlist falls through to the agent_model error."""
+    def test_validate_launch_request_payload_rejects_retired_generate_checker_substeps(self) -> None:
+        """The retired per-checker substep names (lint/syntax/static) are NOT in the
+        deterministic-flag allowlist: a legacy resume that still emits one fails closed loudly
+        at record-launch, rather than silently claiming the reduced launch-prompt guards."""
         from tools.orchestration_runtime import _validate_launch_request_payload
 
-        static = {"node_key": "component/spec_x@0.1.0", "step": "generate",
-                  "substep": "static", "deterministic": True}
-        with self.assertRaisesRegex(ValueError, "agent_model"):
-            _validate_launch_request_payload(static)
+        for retired in ("lint", "syntax", "static"):
+            payload = {"node_key": "component/spec_x@0.1.0", "step": "generate",
+                       "substep": retired, "deterministic": True}
+            with self.assertRaisesRegex(ValueError, "deterministic=True is only valid"):
+                _validate_launch_request_payload(payload)
 
     def test_validate_launch_request_payload_accepts_deterministic_compile_static(self) -> None:
         """The deterministic-flag allowlist must also include compile.static (else every compile
@@ -2866,73 +2867,48 @@ shell_tool                       stable             true
                     allowed_output_paths=[src_other],
                 )
 
-    def test_generate_lint_launch_accepts_lint_meta_json(self) -> None:
-        """The deterministic Generate.lint substep declares
-        source/<source_id>/lint_meta.json as its conductor-authored deliverable
-        (workflow_conductor._lint_inproc). It sits at the source root — a sibling
-        of source_meta.json, NOT under src/ — so the generate phase contract must
-        accept it. Regression for the billed-E2E fail "allowed_output_paths[0] is
-        outside phase contract outputs for step='generate': .../lint_meta.json".
+    def test_generate_gate_launch_accepts_gate_meta_json(self) -> None:
+        """The deterministic Generate.gate substep declares
+        source/<source_id>/gate_meta.json as its conductor-authored deliverable
+        (workflow_conductor._gate_inproc), plus the canonical src/command_log.jsonl its
+        lint/syntax checkers append to. gate_meta.json sits at the source root — a sibling of
+        source_meta.json, NOT under src/ — so the generate phase contract must accept it.
+        Regression for the billed-E2E fail "allowed_output_paths[0] is outside phase contract
+        outputs for step='generate': .../gate_meta.json".
         """
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
-        src_id = "src_lint_meta_001"
-        lint_meta = f"{_FIX_PIPE_REF}/source/{src_id}/lint_meta.json"
+        src_id = "src_gate_meta_001"
+        gate_meta = f"{_FIX_PIPE_REF}/source/{src_id}/gate_meta.json"
         command_log = f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
         req = {
             "agent_role": "substep",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "generate",
-            "substep": "lint",
+            "substep": "gate",
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "source_id": src_id,
-            "allowed_output_paths": [lint_meta, command_log],
+            "allowed_output_paths": [gate_meta, command_log],
         }
         out = _allowed_output_paths_for_launch(
             request_payload=req,
             write_roots=[f"{_FIX_PIPE_REF}/source/"],
         )
-        self.assertIn(lint_meta, out)
+        self.assertIn(gate_meta, out)
         self.assertIn(command_log, out)
 
-    def test_generate_static_launch_accepts_static_meta_json(self) -> None:
-        """The deterministic Generate.static substep declares
-        source/<source_id>/static_meta.json as its conductor-authored deliverable
-        (workflow_conductor._static_inproc). It sits at the source root, so the generate phase
-        contract must accept it — else every generate node fails at the static substep's
-        record-launch with "outside phase contract outputs for step='generate'".
+    def test_generate_non_gate_launch_rejects_gate_meta_json(self) -> None:
+        """gate_meta.json is conductor-authored and leaf-non-writable. A Generate.generate /
+        Generate.verify leaf launch must NOT be able to list it as an output (it would
+        auto-authorize overwriting the gate verdict). The generate phase contract accepts
+        gate_meta.json for the deterministic Generate.gate substep ONLY. The retired per-checker
+        meta names are rejected outright, for the gate substep too.
         """
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
-        src_id = "src_static_meta_001"
-        static_meta = f"{_FIX_PIPE_REF}/source/{src_id}/static_meta.json"
-        req = {
-            "agent_role": "substep",
-            "node_key": "problem/shallow_water2d@0.3.0",
-            "step": "generate",
-            "substep": "static",
-            "ir_ref": _FIX_IR_REF,
-            "pipeline_ref": _FIX_PIPE_REF,
-            "source_id": src_id,
-            "allowed_output_paths": [static_meta],
-        }
-        out = _allowed_output_paths_for_launch(
-            request_payload=req,
-            write_roots=[f"{_FIX_PIPE_REF}/source/"],
-        )
-        self.assertIn(static_meta, out)
-
-    def test_generate_non_static_launch_rejects_static_meta_json(self) -> None:
-        """static_meta.json is conductor-authored and leaf-non-writable. A
-        Generate.generate / Generate.verify leaf launch must NOT be able to list it as an
-        output (it would auto-authorize overwriting the static verdict). The generate phase
-        contract accepts static_meta.json for the deterministic Generate.static substep ONLY.
-        """
-        from tools.orchestration_runtime import _allowed_output_paths_for_launch
-
-        src_id = "src_static_meta_002"
-        static_meta = f"{_FIX_PIPE_REF}/source/{src_id}/static_meta.json"
+        src_id = "src_gate_meta_002"
+        gate_meta = f"{_FIX_PIPE_REF}/source/{src_id}/gate_meta.json"
         model_src = f"{_FIX_PIPE_REF}/source/{src_id}/src/m_model.f90"
         for substep in ("generate", "verify"):
             with self.subTest(substep=substep):
@@ -2944,13 +2920,34 @@ shell_tool                       stable             true
                     "ir_ref": _FIX_IR_REF,
                     "pipeline_ref": _FIX_PIPE_REF,
                     "source_id": src_id,
-                    "allowed_output_paths": [model_src, static_meta],
+                    "allowed_output_paths": [model_src, gate_meta],
                 }
                 with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
                     _allowed_output_paths_for_launch(
                         request_payload=req,
                         write_roots=[f"{_FIX_PIPE_REF}/source/"],
                     )
+        # The retired lint/syntax/static_meta names are rejected for EVERY generate substep
+        # (incl. the gate substep) — a leaf can never mint a forged verdict under a stale name.
+        for substep in ("gate", "generate", "verify"):
+            for retired in ("lint_meta.json", "syntax_meta.json", "static_meta.json"):
+                retired_path = f"{_FIX_PIPE_REF}/source/{src_id}/{retired}"
+                req = {
+                    "agent_role": "substep",
+                    "node_key": "problem/shallow_water2d@0.3.0",
+                    "step": "generate",
+                    "substep": substep,
+                    "ir_ref": _FIX_IR_REF,
+                    "pipeline_ref": _FIX_PIPE_REF,
+                    "source_id": src_id,
+                    "allowed_output_paths": [retired_path],
+                }
+                with self.subTest(substep=substep, retired=retired):
+                    with self.assertRaisesRegex(ValueError, "outside phase contract outputs"):
+                        _allowed_output_paths_for_launch(
+                            request_payload=req,
+                            write_roots=[f"{_FIX_PIPE_REF}/source/"],
+                        )
 
     def test_compile_static_launch_accepts_compile_static_meta_json(self) -> None:
         """The deterministic Compile.static substep declares
@@ -3069,40 +3066,51 @@ shell_tool                       stable             true
                         write_roots=[f"{_FIX_PIPE_REF}/source/"],
                     )
 
-    def test_lint_meta_json_not_file_tool_writable(self) -> None:
-        """Even for the Generate.lint substep, lint_meta.json must stay out of the
+    def test_gate_meta_json_not_file_tool_writable(self) -> None:
+        """Even for the Generate.gate substep, gate_meta.json must stay out of the
         auto-derived allowed_file_tool_paths set (no leaf may Edit/Write it; the
-        conductor writes it in-process). An explicit request listing it is rejected.
+        conductor writes it in-process). An explicit request listing it — or any retired
+        per-checker meta name — is rejected.
         """
         from tools.orchestration_runtime import _allowed_file_tool_paths_for_launch
 
-        src_id = "src_lint_meta_003"
-        lint_meta = f"{_FIX_PIPE_REF}/source/{src_id}/lint_meta.json"
+        src_id = "src_gate_meta_003"
+        gate_meta = f"{_FIX_PIPE_REF}/source/{src_id}/gate_meta.json"
         command_log = f"{_FIX_PIPE_REF}/source/{src_id}/src/command_log.jsonl"
         model_src = f"{_FIX_PIPE_REF}/source/{src_id}/src/m_model.f90"
         req = {
             "agent_role": "substep",
             "node_key": "problem/shallow_water2d@0.3.0",
             "step": "generate",
-            "substep": "lint",
+            "substep": "gate",
             "ir_ref": _FIX_IR_REF,
             "pipeline_ref": _FIX_PIPE_REF,
             "source_id": src_id,
         }
-        # Auto-derive (allowed_file_tool_paths unset): lint_meta.json excluded.
+        # Auto-derive (allowed_file_tool_paths unset): gate_meta.json excluded.
         derived = _allowed_file_tool_paths_for_launch(
             request_payload=req,
-            allowed_output_paths=[lint_meta, model_src, command_log],
+            allowed_output_paths=[gate_meta, model_src, command_log],
         )
-        self.assertNotIn(lint_meta, derived)
+        self.assertNotIn(gate_meta, derived)
         self.assertIn(model_src, derived)
-        # Explicit list including lint_meta.json: rejected.
-        req_explicit = {**req, "allowed_file_tool_paths": [model_src, lint_meta]}
-        with self.assertRaisesRegex(ValueError, "conductor-authored lint deliverable"):
+        # Explicit list including gate_meta.json: rejected.
+        req_explicit = {**req, "allowed_file_tool_paths": [model_src, gate_meta]}
+        with self.assertRaisesRegex(ValueError, "conductor-authored gate deliverable"):
             _allowed_file_tool_paths_for_launch(
                 request_payload=req_explicit,
-                allowed_output_paths=[lint_meta, model_src, command_log],
+                allowed_output_paths=[gate_meta, model_src, command_log],
             )
+        # The retired per-checker meta names are also rejected in an explicit list.
+        for retired in ("lint_meta.json", "syntax_meta.json", "static_meta.json"):
+            retired_path = f"{_FIX_PIPE_REF}/source/{src_id}/{retired}"
+            req_retired = {**req, "allowed_file_tool_paths": [model_src, retired_path]}
+            with self.subTest(retired=retired):
+                with self.assertRaisesRegex(ValueError, "retired per-checker deliverable"):
+                    _allowed_file_tool_paths_for_launch(
+                        request_payload=req_retired,
+                        allowed_output_paths=[retired_path, model_src, command_log],
+                    )
 
     def test_dependency_graph_sidecar_not_file_tool_writable(self) -> None:
         """The conductor-authored dependency-graph sidecar <ir_ref>/dependency_graph.json
@@ -7826,10 +7834,11 @@ shell_tool                       stable             true
 
     def test_build_capability_document_mcp_permissions_per_substep(self) -> None:
         """Least-privilege: `mcp_permissions` is granted per (step, substep) — ONLY the
-        four conductor in-process bodies that actually call a gated build-runtime tool get a
-        grant; every LLM leaf and every other deterministic in-process validator falls
-        through to the fail-closed `[]`. Asserted through build_capability_document (the
-        production path) so the wiring — not just the table lookup — is pinned."""
+        three conductor in-process bodies that actually call a gated build-runtime tool get a
+        grant (build, generate.gate, validate.execute); every LLM leaf and every other
+        deterministic in-process validator falls through to the fail-closed `[]`. Asserted
+        through build_capability_document (the production path) so the wiring — not just the
+        table lookup — is pinned."""
         from tools.orchestration_runtime import build_capability_document
 
         node = "problem/shallow_water2d@0.3.0"
@@ -7853,17 +7862,21 @@ shell_tool                       stable             true
             )
             return cap["mcp_permissions"]
 
-        # The four gated bodies get exactly their tool(s).
+        # The three gated bodies get exactly their tool(s). generate.gate unions the lint +
+        # syntax checkers, so it grants both run_linter and run_syntax_check.
         self.assertEqual(_cap(role="step", step="build", substep=None), ["compile_project"])
-        self.assertEqual(_cap(role="substep", step="generate", substep="lint"), ["run_linter"])
-        self.assertEqual(_cap(role="substep", step="generate", substep="syntax"), ["run_syntax_check"])
+        self.assertEqual(_cap(role="substep", step="generate", substep="gate"),
+                         ["run_linter", "run_syntax_check"])
         self.assertEqual(
             _cap(role="substep", step="validate", substep="execute"),
             ["run_program", "run_quality_checks"],
         )
 
-        # Every LLM leaf and every other deterministic validator: `[]` (fail-closed).
+        # Every LLM leaf and every other deterministic validator: `[]` (fail-closed). The retired
+        # per-checker substep names (lint/syntax/static) are no longer in the table -> `[]`.
         self.assertEqual(_cap(role="substep", step="generate", substep="generate"), [])
+        self.assertEqual(_cap(role="substep", step="generate", substep="lint"), [])
+        self.assertEqual(_cap(role="substep", step="generate", substep="syntax"), [])
         self.assertEqual(_cap(role="substep", step="generate", substep="static"), [])
         self.assertEqual(
             _cap(role="substep", step="generate", substep="verify",
@@ -7898,8 +7911,14 @@ shell_tool                       stable             true
         conductor in-process body calls which gated build-runtime tool. If a body gains,
         loses, or renames a gated `tool_*` call and the table is not updated in lockstep,
         the runtime authz gate would silently fail-closed (deny a needed tool) or over-grant
-        in production, with the existing per-substep tests still green. Introspect the four
-        bodies' source and assert the derived (step, substep) -> tools mapping IS the table."""
+        in production, with the existing per-substep tests still green.
+
+        generate.gate does NOT call any gated tool directly — it delegates to the
+        `self._gate_<checker>_check(...)` helpers. So the derivation is a one-level CALL-GRAPH
+        WALK: it starts from the dispatched body, and for every `self._gate_*_check(` call it
+        finds, UNIONS the gated tools of that helper. A helper call that is removed (dropping a
+        checker) drops its tool from the derived set and reds this test — the negative tooth the
+        plan requires."""
         import inspect
         import re
         import tools.workflow_conductor as wc
@@ -7909,11 +7928,10 @@ shell_tool                       stable             true
         from mcp_servers import build_runtime_server as brs
         from tools.orchestration_runtime import _MCP_TOOL_GRANTS_BY_SUBSTEP
 
-        # (step, substep) -> the Conductor in-process method that runs it.
+        # (step, substep) -> the Conductor in-process method that the dispatcher runs.
         bodies = {
             ("build", ""): wc.Conductor._build_inproc,
-            ("generate", "lint"): wc.Conductor._lint_inproc,
-            ("generate", "syntax"): wc.Conductor._syntax_inproc,
+            ("generate", "gate"): wc.Conductor._gate_inproc,
             ("validate", "execute"): wc.Conductor._execute_inproc,
         }
         # Gated build-runtime handler name -> the MCP tool id it enforces.
@@ -7942,26 +7960,51 @@ shell_tool                       stable             true
             "`handler_to_tool` and _MCP_TOOL_GRANTS_BY_SUBSTEP with build_runtime_server",
         )
 
-        derived: dict[tuple[str, str], tuple[str, ...]] = {}
-        for key, fn in bodies.items():
-            src = inspect.getsource(fn)
-            # Match the CALL shape `tool_x(` — not a bare name, which would also match the
+        def _tools_in(src: str) -> set[str]:
+            # Match the CALL shape `tool_x(` — not a bare name, which would also match an
             # in-body `from build_runtime_server import tool_x` line and let a removed call
             # with a retained import slip through as a false grant.
-            tools_called = tuple(sorted(
-                tool for handler, tool in handler_to_tool.items()
-                if re.search(rf"\b{handler}\s*\(", src)
-            ))
-            derived[key] = tools_called
+            return {tool for handler, tool in handler_to_tool.items()
+                    if re.search(rf"\b{handler}\s*\(", src)}
 
-        # The table must grant EXACTLY the tools each body calls (order-insensitive), and
-        # cover exactly these four keys — no stale entry, no missing body.
+        def _tools_for_body(fn) -> tuple[str, ...]:
+            src = inspect.getsource(fn)
+            tools = set(_tools_in(src))
+            # One-level call-graph walk: expand every self._gate_<checker>_check( helper the
+            # body calls, unioning the gated tools that helper itself invokes.
+            for m in re.finditer(r"self\.(_gate_\w+_check)\s*\(", src):
+                helper = getattr(wc.Conductor, m.group(1), None)
+                if helper is not None:
+                    tools |= _tools_in(inspect.getsource(helper))
+            return tuple(sorted(tools))
+
+        derived = {key: _tools_for_body(fn) for key, fn in bodies.items()}
+
+        # The table must grant EXACTLY the tools each body (transitively) calls
+        # (order-insensitive), covering exactly these keys — no stale entry, no missing body.
         self.assertEqual(
             {k: tuple(sorted(v)) for k, v in _MCP_TOOL_GRANTS_BY_SUBSTEP.items()},
             derived,
             "grant table drifted from the conductor in-process call sites — update "
             "_MCP_TOOL_GRANTS_BY_SUBSTEP (and this test's `bodies` map) together",
         )
+
+        # NEGATIVE TEETH — the gate grant lives ENTIRELY in the helper call-graph:
+        #   (i) _gate_inproc calls no gated tool directly (a direct-only scan derives nothing),
+        #       so an inlined checker with no self._gate_*_check( call would DROP its tools and
+        #       red the equality above instead of silently over-granting.
+        gate_src = inspect.getsource(wc.Conductor._gate_inproc)
+        self.assertEqual(_tools_in(gate_src), set(),
+                         "_gate_inproc must delegate gated tools to the checker helpers")
+        #   (ii) each helper contributes exactly its checker's tool, and _gate_inproc actually
+        #        calls both — so removing either helper call drops that tool from `derived`.
+        self.assertEqual(_tools_in(inspect.getsource(wc.Conductor._gate_lint_check)),
+                         {"run_linter"})
+        self.assertEqual(_tools_in(inspect.getsource(wc.Conductor._gate_syntax_check)),
+                         {"run_syntax_check"})
+        self.assertEqual(_tools_in(inspect.getsource(wc.Conductor._gate_static_check)), set())
+        self.assertTrue(re.search(r"self\._gate_lint_check\s*\(", gate_src))
+        self.assertTrue(re.search(r"self\._gate_syntax_check\s*\(", gate_src))
 
     def test_mcp_grant_table_is_immutable(self) -> None:
         """The grant table is frozen (MappingProxyType) so a stray mutation cannot flip a
@@ -14361,47 +14404,51 @@ class TestPhase2PlanGuardsIntegration(unittest.TestCase):
                 )
             self.assertIn("not permitted by capability", str(ctx.exception))
 
-    def test_validate_mcp_generate_lint_grant_is_least_privilege(self) -> None:
-        """The deterministic generate.lint body gets exactly run_linter: the real authz gate
-        accepts run_linter under its capability token but refuses run_syntax_check on the same
-        child (cross-substep least-privilege — the sibling grant is not shared)."""
+    def test_validate_mcp_generate_gate_grant_is_least_privilege(self) -> None:
+        """The deterministic generate.gate body gets exactly {run_linter, run_syntax_check} (the
+        lint + syntax checkers): the real authz gate accepts BOTH under its capability token but
+        refuses the build/execute tools (compile_project, run_program) on the same child —
+        per-substep least-privilege, no unrelated grant leaks in."""
         import tools.workflow_conductor as wc
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             self._perm_test_preflight(repo_root, "vperm2")
             req = wc.build_launch_request(
                 self._perm_test_refs(),
-                step="generate", substep="lint",
+                step="generate", substep="gate",
                 orchestration_id="vperm2",
                 orchestration_agent_run_id="orch_vperm2",
-                child_agent_run_id="gen_lint_child",
+                child_agent_run_id="gen_gate_child",
                 agent_model="claude-opus-4-8",
                 workflow_mode="dev",
             )
             self.assertTrue(req.get("deterministic"))
             cap = self._perm_record_and_cap(
                 repo_root, orchestration_id="vperm2", parent="orch_vperm2",
-                child="gen_lint_child", req=req,
+                child="gen_gate_child", req=req,
             )
-            self.assertEqual(cap["mcp_permissions"], ["run_linter"])
-            # run_linter is accepted.
-            validate_mcp_build_tool_invocation(
-                repo_root,
-                orchestration_id="vperm2",
-                agent_run_id="gen_lint_child",
-                capability_token=str(cap["capability_token"]),
-                tool_name="run_linter",
-            )
-            # The sibling generate.syntax tool is refused on this lint child.
-            with self.assertRaises(RuntimeError) as ctx:
+            self.assertEqual(cap["mcp_permissions"], ["run_linter", "run_syntax_check"])
+            # Both checker tools are accepted.
+            for tool_name in ("run_linter", "run_syntax_check"):
                 validate_mcp_build_tool_invocation(
                     repo_root,
                     orchestration_id="vperm2",
-                    agent_run_id="gen_lint_child",
+                    agent_run_id="gen_gate_child",
                     capability_token=str(cap["capability_token"]),
-                    tool_name="run_syntax_check",
+                    tool_name=tool_name,
                 )
-            self.assertIn("not permitted by capability", str(ctx.exception))
+            # The unrelated build/execute tools are refused on this gate child.
+            for tool_name in ("compile_project", "run_program"):
+                with self.subTest(tool_name=tool_name):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        validate_mcp_build_tool_invocation(
+                            repo_root,
+                            orchestration_id="vperm2",
+                            agent_run_id="gen_gate_child",
+                            capability_token=str(cap["capability_token"]),
+                            tool_name=tool_name,
+                        )
+                    self.assertIn("not permitted by capability", str(ctx.exception))
 
     def test_validate_mcp_build_grant_accepts_compile_project(self) -> None:
         """The build step's grant is exercised through the REAL authz gate (not just the
@@ -16210,14 +16257,15 @@ class TerminalUnauthorizedWriteDirectWriteTests(unittest.TestCase):
 
 
 class TerminalLintEvidenceExemptionTests(unittest.TestCase):
-    """The conductor-run generate.lint substep writes a host-authored, leaf-non-writable
+    """The conductor-run generate.gate substep writes a host-authored, leaf-non-writable lint
     certificate at <pipeline_ref>/lint_evidence/<source_id>.json -- deliberately outside the
-    substep's source/ write_root (workflow_conductor.Conductor._lint_inproc). That host write
-    must be exempt from FS-diff write attribution, but ONLY for the lint substep."""
+    substep's source/ write_root (workflow_conductor.Conductor._gate_inproc -> _gate_lint_check).
+    That host write must be exempt from FS-diff write attribution, but ONLY for the gate
+    substep."""
 
     _SOURCE_ID = "src_20260415_001"
     _EVIDENCE_REL = f"{_FIX_PIPE_REF}/lint_evidence/{_SOURCE_ID}.json"
-    _LINT_META_REL = f"{_FIX_PIPE_REF}/source/{_SOURCE_ID}/lint_meta.json"
+    _LINT_META_REL = f"{_FIX_PIPE_REF}/source/{_SOURCE_ID}/gate_meta.json"
     # A sibling under lint_evidence/ that is NOT the run's own <source_id>.json certificate.
     _OTHER_EVIDENCE_REL = f"{_FIX_PIPE_REF}/lint_evidence/src_other_999.json"
 
@@ -16288,16 +16336,16 @@ class TerminalLintEvidenceExemptionTests(unittest.TestCase):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('{"ok": true}\n', encoding="utf-8")
 
-    def test_lint_substep_exempts_pipeline_root_evidence(self) -> None:
+    def test_gate_substep_exempts_pipeline_root_evidence(self) -> None:
         from tools.orchestration_runtime import _validate_actual_write_paths
 
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch, run_id = "orch_lint_ev_001", "substep_lint_ev_001"
-            self._setup(repo_root, orch=orch, run_id=run_id, substep="lint")
+            self._setup(repo_root, orch=orch, run_id=run_id, substep="gate")
             self._write_evidence_and_meta(repo_root)
 
-            # Must NOT raise: lint_meta is in write_roots, lint_evidence is the exempt
+            # Must NOT raise: gate_meta is in write_roots, the evidence is the exempt
             # host-authored certificate.
             _validate_actual_write_paths(
                 repo_root,
@@ -16336,9 +16384,9 @@ class TerminalLintEvidenceExemptionTests(unittest.TestCase):
         payload = json.loads(violation.read_text(encoding="utf-8"))
         self.assertIn(self._EVIDENCE_REL, payload.get("unauthorized_paths") or [])
 
-    def test_non_lint_generate_substep_does_not_exempt_evidence(self) -> None:
+    def test_non_gate_generate_substep_does_not_exempt_evidence(self) -> None:
         # Scoping (substep gate): the sandboxed generate.generate leaf carries
-        # substep=="generate", NOT "lint" -- writing the same pipeline-root path is
+        # substep=="generate", NOT "gate" -- writing the same pipeline-root path is
         # still rejected. Models the real actor the exemption must exclude.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -16347,27 +16395,37 @@ class TerminalLintEvidenceExemptionTests(unittest.TestCase):
             self._write_evidence_and_meta(repo_root)
             self._assert_evidence_rejected(repo_root, orch, run_id)
 
-    def test_non_generate_step_lint_substep_does_not_exempt_evidence(self) -> None:
-        # Scoping (step gate is load-bearing): a substep named "lint" under a NON-generate
-        # step, even with a source/ write_root present, is still rejected -- both halves of
-        # the step==generate AND substep==lint gate are required.
+    def test_generate_verify_substep_does_not_exempt_evidence(self) -> None:
+        # Scoping (substep gate): generate.verify (also step==generate) is NOT exempt either --
+        # only the deterministic gate substep writes the certificate.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            orch, run_id = "orch_lint_ev_003", "substep_lint_ev_003"
-            self._setup(repo_root, orch=orch, run_id=run_id, step="build", substep="lint")
+            orch, run_id = "orch_lint_ev_002b", "substep_lint_ev_002b"
+            self._setup(repo_root, orch=orch, run_id=run_id, step="generate", substep="verify")
             self._write_evidence_and_meta(repo_root)
             self._assert_evidence_rejected(repo_root, orch, run_id)
 
-    def test_lint_substep_does_not_exempt_sibling_evidence_file(self) -> None:
+    def test_non_generate_step_gate_substep_does_not_exempt_evidence(self) -> None:
+        # Scoping (step gate is load-bearing): a substep named "gate" under a NON-generate
+        # step, even with a source/ write_root present, is still rejected -- both halves of
+        # the step==generate AND substep==gate gate are required.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            orch, run_id = "orch_lint_ev_003", "substep_lint_ev_003"
+            self._setup(repo_root, orch=orch, run_id=run_id, step="build", substep="gate")
+            self._write_evidence_and_meta(repo_root)
+            self._assert_evidence_rejected(repo_root, orch, run_id)
+
+    def test_gate_substep_does_not_exempt_sibling_evidence_file(self) -> None:
         # The exemption is bound to the EXACT <source_id>.json certificate, not the whole
         # lint_evidence/ dir: a stray sibling (e.g. left by a retry bug) under lint_evidence/
-        # is still flagged as an unauthorized write even for the lint substep.
+        # is still flagged as an unauthorized write even for the gate substep.
         from tools.orchestration_runtime import _validate_actual_write_paths
 
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch, run_id = "orch_lint_ev_004", "substep_lint_ev_004"
-            self._setup(repo_root, orch=orch, run_id=run_id, substep="lint")
+            self._setup(repo_root, orch=orch, run_id=run_id, substep="gate")
             # The run's own certificate (exempt) AND a foreign sibling (must be flagged).
             for rel in (self._EVIDENCE_REL, self._LINT_META_REL, self._OTHER_EVIDENCE_REL):
                 p = repo_root / rel
@@ -16397,37 +16455,24 @@ class TerminalLintEvidenceExemptionTests(unittest.TestCase):
 
 
 class TerminalSyntaxEvidenceExemptionTests(TerminalLintEvidenceExemptionTests):
-    """The conductor-run generate.syntax substep writes the analogous host-authored
-    certificate at <pipeline_ref>/syntax_evidence/<source_id>.json (Conductor.
-    _syntax_inproc -> write_syntax_evidence). Reuses the lint exemption suite with the
-    syntax paths/substep: the same exemption semantics (exact file, step==generate ∧
-    substep==syntax only) must hold."""
+    """The same generate.gate substep ALSO writes the analogous host-authored certificate at
+    <pipeline_ref>/syntax_evidence/<source_id>.json (Conductor._gate_inproc ->
+    _gate_syntax_check -> write_syntax_evidence). Reuses the exemption suite with the syntax
+    paths: the same exemption semantics (exact file, step==generate ∧ substep==gate only) must
+    hold for the syntax certificate too — both certificates come from the one gate substep."""
 
     _SOURCE_ID = TerminalLintEvidenceExemptionTests._SOURCE_ID
     _EVIDENCE_REL = f"{_FIX_PIPE_REF}/syntax_evidence/{_SOURCE_ID}.json"
-    _LINT_META_REL = f"{_FIX_PIPE_REF}/source/{_SOURCE_ID}/syntax_meta.json"
+    _LINT_META_REL = f"{_FIX_PIPE_REF}/source/{_SOURCE_ID}/gate_meta.json"
     _OTHER_EVIDENCE_REL = f"{_FIX_PIPE_REF}/syntax_evidence/src_other_999.json"
 
-    def _setup(self, repo_root: Path, *, orch: str, run_id: str,
-               substep: str | None, step: str = "generate",
-               source_id: str | None = _SOURCE_ID) -> None:
-        # The inherited tests pass substep="lint"/"generate": map the exempt substep
-        # to "syntax" so each inherited scenario exercises the syntax gate instead
-        # (the non-exempt actors — generate.generate / a non-generate step — stay as-is).
-        if substep == "lint":
-            substep = "syntax"
-        super()._setup(repo_root, orch=orch, run_id=run_id, substep=substep,
-                       step=step, source_id=source_id)
-
-    def test_lint_substep_does_not_exempt_syntax_evidence(self) -> None:
-        # Cross-substep scoping: the generate.lint substep must NOT be exempt for the
-        # SYNTAX certificate (each substep is exempt only for its own evidence file).
+    def test_generate_generate_substep_does_not_exempt_syntax_evidence(self) -> None:
+        # Cross-substep scoping: the generate.generate producer leaf must NOT be exempt for the
+        # SYNTAX certificate (only the deterministic gate substep writes it).
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             orch, run_id = "orch_syn_ev_005", "substep_syn_ev_005"
-            # Call the base _setup directly so substep stays literally "lint".
-            TerminalLintEvidenceExemptionTests._setup(
-                self, repo_root, orch=orch, run_id=run_id, substep="lint")
+            self._setup(repo_root, orch=orch, run_id=run_id, substep="generate")
             self._write_evidence_and_meta(repo_root)
             self._assert_evidence_rejected(repo_root, orch, run_id)
 
@@ -17332,21 +17377,22 @@ class GateRunbookTests(unittest.TestCase):
 
     def test_runbook_generate_verify_emits_no_gate(self) -> None:
         # The post_generate + workspace_root gates moved to the conductor's deterministic
-        # generate.static substep, so generate.verify is a pure LLM pass that emits NO runbook.
+        # generate.gate substep (its static checker), so generate.verify is a pure LLM pass that
+        # emits NO runbook.
         from tools.orchestration_runtime import (
             _build_gate_runbook,
             ALLOWED_VALIDATE_PIPELINE_STAGES,
         )
 
         self.assertEqual(_build_gate_runbook(self._payload("generate", "verify")), "")
-        # The substep table maps both generate.verify and the deterministic generate.static
-        # to the empty stage set (keeps the table total; no validator gate from either).
+        # The substep table maps both generate.verify and the deterministic generate.gate
+        # to the empty stage set (keeps the table total; no leaf validator gate from either).
         self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("generate", "verify")], frozenset())
-        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("generate", "static")], frozenset())
-        # generate.static is deterministic -> empty runbook (the deterministic short-circuit).
+        self.assertEqual(ALLOWED_VALIDATE_PIPELINE_STAGES[("generate", "gate")], frozenset())
+        # generate.gate is deterministic -> empty runbook (the deterministic short-circuit).
         self.assertEqual(
             _build_gate_runbook(
-                self._payload("generate", "static", deterministic=True)), "")
+                self._payload("generate", "gate", deterministic=True)), "")
 
     def test_runbook_compile_verify_emits_no_gate(self) -> None:
         # The workspace_root + check_artifact_syntax + --stage compile gates moved to the
@@ -27664,12 +27710,35 @@ class ReopenPhaseTest(unittest.TestCase):
                     reason="x", trigger_agent_run_id=arids["v_judge"],
                 )
 
-    def test_reopen_accepts_same_phase_generate_lint_trigger(self) -> None:
-        # The lint carve-out: a failed generate.lint substep may reopen generate itself
-        # (same-phase) so generate.generate warm-resumes to fix its source.
+    def test_reopen_accepts_same_phase_generate_gate_trigger(self) -> None:
+        # The gate carve-out: a failed generate.gate substep (unioned lint/syntax/static
+        # violation) may reopen generate itself (same-phase) so generate.generate warm-resumes
+        # to fix its source.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
-            oid = "orch_reopen_lint"
+            oid = "orch_reopen_gate"
+            self._build_fixture(repo_root, oid)
+            root = repo_root / "workspace" / "orchestrations" / oid
+            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "agent_run_id": "generate-gate-1", "agent_role": "substep",
+                    "step": "generate", "substep": "gate", "status": "fail",
+                    "node_key": self.NODE_KEY,
+                }) + "\n")
+            result = reopen_phase(
+                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                reason="gate_syntax_error+lint_findings",
+                trigger_agent_run_id="generate-gate-1")
+            self.assertEqual(result["status"], "reopened")
+            self.assertEqual(result["affected_phases"], ["generate", "build", "validate"])
+
+    def test_reopen_rejects_retired_generate_checker_trigger(self) -> None:
+        # The retired per-checker substep tokens (lint/syntax/static) are dropped from the
+        # same-phase carve-out: a legacy in-flight trigger carrying one is NOT strictly
+        # downstream of from_phase=generate, so reopen fails closed loudly.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            oid = "orch_reopen_retired"
             self._build_fixture(repo_root, oid)
             root = repo_root / "workspace" / "orchestrations" / oid
             with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
@@ -27678,33 +27747,10 @@ class ReopenPhaseTest(unittest.TestCase):
                     "step": "generate", "substep": "lint", "status": "fail",
                     "node_key": self.NODE_KEY,
                 }) + "\n")
-            result = reopen_phase(
-                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
-                reason="lint_lint_findings", trigger_agent_run_id="generate-lint-1")
-            self.assertEqual(result["status"], "reopened")
-            self.assertEqual(result["affected_phases"], ["generate", "build", "validate"])
-
-    def test_reopen_accepts_same_phase_generate_static_trigger(self) -> None:
-        # The carve-out extends to generate.static: a failed static substep (post_generate /
-        # workspace_root violation) may reopen generate itself so generate.generate
-        # warm-resumes to fix its source — same mechanism as lint.
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            oid = "orch_reopen_static"
-            self._build_fixture(repo_root, oid)
-            root = repo_root / "workspace" / "orchestrations" / oid
-            with (root / "agent_runs.jsonl").open("a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "agent_run_id": "generate-static-1", "agent_role": "substep",
-                    "step": "generate", "substep": "static", "status": "fail",
-                    "node_key": self.NODE_KEY,
-                }) + "\n")
-            result = reopen_phase(
-                repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
-                reason="static_post_generate_violation",
-                trigger_agent_run_id="generate-static-1")
-            self.assertEqual(result["status"], "reopened")
-            self.assertEqual(result["affected_phases"], ["generate", "build", "validate"])
+            with self.assertRaisesRegex(RuntimeError, "strictly downstream"):
+                reopen_phase(
+                    repo_root, oid, node_key=self.NODE_KEY, from_phase="generate",
+                    reason="lint_lint_findings", trigger_agent_run_id="generate-lint-1")
 
     def test_reopen_accepts_same_phase_compile_static_trigger(self) -> None:
         # The carve-out extends to compile.static: a failed static substep (--stage compile /
