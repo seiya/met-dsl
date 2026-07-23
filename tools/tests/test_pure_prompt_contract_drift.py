@@ -93,6 +93,10 @@ PINNED: dict[str, str] = {
     "pure-9": "273f38bdbf82569ed5f7ebb7a4ce9896c6b386297f1e25ccbd74923b4f38c70a",
     "pure-10": "ba2da518724e26df35bae96bd69a462f96bfb9509b8785b6355ebf51e7e8cc4b",
     "pure-11": "cec79c570b3de442677ab90d18f2064bf32e8e113d9200b862dbf6a89254b8f8",
+    # pure-12: generate lint+syntax+static merged into the single `Generate.gate` substep — the
+    # pure templates renamed the checker-gate anchors (Generate.lint/syntax/static ->
+    # Generate.gate's lint/syntax/static check). Checker terminology preserved; substep name only.
+    "pure-12": "d7ca2da3a13e0bfc07aee6bd03baaada7aa8d10bf4333db20b4848ff9827b4ef",
 }
 
 
