@@ -1594,7 +1594,7 @@ shell_tool                       stable             true
 
     def test_validate_launch_request_payload_accepts_deterministic_compile_static(self) -> None:
         """The deterministic-flag allowlist must also include compile.static (else every compile
-        node fails at the static substep's record-launch). Like generate.static, a compile.static
+        node fails at the static substep's record-launch). Like generate.gate, a compile.static
         payload that passes the allowlist falls through to the agent_model error; a non-static
         deterministic compile substep is still rejected."""
         from tools.orchestration_runtime import _validate_launch_request_payload
@@ -3033,13 +3033,11 @@ shell_tool                       stable             true
                         write_roots=[f"{_FIX_IR_REF}/"],
                     )
 
-    def test_generate_non_lint_launch_rejects_lint_meta_json(self) -> None:
-        """lint_meta.json is conductor-authored and leaf-non-writable. A
-        Generate.generate / Generate.verify leaf launch (real leaf with Edit/Write)
-        must NOT be able to list it as an output — otherwise it would be
-        auto-authorized for direct file-tool writes and could overwrite the lint
-        verdict. The generate phase contract accepts lint_meta.json for the
-        deterministic Generate.lint substep ONLY.
+    def test_generate_leaf_launch_rejects_retired_lint_meta_json(self) -> None:
+        """The retired lint_meta.json (superseded by gate_meta.json) is accepted for NO substep
+        — a Generate.generate / Generate.verify leaf launch (real leaf with Edit/Write) listing
+        it as an output is rejected by the generate phase contract, so a leaf can never mint a
+        forged verdict under the stale name. (Only gate_meta.json is accepted, for Generate.gate.)
         """
         from tools.orchestration_runtime import _allowed_output_paths_for_launch
 
@@ -17333,8 +17331,8 @@ class GateRunbookTests(unittest.TestCase):
                     r"validate_pipeline_semantics\.py --stage (\w+)", rb))
                 # Every emitted vps stage must be in the allow-set; empty allow-set
                 # means no vps command at all. (generate.verify now has an empty allow-set
-                # and emits NO runbook — its gates moved to the deterministic generate.static
-                # substep — so an empty rb is legitimate here.)
+                # and emits NO runbook — its gates moved to the deterministic generate.gate
+                # static check — so an empty rb is legitimate here.)
                 self.assertTrue(stages <= set(allowed),
                                 f"emitted {stages} not subset of allowed {set(allowed)}")
                 if not allowed:
@@ -17432,8 +17430,8 @@ class GateRunbookTests(unittest.TestCase):
         )
 
         # generate.verify, compile.verify AND validate.judge are intentionally excluded: their
-        # validator gates moved to the deterministic generate.static / compile.static substeps
-        # and (for judge) to the conductor-owned pre_judge gate, so they now render with no Gate
+        # validator gates moved to the deterministic generate.gate static check / compile.static
+        # substep and (for judge) to the conductor-owned pre_judge gate, so they render with no Gate
         # Runbook (covered by test_rendered_prompt_unmapped_phase_no_stray_marker's empty-runbook
         # behavior and test_runbook_judge_emits_no_gate).
         for step, substep in (
@@ -27755,7 +27753,7 @@ class ReopenPhaseTest(unittest.TestCase):
     def test_reopen_accepts_same_phase_compile_static_trigger(self) -> None:
         # The carve-out extends to compile.static: a failed static substep (--stage compile /
         # syntax / workspace_root violation) may reopen compile itself so compile.generate
-        # warm-resumes to fix its IR — same mechanism as generate.lint/static.
+        # warm-resumes to fix its IR — same mechanism as generate.gate.
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             oid = "orch_reopen_compile_static"

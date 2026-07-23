@@ -15,12 +15,12 @@ is keyed on the pipeline root (which the validator already receives as `--pipeli
 rather than the orchestration id, so no extra `--orchestration-id` plumbing is needed.
 
 Unlike the codex cache (written outside any substep window), this certificate is written by
-the conductor DURING the in-process `generate.lint` substep, so it lands in that substep's
-FS-diff at terminalization. Because it sits at the pipeline root — outside the generate
-substep's `source/` write_root — the write-attribution check
+the conductor DURING the in-process `generate.gate` substep (its lint check), so it lands in
+that substep's FS-diff at terminalization. Because it sits at the pipeline root — outside the
+generate substep's `source/` write_root — the write-attribution check
 (`orchestration_runtime._validate_actual_write_paths`) explicitly EXEMPTS the EXACT
-`<pipeline_root>/lint_evidence/<source_id>.json` certificate for the lint substep (scoped to
-step==generate ∧ substep==lint; `source_id` from the host-authored launch request). The
+`<pipeline_root>/lint_evidence/<source_id>.json` certificate for the gate substep (scoped to
+step==generate ∧ substep==gate; `source_id` from the host-authored launch request). The
 exemption is the exact file, NOT the whole `lint_evidence/` directory, so a stray sibling
 there is still flagged. The sandboxed `generate.generate` leaf is never exempted and cannot
 reach the pipeline root under bwrap, preserving non-forgeability.

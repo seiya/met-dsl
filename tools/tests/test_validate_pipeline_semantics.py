@@ -628,7 +628,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
         },
     )
     # Conductor-authored, leaf-non-writable syntax evidence (pipeline-root). post_generate
-    # certifies the conductor-run generate.syntax gate (gfortran -fsyntax-only) against it.
+    # certifies the conductor-run generate.gate syntax check (gfortran -fsyntax-only) against it.
     _write_json(
         pipeline_dir / "syntax_evidence" / "src_20260415_001.json",
         {
@@ -9488,7 +9488,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
             )
 
     def test_validate_generate_lint_certifies_at_static_without_pass(self) -> None:
-        # New flow: post_generate runs in generate.static BEFORE verify sets
+        # New flow: post_generate runs in generate.gate (its static check) BEFORE verify sets
         # verification_status=pass. The cert must still run (and catch a bad evidence)
         # purely because the conductor's lint_evidence is present — not gated on pass.
         with tempfile.TemporaryDirectory() as tmp:
@@ -9693,7 +9693,7 @@ shallow_water2d_runner.o: shallow_water2d_runner.f90 shallow_water2d_model.mod
 
     def test_validate_generate_syntax_certifies_at_static_without_pass(self) -> None:
         # Like lint: the cert runs whenever the conductor evidence exists, not only on a
-        # verify pass (post_generate runs in generate.static BEFORE verify).
+        # verify pass (post_generate runs in generate.gate (its static check) BEFORE verify).
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             meta_path = self._syntax_evidence_fixture(repo_root, {

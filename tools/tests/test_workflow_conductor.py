@@ -1179,7 +1179,7 @@ class ConductRoutingTest(unittest.TestCase):
     def test_compile_static_finding_warm_reopens_compile_same_phase(self) -> None:
         # A compile.static finding routes retry/compile/reuse (same-phase); conduct
         # must do a SAME-PHASE warm reopen (reopen-phase --from-phase compile) and re-run
-        # compile, exactly like a generate.static finding reopens generate.
+        # compile, exactly like a generate.gate finding reopens generate.
         c = self._conductor()
         state = {"static_failed": False}
 
@@ -6647,7 +6647,7 @@ class DeterministicLintTest(unittest.TestCase):
             self.assertTrue(
                 ev["run_linter"][0]["command_log_ref"].endswith("/src/command_log.jsonl"))
 
-    def test_lint_inproc_findings_is_content_fail(self) -> None:
+    def test_gate_lint_check_findings_is_content_fail(self) -> None:
         import tempfile
         from tools.hooks.lint_evidence import read_lint_evidence
         with tempfile.TemporaryDirectory() as td:
@@ -6668,7 +6668,7 @@ class DeterministicLintTest(unittest.TestCase):
             assert ev is not None
             self.assertFalse(ev["ok"])
 
-    def test_lint_inproc_mixed_records_two_entries(self) -> None:
+    def test_gate_lint_check_mixed_records_two_entries(self) -> None:
         import tempfile
         from tools.hooks.lint_evidence import read_lint_evidence
         with tempfile.TemporaryDirectory() as td:
@@ -6690,7 +6690,7 @@ class DeterministicLintTest(unittest.TestCase):
             self.assertEqual(ev["preset"], "mixed")
             self.assertEqual({e["preset"] for e in ev["run_linter"]}, {"fortitude", "cppcheck"})
 
-    def test_lint_inproc_unknown_language_raises(self) -> None:
+    def test_gate_lint_check_unknown_language_raises(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -6778,7 +6778,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertTrue(
                 ev["stages"][0]["command_log_ref"].endswith("/src/command_log.jsonl"))
 
-    def test_syntax_inproc_compile_error_is_content_fail(self) -> None:
+    def test_gate_syntax_check_compile_error_is_content_fail(self) -> None:
         import tempfile
         from tools.hooks.syntax_evidence import read_syntax_evidence
         with tempfile.TemporaryDirectory() as td:
@@ -6806,7 +6806,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertFalse(ev["ok"])
             self.assertEqual(ev["stages"][0]["status"], "fail")
 
-    def test_syntax_inproc_non_fortran_passes_through(self) -> None:
+    def test_gate_syntax_check_non_fortran_passes_through(self) -> None:
         import tempfile
         from tools.hooks.syntax_evidence import syntax_evidence_path
         with tempfile.TemporaryDirectory() as td:
@@ -6829,7 +6829,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
                 syntax_evidence_path(pipeline_root=repo / refs.pipeline_ref,
                                      source_id="src_1").exists())
 
-    def test_syntax_inproc_no_sources_is_content_fail(self) -> None:
+    def test_gate_syntax_check_no_sources_is_content_fail(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -6843,7 +6843,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "syntax_error")
 
-    def test_syntax_inproc_missing_gfortran_is_transport_fail(self) -> None:
+    def test_gate_syntax_check_missing_gfortran_is_transport_fail(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -6856,7 +6856,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     c._gate_syntax_check(refs, "child-1", "captok")
 
-    def test_syntax_inproc_optional_stage_skipped_records_and_passes(self) -> None:
+    def test_gate_syntax_check_optional_stage_skipped_records_and_passes(self) -> None:
         import sys
         import tempfile
         from unittest import mock
@@ -6896,7 +6896,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertEqual(by_compiler["gfortran"]["status"], "pass")
             self.assertEqual(by_compiler["frt"]["status"], "skipped")
 
-    def test_syntax_inproc_nonmake_with_deps_fails_closed_not_loops(self) -> None:
+    def test_gate_syntax_check_nonmake_with_deps_fails_closed_not_loops(self) -> None:
         # A fortran node whose dependency modules cannot be staged (non-make: the conductor
         # does not own its Makefile, so _stage_dependency_sources is a no-op) must fail
         # CLOSED (RuntimeError -> transport) rather than run gfortran, get "Cannot open
@@ -6949,7 +6949,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             return "probe"
         return "stage"
 
-    def test_syntax_inproc_dependency_source_finding_fails_closed_not_loops(self) -> None:
+    def test_gate_syntax_check_dependency_source_finding_fails_closed_not_loops(self) -> None:
         # The gate compiles the node's src TOGETHER with the certified dependency-closure
         # `<dep>_model.f90`. A failure the DEPENDENCY sources cause is unfixable by this
         # node's leaf (they lie outside its src/ and its write_roots), so routing it as a
@@ -6984,7 +6984,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             # no content-fail deliverable is authored on a transport fail_closed
             self.assertFalse((repo / refs.source_dir() / "syntax_meta.json").exists())
 
-    def test_syntax_inproc_node_source_finding_with_deps_staged_still_content_fail(self) -> None:
+    def test_gate_syntax_check_node_source_finding_with_deps_staged_still_content_fail(self) -> None:
         # The mirror of the test above: with a dependency staged, a finding in the NODE's own
         # source stays a content failure (warm-resume). The attribution probe must not
         # over-trigger and turn every syntax finding on a node with deps into fail_closed.
@@ -7010,7 +7010,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertEqual(meta["status"], "fail")
             self.assertEqual(meta["failure_category"], "syntax_error")
 
-    def test_syntax_inproc_unviable_invocation_fails_closed_not_blaming_deps(self) -> None:
+    def test_gate_syntax_check_unviable_invocation_fails_closed_not_blaming_deps(self) -> None:
         # `std` comes from the LLM-authored IR and is passed verbatim as `-std=<value>`. An
         # unknown value (`2008`, the elided-`f` form the IMPL_PLAN_SPEC example once showed)
         # makes the driver reject the COMMAND LINE: no source is parsed and every file fails
@@ -7037,7 +7037,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertIn("toolchain.standard", msg)
             self.assertNotIn(self.DEP_REF, msg)  # the dependency must NOT be blamed
 
-    def test_syntax_inproc_dep_failure_message_names_both_causes(self) -> None:
+    def test_gate_syntax_check_dep_failure_message_names_both_causes(self) -> None:
         # A closure failing under this node's std has two possible causes, and the leaf can
         # fix NEITHER, so both take the same fail_closed: the dependency's certified source is
         # defective, OR this node's declared standard is narrower than the sound closure needs.
@@ -7072,7 +7072,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertIn(self.DEP_REF, msg)          # what was staged
             self.assertIn("not in the selected standard", msg)  # the diagnostics decide
 
-    def test_syntax_inproc_dep_warning_beside_node_error_is_content_fail(self) -> None:
+    def test_gate_syntax_check_dep_warning_beside_node_error_is_content_fail(self) -> None:
         # The attribution probe asks the compiler ("does the dependency closure pass on its
         # own?"), never the diagnostics text. A clean dependency still PRINTS default-on
         # warnings (-Wampersand / -Wtabs / -Wunderflow) that name its file, and gfortran emits
@@ -7109,7 +7109,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
             self.assertEqual(meta["status"], "fail")
             self.assertIn("no IMPLICIT type", meta["failure_excerpt"])
 
-    def test_syntax_inproc_unregistered_optional_compiler_skipped(self) -> None:
+    def test_gate_syntax_check_unregistered_optional_compiler_skipped(self) -> None:
         # An optional METDSL_SYNTAX_COMPILERS entry with no registered adapter is recorded
         # skipped, NOT crashed: the tool raises ValueError for an unknown compiler, which
         # would otherwise propagate as a transport fail_closed even though gfortran passed.
@@ -7186,7 +7186,7 @@ class DeterministicStaticTest(unittest.TestCase):
             self.assertEqual(meta["status"], "pass")
             self.assertIsNone(meta["failure_category"])
 
-    def test_static_inproc_post_generate_violation_is_content_fail(self) -> None:
+    def test_gate_static_check_post_generate_violation_is_content_fail(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -7201,7 +7201,7 @@ class DeterministicStaticTest(unittest.TestCase):
             self.assertEqual(meta["failure_category"], "post_generate_violation")
             self.assertIn("pg-out", meta["failure_excerpt"])
 
-    def test_static_inproc_workspace_root_violation_short_circuits(self) -> None:
+    def test_gate_static_check_workspace_root_violation_short_circuits(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)

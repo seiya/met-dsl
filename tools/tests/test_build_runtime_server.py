@@ -306,7 +306,7 @@ class RunSyntaxCheckGfortranSmokeTests(unittest.TestCase):
     def test_default_on_warning_names_its_file_without_failing_the_gate(self) -> None:
         # Only the two promoted classes are errors. Other default-on warnings (-Wampersand
         # here) still print, anchored to their file, on a source the gate PASSES. The
-        # conductor's dependency attribution (`_syntax_inproc`) relies on exactly this: a
+        # conductor's dependency attribution (`_gate_syntax_check`) relies on exactly this: a
         # staged dependency's filename appearing in a failing stage's output proves nothing
         # about whose defect it is, so attribution asks the compiler (does the dependency
         # closure pass on its own?) instead of reading the diagnostics.

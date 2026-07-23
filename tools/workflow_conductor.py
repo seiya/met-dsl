@@ -4386,7 +4386,7 @@ clean:
             # No static-lint mapping for this language: a precondition error, not a content
             # failure the generate retry loop could fix -> transport fail_closed.
             raise RuntimeError(
-                f"generate.lint: toolchain.language={language!r} has no static lint preset "
+                f"generate.gate lint check: toolchain.language={language!r} has no static lint preset "
                 f"mapping (expected one of {sorted(_LINT_PRESET_FOR_LANGUAGE)})")
 
         src_dir = self.repo_root / refs.source_dir() / "src"
@@ -4557,7 +4557,7 @@ clean:
             staged_deps = self._stage_dependency_sources(refs, deps_dir)
             if not staged_deps and self._dependency_closure_nodes(refs):
                 raise RuntimeError(
-                    f"generate.syntax: cannot stage dependency modules for build_system="
+                    f"generate.gate syntax check: cannot stage dependency modules for build_system="
                     f"{tc['build_system']!r} (only make+fortran staging is supported); the "
                     f"syntax gate would misdiagnose an unresolved `use <dep>_model` as a "
                     f"content error and loop — fail closed (this node is unbuildable anyway)")
@@ -4579,7 +4579,7 @@ clean:
                 if compiler not in _SYNTAX_COMPILER_ADAPTERS:
                     if compiler == "gfortran":
                         raise RuntimeError(
-                            "generate.syntax: gfortran has no registered syntax-check "
+                            "generate.gate syntax check: gfortran has no registered syntax-check "
                             "adapter (build-tooling bug)")
                     stages.append({
                         "compiler": compiler,
@@ -4609,7 +4609,7 @@ clean:
                 if result.get("skipped"):
                     if compiler == "gfortran":
                         raise RuntimeError(
-                            f"generate.syntax: mandatory gfortran stage unavailable "
+                            f"generate.gate syntax check: mandatory gfortran stage unavailable "
                             f"({result.get('reason')})")
                     stages.append({
                         "compiler": compiler,
@@ -4668,7 +4668,7 @@ clean:
                         canary_excerpt = ((canary.get("stdout", "") or "")
                                           + (canary.get("stderr", "") or ""))
                         raise RuntimeError(
-                            f"generate.syntax: the {compiler} invocation is not viable — it "
+                            f"generate.gate syntax check: the {compiler} invocation is not viable — it "
                             f"rejects even a canary source valid under every standard, so the "
                             f"failure is the invocation, not the sources. Check "
                             f"impl_defaults.toolchain.standard={tc['standard']!r} (it is passed "
@@ -4735,7 +4735,7 @@ clean:
                             # be reported as sound, sending the operator to widen this node's
                             # standard to accommodate nonconforming code.
                             raise RuntimeError(
-                                f"generate.syntax: the certified dependency closure does not "
+                                f"generate.gate syntax check: the certified dependency closure does not "
                                 f"pass the {compiler} gate under this node's "
                                 f"impl_defaults.toolchain.standard={tc['standard']!r}, and this "
                                 f"node's leaf can fix neither the closure (it lies outside "

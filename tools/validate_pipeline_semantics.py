@@ -3050,8 +3050,8 @@ def _validate_source_meta_json_files(
             violations.append(f"{meta_path}:{clause}")
         # NOTE: lint is no longer recorded in source_meta.lint_command_ref (the leaf does
         # not run run_linter); the conductor-run lint is certified by post_generate (which now
-        # runs in the deterministic generate.static substep, before verify) against the
-        # host-authored lint evidence (_validate_generate_lint_command_logs).
+        # runs as the static check of the deterministic generate.gate substep, before verify)
+        # against the host-authored lint evidence (_validate_generate_lint_command_logs).
 
 
 def _validate_ir_meta_json(ir_dir: Path, violations: list[str]) -> None:
@@ -3859,7 +3859,7 @@ def _validate_generate_outputs(
 # name (identifier) to 63 characters. Used by the module-name check below to fail an
 # over-limit `<spec_id>_model` as a spec-level problem (the spec_id is too long) at
 # post_generate. General over-limit identifiers in the generated source are caught by
-# the real compiler front-end in the deterministic `generate.syntax` substep
+# the real compiler front-end in the deterministic `generate.gate` substep
 # (gfortran -fsyntax-only via MCP run_syntax_check), which replaced the retired
 # post_generate text heuristics (identifier length / `implicit none` spec-list /
 # non-constant STOP code) that could only mimic gfortran one observed failure at a time.
@@ -5648,7 +5648,7 @@ def _validate_generate_lint_command_logs(
     """Certify the conductor-run static lint for Generate against its host-authored,
     leaf-non-writable evidence (`<pipeline_root>/lint_evidence/<source_id>.json`).
 
-    Static lint is no longer run by the leaf (it is the deterministic `generate.lint`
+    Static lint is no longer run by the leaf (it is the deterministic `generate.gate`
     substep run in-process by the conductor — Conductor._gate_lint_check). The evidence
     certificate cannot be forged by the leaf (the pipeline root is read-only inside the
     sandbox), so this validates against it rather than the former leaf-written
@@ -5658,9 +5658,9 @@ def _validate_generate_lint_command_logs(
     pipeline_root = meta_path.parents[2]
     from tools.hooks.lint_evidence import lint_evidence_path, read_lint_evidence
 
-    # post_generate now runs in the deterministic `generate.static` substep, which executes
+    # post_generate now runs in the deterministic `generate.gate` substep, which executes
     # BEFORE `generate.verify` sets verification_status=pass — but the conductor already wrote
-    # the lint evidence in `generate.lint`. Certify whenever that evidence exists (the
+    # the lint evidence in `generate.gate`. Certify whenever that evidence exists (the
     # static-stage flow) OR the leaf is claiming pass (legacy/back-compat). Skip only when
     # neither holds (e.g. a manual or pre-lint invocation on an un-certified source), matching
     # the prior "only certify a pass" behavior so unrelated callers are unaffected.
@@ -5699,7 +5699,7 @@ def _validate_generate_lint_command_logs(
         violations.append(
             f"{meta_path}: missing conductor lint evidence "
             f"(expected {pipeline_root.name}/lint_evidence/{source_id}.json) when "
-            "verification_status=pass; lint is run by the conductor (generate.lint)"
+            "verification_status=pass; lint is run by the conductor (generate.gate)"
         )
         return
     if evidence.get("ok") is not True:
@@ -5825,7 +5825,7 @@ def _validate_generate_syntax_command_logs(
     host-authored, leaf-non-writable evidence
     (`<pipeline_root>/syntax_evidence/<source_id>.json`).
 
-    The syntax gate is the deterministic `generate.syntax` substep run in-process by the
+    The syntax gate is the deterministic `generate.gate` substep run in-process by the
     conductor (Conductor._gate_syntax_check -> MCP run_syntax_check). Mirrors
     `_validate_generate_lint_command_logs`: the certificate cannot be forged by the leaf
     (the pipeline root is read-only inside the sandbox). Required only for
@@ -5838,7 +5838,7 @@ def _validate_generate_syntax_command_logs(
     from tools.hooks.syntax_evidence import read_syntax_evidence, syntax_evidence_path
 
     # fortran is the only language the gate runs for; other languages pass through the
-    # generate.syntax substep without evidence, so there is nothing to certify.
+    # generate.gate syntax check without evidence, so there is nothing to certify.
     if not impl_language or impl_language.strip().lower() != "fortran":
         return
 
@@ -5868,7 +5868,7 @@ def _validate_generate_syntax_command_logs(
             f"{meta_path}: missing conductor syntax evidence "
             f"(expected {pipeline_root.name}/syntax_evidence/{source_id}.json) when "
             "verification_status=pass; the syntax gate is run by the conductor "
-            "(generate.syntax)"
+            "(generate.gate)"
         )
         return
     if evidence.get("ok") is not True:
