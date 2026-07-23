@@ -96,7 +96,7 @@ PINNED: dict[str, str] = {
     # pure-12: generate lint+syntax+static merged into the single `Generate.gate` substep — the
     # pure templates renamed the checker-gate anchors (Generate.lint/syntax/static ->
     # Generate.gate's lint/syntax/static check). Checker terminology preserved; substep name only.
-    "pure-12": "d7ca2da3a13e0bfc07aee6bd03baaada7aa8d10bf4333db20b4848ff9827b4ef",
+    "pure-12": "35239881cab2c79d1f59a52985d21c8cdc330c05c1b2a1f7106ac436b107d11c",
 }
 
 

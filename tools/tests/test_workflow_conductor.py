@@ -6623,7 +6623,7 @@ class DeterministicLintTest(unittest.TestCase):
         import build_runtime_server  # type: ignore
         return mock.patch.object(build_runtime_server, "tool_run_linter", fn)
 
-    def test_lint_inproc_pass_writes_meta_and_evidence(self) -> None:
+    def test_gate_lint_check_pass_returns_section_and_writes_evidence(self) -> None:
         import tempfile
         from tools.hooks.lint_evidence import read_lint_evidence
         with tempfile.TemporaryDirectory() as td:
@@ -6739,7 +6739,7 @@ class DeterministicSyntaxTest(unittest.TestCase):
         import build_runtime_server  # type: ignore
         return mock.patch.object(build_runtime_server, "tool_run_syntax_check", fn)
 
-    def test_syntax_inproc_pass_writes_meta_and_evidence(self) -> None:
+    def test_gate_syntax_check_pass_returns_section_and_writes_evidence(self) -> None:
         import tempfile
         from tools.hooks.syntax_evidence import read_syntax_evidence
         with tempfile.TemporaryDirectory() as td:
@@ -7172,7 +7172,7 @@ class DeterministicStaticTest(unittest.TestCase):
             raise AssertionError(f"unexpected subprocess: {cmd}")
         return run
 
-    def test_static_inproc_pass_writes_meta(self) -> None:
+    def test_gate_static_check_pass_returns_section(self) -> None:
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -7435,6 +7435,37 @@ class DeterministicGateTest(unittest.TestCase):
                     refs, "generate", "gate", "child-1",
                     {"step": "generate", "substep": "gate"})
             self.assertNotEqual(proc.returncode, 0)  # transport fail_closed
+            self.assertFalse((repo / refs.source_dir() / "gate_meta.json").exists())
+
+    def test_static_checker_exception_is_transport_fail_not_content_pass(self) -> None:
+        """An unexpected error in the static checker (e.g. the validator subprocess raising)
+        must propagate out of _gate_inproc — NOT be swallowed into a content pass. lint+syntax
+        pass so static runs; its subprocess raises; _run_deterministic_substep converts it to a
+        transport failure (rc != 0) with no gate_meta written."""
+        import contextlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            refs = self._refs()
+            self._seed(repo, refs)
+            c = self._conductor(repo)
+
+            def linter(args):
+                return {"ok": True, "return_code": 0, "command_id": "cid", "preset": "fortitude"}
+
+            def run(cmd, **kwargs):  # the static checker's validator subprocess blows up
+                raise OSError("python3 not found")
+
+            from unittest import mock
+            with contextlib.ExitStack() as stack:
+                for p in self._patches(linter, self._syntax_pass, run):
+                    stack.enter_context(p)
+                stack.enter_context(
+                    mock.patch.object(c, "_capability_token", lambda arid: "captok"))
+                proc = c._run_deterministic_substep(
+                    refs, "generate", "gate", "child-1",
+                    {"step": "generate", "substep": "gate"})
+            self.assertNotEqual(proc.returncode, 0)  # transport fail_closed, not content pass
             self.assertFalse((repo / refs.source_dir() / "gate_meta.json").exists())
 
 

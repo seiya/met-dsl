@@ -50,9 +50,7 @@ It canonicalizes, per `(step, substep)`, the `validate_pipeline_semantics --stag
 | compile | static | (none) | deterministic conductor substep; the conductor (not a leaf) runs `validate_workspace_root` + `check_artifact_syntax` + `--stage compile` in-process. |
 | compile | verify | (none) | pure LLM semantic pass (spec-cross-reference invariants V1/V3/V5); the `--stage compile` gate moved to `Compile.static`, so verify launches no `validate_pipeline_semantics`. |
 | generate | generate | (none) | `--stage post_generate` is the conductor's deterministic `Generate.gate` static check responsibility (no leaf). |
-| generate | lint | (none) | deterministic conductor substep (`run_linter`); no leaf, no `validate_pipeline_semantics`. |
-| generate | syntax | (none) | deterministic conductor substep (`run_syntax_check`, gfortran `-fsyntax-only`); no leaf, no `validate_pipeline_semantics`. |
-| generate | static | (none) | deterministic conductor substep; the conductor (not a leaf) runs `validate_workspace_root` + `--stage post_generate` in-process. |
+| generate | gate | (none) | deterministic conductor substep unioning three checkers (lint `run_linter`, syntax `run_syntax_check` gfortran `-fsyntax-only`, static `validate_workspace_root` + `--stage post_generate`), all run in-process; no leaf, no leaf `validate_pipeline_semantics`. |
 | generate | verify | (none) | pure LLM semantic pass; the static gates moved to the `Generate.gate` static check, so verify launches no `validate_pipeline_semantics`. |
 | build | — | `post_build` | invoked after the MCP `compile_project` call. |
 | validate | pre_judge | (none) | deterministic conductor substep (index 0); the dependency-DAG readiness check, authoring `pre_judge_meta.json`. No leaf, no `validate_pipeline_semantics` from a leaf. |
