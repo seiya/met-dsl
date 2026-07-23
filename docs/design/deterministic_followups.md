@@ -3138,3 +3138,53 @@ of scope and remains for `Z4`.
 **Confirmation E2E (operator-run, after the commit).** flux
 (`spec/component/dynamics/advection_diffusion/dynamics_advdiff_flux_1d_upwind_center2`): _orch id + result pending._
 Acceptance = `workflow_status=pass` + the audit's Pure-leaf A/B section shows executor `pure` with bundle/verdict metas.
+
+## Dependency operation-name truth path — the component published op name had no carrier, so the pure leaf reinvented it every regeneration (LANDED 2026-07-23)
+
+The 2026-07-23 billed re-auth closure (`advdiff1d_linear --with-deps`, harness 0.6.0) fail_closed at the profile node
+with `retry_budget_exhausted: generate exceeded 3`. Root cause: a component's public op name (`__compute_flux` /
+`__advance` / `__apply`) lived only in its controlled_spec §5 and, transiently, in its just-generated source — never in
+its certified IR (a component IR carried no `public_api`). So on a fresh closure each component re-picked its own op name,
+the profile consumer's `Compile` authored a `direct_deps[].operations` name from convention (`__apply` for all three),
+the `operations ⊆ published` check (V4c-ii) was LLM-only and let the wrong name through, and `_resolve_dependency_facts`
+**silently dropped** the unresolvable name — so the generate leaf calling the invented symbol was rejected by the syntax
+gate (`use` present) AND the static gate (`use` absent) every retry, a pincer with no repairable signal.
+
+The fix is a four-layer truth path for the op NAME (the argument ABI stays derived post-hoc — user decision: pin names
+only, never full signatures, on a component):
+- **L1 — the name gets a carrier.** A component IR now pins its published op names in `public_api.published_operations`
+  (`_validate_component_public_api`, `Compile.static`, V8b — names only; `signatures`/`module_parameters` are forbidden
+  keys). Its generation-side mate `_validate_component_generated_surface` (`Generate.gate`) pins the generated
+  `<spec_id>__` subroutine set == that list, and the bundle layer `pure_bundle_contract_violation`'s
+  `bundle_published_surface_mismatch` (L1c) pins the `operation` entrypoints to it — so §5, IR, source, and bundle are one
+  surface.
+- **L2 — the consumer's Compile is shown a real catalog.** The conductor authors `<ir_ref>/dependency_surface.json` at
+  compile-phase start (`_write_dependency_surface` → `_resolve_component_dep_surface`), resolving each component dep's
+  published names from its certified IR public_api (else its certified source, else `unresolved`). One snapshot feeds both
+  the `compile.generate` prompt (the injected op-name catalog) and the L3 gate — TOCTOU-free.
+- **L3 — V4c-ii is now deterministic.** `_validate_component_dep_operations_membership` checks the authored
+  `operations ⊆` the sidecar's published surface, embedding the full catalog + `source` tag in the violation (the
+  slim-repair lifeline).
+- **L4 — the silent drop is abolished.** `_resolve_dependency_facts`, on an already-certified mis-named IR resumed into
+  Generate, no longer drops the bad name: it replaces the enumeration wholesale with the certified surface (never
+  unioned) and records `declared_operations_unresolved` so the render WARNs the leaf.
+
+**Removal condition 1 — L3's skip→fail-closed asymmetry.** L3 is inert where the sidecar is absent or a dep entry is
+`unresolved`, so a legacy tree (component IRs with no public_api pin) and an unresolved graph edge do not fail-close during
+the transition. Once the fleet is re-authenticated (every certified component IR carries a `public_api` pin and every
+component dep resolves to `ir_public_api`), tighten the two `unresolved`/missing-entry skips to fail-closed so a
+resolution gap can no longer step over the membership check. Do NOT declare the trigger met until a billed re-auth of the
+full advdiff + sw2d closures shows every component dep entry resolving `ir_public_api` (a `certified_source`/`unresolved`
+entry means a component IR still lacks the pin).
+
+**Removal condition 2 — L4 is a resume-safety net, not the primary path.** L4 exists only to converge a resume over a
+component IR that was certified BEFORE L1 (or one that slips a mis-name past a gap). Once no pre-L1 certified component IR
+remains in any live closure (a full re-auth regenerates them all with the public_api pin, and L1a/L1b/L1c reject a
+mis-named one at authoring time), L4's wrong-name replace + `declared_operations_unresolved` WARN become dead code and may
+be retired to a plain empty-list fallback. Same trigger gate as condition 1: keep it until the billed re-auth confirms the
+pin is universal.
+
+**Acceptance vehicle.** The pending billed re-auth closure IS the rollout & acceptance: the fresh component IRs must show
+`public_api.published_operations`, the profile `compile.generate` prompt must carry the op-name catalog, `--stage compile`
+must pass first try, and generate must converge with no syntax-gate retry. sw2d closure likewise. _orch id + result
+pending._

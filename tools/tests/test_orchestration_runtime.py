@@ -27570,7 +27570,13 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # zero-signal presence floor (`_validate_local_operation_lowering`, a `Compile.static` gate
         # routing to compile.generate) and scopes the `major` to the present-but-incomplete band
         # above it — a Compile-failing rule that must live in the force-read doc.
-        "docs/workflow/phases/phase_01_compile.md": 39900,
+        # Bumped 39900->43600: the dep op-name truth path lands four Compile-failing gates the
+        # force-read doc must state — V8b component public_api (names-only pin,
+        # `_validate_component_public_api`), the now-deterministic V4c-ii membership gate against the
+        # conductor-authored `dependency_surface.json` sidecar
+        # (`_validate_component_dep_operations_membership`), V8a/V8b split, and the two new
+        # Verification-tools entries — plus the component public_api authoring bullet.
+        "docs/workflow/phases/phase_01_compile.md": 43600,
         # Per-substep SKILLs — each force-read by its own LLM leaf.
         # Bumped 10800->11500: Compile.generate now authors the io_contract section (G2 /
         # docs/design/deterministic_followups.md) — it was moved here from Compile.verify so the
@@ -27621,7 +27627,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # §5.1's list value-included; the gate pins it == §5.1 by value). This leaf authors public_api
         # and does not read the validator, and Generate.generate is walled off from controlled_spec, so
         # the IR is the leaf's only carrier of the dp/case_id_len values — a Compile-failing rule.
-        "skills/workflow-compile-generate/SKILL.md": 22200,
+        # Bumped 22200->23600: the dep op-name truth path — a new component `public_api` names-only
+        # bullet (V8b; this leaf authors it and does not read the validator), and the component-dep
+        # `operations` bullet gains the membership obligation (copy VERBATIM from the injected
+        # published-operations catalog; a fabricated name is a Compile fail). Compile-failing rules.
+        "skills/workflow-compile-generate/SKILL.md": 23600,
         # Bumped 11800->12100: G7 — compile.verify checks V4c only (operations ⊆ published); the
         # closure/topo consistency is conductor-authored + gate-checked, no longer LLM-verified (G7).
         # Bumped 12100->13100: R2 (G8) — compile.verify owns the SEMANTIC test_predicates fidelity
@@ -27720,7 +27730,11 @@ class ChildContextDocSizeTests(unittest.TestCase):
         # lowering the doc-reading leaf must apply (string `len` deferred->`:` / assumed->`*`, kind
         # value `float64`->`real64`), without which a doc-blind leaf false-starts by emitting the
         # neutral token verbatim into the generated source.
-        "skills/workflow-generate-generate/SKILL.md": 35700,
+        # Bumped 35700->36100: the published-surface bullet gains the component case — with a pinned
+        # IR public_api, the generated `<spec_id>__` set must equal public_api.published_operations
+        # (`_validate_component_generated_surface`, Generate.gate). A doc-reading agentic component
+        # leaf must know this exact-set obligation, not just "prefix io_contract.outputs".
+        "skills/workflow-generate-generate/SKILL.md": 36100,
         # Bumped 21400->21700: the test/check target must invoke the runner with
         # `--cases $(SPEC) $(CASES)` (the runner aborts without it; make test must
         # match run_program's argv) after a validate.execute failure where a bare

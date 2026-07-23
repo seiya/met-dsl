@@ -9978,7 +9978,7 @@ def _validate_component_dep_operations_membership(
     resolution gap). A sidecar that is unreadable, or an entry whose ``published_operations`` is
     the wrong shape, is fail-closed. The skip→fail-closed asymmetry is a deliberate rollout
     affordance; its removal after fleet re-auth is tracked in
-    ``docs/workflow/deterministic_followups.md``. No-op on a missing/unparseable IR or a node
+    ``docs/design/deterministic_followups.md``. No-op on a missing/unparseable IR or a node
     with no component dependency."""
     derived_path = ir_dir / "spec.ir.yaml"
     if not derived_path.exists():

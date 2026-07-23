@@ -93,7 +93,8 @@ Place **0. Meta information** at the top. The subsequent sections are fixed per 
 - Required statement: state the judgment conditions for invalid input, the error-termination conditions, and the handling of out-of-tolerance.
 
 5. **Public API and compatibility**
-- Required statement: state the `operation_id` list, the `major` / `minor` update rules, and the backward-compatibility policy.
+- Required statement: state the published `operation_id` list (each a backtick span carrying the `<spec_id>__` prefix — a **language-neutral DSL identifier**, the `__` separator a DSL convention the language backend maps 1:1 to a generated symbol), the `major` / `minor` update rules, and the backward-compatibility policy.
+- `Compile` transcribes this published `operation_id` list into the `IR`'s `public_api.published_operations` (**NAMES ONLY** — a component carries no `signatures` / `module_parameters`; the argument ABI stays derived from the certified source at `Build`, keeping the contract language-neutral), pinned == §5 by set equality (`_validate_component_public_api`, `Compile.static`). That name pin is the source of truth a consumer's `Compile` is shown (the `dependency_surface.json` catalog) and that `_validate_component_generated_surface` pins the generated `<spec_id>__` subroutine set against — so a component's published op name cannot drift between spec, IR, generated source, and a consumer's dependency call. Unlike an `infrastructure` spec, a component §5 needs **no** `### 5.1` block (no signatures are pinned).
 
 6. **Prohibitions**
 - Required statement: state the rules that forbid automatic switching, implicit completion, and silent ignoring of out-of-spec input.

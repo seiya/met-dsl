@@ -256,6 +256,15 @@ declares it.
   **exactly one**, a `component` / `infrastructure` member **at least one**, a `profile` member
   **exactly zero**. A member may have any number of `checks_interface` entrypoints — the checks
   surface is a fixed ABI.
+- **Published-surface invariant (L1c, `component` members)**: when the member's certified IR
+  pins its published operation names in `public_api.published_operations`, that member's
+  `operation` entrypoint `symbol` set must equal that name set (casefold) — a member with a
+  published op but no matching entrypoint, or an entrypoint symbol absent from the pinned
+  surface, is rejected (`bundle_published_surface_mismatch`). The host passes the pinned names
+  to `pure_bundle_contract_violation` as `ir_published_operations` (single-sourced via
+  `published_operations_from_ir`); it is inert on a legacy IR with no `public_api` pin or a
+  non-`component` member. This keeps the bundle entrypoints, the generated `<spec_id>__`
+  subroutines (`_validate_component_generated_surface`), and the IR public_api one surface.
 
 `entrypoints` plus `state_bindings` are the structural anchors that replace
 signature-shape heuristics: the published update path of a node is a declared field,
