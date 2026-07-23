@@ -171,16 +171,17 @@ dependency:
                                              #   `infrastructure` dep: `[]` (leaf never calls the harness API).
 
 public_api:
-  # infrastructure nodes ONLY (spec_kind: infrastructure); OMIT for component/profile/problem.
+  # This FULL shape (signatures + module_parameters) is infrastructure ONLY (spec_kind: infrastructure, V8a).
+  # A component authors public_api with `published_operations` ONLY (names, no signatures — V8b); profile/problem OMIT it.
   # The COMPLETE published surface controlled_spec §5 declares ("operation_ids are exactly: ...") —
   # every operation incl. helper emitters/writers no test exercises directly — so Generate
   # publishes all of them and the runner CALLS them, not reimplements. The --stage compile gate
-  # (_validate_infrastructure_public_api) pins these sets == §5 (V8).
+  # (_validate_infrastructure_public_api) pins these sets == §5 (V8a).
   published_operations:
     - operation_id: "<spec_id>__<name>"   # every §5 operation_id (set equality with §5)
       exercised_by: ["<test_id>", ...]    # optional: tests exercising it ([] for a helper)
   published_types: ["<spec_id>__<type>", ...]   # every §5 published derived type (set equality)
-  module_parameters:                      # copy each §5.1 module_parameters entry, value included (V8)
+  module_parameters:                      # copy each §5.1 module_parameters entry, value included (V8a)
     - {name: dp, base: integer, value: float64}         # {name, value} (base: integer optional); gate
     - {name: case_id_len, base: integer, value: 64}     # pins == §5.1 by value (leaf's only carrier)
   signatures:                             # copy §5.1 structured signatures, one {symbol, signature} each
@@ -190,7 +191,7 @@ public_api:
         name: "<spec_id>__<name>"         #   entity {name, rank?, intent?, spec:{type, kind?, len?,
         args:                             #   name?, alloc?}}. Generate renders it to Fortran
           - {name: a, intent: in, spec: {type: real, kind: dp}}   #  (phase_02 §2-1); the gate
-          - {name: b, intent: in, spec: {type: string, len: case_id_len}}   # pins == §5.1 (V8).
+          - {name: b, intent: in, spec: {type: string, len: case_id_len}}   # pins == §5.1 (V8a).
 ```
 
 ### `<ir_ref>/dependency_graph.json` sidecar (conductor-authored)
