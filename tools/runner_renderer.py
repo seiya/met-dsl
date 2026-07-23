@@ -21,7 +21,7 @@ The rendered runner ``use``s two modules: ``harness_fortran_cpu_model`` (the
 certified plumbing) and ``<spec_id>_checks`` (the leaf's fixed-ABI callbacks,
 see ``docs/workflow/CHECKS_MODULE_CONTRACT.md``). It is authored lint-clean
 (``use only:``, ``! allow(C003)``, ≤100-column lines) so the deterministic
-Generate.gate's lint checker — which lints the whole ``src/`` tree — stays green.
+Generate.gate lint checker — which lints the whole ``src/`` tree — stays green.
 
 ``render_runner`` raises ``RenderError`` (→ transport fail_closed, NOT a Generate
 retry) for any IR it cannot faithfully render: an unparseable ``shape_expr``, a
@@ -349,7 +349,7 @@ def _checks(ir: dict[str, Any]) -> list[str]:
             raise RenderError(
                 f"check id {sid!r} renders a {width}-column `case_checks(...)%id` assignment "
                 f"(>= the {MAX_RENDERED_LINE}-column S001 lint limit) after Fortran apostrophe "
-                "escaping; the host-authored runner line would fail Generate.gate's lint check unrepairably. "
+                "escaping; the host-authored runner line would fail Generate.gate lint check unrepairably. "
                 "Declare a shorter check id (or one with fewer apostrophes).")
     return ids
 

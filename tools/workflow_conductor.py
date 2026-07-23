@@ -227,7 +227,7 @@ COMPILE_STATIC_FAILURE_ROUTING: dict[str, tuple[str, str]] = {
 }
 
 # Bound on the validate.execute `failure_excerpt`, which is rendered verbatim into the slim
-# repair prompt. Both axes are needed: the 50-line tail matches the binary_meta / lint_meta
+# repair prompt. Both axes are needed: the 50-line tail matches the binary_meta / gate_meta
 # convention, but a post_execute violation is NOT line-shaped like compiler stderr — it prints
 # whole dict/list payloads inline (`declared state_variables missing in snapshot files ({...})`),
 # and `_snapshot_deliverable_gap` emits its expected/written/missing sets on a single line. Fifty
@@ -4684,8 +4684,8 @@ clean:
                     # write_roots. Warm-resuming generate.generate would regenerate the node's
                     # own files and hit the identical finding — the same futile loop the
                     # non-make staging branch above already fails closed on. The dependency
-                    # itself must be regenerated / re-certified (its own Generate.syntax gate
-                    # enforces the same rules), which is an operator decision, not a retry.
+                    # itself must be regenerated / re-certified (its own Generate.gate syntax
+                    # check enforces the same rules), which is an operator decision, not a retry.
                     # Reachable because a dependency certified BEFORE a gate rule was added
                     # (e.g. the promoted -Werror=unused-* classes) is not clean by induction —
                     # only a dependency certified under the current gate is.
@@ -4741,7 +4741,7 @@ clean:
                                 f"node's leaf can fix neither the closure (it lies outside "
                                 f"source/<source_id>/src/) nor the IR. Either the dependency's "
                                 f"certified source is defective — regenerate and re-certify it, "
-                                f"its own Generate.syntax gate enforces the same rules — or this "
+                                f"its own Generate.gate syntax check enforces the same rules — or this "
                                 f"node's declared standard rejects a sound closure, in which "
                                 f"case fix toolchain.standard (Build would compile the same "
                                 f"closure under the same -std). The diagnostics below say which. "

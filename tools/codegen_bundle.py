@@ -98,7 +98,7 @@ LOGICAL_PATH_PATTERN = rf"^{_SEGMENT_BODY}(?:/{_SEGMENT_BODY})*{_END}"
 _SEGMENT_RE = re.compile(LOGICAL_PATH_SEGMENT_PATTERN)
 # A Fortran identifier: 1-63 characters (the f2008/f2018 limit). An entrypoint `symbol` /
 # `module`, or a `state_bindings` `state_variable` / `storage_symbol`, longer than this cannot
-# pass the mandatory `Generate.gate's syntax check` compiler gate, so the bundle contract rejects it before
+# pass the mandatory `Generate.gate` syntax check compiler gate, so the bundle contract rejects it before
 # assembly rather than deferring the failure to the build (v1 is fortran-only; a per-language
 # limit arrives with a second language).
 FORTRAN_IDENTIFIER_MAX = 63
@@ -1436,7 +1436,7 @@ def m3c_literal_name_violation(doc: Mapping[str, Any], spec_id: str) -> str | No
         # demands it opens `src_dir / f"{spec_id}_checks.f90"` on a case-sensitive filesystem
         # (`_validate_checks_source_files`). Casefolding here accepted `Shallow_Water2d_Checks.f90`
         # — which lints and compiles fine, since Fortran resolves `use` by module name and never
-        # by filename — and then `Generate.gate's static check` rejected it on the name, reopening the phase.
+        # by filename — and then `Generate.gate` static check rejected it on the name, reopening the phase.
         # The module comparison below stays casefolded for the mirror-image reason: a Fortran
         # identifier IS case-insensitive.
         match = next((e for e in candidates
@@ -1464,35 +1464,35 @@ def m3c_checks_abi_violation(doc: Mapping[str, Any], spec_id: str) -> str | None
     bounded in-conversation repair (Z2 defect D: sw2d burned its whole retry budget re-guessing
     an ABI it had never been shown):
 
-    - `Generate.gate's static check` (`_validate_checks_source_files`) requires all of the names to be
+    - `Generate.gate` static check (`_validate_checks_source_files`) requires all of the names to be
       PUBLISHED. It does not distinguish a subroutine from a function.
-    - `Generate.gate's syntax check` rejects a name the runner imports but the module does not define
+    - `Generate.gate` syntax check rejects a name the runner imports but the module does not define
       (`Symbol '<name>' not found in module`) or defines as a FUNCTION (`'<name>' ... has a type,
       which is not consistent with the CALL`).
 
     The required set is the FULL fixed ABI, never the subset the node's own runner happens to
     import: the runner's import list IS dynamic in the IR (`get_r<rank>` per declared rank,
-    `metric_compute` only with metrics), but `Generate.gate's static check` requires all ten regardless, so
+    `metric_compute` only with metrics), but `Generate.gate` static check requires all ten regardless, so
     requiring only the imported subset would accept a bundle that gate then rejects — which is
     what it did until a review caught it.
 
     Conservative NECESSARY condition: every ABI name is published — defined in this module, or
     named in one of its `public ::` statements — and none is defined HERE as a function. It does
-    not check dummy-argument agreement; `Generate.gate's syntax check` stages the runner with the source and
+    not check dummy-argument agreement; `Generate.gate` syntax check stages the runner with the source and
     owns call resolution.
 
-    "Published" is `Generate.gate's static check`'s own notion, deliberately, not a better one. Fortran has
+    "Published" is the `Generate.gate` static check's own notion, deliberately, not a better one. Fortran has
     ways to export a callable name that neither gate models — a whole-module `use` re-export with
     no `public ::`, a generic `interface`, an interface-only module implemented by a submodule —
     and all of them compile and `call` fine while both gates report the ABI unpublished. That is a
     shared false positive, and it stays shared ON PURPOSE: this layer exists to pre-empt
-    `Generate.gate's static check`, so being more permissive than it would just move the rejection later and
+    `Generate.gate` static check, so being more permissive than it would just move the rejection later and
     recreate the disagreement this defect is about, in the other direction. The certified idiom
     (a bare `private` plus an explicit `public ::` list, which authoring rule 1 mandates and all
     16 certified modules use) is well inside what both accept. The parse is delegated to `validate_pipeline_semantics.checks_module_abi_facts` —
-    the SAME parser `Generate.gate's static check` uses, so the two gates cannot disagree about what a given
+    the SAME parser `Generate.gate` static check uses, so the two gates cannot disagree about what a given
     source publishes. (A second implementation is exactly how this layer came to accept output
-    `Generate.gate's static check` rejected.)"""
+    `Generate.gate` static check rejected.)"""
     from tools.runner_renderer import CHECKS_PUBLIC_NAMES
     from tools.validate_pipeline_semantics import checks_module_abi_facts
     # `m3c_literal_name_violation` runs first and guarantees this file exists and declares this
@@ -1513,7 +1513,7 @@ def m3c_checks_abi_violation(doc: Mapping[str, Any], spec_id: str) -> str | None
     # implemented in a submodule, all of which compile, link, and `call` fine. Rejecting those
     # would fail a LEGAL module with findings telling the producer to write the subroutine it had
     # already written: an unexitable repair loop, which is this defect's own failure mode.
-    # `Generate.gate's syntax check` stages the runner with the source and is the authority on call resolution.
+    # `Generate.gate` syntax check stages the runner with the source and is the authority on call resolution.
     wrong_kind = [n for n in CHECKS_PUBLIC_NAMES
                   if n not in unpublished and n in defined and n not in subroutines]
     if unpublished or wrong_kind:
