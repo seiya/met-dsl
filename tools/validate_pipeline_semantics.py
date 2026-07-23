@@ -4308,8 +4308,14 @@ def _list_component_published_subroutines(text: str, spec_id: str) -> list[str]:
     (case-insensitive) with ``<spec_id>__`` — the component's published operation surface. The
     validator may NOT import ``orchestration_runtime`` (module-boundary rule), so this is a
     self-contained mirror of that module's ``_list_prefixed_subroutines``; the cross-scanner
-    parity test pins the two implementations to the same result. Uses this file's
-    ``_iter_fortran_logical_lines`` (comment-strip + continuation-join). NEVER raises."""
+    parity test pins the two implementations to the same result over the domain a code generator
+    emits — declarations on one logical line and continuations broken at a TOKEN boundary (the
+    ``subroutine __op( &`` argument-list wrap). The two scanners' shared-helper continuation joins
+    differ in whitespace (``_iter_fortran_logical_lines`` here joins with no separator,
+    ``orchestration_runtime._fortran_logical_lines`` with a space), so a pathological split
+    THROUGH the ``subroutine`` keyword or through the name identifier (``pure&``/``dep__fo&\\no``)
+    resolves differently — but no generator emits that, so it is out of the pinned domain. Uses
+    this file's ``_iter_fortran_logical_lines`` (comment-strip + continuation-join). NEVER raises."""
     try:
         prefix = f"{spec_id}__".lower()
         out: list[str] = []
@@ -10027,6 +10033,11 @@ def _validate_component_dep_operations_membership(
         if len(declared) != len(ops):
             continue  # malformed entry — handled by _validate_component_dep_operations
 
+        # Exact-node_key lookup (incl. `@version`): the sidecar is keyed by the graph's resolved
+        # node_keys. A version-drifted `direct_deps` entry — which the version-AGNOSTIC
+        # `_validate_compile_dependency_consistency` would still pass — finds no entry and this
+        # gate goes inert (fail-open, consistent with the tracked rollout affordance); the leaf is
+        # shown the full versioned node_key in the injected catalog, so a drift is unlikely.
         surface = surface_by_key.get(node_key)
         if not isinstance(surface, dict):
             continue  # inert: no sidecar entry (unresolved graph edge / legacy)
@@ -10042,7 +10053,20 @@ def _validate_component_dep_operations_membership(
         published = {
             p.strip() for p in published_raw if isinstance(p, str) and p.strip()
         }
-        unknown = [d for d in declared if d not in published]
+        if not published:
+            # A resolved-but-EMPTY published surface (a degenerate component publishing nothing,
+            # or a certified source with no `<dep_spec_id>__` subroutine) cannot meaningfully
+            # bound a subset — checking against it would reject EVERY authored op, a
+            # non-convergent loop. Treat it like `unresolved` (inert), matching the
+            # compile.generate renderer (`_build_dependency_surface_facts`), which sends the leaf
+            # to the dependency's §5 for an empty surface; a genuinely wrong call is still caught
+            # downstream at Generate.
+            continue
+        # Fortran symbols are case-INsensitive, so compare casefolded (matching the L1b/L1c
+        # sibling gates and the `use`/`call` the linker resolves): a case-variant of a real
+        # published name links fine and must not be a false reject.
+        published_cf = {p.casefold() for p in published}
+        unknown = [d for d in declared if d.casefold() not in published_cf]
         if unknown:
             catalog = ", ".join(sorted(published)) or "(none)"
             violations.append(

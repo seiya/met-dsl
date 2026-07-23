@@ -14270,6 +14270,21 @@ class ComponentDepOperationsMembershipGateTests(unittest.TestCase):
         self.assertEqual(len(v), 1, v)
         self.assertIn("unreadable or malformed", v[0])
 
+    def test_empty_published_surface_inert(self) -> None:
+        # A resolved-but-empty published surface (degenerate dep publishing nothing) is inert,
+        # not a non-convergent fail (it matches the renderer's "use §5" treatment).
+        v = self._run([self._DEP], self._surface([], source="ir_public_api"))
+        self.assertEqual(v, [])
+
+    def test_casefold_membership(self) -> None:
+        # Fortran is case-insensitive: a case-variant of a real published name links fine and
+        # must NOT be a false reject.
+        v = self._run(
+            [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+              "operations": ["dep_base__Scale"]}],
+            self._surface(["dep_base__scale"]))
+        self.assertEqual(v, [])
+
 
 class ComponentGeneratedSurfaceGateTests(unittest.TestCase):
     """`_validate_component_generated_surface` (L1b, generate stage): the generated model's
@@ -14343,9 +14358,13 @@ class ComponentGeneratedSurfaceGateTests(unittest.TestCase):
 
     def test_cross_scanner_parity_with_runtime(self) -> None:
         # Drift guard: the validator's self-contained scanner must agree with
-        # orchestration_runtime._list_prefixed_subroutines (which it may not import) across
-        # continuation / comment / interface-block / parenless / case edge cases and a real
-        # committed certified source.
+        # orchestration_runtime._list_prefixed_subroutines (which it may not import) over the
+        # domain a code generator emits — one-line declarations and TOKEN-boundary continuations
+        # (the `subroutine __op( &` argument-list wrap below), plus comment / interface-block /
+        # parenless / case / mixed-prefix edge cases and a real committed certified source. A
+        # pathological split THROUGH the `subroutine` keyword or the name identifier is out of
+        # scope (the two shared logical-line helpers join continuations with different whitespace;
+        # no generator emits a mid-token split — see `_list_component_published_subroutines`).
         from tools.orchestration_runtime import _list_prefixed_subroutines
         sources = [
             self._GOOD_MODEL,
