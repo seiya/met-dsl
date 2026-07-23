@@ -17723,6 +17723,45 @@ class DependencyFactsRenderTests(unittest.TestCase):
         self.assertNotIn("\n    ", block)
         self.assertNotIn("listed under its header", block)
 
+    def test_published_operations_render_warns_on_dropped_declared_name(self) -> None:
+        # L4 render: a dep whose IR-declared name was dropped surfaces a WARNING naming the
+        # unreal op(s), even alongside the replacement surface, so the pure repair leaf stops
+        # authoring the invented `call`.
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        dep = {
+            **self.DEP,
+            "declared_operations_unresolved": ["demo_dep_base__apply"],
+            "published_operations": [
+                {"operation": "demo_dep_base__scale",
+                 "interface": "subroutine demo_dep_base__scale(x, n, y)",
+                 "argument_order": ["x", "n", "y"]},
+            ],
+        }
+        block = _build_dependency_facts(
+            dict(self.BASE, resolved_dependencies=[dep]))
+        self.assertIn("WARNING", block)
+        self.assertIn("demo_dep_base__apply", block)
+        self.assertIn("do NOT exist", block)
+        self.assertIn("ONLY real public surface", block)
+        # The real replacement surface is still listed.
+        self.assertIn(
+            "- component/demo_dep_base@0.1.0 :: "
+            "subroutine demo_dep_base__scale(x, n, y)", block)
+
+    def test_published_operations_render_warns_even_without_published_surface(self) -> None:
+        # The WARNING survives a degenerate dep with no resolvable replacement surface.
+        from tools.orchestration_runtime import _build_dependency_facts
+
+        dep = {
+            **self.DEP,
+            "declared_operations_unresolved": ["demo_dep_base__apply"],
+        }
+        block = _build_dependency_facts(
+            dict(self.BASE, resolved_dependencies=[dep]))
+        self.assertIn("WARNING", block)
+        self.assertIn("demo_dep_base__apply", block)
+
     def test_render_judge_carries_verdict_path_and_no_dep_does_not(self) -> None:
         from tools.orchestration_runtime import (
             prepare_launch_request_payload,
@@ -18242,6 +18281,223 @@ class ResolveDependencyFactsTests(unittest.TestCase):
                 repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
             self.assertEqual(len(facts), 1)
             self.assertNotIn("published_operations", facts[0])
+
+    def test_wrong_name_operations_replaced_with_certified_surface(self) -> None:
+        # L4: the IR enumerates a name that does NOT exist in the certified source (a resume
+        # over a mis-named certified IR — the 2026-07-23 closure fail). The enumeration
+        # forfeits its authority WHOLESALE: it is replaced by the certified `<dep>__` surface,
+        # the invented name is dropped (never surfaced), and the drop is recorded so the render
+        # can WARN the leaf.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_multi_op_pipeline(repo_root)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": ["dep_base__apply"]}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(len(facts), 1)
+            ops = [p["operation"] for p in facts[0]["published_operations"]]
+            self.assertEqual(ops, ["dep_base__scale", "dep_base__shift"])
+            self.assertNotIn("dep_base__apply", ops)
+            self.assertEqual(
+                facts[0]["declared_operations_unresolved"], ["dep_base__apply"])
+
+    def test_partial_wrong_name_replaces_whole_surface_not_union(self) -> None:
+        # L4 union guard: one valid + one invented name. ANY unresolved name forfeits the
+        # WHOLE enumeration — the certified surface REPLACES it (so `dep_base__shift`, never
+        # enumerated, appears), and the invented name is NOT unioned in. If the code had
+        # merely filtered the invalid name out of the enumeration, `shift` would be absent.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_multi_op_pipeline(repo_root)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": ["dep_base__scale", "dep_base__nope"]}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            ops = [p["operation"] for p in facts[0]["published_operations"]]
+            self.assertEqual(ops, ["dep_base__scale", "dep_base__shift"])
+            self.assertNotIn("dep_base__nope", ops)
+            self.assertEqual(
+                facts[0]["declared_operations_unresolved"], ["dep_base__nope"])
+
+    def test_all_correct_operations_not_replaced_no_unresolved_key(self) -> None:
+        # L4 must NOT fire when every enumerated op resolves: the enumeration is honored
+        # verbatim (only `scale`, not the un-enumerated `shift`) and no drop is recorded.
+        from tools.orchestration_runtime import _resolve_dependency_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_multi_op_pipeline(repo_root)
+            self._write_ir(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001",
+                [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                  "operations": ["dep_base__scale"]}],
+                impl_defaults={"toolchain": {"language": "fortran"}})
+            facts = _resolve_dependency_facts(
+                repo_root, "workspace/ir/component__dep_top__0.1.0/top_001")
+            self.assertEqual(
+                [p["operation"] for p in facts[0]["published_operations"]],
+                ["dep_base__scale"])
+            self.assertNotIn("declared_operations_unresolved", facts[0])
+
+
+class ResolveComponentDepSurfaceTests(unittest.TestCase):
+    """_resolve_component_dep_surface reads the consumer's direct COMPONENT deps from the
+    conductor-authored dependency_graph (all_nodes − self − transitive) and resolves each
+    dep's published operation NAMES — from the dep IR public_api (the L1 pin), else the
+    certified source — for the compile.generate `dependency_surface.json` sidecar."""
+
+    def _graph(self, consumer: str, all_nodes: list, transitive: list | None = None) -> dict:
+        return {
+            "node_key": consumer,
+            "all_nodes": [{"node_key": nk, "topo_level": lvl} for nk, lvl in all_nodes],
+            "transitive_deps": [
+                {"node_key": nk, "via": []} for nk in (transitive or [])],
+        }
+
+    def _write_dep_ir(
+        self, repo_root: Path, kind: str, spec_id: str, version: str, ir_id: str,
+        *, public_api: dict | None = None,
+    ) -> None:
+        import yaml as _yaml
+        d = repo_root / "workspace" / "ir" / f"{kind}__{spec_id}__{version}" / ir_id
+        d.mkdir(parents=True)
+        doc: dict = {"meta": {"spec_kind": kind}}
+        if public_api is not None:
+            doc["public_api"] = public_api
+        (d / "spec.ir.yaml").write_text(_yaml.safe_dump(doc), encoding="utf-8")
+        (d / "ir_meta.json").write_text(
+            json.dumps({"verification_status": "pass"}), encoding="utf-8")
+
+    def _write_dep_source(
+        self, repo_root: Path, safe: str, spec_id: str, model_text: str,
+    ) -> None:
+        pipe = repo_root / "workspace" / "pipelines" / safe / "p_20260601_002"
+        b = pipe / "binary" / "bin_20260601_002"
+        b.mkdir(parents=True)
+        (b / "binary_meta.json").write_text(
+            json.dumps({"verification_status": "pass",
+                        "source_source_id": "src_20260601_001"}), encoding="utf-8")
+        src = pipe / "source" / "src_20260601_001" / "src"
+        src.mkdir(parents=True)
+        (src / f"{spec_id}_model.f90").write_text(model_text, encoding="utf-8")
+
+    _MODEL = (
+        "module dep_base_model\ncontains\n"
+        "  subroutine dep_base__scale(x, n, y)\n  end subroutine\n"
+        "  subroutine dep_base__shift(a, b)\n  end subroutine\n"
+        "end module\n"
+    )
+
+    def test_source_ir_public_api(self) -> None:
+        from tools.orchestration_runtime import _resolve_component_dep_surface
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_dep_ir(
+                repo_root, "component", "dep_base", "0.1.0", "ir_20260601_001",
+                public_api={"published_operations": [
+                    {"operation_id": "dep_base__compute_flux"}], "published_types": []})
+            graph = self._graph(
+                "profile/top@0.1.0",
+                [("profile/top@0.1.0", 1), ("component/dep_base@0.1.0", 0)])
+            surface = _resolve_component_dep_surface(
+                repo_root, "profile/top@0.1.0", graph)
+            self.assertEqual(len(surface), 1)
+            self.assertEqual(surface[0]["node_key"], "component/dep_base@0.1.0")
+            self.assertEqual(surface[0]["source"], "ir_public_api")
+            self.assertEqual(
+                surface[0]["published_operations"], ["dep_base__compute_flux"])
+
+    def test_source_certified_fallback_for_legacy_ir(self) -> None:
+        # A legacy dep IR with NO public_api falls back to the certified `<dep>__` surface.
+        from tools.orchestration_runtime import _resolve_component_dep_surface
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_dep_ir(
+                repo_root, "component", "dep_base", "0.1.0", "ir_20260601_001")
+            self._write_dep_source(
+                repo_root, "component__dep_base__0.1.0", "dep_base", self._MODEL)
+            graph = self._graph(
+                "profile/top@0.1.0",
+                [("profile/top@0.1.0", 1), ("component/dep_base@0.1.0", 0)])
+            surface = _resolve_component_dep_surface(
+                repo_root, "profile/top@0.1.0", graph)
+            self.assertEqual(surface[0]["source"], "certified_source")
+            self.assertEqual(
+                surface[0]["published_operations"],
+                ["dep_base__scale", "dep_base__shift"])
+
+    def test_public_api_present_but_empty_is_authoritative(self) -> None:
+        # A PRESENT public_api with an empty operation list is authoritative-empty (NOT a
+        # fallback to the certified source).
+        from tools.orchestration_runtime import _resolve_component_dep_surface
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self._write_dep_ir(
+                repo_root, "component", "dep_base", "0.1.0", "ir_20260601_001",
+                public_api={"published_operations": []})
+            self._write_dep_source(
+                repo_root, "component__dep_base__0.1.0", "dep_base", self._MODEL)
+            graph = self._graph(
+                "profile/top@0.1.0",
+                [("profile/top@0.1.0", 1), ("component/dep_base@0.1.0", 0)])
+            surface = _resolve_component_dep_surface(
+                repo_root, "profile/top@0.1.0", graph)
+            self.assertEqual(surface[0]["source"], "ir_public_api")
+            self.assertEqual(surface[0]["published_operations"], [])
+
+    def test_unresolved_when_no_ir_no_source(self) -> None:
+        from tools.orchestration_runtime import _resolve_component_dep_surface
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            graph = self._graph(
+                "profile/top@0.1.0",
+                [("profile/top@0.1.0", 1), ("component/dep_base@0.1.0", 0)])
+            surface = _resolve_component_dep_surface(
+                repo_root, "profile/top@0.1.0", graph)
+            self.assertEqual(len(surface), 1)
+            self.assertEqual(surface[0]["source"], "unresolved")
+            self.assertEqual(surface[0]["published_operations"], [])
+
+    def test_transitive_and_non_component_deps_excluded(self) -> None:
+        # Only DIRECT component deps are surfaced: a transitive component and a direct
+        # infrastructure dep are both excluded.
+        from tools.orchestration_runtime import _resolve_component_dep_surface
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            for sid in ("dep_direct", "dep_trans"):
+                self._write_dep_ir(
+                    repo_root, "component", sid, "0.1.0", "ir_20260601_001",
+                    public_api={"published_operations": [
+                        {"operation_id": f"{sid}__op"}]})
+            graph = self._graph(
+                "profile/top@0.1.0",
+                [("profile/top@0.1.0", 2),
+                 ("component/dep_direct@0.1.0", 1),
+                 ("component/dep_trans@0.1.0", 0),
+                 ("infrastructure/harness@0.2.0", 0)],
+                transitive=["component/dep_trans@0.1.0"])
+            surface = _resolve_component_dep_surface(
+                repo_root, "profile/top@0.1.0", graph)
+            self.assertEqual(
+                [e["node_key"] for e in surface], ["component/dep_direct@0.1.0"])
+
+    def test_malformed_graph_never_raises(self) -> None:
+        from tools.orchestration_runtime import _resolve_component_dep_surface
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            self.assertEqual(
+                _resolve_component_dep_surface(repo_root, "profile/top@0.1.0", None), [])
+            self.assertEqual(
+                _resolve_component_dep_surface(
+                    repo_root, "profile/top@0.1.0", {"all_nodes": "nope"}), [])
 
 
 class ListPrefixedSubroutinesTests(unittest.TestCase):

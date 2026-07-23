@@ -1832,9 +1832,20 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, An
     subroutines are never surfaced (matching the ``_validate_component_dep_operations`` scope). Without this, the ``use``/``call`` the generate-side gate
     unconditionally requires for a component dep has no facts to build against, and the
     pure (tool-less) leaf must invent symbol names / argument orders that ``Generate.gate``
-    rejects every retry — the closure fail_closed this fallback closes. The fallback is
-    empty-list-only: when the IR DOES enumerate operations, only that enumerated surface is
-    injected (IR is the sole carrier; never union in the fallback set).
+    rejects every retry — the closure fail_closed this fallback closes. The empty-list
+    fallback fires ONLY when ``operations`` is empty/absent; when the IR enumerates real
+    operations, only that enumerated surface is injected (IR is the sole carrier; never
+    unioned).
+
+    L4 (silent-drop abolition, ``component/`` deps only): when the IR enumerates operations
+    but one or more of the enumerated names do not exist in the certified source (a name
+    drift the compile gate is meant to catch but a resume on an already-certified IR steps
+    over), the enumeration forfeits its authority WHOLESALE — it is replaced (never unioned)
+    by the certified ``<dep_spec_id>__`` public surface, and the dropped declared names are
+    recorded on ``fact["declared_operations_unresolved"]`` so the render can WARN the leaf its
+    IR-declared symbol is unreal. This is what lets a resume over a mis-named certified IR
+    converge on the first retry instead of the leaf re-authoring the invented ``call`` (which
+    the syntax/static gate pincer rejects) every attempt from the same silently-dropped fact.
 
     The dependency ``@version`` is taken from the IR ``direct_deps[].node_key`` (a well-
     formed IR pins the resolved version, consistent with how readiness resolves it from
@@ -1941,26 +1952,52 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, An
                     except Exception:
                         source_text = None
                     if source_text is not None:
-                        op_names = (
+                        enumerated = (
                             [op.strip() for op in ops if isinstance(op, str) and op.strip()]
                             if isinstance(ops, list) else []
                         )
-                        # FALLBACK (empty-list-only, COMPONENT deps only): the IR authored no
-                        # operations for this component dep. Surface every `<dep_spec_id>__`
-                        # subroutine from the certified source so the leaf's mandatory
-                        # `call <dep>__*` has a real interface to build against. When ops IS
-                        # enumerated, only that surface is used — never unioned (IR is the sole
-                        # carrier). Scoped to `component/` deps because the empty-ops fail_closed
-                        # loop this closes is driven by the component-only generate gate
-                        # (`_validate_dependency_operation_on_model_files`); a profile/problem
-                        # dep authors `operations: []` legitimately and must NOT be called (the
-                        # validator + docs exempt it), so surfacing its prefixed subroutines
-                        # would tempt Generate into an undeclared call. See
-                        # `_validate_component_dep_operations`.
-                        if not op_names and is_component_dep and dep_spec_id:
-                            op_names = _list_prefixed_subroutines(
-                                source_text, f"{dep_spec_id}__"
-                            )
+                        op_names = enumerated
+                        declared_unresolved: list[str] = []
+                        if is_component_dep and dep_spec_id:
+                            if not enumerated:
+                                # FALLBACK (empty-list-only, COMPONENT deps only): the IR authored
+                                # no operations for this component dep. Surface every
+                                # `<dep_spec_id>__` subroutine from the certified source so the
+                                # leaf's mandatory `call <dep>__*` has a real interface to build
+                                # against. Scoped to `component/` deps because the empty-ops
+                                # fail_closed loop this closes is driven by the component-only
+                                # generate gate (`_validate_dependency_operation_on_model_files`); a
+                                # profile/problem dep authors `operations: []` legitimately and must
+                                # NOT be called (the validator + docs exempt it), so surfacing its
+                                # prefixed subroutines would tempt Generate into an undeclared call.
+                                # See `_validate_component_dep_operations`.
+                                op_names = _list_prefixed_subroutines(
+                                    source_text, f"{dep_spec_id}__"
+                                )
+                            else:
+                                # L4 (COMPONENT deps only): silent-drop abolition. When the IR
+                                # ENUMERATES operations but one or more do not exist in the certified
+                                # source (a name-drift authoring wobble the compile gate is meant to
+                                # catch, but which a resume on an already-certified IR steps over),
+                                # the enumeration forfeits its authority WHOLESALE: replace it with
+                                # the certified `<dep_spec_id>__` public surface (never union — an
+                                # invented name must not survive) and record the dropped declared
+                                # names so the render WARNs the leaf its IR symbol is unreal. Without
+                                # this the resolver silently drops the bad name and the pure generate
+                                # leaf — re-injected the same stale fact by the repair prompt — calls
+                                # the nonexistent symbol every retry (the syntax-gate/static-gate
+                                # pincer the closure fail_closed on). Only fires on a NON-empty
+                                # enumeration; empty-ops took the fallback above. IR remains the sole
+                                # carrier — the enumerated surface is used verbatim UNLESS it is
+                                # unreal, in which case the certified source (not a union) replaces it.
+                                declared_unresolved = [
+                                    op for op in enumerated
+                                    if _extract_subroutine_interface(source_text, op) is None
+                                ]
+                                if declared_unresolved:
+                                    op_names = _list_prefixed_subroutines(
+                                        source_text, f"{dep_spec_id}__"
+                                    )
                         published: list[dict[str, Any]] = []
                         for op in op_names:
                             iface = _extract_subroutine_interface(source_text, op)
@@ -1968,10 +2005,142 @@ def _resolve_dependency_facts(repo_root: Path, ir_ref: Any) -> list[dict[str, An
                                 published.append({"operation": op, **iface})
                         if published:
                             fact["published_operations"] = published
+                        if declared_unresolved:
+                            fact["declared_operations_unresolved"] = declared_unresolved
             facts.append(fact)
     except Exception:
         return facts
     return facts
+
+
+def _resolve_component_dep_surface(
+    repo_root: Path, node_key: str, graph: Any
+) -> list[dict[str, Any]]:
+    """Resolve, host-side at COMPILE phase start, the published operation-NAME surface of
+    each COMPONENT direct dependency of ``node_key`` (the consumer, whose own IR does not yet
+    exist), for the conductor to author into ``<ir_ref>/dependency_surface.json`` and inject
+    into ``compile.generate``.
+
+    The consumer's IR is absent at compile start, so the direct-dep set is read from the
+    conductor-authored ``dependency_graph.json`` ``graph`` — ``all_nodes − {self} −
+    transitive_deps`` — a pure function of ``deps.yaml`` + ``spec_catalog.yaml``, NOT from a
+    not-yet-existing consumer IR (this is the L2 correction: ``_resolve_dependency_facts`` is
+    keyed on the consumer IR's ``direct_deps`` and cannot run before compile authors it).
+
+    Only ``component/`` deps are surfaced — a ``profile``/``problem`` dep is not
+    operation-enumerated by the consumer's ``public_api`` gate, and an ``infrastructure`` dep
+    is never called (the runner harness is host-rendered). Each entry is ``{node_key,
+    published_operations: [op_name, ...], source}`` where ``source`` is:
+      - ``ir_public_api``   — names read from the dep's CERTIFIED IR
+        ``public_api.published_operations[].operation_id`` (the L1 name pin);
+      - ``certified_source`` — fallback for a legacy dep IR with no ``public_api``: the
+        ``<dep_spec_id>__`` public subroutines in the certified ``<spec_id>_model.f90`` Build
+        links (via the shared ``_certified_model_source``);
+      - ``unresolved``      — neither resolvable (``published_operations == []``).
+
+    NAMES ONLY — the argument ABI is deliberately NOT carried here (the op-name-pin design;
+    the ABI stays derived from the certified source at Generate, never frozen into the
+    IR/sidecar). Best-effort: NEVER raises; a malformed / missing graph yields ``[]``.
+    """
+    try:
+        if not isinstance(graph, dict):
+            return []
+        all_nodes = graph.get("all_nodes")
+        if not isinstance(all_nodes, list):
+            return []
+        self_nk = str(graph.get("node_key") or node_key or "").strip()
+        transitive = graph.get("transitive_deps")
+        transitive_nks: set[str] = set()
+        if isinstance(transitive, list):
+            for t in transitive:
+                tk = t.get("node_key") if isinstance(t, dict) else None
+                if isinstance(tk, str) and tk.strip():
+                    transitive_nks.add(tk.strip())
+        direct: list[str] = []
+        seen: set[str] = set()
+        for n in all_nodes:
+            nk = n.get("node_key") if isinstance(n, dict) else None
+            if not isinstance(nk, str) or not nk.strip():
+                continue
+            nk = nk.strip()
+            if nk == self_nk or nk in transitive_nks or nk in seen:
+                continue
+            seen.add(nk)
+            direct.append(nk)
+        out: list[dict[str, Any]] = []
+        for nk in direct:
+            if nk.split("/", 1)[0].strip() != "component":
+                continue
+            entry: dict[str, Any] = {
+                "node_key": nk, "published_operations": [], "source": "unresolved",
+            }
+            try:
+                kind, spec_id, version = _parse_node_key_strict(nk)
+            except Exception:
+                out.append(entry)
+                continue
+            # Primary: the dep's certified IR public_api (the L1 name pin). A public_api that
+            # is PRESENT (even with an empty operation list) is authoritative — a legacy dep IR
+            # with NO public_api falls through to the certified source.
+            names = _ir_published_operation_ids(repo_root, kind, spec_id, version)
+            if names is not None:
+                entry["published_operations"] = names
+                entry["source"] = "ir_public_api"
+                out.append(entry)
+                continue
+            # Fallback: the `<dep_spec_id>__` public subroutines in the certified model source.
+            try:
+                safe = _node_key_to_safe(nk)
+            except Exception:
+                out.append(entry)
+                continue
+            pipe_dir = _latest_pipeline_dir(repo_root / "workspace" / "pipelines" / safe)
+            if pipe_dir is not None:
+                model_src = _certified_model_source(pipe_dir, spec_id)
+                if model_src is not None:
+                    try:
+                        text = model_src.read_text(encoding="utf-8")
+                    except Exception:
+                        text = None
+                    if text is not None:
+                        entry["published_operations"] = _list_prefixed_subroutines(
+                            text, f"{spec_id}__")
+                        entry["source"] = "certified_source"
+            out.append(entry)
+        return out
+    except Exception:
+        return []
+
+
+def _ir_published_operation_ids(
+    repo_root: Path, kind: str, spec_id: str, version: str
+) -> list[str] | None:
+    """The ``public_api.published_operations[].operation_id`` names of the CURRENT certified
+    IR for ``(kind, spec_id, version)``, or ``None`` when the IR has NO ``public_api`` block
+    (a legacy IR — the caller then falls back to the certified source). A PRESENT
+    ``public_api`` with an empty/malformed ``published_operations`` yields ``[]`` (authoritative
+    empty), NOT ``None``. NEVER raises."""
+    try:
+        ir_dir = _certified_ir_dir(repo_root, kind, spec_id, version)
+        if ir_dir is None:
+            return None
+        doc = _require_yaml().safe_load(
+            (ir_dir / "spec.ir.yaml").read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return None
+        pa = doc.get("public_api")
+        if not isinstance(pa, dict) or "published_operations" not in pa:
+            return None
+        pub = pa.get("published_operations")
+        names: list[str] = []
+        if isinstance(pub, list):
+            for it in pub:
+                oid = it.get("operation_id") if isinstance(it, dict) else None
+                if isinstance(oid, str) and oid.strip():
+                    names.append(oid.strip())
+        return names
+    except Exception:
+        return None
 
 
 def _catalog_family_index(repo_root: Path) -> list[dict[str, str]]:
@@ -10070,8 +10239,25 @@ def _published_operations_lines(deps: list[Any]) -> list[str]:
         if not isinstance(dep, dict):
             continue
         node_key = str(dep.get("node_key", "")).strip()
+        if not node_key:
+            continue
+        # L4 WARNING: an IR-declared operation name that does not exist in the certified
+        # source was dropped (the resolver replaced the enumeration with the real surface).
+        # Surface it so the pure repair leaf — re-injected the same stale facts — stops
+        # authoring the invented `call` the syntax/static gate pincer rejects every retry.
+        # Emitted BEFORE the pub-op guard so it survives even a degenerate empty surface.
+        unresolved = dep.get("declared_operations_unresolved")
+        if isinstance(unresolved, list):
+            bad = [str(u).strip() for u in unresolved if isinstance(u, str) and u.strip()]
+            if bad:
+                rows.append(
+                    f"- {node_key} :: WARNING — the IR-declared operation name(s) "
+                    f"{', '.join(bad)} do NOT exist in this dependency's certified source and "
+                    "were dropped. Do NOT call them. The operations listed for this dependency "
+                    "are the ONLY real public surface; call those instead."
+                )
         pub_ops = dep.get("published_operations")
-        if not node_key or not isinstance(pub_ops, list) or not pub_ops:
+        if not isinstance(pub_ops, list) or not pub_ops:
             continue
         for op in pub_ops:
             if not isinstance(op, dict):
