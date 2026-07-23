@@ -14107,6 +14107,268 @@ class ComponentDepOperationsGateTests(unittest.TestCase):
                 any("component dependency" in x and "empty `operations: []`" in x for x in v), v)
 
 
+class ComponentPublicApiGateTests(unittest.TestCase):
+    """`_validate_component_public_api` (compile stage): the L1 gate pinning a component node's
+    IR public_api == controlled_spec §5 published operation NAME surface. NAMES ONLY —
+    `signatures` / `module_parameters` are forbidden on a component."""
+
+    _SPEC_ID = "dep_base"
+
+    def _controlled_spec(self) -> str:
+        return (
+            "# Controlled Spec\n"
+            "## 5. Public API and compatibility\n"
+            "The only published `operation_id` is `dep_base__scale`. On a `major` "
+            "compatibility break, separate the `spec_id`.\n"
+            "## 6. Prohibitions\n- none.\n")
+
+    def _seed(self, tmp: Path, *, public_api: object, spec_kind: str = "component",
+              cs_ref: str | None = "cs.md", write_cs: bool = True) -> Path:
+        if write_cs:
+            (tmp / "cs.md").write_text(self._controlled_spec(), encoding="utf-8")
+        meta = {"spec_kind": spec_kind, "spec_id": self._SPEC_ID}
+        if cs_ref is not None:
+            meta["source_refs"] = {"controlled_spec": cs_ref}
+        ir: dict = {"meta": meta}
+        if public_api is not _OMIT:
+            ir["public_api"] = public_api
+        (tmp / "spec.ir.yaml").write_text(yaml.safe_dump(ir), encoding="utf-8")
+        return tmp
+
+    def _run(self, **kw) -> list[str]:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ir_dir = self._seed(tmp, **kw)
+            v: list[str] = []
+            vps._validate_component_public_api(tmp, ir_dir, v)
+            return v
+
+    def test_exact_match_no_violation(self) -> None:
+        self.assertEqual(
+            self._run(public_api={"published_operations": [
+                {"operation_id": "dep_base__scale"}], "published_types": []}), [])
+
+    def test_missing_public_api_flagged(self) -> None:
+        v = self._run(public_api=_OMIT)
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("public_api missing", v[0])
+
+    def test_wrong_name_flagged_both_directions(self) -> None:
+        v = self._run(public_api={"published_operations": [
+            {"operation_id": "dep_base__apply"}]})
+        self.assertTrue(any("omits controlled_spec §5 operation_id 'dep_base__scale'" in x
+                            for x in v), v)
+        self.assertTrue(any("declares operation_id 'dep_base__apply' absent" in x
+                            for x in v), v)
+
+    def test_forbidden_signatures_key_flagged(self) -> None:
+        v = self._run(public_api={
+            "published_operations": [{"operation_id": "dep_base__scale"}],
+            "signatures": {"operations": []}})
+        self.assertTrue(any("public_api.signatures is forbidden on a component" in x
+                            for x in v), v)
+
+    def test_forbidden_module_parameters_key_flagged(self) -> None:
+        v = self._run(public_api={
+            "published_operations": [{"operation_id": "dep_base__scale"}],
+            "module_parameters": []})
+        self.assertTrue(any("public_api.module_parameters is forbidden on a component" in x
+                            for x in v), v)
+
+    def test_non_component_is_noop(self) -> None:
+        # A profile/problem node has no component-name pin — the gate no-ops (its public_api,
+        # if any, is not compared to §5 here).
+        self.assertEqual(
+            self._run(spec_kind="profile", public_api=_OMIT), [])
+
+    def test_unresolvable_controlled_spec_fail_closed(self) -> None:
+        v = self._run(public_api={"published_operations": [
+            {"operation_id": "dep_base__scale"}]}, write_cs=False)
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("unresolvable", v[0])
+
+
+class ComponentDepOperationsMembershipGateTests(unittest.TestCase):
+    """`_validate_component_dep_operations_membership` (L3, compile stage): a component dep's
+    non-empty declared `operations` must be a subset of the `dependency_surface.json` sidecar's
+    published surface, with the certified catalog embedded in the violation message."""
+
+    def _run(self, direct_deps: object, sidecar: object = _OMIT) -> list[str]:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            ir_dir = tmp / "ir"
+            ir_dir.mkdir()
+            ir = {"dependency": {"direct_deps": direct_deps}}
+            (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(ir), encoding="utf-8")
+            if sidecar is not _OMIT:
+                (ir_dir / "dependency_surface.json").write_text(
+                    json.dumps(sidecar) if not isinstance(sidecar, str) else sidecar,
+                    encoding="utf-8")
+            v: list[str] = []
+            vps._validate_component_dep_operations_membership(tmp, ir_dir, v)
+            return v
+
+    _DEP = {"node_key": "component/dep_base@0.1.0", "kind": "component",
+            "operations": ["dep_base__scale"]}
+
+    def _surface(self, ops, source="ir_public_api", node_key="component/dep_base@0.1.0"):
+        return {"dependencies": [
+            {"node_key": node_key, "published_operations": ops, "source": source}]}
+
+    def test_subset_passes(self) -> None:
+        self.assertEqual(
+            self._run([self._DEP],
+                      self._surface(["dep_base__scale", "dep_base__shift"])), [])
+
+    def test_fabricated_name_flagged_with_catalog(self) -> None:
+        v = self._run(
+            [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+              "operations": ["dep_base__apply"]}],
+            self._surface(["dep_base__scale"]))
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("dep_base__apply", v[0])
+        # The real catalog + source tag ride in the message (slim-repair lifeline).
+        self.assertIn("dep_base__scale", v[0])
+        self.assertIn("source: ir_public_api", v[0])
+
+    def test_no_sidecar_inert(self) -> None:
+        self.assertEqual(self._run([self._DEP]), [])
+
+    def test_unresolved_source_inert(self) -> None:
+        v = self._run(
+            [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+              "operations": ["dep_base__apply"]}],
+            self._surface([], source="unresolved"))
+        self.assertEqual(v, [])
+
+    def test_missing_sidecar_entry_inert(self) -> None:
+        # A component dep with no sidecar entry at all (unresolved graph edge) is skipped.
+        v = self._run(
+            [{"node_key": "component/dep_base@0.1.0", "kind": "component",
+              "operations": ["dep_base__apply"]}],
+            {"dependencies": []})
+        self.assertEqual(v, [])
+
+    def test_empty_operations_inert_here(self) -> None:
+        # Empty/absent operations is _validate_component_dep_operations' province, not L3's.
+        self.assertEqual(
+            self._run([{"node_key": "component/dep_base@0.1.0", "kind": "component",
+                        "operations": []}],
+                      self._surface(["dep_base__scale"])), [])
+
+    def test_malformed_published_operations_fail_closed(self) -> None:
+        v = self._run(
+            [self._DEP],
+            {"dependencies": [
+                {"node_key": "component/dep_base@0.1.0",
+                 "published_operations": "not-a-list", "source": "ir_public_api"}]})
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("malformed", v[0])
+
+    def test_unreadable_sidecar_fail_closed(self) -> None:
+        v = self._run([self._DEP], "{not json")
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("unreadable or malformed", v[0])
+
+
+class ComponentGeneratedSurfaceGateTests(unittest.TestCase):
+    """`_validate_component_generated_surface` (L1b, generate stage): the generated model's
+    `<spec_id>__` subroutine set must equal the IR public_api published_operations. Inert on a
+    legacy IR with no public_api."""
+
+    def _run(self, *, public_api: object, model_text: str,
+             spec_kind: str = "component",
+             node_key: str = "component/dep_base@0.1.0") -> list[str]:
+        with tempfile.TemporaryDirectory() as t:
+            repo_root = Path(t)
+            ir_ref = "workspace/ir/component__dep_base__0.1.0/ir_20260601_001"
+            ir_dir = repo_root / ir_ref
+            ir_dir.mkdir(parents=True)
+            meta: dict = {"spec_kind": spec_kind, "spec_id": "dep_base"}
+            ir: dict = {"meta": meta}
+            if public_api is not _OMIT:
+                ir["public_api"] = public_api
+            (ir_dir / "spec.ir.yaml").write_text(yaml.safe_dump(ir), encoding="utf-8")
+            pipeline_dir = repo_root / "workspace/pipelines/component__dep_base__0.1.0/p1"
+            src_dir = pipeline_dir / "source" / "src_20260601_001" / "src"
+            src_dir.mkdir(parents=True)
+            (pipeline_dir / "lineage.json").write_text(
+                json.dumps({"node_key": node_key, "ir_ref": ir_ref}), encoding="utf-8")
+            model = src_dir / "dep_base_model.f90"
+            model.write_text(model_text, encoding="utf-8")
+            execution = vps._stub_execution(pipeline_dir, node_key)
+            v: list[str] = []
+            vps._validate_component_generated_surface(repo_root, execution, [model], v)
+            return v
+
+    _GOOD_MODEL = (
+        "module dep_base_model\ncontains\n"
+        "  subroutine dep_base__scale(x, n, y)\n  end subroutine\n"
+        "end module\n")
+
+    def test_matching_surface_passes(self) -> None:
+        self.assertEqual(
+            self._run(public_api={"published_operations": [
+                {"operation_id": "dep_base__scale"}]}, model_text=self._GOOD_MODEL), [])
+
+    def test_missing_published_op_flagged(self) -> None:
+        v = self._run(
+            public_api={"published_operations": [
+                {"operation_id": "dep_base__scale"},
+                {"operation_id": "dep_base__shift"}]},
+            model_text=self._GOOD_MODEL)
+        self.assertTrue(any("does not publish component public_api operation 'dep_base__shift'"
+                            in x for x in v), v)
+
+    def test_extra_prefixed_subroutine_flagged(self) -> None:
+        model = (
+            "module dep_base_model\ncontains\n"
+            "  subroutine dep_base__scale(x)\n  end subroutine\n"
+            "  subroutine dep_base__extra(y)\n  end subroutine\n"
+            "end module\n")
+        v = self._run(
+            public_api={"published_operations": [{"operation_id": "dep_base__scale"}]},
+            model_text=model)
+        self.assertTrue(any("'dep_base__extra'" in x and "NOT in the IR public_api" in x
+                            for x in v), v)
+
+    def test_legacy_ir_without_public_api_inert(self) -> None:
+        self.assertEqual(self._run(public_api=_OMIT, model_text=self._GOOD_MODEL), [])
+
+    def test_non_component_inert(self) -> None:
+        self.assertEqual(
+            self._run(public_api={"published_operations": [
+                {"operation_id": "dep_base__scale"}]}, model_text=self._GOOD_MODEL,
+                spec_kind="profile", node_key="profile/dep_base@0.1.0"), [])
+
+    def test_cross_scanner_parity_with_runtime(self) -> None:
+        # Drift guard: the validator's self-contained scanner must agree with
+        # orchestration_runtime._list_prefixed_subroutines (which it may not import) across
+        # continuation / comment / interface-block / parenless / case edge cases and a real
+        # committed certified source.
+        from tools.orchestration_runtime import _list_prefixed_subroutines
+        sources = [
+            self._GOOD_MODEL,
+            ("module m\ncontains\n"
+             "  ! a comment mentioning subroutine dep_base__ghost\n"
+             "  PURE subroutine dep_base__Scale( &\n      x, n, y)\n  end subroutine\n"
+             "  subroutine dep_base__ping\n  end subroutine\n"
+             "  interface\n    subroutine dep_base__scale(x, n, y)\n    end subroutine\n"
+             "  end interface\n"
+             "  subroutine helper_internal(z)\n  end subroutine\n"
+             "  function dep_base__notasub(x)\n  end function\n"
+             "end module\n"),
+            Path("tools/tests/data/sw2d_call_only_unext_model.f90").read_text(encoding="utf-8"),
+        ]
+        prefixes = ["dep_base__", "dep_base__", "dynamics_shallow_water"]
+        for src, pfx in zip(sources, prefixes):
+            spec_id = pfx[:-2] if pfx.endswith("__") else pfx
+            self.assertEqual(
+                vps._list_component_published_subroutines(src, spec_id),
+                _list_prefixed_subroutines(src, f"{spec_id}__"),
+                f"scanner drift on prefix {spec_id}__")
+
+
 class LocalOperationLoweringGateTests(unittest.TestCase):
     """`_validate_local_operation_lowering` (compile stage): a LOCAL op (one an
     `algorithm.steps[].operation_ref` names but no `dependency.direct_deps[].operations[]`

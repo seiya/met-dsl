@@ -4284,6 +4284,120 @@ def _validate_generate_outputs_for_generation(
     _validate_infrastructure_generated_signatures(
         repo_root, execution, model_files, violations
     )
+    # L1b: a component node's generated model must publish EXACTLY its IR public_api op NAMES
+    # (inert on a legacy IR that carries no public_api pin; no-op for non-component nodes).
+    _validate_component_generated_surface(
+        repo_root, execution, model_files, violations
+    )
+
+
+# `subroutine` declaration opener mirroring orchestration_runtime._FORTRAN_SUBROUTINE_RE (the
+# published-surface scanner the resolver uses): optional pure/impure/elemental/recursive/module
+# prefixes, then `subroutine <name>`. `^\s*` anchors at the (comment-stripped, continuation-
+# joined) logical-line start, so `end subroutine` / `call` lines never match. Kept in lock-step
+# with the runtime regex by the cross-scanner parity test (ComponentGeneratedSurfaceTests).
+_COMPONENT_PUBLISHED_SUB_RE = re.compile(
+    r"^\s*(?:(?:pure|impure|elemental|recursive|module)\s+)*"
+    r"subroutine\s+(?P<name>[A-Za-z]\w*)",
+    re.IGNORECASE,
+)
+
+
+def _list_component_published_subroutines(text: str, spec_id: str) -> list[str]:
+    """Distinct, first-appearance-ordered ``subroutine`` names in ``text`` whose name begins
+    (case-insensitive) with ``<spec_id>__`` — the component's published operation surface. The
+    validator may NOT import ``orchestration_runtime`` (module-boundary rule), so this is a
+    self-contained mirror of that module's ``_list_prefixed_subroutines``; the cross-scanner
+    parity test pins the two implementations to the same result. Uses this file's
+    ``_iter_fortran_logical_lines`` (comment-strip + continuation-join). NEVER raises."""
+    try:
+        prefix = f"{spec_id}__".lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for _lineno, stmt in _iter_fortran_logical_lines(text):
+            m = _COMPONENT_PUBLISHED_SUB_RE.match(stmt)
+            if m is None:
+                continue
+            name = m.group("name")
+            if not name.lower().startswith(prefix):
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+        return out
+    except Exception:
+        return []
+
+
+def _validate_component_generated_surface(
+    repo_root: Path,
+    execution: NodeExecution,
+    model_files: list[Path],
+    violations: list[str],
+) -> None:
+    """L1b deterministic generated-source gate (``component`` nodes with a pinned public_api):
+    the generated model source must publish EXACTLY the ``<spec_id>__`` public subroutine set the
+    IR's ``public_api.published_operations`` names — no more, no less.
+
+    This closes the generation half of the L1 name pin. Compile pins the published op NAMES into
+    the component IR (``_validate_component_public_api``); this gate proves the generated ``.f90``
+    realizes exactly those names, so a component's published surface cannot drift between the IR a
+    consumer's Compile is shown (via the sidecar) and the source Build links. A mismatch routes
+    back to ``Generate.generate``.
+
+    Inert (skip) when the IR carries NO ``public_api`` (a legacy pre-L1 certified IR — nothing to
+    pin against; L4 guards that resume path). No-op for a non-component node, an unresolvable IR,
+    or a missing model (already flagged upstream)."""
+    ir_dir = _ir_dir_for_execution(repo_root, execution)
+    if ir_dir is None:
+        return
+    ir_path = ir_dir / "spec.ir.yaml"
+    if not ir_path.is_file():
+        return
+    try:
+        ir = _read_yaml(ir_path)
+    except yaml.YAMLError:
+        return
+    if not isinstance(ir, dict):
+        return
+    meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
+    if meta.get("spec_kind") != "component":
+        return
+    public_api = ir.get("public_api")
+    if not isinstance(public_api, dict) or "published_operations" not in public_api:
+        return  # legacy IR without the L1 pin — inert (L4 guards the resume path)
+
+    ops_raw = public_api.get("published_operations")
+    published = {
+        entry["operation_id"].strip()
+        for entry in (ops_raw if isinstance(ops_raw, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("operation_id"), str)
+        and entry["operation_id"].strip()
+    }
+    spec_id = _spec_id_from_node_key(execution.node_key)
+    if not spec_id or not model_files:
+        return  # spec_id/model resolution already handled upstream
+
+    combined = "\n".join(
+        f.read_text(encoding="utf-8", errors="ignore") for f in model_files)
+    generated = _list_component_published_subroutines(combined, spec_id)
+    gen_cf = {g.casefold() for g in generated}
+    pub_cf = {p.casefold() for p in published}
+    target = model_files[0]
+    for missing in sorted(p for p in published if p.casefold() not in gen_cf):
+        violations.append(
+            f"{target}: generated model source does not publish component public_api operation "
+            f"'{missing}' — declare `subroutine {missing}(...)` (the IR public_api pins it as a "
+            "published operation)")
+    for extra in sorted(g for g in generated if g.casefold() not in pub_cf):
+        violations.append(
+            f"{target}: generated model source publishes `{spec_id}__` subroutine '{extra}' that "
+            "is NOT in the IR public_api.published_operations — a component's published surface "
+            "must match its IR public_api exactly (rename an internal helper without the "
+            f"`{spec_id}__` prefix, or add it to the published operations)")
 
 
 def _read_dependency_graph_sidecar(repo_root: Path, ir_ref: str | None) -> dict[str, Any] | None:
@@ -9690,10 +9804,12 @@ def _validate_compile_stage_impl(
     _validate_ir_meta_json(ir_dir, violations)
     _validate_compile_dependency_consistency(repo_root, ir_dir, violations)
     _validate_component_dep_operations(repo_root, ir_dir, violations)
+    _validate_component_dep_operations_membership(repo_root, ir_dir, violations)
     _validate_local_operation_lowering(repo_root, ir_dir, violations)
     _validate_test_predicates(repo_root, ir_dir, violations)
     _validate_case_ids(ir_dir, violations)
     _validate_infrastructure_public_api(repo_root, ir_dir, violations)
+    _validate_component_public_api(repo_root, ir_dir, violations)
     _validate_harness_dependency_consistency(repo_root, ir_dir, violations)
     _validate_harness_render_preconditions(repo_root, ir_dir, violations)
 
@@ -9837,6 +9953,107 @@ def _validate_component_dep_operations(
             "<dependency_facts> while the calls are still required, so the leaf cannot "
             "converge (its retry budget exhausts)"
         )
+
+
+def _validate_component_dep_operations_membership(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """L3 deterministic compile gate: every ``component/`` direct dependency's declared
+    ``operations`` (when NON-EMPTY and all-valid — the empty / malformed shapes are
+    ``_validate_component_dep_operations``'s province) must be a SUBSET of that dependency's
+    published operation names, as resolved host-side into the ``dependency_surface.json``
+    sidecar the conductor authors at compile-phase start.
+
+    This determinizes the old V4c-ii "operations ⊆ published" check that phase_01 left to the
+    LLM as 'not deterministically checkable'. Once L1 pins each component's public op names into
+    its certified IR, the published surface IS a deterministic input (the sidecar), so a
+    fabricated dep operation name (the 2026-07-23 ``__apply`` drift) is an unambiguous structural
+    failure. The violation message embeds the FULL certified catalog + its source tag for the
+    dep, because the warm-resume slim repair prompt carries only findings — the leaf must see the
+    real names here to converge.
+
+    Inert (skip) when: the sidecar file is absent (a legacy tree / a non-conductor-driven
+    compile), a dep has NO sidecar entry (an unresolved graph edge), or its entry's ``source`` is
+    ``unresolved`` (the surface could not be resolved — never manufacture a violation from a
+    resolution gap). A sidecar that is unreadable, or an entry whose ``published_operations`` is
+    the wrong shape, is fail-closed. The skip→fail-closed asymmetry is a deliberate rollout
+    affordance; its removal after fleet re-auth is tracked in
+    ``docs/workflow/deterministic_followups.md``. No-op on a missing/unparseable IR or a node
+    with no component dependency."""
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return
+    try:
+        ir = _read_yaml(derived_path)
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return
+    if not isinstance(ir, dict):
+        return
+    dep = ir.get("dependency")
+    direct_deps = dep.get("direct_deps") if isinstance(dep, dict) else None
+    if not isinstance(direct_deps, list):
+        return
+
+    sidecar_path = ir_dir / "dependency_surface.json"
+    if not sidecar_path.is_file():
+        return  # inert: no sidecar authored (legacy tree / not a conductor-driven compile)
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception:
+        violations.append(
+            f"{derived_path}: dependency_surface.json sidecar is unreadable or malformed")
+        return
+    surface_by_key: dict[str, dict] = {}
+    entries = sidecar.get("dependencies") if isinstance(sidecar, dict) else None
+    if isinstance(entries, list):
+        for e in entries:
+            if isinstance(e, dict) and isinstance(e.get("node_key"), str):
+                surface_by_key[e["node_key"].strip()] = e
+
+    for entry in direct_deps:
+        if not isinstance(entry, dict):
+            continue
+        nk = entry.get("node_key")
+        node_key = nk.strip() if isinstance(nk, str) else ""
+        if not node_key.startswith("component/"):
+            continue
+        ops = entry.get("operations")
+        # Only a non-empty, all-valid operations list is membership-checked here; the empty /
+        # malformed shapes are _validate_component_dep_operations' province (double-reporting
+        # them here would only add noise).
+        if not isinstance(ops, list) or not ops:
+            continue
+        declared = [o.strip() for o in ops if isinstance(o, str) and o.strip()]
+        if len(declared) != len(ops):
+            continue  # malformed entry — handled by _validate_component_dep_operations
+
+        surface = surface_by_key.get(node_key)
+        if not isinstance(surface, dict):
+            continue  # inert: no sidecar entry (unresolved graph edge / legacy)
+        source_tag = str(surface.get("source") or "").strip()
+        if source_tag == "unresolved":
+            continue  # inert: surface could not be resolved — not a violation
+        published_raw = surface.get("published_operations")
+        if not isinstance(published_raw, list):
+            violations.append(
+                f"{derived_path}: dependency_surface.json entry for {node_key!r} is malformed "
+                "(published_operations is not a list)")
+            continue
+        published = {
+            p.strip() for p in published_raw if isinstance(p, str) and p.strip()
+        }
+        unknown = [d for d in declared if d not in published]
+        if unknown:
+            catalog = ", ".join(sorted(published)) or "(none)"
+            violations.append(
+                f"{derived_path}: component dependency {node_key!r} declares operation(s) "
+                f"{unknown} that are NOT in its published surface. The published operations of "
+                f"{node_key} are exactly: [{catalog}] (source: {source_tag or 'unknown'}). "
+                "Author dependency.direct_deps[].operations using ONLY names from that "
+                "published set (copy the operation_id verbatim); a fabricated name starves the "
+                "injected <dependency_facts> and the pure leaf cannot converge (its retry "
+                "budget exhausts)"
+            )
 
 
 _LOWERING_STEP_STRUCTURAL_KEYS = frozenset(
@@ -10154,6 +10371,148 @@ def _validate_harness_render_preconditions(
         violations.append(f"{derived_path}: {msg}")
 
 
+def _validate_public_api_name_surface(
+    derived_path: Path,
+    spec_ops: set[str],
+    spec_types: set[str],
+    public_api: dict,
+    violations: list[str],
+) -> None:
+    """Set-equality of the IR ``public_api`` NAME surface against the controlled_spec §5 name
+    lists: ``public_api.published_operations[].operation_id`` == ``spec_ops`` and
+    ``public_api.published_types`` == ``spec_types``. Appends one violation per missing / extra
+    name. Shared by the infrastructure gate (which then ALSO pins the §5.1 signatures /
+    module_parameters) and the component gate (``_validate_component_public_api``, NAMES ONLY).
+    The messages are language-neutral (they name §5, not any backend), so both callers reuse
+    them verbatim."""
+    ops_raw = public_api.get("published_operations")
+    ir_ops = {
+        entry["operation_id"].strip()
+        for entry in (ops_raw if isinstance(ops_raw, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("operation_id"), str)
+        and entry["operation_id"].strip()
+    }
+    for missing in sorted(spec_ops - ir_ops):
+        violations.append(
+            f"{derived_path}:public_api.published_operations omits controlled_spec §5 "
+            f"operation_id '{missing}'")
+    for extra in sorted(ir_ops - spec_ops):
+        violations.append(
+            f"{derived_path}:public_api.published_operations declares operation_id '{extra}' "
+            "absent from controlled_spec §5")
+
+    types_raw = public_api.get("published_types")
+    ir_types = {
+        token.strip()
+        for token in (types_raw if isinstance(types_raw, list) else [])
+        if isinstance(token, str) and token.strip()
+    }
+    for missing in sorted(spec_types - ir_types):
+        violations.append(
+            f"{derived_path}:public_api.published_types omits controlled_spec §5 "
+            f"derived type '{missing}'")
+    for extra in sorted(ir_types - spec_types):
+        violations.append(
+            f"{derived_path}:public_api.published_types declares type '{extra}' "
+            "absent from controlled_spec §5")
+
+
+def _validate_component_public_api(
+    repo_root: Path, ir_dir: Path, violations: list[str]
+) -> None:
+    """L1 deterministic public-API gate (``component`` nodes only): the IR's ``public_api``
+    must enumerate EXACTLY the published operation NAME surface the controlled_spec §5 declares
+    ("The only published ``operation_id`` is ...") — NAMES ONLY.
+
+    This is the source-of-truth pin for a component's public op names. Without it the pure
+    generate leaf re-picks a component's public op name on every regeneration (the 2026-07-23
+    closure fail: the three advdiff components each authored a fresh name — ``__compute_flux`` /
+    ``__advance`` / ``__apply`` — and the profile consumer then authored a fabricated dep
+    ``operations`` entry the facts resolver silently dropped, starving the leaf's mandatory
+    ``call`` until the retry budget exhausted). Pinning the names into the certified component IR
+    lets a consumer's Compile be shown a real catalog (the L2 ``dependency_surface.json`` sidecar)
+    and lets L1b prove the generated source realizes exactly those names.
+
+    Unlike the infrastructure gate this pins NAMES ONLY: ``signatures`` and ``module_parameters``
+    are FORBIDDEN keys on a component (the argument ABI stays derived post-hoc from the certified
+    source at Build — freezing an unverified signature into a component IR both breaks the spec's
+    language-neutrality and pins an ABI no gate checks). §5 is parsed with the same
+    ``_parse_public_api_from_controlled_spec`` the infrastructure gate uses; it extracts exactly
+    the component's one published op across the whole component corpus.
+
+    Fail-closed, mirroring the infrastructure gate: a missing/unresolvable controlled_spec ref, a
+    §5 parsing to zero operations, an absent ``public_api``, or a forbidden ``signatures`` /
+    ``module_parameters`` key is a violation that routes (via ``classify_compile_static_failure``)
+    back to ``compile.generate``. No-op on a non-component node or a missing/unparseable IR
+    (flagged upstream)."""
+    derived_path = ir_dir / "spec.ir.yaml"
+    if not derived_path.exists():
+        return  # missing IR already flagged upstream
+    try:
+        ir = _read_yaml(derived_path)
+    except yaml.YAMLError:
+        return  # malformed IR already flagged upstream
+    if not isinstance(ir, dict):
+        return
+
+    meta = ir.get("meta") if isinstance(ir.get("meta"), dict) else {}
+    if meta.get("spec_kind") != "component":
+        return  # name-surface pin is component-only (infra has its own fuller gate)
+
+    spec_id = meta.get("spec_id")
+    if not isinstance(spec_id, str) or not spec_id.strip():
+        violations.append(
+            f"{derived_path}:meta.spec_id missing "
+            "(required to pin a component node's public_api to controlled_spec §5)")
+        return
+    spec_id = spec_id.strip()
+
+    source_refs = meta.get("source_refs") if isinstance(meta.get("source_refs"), dict) else {}
+    cs_ref = source_refs.get("controlled_spec")
+    if not isinstance(cs_ref, str) or not cs_ref.strip():
+        violations.append(
+            f"{derived_path}:meta.source_refs.controlled_spec missing "
+            "(cannot pin component public_api to §5)")
+        return
+    cs_path = Path(cs_ref.strip())
+    if not cs_path.is_absolute():
+        cs_path = repo_root / cs_path
+    if not _is_readable_file(cs_path):
+        violations.append(
+            f"{derived_path}:controlled_spec ({cs_ref}) unresolvable "
+            "(cannot pin component public_api to §5)")
+        return
+
+    spec_ops, spec_types = _parse_public_api_from_controlled_spec(cs_path, spec_id)
+    if not spec_ops:
+        violations.append(
+            f"{derived_path}:controlled_spec ({cs_ref}) §5 parsed 0 published operation_ids "
+            "(unrecognized published-operation form — cannot pin component public_api)")
+        return
+
+    public_api = ir.get("public_api")
+    if not isinstance(public_api, dict):
+        violations.append(
+            f"{derived_path}:public_api missing — a component node must enumerate its "
+            "controlled_spec §5 published operation NAMES (public_api.published_operations, "
+            "and public_api.published_types if any)")
+        return
+
+    # FORBIDDEN keys: a component pins names only. `signatures` / `module_parameters` belong to
+    # an infrastructure node (a full §5.1 signature pin); on a component they would freeze an ABI
+    # no gate checks and break the spec's backend-agnostic language-neutrality.
+    for forbidden in ("signatures", "module_parameters"):
+        if forbidden in public_api:
+            violations.append(
+                f"{derived_path}:public_api.{forbidden} is forbidden on a component node — a "
+                "component publishes operation NAMES only (the argument ABI is derived from the "
+                "certified source at Build, never frozen into the IR)")
+
+    _validate_public_api_name_surface(
+        derived_path, spec_ops, spec_types, public_api, violations)
+
+
 def _validate_infrastructure_public_api(
     repo_root: Path, ir_dir: Path, violations: list[str]
 ) -> None:
@@ -10250,37 +10609,8 @@ def _validate_infrastructure_public_api(
             "and public_api.published_types)")
         return
 
-    ops_raw = public_api.get("published_operations")
-    ir_ops = {
-        entry["operation_id"].strip()
-        for entry in (ops_raw if isinstance(ops_raw, list) else [])
-        if isinstance(entry, dict)
-        and isinstance(entry.get("operation_id"), str)
-        and entry["operation_id"].strip()
-    }
-    for missing in sorted(spec_ops - ir_ops):
-        violations.append(
-            f"{derived_path}:public_api.published_operations omits controlled_spec §5 "
-            f"operation_id '{missing}'")
-    for extra in sorted(ir_ops - spec_ops):
-        violations.append(
-            f"{derived_path}:public_api.published_operations declares operation_id '{extra}' "
-            "absent from controlled_spec §5")
-
-    types_raw = public_api.get("published_types")
-    ir_types = {
-        token.strip()
-        for token in (types_raw if isinstance(types_raw, list) else [])
-        if isinstance(token, str) and token.strip()
-    }
-    for missing in sorted(spec_types - ir_types):
-        violations.append(
-            f"{derived_path}:public_api.published_types omits controlled_spec §5 "
-            f"derived type '{missing}'")
-    for extra in sorted(ir_types - spec_types):
-        violations.append(
-            f"{derived_path}:public_api.published_types declares type '{extra}' "
-            "absent from controlled_spec §5")
+    _validate_public_api_name_surface(
+        derived_path, spec_ops, spec_types, public_api, violations)
 
     # §5.1 canonical interface block: cross-check its signature set against §5's name lists so
     # the two halves of the spec (prose surface + machine-readable signatures) cannot drift, and
@@ -11210,7 +11540,8 @@ def _validate_post_generate_bundle(
     if not bundle_path.exists():
         return
     from tools.codegen_bundle import (
-        pure_bundle_contract_violation, harness_provided_capabilities, derive_build_graph)
+        pure_bundle_contract_violation, harness_provided_capabilities, derive_build_graph,
+        published_operations_from_ir)
     try:
         doc = _read_json(bundle_path)
     except json.JSONDecodeError:
@@ -11241,7 +11572,8 @@ def _validate_post_generate_bundle(
     contract = pure_bundle_contract_violation(
         doc, node_key=node_key, spec_id=spec_id,
         ir_state_variables=(algorithm.get("state_variables") or []),
-        harness_provided=provided, harness_label=harness_nk, build_graph=_build_graph)
+        harness_provided=provided, harness_label=harness_nk, build_graph=_build_graph,
+        ir_published_operations=published_operations_from_ir(ir))
     if contract is not None:
         violations.append(
             f"{bundle_path}: host acceptance contract re-check failed ({contract[0]}): "

@@ -2442,5 +2442,115 @@ class PromptContractedBundleShapesTest(unittest.TestCase):
              "role model"])
 
 
+class PublishedOperationsFromIrTests(unittest.TestCase):
+    """`published_operations_from_ir`: the single-source L1c surface extractor."""
+
+    def test_returns_op_ids(self) -> None:
+        self.assertEqual(
+            cb.published_operations_from_ir(
+                {"public_api": {"published_operations": [
+                    {"operation_id": "bx__compute_flux"}, {"operation_id": "bx__advance"}]}}),
+            ["bx__compute_flux", "bx__advance"])
+
+    def test_none_when_no_public_api(self) -> None:
+        self.assertIsNone(cb.published_operations_from_ir({"meta": {}}))
+        self.assertIsNone(cb.published_operations_from_ir({"public_api": {}}))
+
+    def test_present_but_empty_is_empty_list(self) -> None:
+        self.assertEqual(
+            cb.published_operations_from_ir(
+                {"public_api": {"published_operations": []}}), [])
+
+
+class PurePublishedSurfacePinTests(unittest.TestCase):
+    """L1c: `pure_bundle_contract_violation`'s component published-surface layer — the bundle's
+    `operation` entrypoint symbols must equal the IR public_api published surface (casefold).
+    Inert on `ir_published_operations=None` (legacy IR) and on a non-component node."""
+
+    _CHECKS_OK = (
+        "module bx_checks\n"
+        "  use, intrinsic :: iso_fortran_env, only: real64\n"
+        "  ! allow(C003)\n"
+        "  implicit none\n"
+        "  private\n"
+        "  public :: case_setup, case_run, get_time\n"
+        "  public :: get_scalar, get_r1, get_r2, get_r3, get_r4\n"
+        "  public :: checks_compute, metric_compute\n"
+        "contains\n"
+        "  subroutine case_setup(case_id, ok)\n"
+        "    character(len=*), intent(in) :: case_id\n"
+        "    logical, intent(out) :: ok\n"
+        "    ok = .true.\n"
+        "  end subroutine case_setup\n"
+        "end module bx_checks\n")
+    _MODEL_OK = "module bx_model\n! allow(C003)\nimplicit none\nend module bx_model\n"
+
+    def _bundle(self, member: str, op_symbols: "list[str]") -> dict:
+        return {
+            "bundle_schema_version": "1.0.0",
+            "optimization_unit": {"members": [member]},
+            "files": [
+                {"logical_path": "bx_model.f90", "role": "model", "language": "fortran",
+                 "member_node_key": member, "content": self._MODEL_OK, "modules": ["bx_model"]},
+                {"logical_path": "bx_checks.f90", "role": "checks", "language": "fortran",
+                 "member_node_key": member, "content": self._CHECKS_OK, "modules": ["bx_checks"]},
+            ],
+            "entrypoints": [
+                {"symbol": s, "kind": "operation", "node_key": member,
+                 "defined_in": "bx_model.f90", "module": "bx_model"} for s in op_symbols],
+            "target_lowering_plan": {"precision": {"real_kind": "real64"},
+                                     "state_residency": "host"},
+            "capability_requirements": ["sync_single_case@1"],
+            "state_bindings": [],
+        }
+
+    def _run(self, doc: dict, node_key: str, ir_published):
+        return cb.pure_bundle_contract_violation(
+            doc, node_key=node_key, spec_id="bx", ir_state_variables=[],
+            harness_provided={"sync_single_case@1"}, build_graph=lambda d: None,
+            ir_published_operations=ir_published)
+
+    _NK = "component/bx@0.1.0"
+
+    def test_match_passes(self) -> None:
+        self.assertIsNone(
+            self._run(self._bundle(self._NK, ["bx__compute_flux"]), self._NK,
+                      ["bx__compute_flux"]))
+
+    def test_casefold_match_passes(self) -> None:
+        self.assertIsNone(
+            self._run(self._bundle(self._NK, ["BX__Compute_Flux"]), self._NK,
+                      ["bx__compute_flux"]))
+
+    def test_missing_entrypoint_flagged(self) -> None:
+        r = self._run(self._bundle(self._NK, ["bx__compute_flux"]), self._NK,
+                      ["bx__compute_flux", "bx__advance"])
+        self.assertIsNotNone(r)
+        self.assertEqual(r[0], "bundle_published_surface_mismatch")
+        self.assertIn("bx__advance", r[1])
+
+    def test_extra_entrypoint_flagged(self) -> None:
+        r = self._run(self._bundle(self._NK, ["bx__compute_flux", "bx__extra"]), self._NK,
+                      ["bx__compute_flux"])
+        self.assertIsNotNone(r)
+        self.assertEqual(r[0], "bundle_published_surface_mismatch")
+        self.assertIn("bx__extra", r[1])
+
+    def test_none_is_inert(self) -> None:
+        # Legacy IR (no public_api pin) → the surface layer is skipped.
+        self.assertIsNone(
+            self._run(self._bundle(self._NK, ["bx__whatever"]), self._NK, None))
+
+    def test_non_component_node_is_inert(self) -> None:
+        # A profile publishes zero operations; passing a pin must not trip the surface layer
+        # (guarded on the component/ prefix).
+        nk = "profile/bx@0.1.0"
+        doc = self._bundle(nk, [])
+        doc["entrypoints"] = [
+            {"symbol": "checks_compute", "kind": "checks_interface", "node_key": nk,
+             "defined_in": "bx_checks.f90", "module": "bx_checks"}]
+        self.assertIsNone(self._run(doc, nk, ["bx__anything"]))
+
+
 if __name__ == "__main__":
     unittest.main()

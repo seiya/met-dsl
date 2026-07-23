@@ -2601,7 +2601,8 @@ clean:
         this method only assembles the conductor-side inputs (IR state vars, resolved harness
         capabilities, the build-graph derivation) and delegates."""
         from tools.codegen_bundle import (
-            pure_bundle_contract_violation, harness_provided_capabilities)
+            pure_bundle_contract_violation, harness_provided_capabilities,
+            published_operations_from_ir)
         ir = _read_yaml(self.repo_root / refs.ir_ref / "spec.ir.yaml") or {}
         # Capability negotiation against the SINGLE infrastructure (harness) dependency, resolved
         # by the same `_pure_harness_node_key` that narrows the manifest the leaf is SHOWN — so a
@@ -2614,7 +2615,8 @@ clean:
             doc, node_key=refs.node_key, spec_id=refs.spec_id,
             ir_state_variables=(algorithm.get("state_variables") or []),
             harness_provided=provided, harness_label=harness_nk,
-            build_graph=lambda d: self._build_pure_bundle_graph(refs, d))
+            build_graph=lambda d: self._build_pure_bundle_graph(refs, d),
+            ir_published_operations=published_operations_from_ir(ir))
 
     def _build_pure_bundle_graph(self, refs: NodeRefs, doc: Any) -> dict[str, Any]:
         """The deterministic build graph of a bundle (`derive_build_graph`), with the closure,

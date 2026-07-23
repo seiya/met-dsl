@@ -1534,6 +1534,27 @@ def m3c_checks_abi_violation(doc: Mapping[str, Any], spec_id: str) -> str | None
     return None
 
 
+def published_operations_from_ir(ir: Mapping[str, Any]) -> list[str] | None:
+    """The IR's ``public_api.published_operations`` operation_id names (L1c input), or ``None``
+    when the IR carries no ``public_api`` pin (a legacy pre-L1 IR — the L1c layer is then inert).
+    A present-but-empty ``published_operations`` returns ``[]`` (authoritative empty). Single-
+    sourced so the conductor's in-conversation gate and the post-generate tamper gate extract the
+    surface identically before handing it to ``pure_bundle_contract_violation``."""
+    if not isinstance(ir, collections.abc.Mapping):
+        return None
+    pub = ir.get("public_api")
+    if not isinstance(pub, collections.abc.Mapping) or "published_operations" not in pub:
+        return None
+    raw = pub.get("published_operations")
+    return [
+        e["operation_id"].strip()
+        for e in (raw if isinstance(raw, list) else [])
+        if isinstance(e, collections.abc.Mapping)
+        and isinstance(e.get("operation_id"), str)
+        and e["operation_id"].strip()
+    ]
+
+
 def pure_bundle_contract_violation(
     doc: Mapping[str, Any],
     *,
@@ -1543,6 +1564,7 @@ def pure_bundle_contract_violation(
     harness_provided: Iterable[str] | None,
     harness_label: str | None = None,
     build_graph: Callable[[Mapping[str, Any]], Any],
+    ir_published_operations: Iterable[str] | None = None,
 ) -> tuple[str, str] | None:
     """The full Z2 pure-CodegenBundle host acceptance contract as `(category, findings)`, or None.
 
@@ -1561,7 +1583,12 @@ def pure_bundle_contract_violation(
 
     `harness_provided` is the caller-resolved harness capability set (`None` = undeclared harness
     = nothing provided, fail-closed); `harness_label` only names it in the findings text.
-    `build_graph(doc)` performs the caller's `derive_build_graph` assembly. (The former
+    `ir_published_operations` (L1c) is the component IR's `public_api.published_operations` name
+    list (`None` = a legacy IR with no public_api pin, or a non-component node → the surface layer
+    is inert); when present and `node_key` is a `component/`, the bundle's `operation` entrypoint
+    symbols for this member must equal that set (casefold), so the bundle entrypoints cannot drift
+    from the pinned published surface. `build_graph(doc)` performs the caller's `derive_build_graph`
+    assembly. (The former
     diagnostics-contract check-id literal-presence layer is gone: pure-8's runner-driven per-id
     checks ABI passes each declared id to `checks_compute` as a literal actual, so a dropped id is
     structurally impossible — the module authors only the status. `post_execute` stays the
@@ -1607,6 +1634,39 @@ def pure_bundle_contract_violation(
     abi_violation = m3c_checks_abi_violation(doc, spec_id)
     if abi_violation is not None:
         return ("bundle_checks_abi_violation", abi_violation)
+    # L1c: a component's `operation` entrypoint symbols must equal its IR public_api published
+    # surface (casefold). Inert when `ir_published_operations` is None (legacy IR / non-component)
+    # — the single-source pin against the certified IR, checked identically by both callers.
+    if ir_published_operations is not None and node_key.split("/", 1)[0] == "component":
+        published = {
+            p.strip() for p in ir_published_operations
+            if isinstance(p, str) and p.strip()
+        }
+        entry_syms = {
+            e["symbol"].strip()
+            for e in (doc.get("entrypoints") or [])
+            if isinstance(e, dict) and e.get("kind") == "operation"
+            and e.get("node_key") == node_key
+            and isinstance(e.get("symbol"), str) and e["symbol"].strip()
+        }
+        pub_cf = {p.casefold() for p in published}
+        sym_cf = {s.casefold() for s in entry_syms}
+        missing = sorted(p for p in published if p.casefold() not in sym_cf)
+        extra = sorted(s for s in entry_syms if s.casefold() not in pub_cf)
+        if missing or extra:
+            parts = []
+            if missing:
+                parts.append(
+                    "IR public_api operation(s) with no matching operation entrypoint: "
+                    + ", ".join(missing))
+            if extra:
+                parts.append(
+                    "operation entrypoint symbol(s) not in the IR public_api: "
+                    + ", ".join(extra))
+            catalog = ", ".join(sorted(published)) or "(none)"
+            return ("bundle_published_surface_mismatch",
+                    f"component {node_key} bundle operation entrypoints must match the IR "
+                    f"public_api.published_operations exactly [{catalog}] — " + "; ".join(parts))
     try:
         build_graph(doc)
     except RuntimeError as exc:
