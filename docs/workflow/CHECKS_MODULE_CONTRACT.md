@@ -112,7 +112,7 @@ matching actual). The check id is a runner-supplied `intent(in)` actual, so no
 width is pinned for it. `reason_na` is a deferred-length allocatable.
 
 The ten names must be published from `module <spec_id>_checks` **itself**. The
-`Generate.static` gate (`_validate_checks_source_files`) resolves the published set
+`Generate.gate` static check (`_validate_checks_source_files`) resolves the published set
 from that module alone: the names its `public` statements list, plus — only while
 the module keeps Fortran's default public accessibility — the procedures the module
 **defines at module level**, minus the names any `private`
@@ -204,9 +204,9 @@ This section applies to every leaf-authored Fortran source of any `Generate` nod
   `_model` identifiers stay within the f2008 63-character limit (on an M3c node the
   renderer fails closed above this).
 - Author lint-clean f2008 (`use ..., only:`, the inline `! allow(C003)` directive
-  before `implicit none`, ≤100-column lines) — the deterministic `Generate.lint`
-  substep lints the whole `src/` tree, every leaf-authored source included.
-- **Intentionally-unused dummy arguments.** The deterministic `Generate.syntax` substep
+  before `implicit none`, ≤100-column lines) — the deterministic `Generate.gate` lint
+  check lints the whole `src/` tree, every leaf-authored source included.
+- **Intentionally-unused dummy arguments.** The deterministic `Generate.gate` syntax check
   compiles the whole staged source set with
   `-Werror=unused-dummy-argument -Werror=unused-variable`, so an unreferenced dummy
   argument in any leaf-authored source is a compile failure. When an **interface fixes**

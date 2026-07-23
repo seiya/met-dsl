@@ -647,7 +647,9 @@ classification". Intra-phase iteration is unchanged.
   on first occurrence; same in prod → reopen/retry as today; dev intra-phase generate verify loop
   still retries (`DevPhaseRollbackTest`).
 
-## G1 — deterministic `Generate.static` substep: post_generate + workspace_root before LLM verify (IMPLEMENTED 2026-06-29)
+## G1 — deterministic `Generate.gate` static check: post_generate + workspace_root before LLM verify (IMPLEMENTED 2026-06-29)
+
+> **Superseded (structure only).** This section describes the deterministic post_generate/workspace_root gate that was first landed as a standalone static-check substep (alongside separate lint-check and syntax-check substeps). Those three checker substeps were later **merged into the single `Generate.gate` substep** (`SUBSTEPS["generate"] == ("generate", "gate", "verify")`), which runs the lint / syntax / static checks as internal steps and writes ONE `gate_meta.json`. The method bodies are `_gate_lint_check` / `_gate_syntax_check` / `_gate_static_check` composed by `_gate_inproc`; routing is `GATE_FAILURE_ROUTING` + `classify_gate_failure` (`GATE_FAILURE_TERMINAL` for the fail-closed categories). The design rationale below is preserved as history; the standalone checker-substep names in it read as the checker steps of `Generate.gate`.
 
 **Problem.** The purely-static post_generate gate
 (`validate_pipeline_semantics --stage post_generate` + `validate_workspace_root.py`) ran
@@ -661,14 +663,14 @@ wasted tokens with zero accuracy benefit.
 
 ```
 loop1 (outer):
-  loop2 (inner): generate.generate (LLM, warm resume) -> lint -> static   # deterministic gates
+  loop2 (inner): generate.generate (LLM, warm resume) -> gate (lint -> syntax -> static)   # deterministic checks
   generate.verify (pure LLM semantic G1-G7)
 ```
 
 This is produced by the existing conductor machinery, not a new literal loop: the `run_phase`
-substep loop **breaks on the first non-pass substep**, and a `lint`/`static` finding routes to a
+substep loop **breaks on the first non-pass substep**, and a `gate` finding routes to a
 **same-phase warm-resume reopen** of `generate.generate`. So `verify` is reached only when every
-deterministic gate is clean, and the producer leaf stays warm across inner iterations.
+deterministic check is clean, and the producer leaf stays warm across inner iterations.
 
 **Decision — new `static` substep (not folded into `lint`).** `SUBSTEPS["generate"]` becomes
 `("generate", "lint", "static", "verify")`. A distinct substep keeps a distinct
@@ -679,51 +681,53 @@ not index. It also makes the three substep-aware phases symmetric:
 `compile→post_build`, `generate→post_generate`, `validate→post_execute`.
 
 **Where implemented (`tools/workflow_conductor.py`).**
-- `SUBSTEPS["generate"]` + `STATIC_FAILURE_ROUTING` + `classify_static_failure` (mirrors the lint
-  table/classifier).
-- `_is_deterministic_substep` and `_run_deterministic_substep` dispatch `generate.static` →
-  new `_static_inproc`, which runs the two validators via `subprocess.run` (same idiom as the
-  post_build gate in `_build_inproc`) and writes `static_meta.json` (`status` +
-  `failure_category` + `failure_excerpt`). A violation is a CONTENT failure (rc 0) routed via the
-  table; only an unexpected exception becomes a transport `fail_closed`.
-- `determine_substep_status` and `classify_failure` gain `generate.static` branches reading
-  `static_meta.json`.
+- `SUBSTEPS["generate"]` + `GATE_FAILURE_ROUTING` + `classify_gate_failure` (the union
+  table/classifier over the lint / syntax / static checks; `GATE_FAILURE_TERMINAL` for the
+  fail-closed categories).
+- `_is_deterministic_substep` and `_run_deterministic_substep` dispatch `generate.gate` →
+  `_gate_inproc`, whose static check `_gate_static_check` runs the two validators via
+  `subprocess.run` (same idiom as the post_build gate in `_build_inproc`); the substep writes the
+  union `gate_meta.json` (`checkers` + `failure_categories` + composed `failure_excerpt`). A
+  violation is a CONTENT failure (rc 0) routed via the table; only an unexpected exception becomes a
+  transport `fail_closed`.
+- `determine_substep_status` and `classify_failure` gain a `generate.gate` branch reading
+  `gate_meta.json`.
 - The same-phase warm-reopen guard in `conduct` widened from `.startswith("lint_")` to
   `.startswith(("lint_", "static_"))`. (Later superseded — see the "Same-phase producer reopen is
   now a first-class routing outcome" note below: the guard is now the structural condition
   same-phase target + concrete `repair_strategy`, no route-reason prefix and no flag.)
-- `build_launch_request` gains a `static` arm with `allowed_output_paths=[<src>/static_meta.json]`.
-  `static_meta.json` is intentionally NOT a `phase_required_outputs` entry (parity with
-  `lint_meta.json`); the substep freshness gate covers it.
+- `build_launch_request` gains a `gate` arm with `allowed_output_paths=[<src>/gate_meta.json]`.
+  `gate_meta.json` is intentionally NOT a `phase_required_outputs` entry; the substep freshness gate
+  covers it.
 
 **Ownership transfer (`tools/orchestration_runtime.py`).**
 `ALLOWED_VALIDATE_PIPELINE_STAGES[("generate","verify")]` set to `frozenset()`;
-`("generate","static"): frozenset()` added (keeps the table total). `_render_runbook`'s
+`("generate","gate"): frozenset()` added (keeps the table total). `_render_runbook`'s
 `generate.verify` branch removed → it returns `""`. `generate.verify` therefore launches **no**
 validator gate and is a pure LLM semantic pass.
 
 **SKILL/doc updates.** `skills/workflow-generate-verify/SKILL.md` drops the post_generate +
 workspace_root leaf responsibility (old Operations Rules 6/7). `phase_02_generate.md`,
-`WORKFLOW_CORE.md`, `ORCHESTRATION.md` updated to `generate → lint → static → verify`.
+`WORKFLOW_CORE.md`, `ORCHESTRATION.md` updated to `generate → gate → verify`.
 
 **Non-regression notes.**
 - The verify leaf invoked `validate_workspace_root.py` **without** `--write-scope-baseline`; the
-  baseline branch was never reached. `_static_inproc` reproduces the exact bare invocation — no
+  baseline branch was never reached. `_gate_static_check` reproduces the exact bare invocation — no
   dropped argument. (Do not "correct" this by adding a baseline.)
 - `post_generate` is purely static and does **not** read `source_meta.verification_status`, so
   running it before verify is acyclic. It certifies `lint_evidence`, which the conductor wrote in
-  `_lint_inproc` earlier in the same attempt — i.e. it certifies conductor-owned evidence.
-- `static_meta.json` lives under `source/<id>/` (the substep's own write_root), so unlike the
+  `_gate_lint_check` earlier in the same attempt — i.e. it certifies conductor-owned evidence.
+- `gate_meta.json` lives under `source/<id>/` (the substep's own write_root), so unlike the
   pipeline-root `lint_evidence` certificate it needs no `record-agent-run` write exemption.
 
 ### G1-slim — slim warm-resume repair turn (findings-only prompt)
 
-**Context.** The `lint`/`static` finding reopen re-runs `generate.generate` with
+**Context.** The `gate` finding reopen re-runs `generate.generate` with
 `repair_strategy=reuse`, which (claude) warm-`--resume`s the
 producer leaf's session so its context is intact. Empirically that already roughly halves the
 generate substep wall-time (one observed node: 544s cold → 225s warm). But the warm turn still
-re-sent the **full ~11.5KB cold-start prompt** and did **not** include the findings: `lint` runs
-in-process **after** the generate leaf finishes, so the resumed leaf never saw its own findings and
+re-sent the **full ~11.5KB cold-start prompt** and did **not** include the findings: the `gate`
+checks run in-process **after** the generate leaf finishes, so the resumed leaf never saw its own findings and
 fixed them by re-reading its source and *guessing* (a real correctness risk — e.g. the subtle C061
 case-insensitive `u_L`≡`U_L` collision). It also `find`s the rotated new source dir because its
 warm context holds the **stale** old paths.
@@ -742,7 +746,7 @@ the warm leaf already skips re-reading the must-read docs on its own. Token cost
 **Gate.** Always-on — the former opt-in env flags `METDSL_CONDUCTOR_REUSE_SLIM_PROMPT` and
 `METDSL_CONDUCTOR_REUSE_RESUME` were removed (warm resume + slim are now the default). Slim applies
 **only** when a warm resume is actually resolved (session resumable) AND a findings excerpt is
-present — i.e. the `Generate.lint`/`Generate.static`/`Compile.static` deterministic-gate reopens;
+present — i.e. the `Generate.gate`/`Compile.static` deterministic-gate reopens;
 a warm reuse without findings (e.g. a cross-phase code repair) or a cold fallback keeps the full
 prompt unchanged. The warm/cold selection itself stays driven by `repair_strategy`
 (`reuse`→warm, `restart`→cold).
@@ -751,7 +755,7 @@ prompt unchanged. The warm/cold selection itself stays driven by `repair_strateg
 - `tools/workflow_conductor.py`: `_resolve_reuse_resume` (extracted from `run_substep` so the
   resume decision is made **before** `build_launch_request` — the slim/full choice, the
   `record_launch`-persisted prompt and the `spawn_leaf` args must all agree); `_read_repair_findings`
-  (reads the failed source's `{lint,static,compile_static}_meta.json` `failure_excerpt` at the reopen
+  (reads the failed source's `{gate,compile_static}_meta.json` `failure_excerpt` at the reopen
   point, before id rotation); `_repair_payload(..., findings=...)` → `repair_findings`;
   `build_launch_request` sets `req["warm_resume"]` (when a warm resume resolved AND findings present)
   and empties `skill_must_read_refs`. (Update 2026-06-30: warm resume + slim are now ALWAYS-ON — the
@@ -774,7 +778,7 @@ prompt unchanged. The warm/cold selection itself stays driven by `repair_strateg
 - The slim deliverables block lists the **leaf-writable** paths from
   `_allowed_file_tool_paths_for_launch` — NOT the raw `allowed_output_paths`. The raw set includes
   MCP-owned `command_log.jsonl` (integrity-protected) and the conductor-authored in-process
-  `lint_meta.json` / `static_meta.json`; listing those under "re-write the deliverables below" would
+  `gate_meta.json`; listing those under "re-write the deliverables below" would
   have the resumed leaf Edit/Write the command log and trip the write guard / corrupt the MCP audit
   artifact. The full prompt already derives the same file-tool subset, so slim matches its posture.
 - The gate-allowlist lint (`_lint_launch_prompt_gate_allowlist`) scans only the conductor-authored
@@ -796,7 +800,7 @@ ran *inside* the LLM `Compile.verify` leaf. A full, cold, separate-persona verif
 was thrown away whenever a purely structural IR defect (forbidden `shape_expr` form `vector(N)`,
 non-scalar `time_shape_expr`, undefined `steps[]` token binding, null knob, malformed `ir_meta`)
 tripped the gate at completion — wasted tokens with zero accuracy benefit. This is exactly the
-generate.verify→generate.static situation (G1), one phase up.
+generate.verify→generate.gate situation (G1), one phase up.
 
 **Decision — new `static` substep.** `SUBSTEPS["compile"]` becomes `("generate", "static", "verify")`.
 The conductor's `Compile.static` (`_compile_static_inproc`) runs the three gates the old
@@ -824,7 +828,7 @@ coherent AND delivers the fail-fast value): **`Compile.generate` now authors all
 `io_contract`** (this already matched `phase_01_compile.md` §1-1; only the two compile SKILLs +
 GLOSSARY dissented — they were realigned), and `Compile.verify` only CHECKS `io_contract` (V3),
 writing nothing but `ir_meta.json`. Structurally this makes `compile.generate`→`compile.static`→
-`compile.verify` a true analog of `generate.generate`→`generate.static`→`generate.verify`: producer →
+`compile.verify` a true analog of `generate.generate`→`generate.gate`→`generate.verify`: producer →
 deterministic structural gate → pure semantic judge. (Reconciled: `skills/workflow-compile-generate`
 gains the authoring rules, `skills/workflow-compile-verify` drops them, `docs/GLOSSARY.md`
 `diagnostics_contract` provenance, compile-generate SKILL ceiling 10800→11500.)
@@ -1507,7 +1511,7 @@ header is >132 cols and MUST wrap), case, and whitespace. Three deterministic pi
   the language-neutral structured form authored by Compile.generate transcribing §5.1) == §5.1. A derived type's component layout is
   compared ORDERED (positional-construction ABI); a procedure's dummy decls as a SET (the header
   already pins call order). Malformed / mislabeled / duplicated entries are fail-closed.
-- **Generate.static** (`_validate_infrastructure_generated_signatures`): the generated
+- **Generate.gate static check** (`_validate_infrastructure_generated_signatures`): the generated
   `<spec_id>_model.f90` must publish every §5.1 signature — checked PER-SYMBOL (a drift in one
   procedure cannot be masked by an identical decl in another), types ORDERED, procs by membership,
   plus the §5.1 module `parameter` declarations (`dp` / `case_id_len`) pinned by value. Infra-only;
@@ -1519,7 +1523,7 @@ signature-exactness off the ~17-min `Generate.verify` leaf (and the Build link e
 deterministic checks.
 
 **Docs.** `phase_01_compile.md` (V8 + `public_api.signatures` schema + §1-1), `phase_02_generate.md`
-(the new Generate.static signature gate), `skills/workflow-{compile-generate,generate-generate,
+(the new Generate.gate static-check signature gate), `skills/workflow-{compile-generate,generate-generate,
 generate-verify}` (author/transcribe §5.1 verbatim; verify no longer re-audits signatures). Ceilings
 bumped with justifications.
 
@@ -1569,7 +1573,7 @@ informed regardless).
    written, while the structural branch writes one. That branch now also records
    `failure_category` (`post_execute_violation` / `snapshot_deliverable_gap` /
    `quality_check_mismatch`, in that precedence — a gate report is the most specific) and
-   `failure_excerpt` (the `[execute fail]` block, tail 50 lines as in `binary_meta` / `lint_meta`,
+   `failure_excerpt` (the `[execute fail]` block, tail 50 lines as in `binary_meta` / `gate_meta`,
    **and** tail 4000 characters: unlike compiler stderr a `post_execute` violation is not
    line-shaped — it interpolates whole dict payloads into one line — so the line cap alone leaves
    the prompt-rendered excerpt unbounded). `trial_meta.json` is already an execute `allowed_output_paths`
@@ -2574,21 +2578,21 @@ Error: Rank mismatch in argument 'u' (rank-1 and scalar)
 Error: Type mismatch in argument 'dx'; passed LOGICAL(4) to REAL(8)
 ```
 
-Consequence: `advdiff1d_linear@0.3.0`'s `Generate.syntax` gate stages the closure, compiles it, and terminalizes
+Consequence: `advdiff1d_linear@0.3.0`'s `Generate.gate` syntax check stages the closure, compiles it, and terminalizes
 `fail_closed` with `leaf_transport_error`. The gate's attribution is **correct** — the leaf authors neither the IR nor a
 dependency's certified source, so no retry of this node could clear it. The node is unusable for any E2E until the
-profile is re-certified, under `legacy` and `pure` alike (`Generate.syntax` is a deterministic in-process substep and
+profile is re-certified, under `legacy` and `pure` alike (the `Generate.gate` syntax check is a deterministic in-process check and
 does not depend on the `generate-executor`).
 
 **The drift is not the cause of this instance.** The profile's certified source fails against the flux's `2026-07-12`,
 `2026-07-13`, and `2026-07-16` certifications alike, so its inert call was already mismatched at certification time.
-**Undetermined:** why the profile certified at all (its own `Generate.syntax` must have staged the flux, since the
+**Undetermined:** why the profile certified at all (its own `Generate.gate` syntax check must have staged the flux, since the
 profile `use`s the flux module and does not compile without it), and why `advdiff1d_linear` passed E2E #5/#6. Neither
-has been established; do not assume the `Generate.syntax` closure staging post-dates those runs without checking.
+has been established; do not assume the `Generate.gate` syntax-check closure staging post-dates those runs without checking.
 
 **The structural gap.** Nothing detects a stale certified closure. `_certified_model_source` resolves the latest
 certified source at stage time, so re-certifying an upstream node can invalidate a downstream node's certified source
-**with no signal at all**. The only detector is the downstream node's own `Generate.syntax` gate, and only when that
+**with no signal at all**. The only detector is the downstream node's own `Generate.gate` syntax check, and only when that
 node is next re-run. `Z0`'s note that "a dependency certified before a gate rule existed is not clean by induction"
 names the same hazard from the gate-history direction; this is the interface direction of it.
 
@@ -2681,14 +2685,14 @@ A `pure-function leaf` reads no `SKILL` and no contract doc by design; the host 
 needs. The static section of `pure_generate_generate.txt` distills the **output contract** only — the `CodegenBundle`
 schema — because that is all the Z2 design specified to distil. It carries none of the authoring rules the agentic leaf
 gets from `skills/workflow-generate-generate/SKILL.md` and this phase doc: the fortitude idiom checklist, the
-`Generate.syntax` legality rules, the inert-dependency-call rule. The pure leaf therefore authors Fortran with strictly
+`Generate.gate` syntax-check legality rules, the inert-dependency-call rule. The pure leaf therefore authors Fortran with strictly
 less knowledge than the leaf it replaces.
 
 The measured consequence is the documented `C003` ↔ `-std=f2008` trap. On `dynamics_advdiff_flux_1d_upwind_center2`
 the pure producer returned a valid bundle on all four attempts, and the phase still exhausted its retry budget by
 oscillating between exactly the two forms `phase_02_generate.md` names as wrong:
 
-| attempt | generate.generate | Generate.lint | Generate.syntax |
+| attempt | generate.generate | Generate.gate lint | Generate.gate syntax |
 |---|---|---|---|
 | 1 | ok | fail (`C003 'implicit none' missing 'external'`) | — |
 | 2 | ok | ok | fail |
@@ -2702,7 +2706,7 @@ the constraint and did not know the workaround. The same node under the `legacy`
 
 **The scope decision this needs.** Which authoring rules must the pure static section carry, and in what order (the
 static prefix is byte-stable and precedes the variable context). Candidates: the fortitude idiom checklist, the
-`Generate.syntax` legality rules including the `associate (unused_<name> => <name>)` binding, the JSON descriptor rules,
+`Generate.gate` syntax-check legality rules including the `associate (unused_<name> => <name>)` binding, the JSON descriptor rules,
 and the inert-dependency-call rule. Defect B may reduce how much is required — a certified sibling exemplar exhibits
 the correct forms as prior art — but an exemplar is **prior art, not a gate** (R5), so it is not a substitute for
 stating a rule the leaf must follow.
@@ -2712,29 +2716,29 @@ stated where the producer can act on them and nowhere else. Four groups, in the 
 `pure_generate_generate.txt` (immediately after the output contract, still inside the byte-stable static prefix and
 ahead of the variable context):
 
-1. **fortitude idioms** (`Generate.lint`): `S001` line length (stated as **under** 100 — `S001` compares `>=`, so a
+1. **fortitude idioms** (`Generate.gate` lint check): `S001` line length (stated as **under** 100 — `S001` compares `>=`, so a
    line of exactly 100 fails; `phase_02_generate.md` §71's `≤ 100` was wrong and is corrected here too),
    `C121` `use ... only:`, `C122` `use, intrinsic ::`, `PORT011` named kinds on reals *and* integers (with its
    cascade into `C122`), `C131` default accessibility — paired with the `public :: <spec_id>__<op>` lines, since a
-   bare `private` alone publishes nothing and trades the lint failure for a `Generate.syntax` one (the consumer
+   bare `private` alone publishes nothing and trades the lint failure for a `Generate.gate` syntax-check one (the consumer
    staged alongside it cannot resolve the symbol; no static check reads the MODEL module's published set) — and
    `C011` `case default`.
 2. **The `C003` ↔ `-std=f2008` trap**, stated at verbatim strength as the ONE correct form (`! allow(C003)` on its own
    line above a plain `implicit none`) plus BOTH wrong forms named as wrong and an explicit "do not oscillate between
    these two" — the measured failure was not ignorance of the rule but a two-attractor loop.
-3. **`Generate.syntax` legality** (a real `gfortran -fsyntax-only -std=f2008` front-end, so `! allow(...)` suppresses
+3. **`Generate.gate` syntax-check legality** (a real `gfortran -fsyntax-only -std=f2008` front-end, so `! allow(...)` suppresses
    nothing): 63-char identifiers *and* the "do not abbreviate an overlong `<spec_id>_model` — it is a spec-level
    problem" prohibition (§55), constant-only `stop` / `error stop` codes, the EMPTY `associate (unused_<name> =>
    <name>); end associate` bind for `-Werror=unused-dummy-argument`, the unset-`intent(out)` error that belongs to this
    gate, case-insensitive identifier collisions.
-4. **The dependency-dataflow gate** (`Generate.static`, §79) and the **inert dependency-call rule** (§60): sink-in-IR ⇒
+4. **The dependency-dataflow gate** (`Generate.gate` static check, §79) and the **inert dependency-call rule** (§60): sink-in-IR ⇒
    load-bearing, *uncertain correspondence ⇒ load-bearing too*; no sink ⇒ inert, with no invented purpose.
 
 **Distillation is a correctness surface, not editing.** The first cut of the paragraph was reviewed against the gate
 CODE (not against its own prose) and three of its five compressed rules were wrong (the bullets below number against the TEMPLATE's `(1)`-`(5)`, not the four groups above) in ways that would have re-run the
 defect-C failure under a new name — the compression, not the research, was the defect:
 
-- Rule 4 described a check `Generate.static` **does not perform** while omitting the one it does. "Every `intent(out)`
+- Rule 4 described a check the `Generate.gate` static check **does not perform** while omitting the one it does. "Every `intent(out)`
   must be assigned or the gate fails" is false: `_validate_problem_model_dependency_dataflow` `continue`s when the
   subroutine has no dependency-call results (`validate_pipeline_semantics.py:864`), and an unset `intent(out)` is in
   fact the *syntax* gate's `-Werror=unused-dummy-argument` error. The real criterion (`:879`) is that the values a
@@ -2779,8 +2783,8 @@ The P arm must be re-run before the A/B can be evaluated; the L arm baseline is 
 
 **P-arm outcome (`orch_20260717T031645Z_1214d925`, `b915f91`).** The re-run cleared the A/B for
 `dynamics_advdiff_flux_1d_upwind_center2`: `aggregate_verdict=pass` on both arms, the two replaced substeps at
-`186,612` tokens against the L arm's `4,461,022` (−95.8%, `cache_read` −97.8%), and `Generate.lint` / `Generate.syntax`
-/ `Generate.static` all passed on the first attempt — the `C003` oscillation of defect C did not recur. One residual
+`186,612` tokens against the L arm's `4,461,022` (−95.8%, `cache_read` −97.8%), and the `Generate.gate` lint / syntax
+/ static checks all passed on the first attempt — the `C003` oscillation of defect C did not recur. One residual
 information gap surfaced within the run and is recorded below.
 
 ## Z2 pure `generate.generate` — `state_bindings` on an IR that declares no state (FIXED 2026-07-17)
@@ -2884,7 +2888,7 @@ the leaf is shown its own harness alone; each test was confirmed to FAIL against
 ## Z2 pure `generate.generate` — the checks-module ABI was never shown to the producer (FIXED 2026-07-17)
 
 **Symptom.** The `shallow_water2d` P arm (`orch_20260717T061125Z_a508d4df`, commit `951c7ea` = `pure-3`) was
-terminated `retry_budget_exhausted` / `generate exceeded 3`. Every attempt died at `Generate.syntax` on the
+terminated `retry_budget_exhausted` / `generate exceeded 3`. Every attempt died at the `Generate.gate` syntax check on the
 leaf-authored `shallow_water2d_checks.f90`, in two shapes: `src_20260717_003` omitted the names outright
 (`Symbol 'case_setup' referenced at (1) not found in module 'shallow_water2d_checks'`, and likewise for `case_run`,
 `get_time`, `get_r2`, `checks_compute`, `metric_compute`), and `src_20260717_004`, after a repair turn, defined
@@ -2928,9 +2932,9 @@ generate retry can fix.
 and `build_graph`) makes a mis-authored ABI a BOUNDED in-conversation repair instead of a phase reopen per guess. It
 requires every name in `runner_renderer.CHECKS_PUBLIC_NAMES` to be published by `module <spec_id>_checks` AND defined
 there as a SUBROUTINE. That is a conservative necessary condition which pre-empts BOTH downstream gates:
-`Generate.static` (`_validate_checks_source_files`) requires all ten published but cannot tell a subroutine from a
-function, and `Generate.syntax` rejects both an undefined name and a function-form one. Dummy-argument agreement stays
-with `Generate.syntax`, which stages the runner with the source and owns it. The check is scoped to the ONE module the
+the `Generate.gate` static check (`_validate_checks_source_files`) requires all ten published but cannot tell a subroutine from a
+function, and the `Generate.gate` syntax check rejects both an undefined name and a function-form one. Dummy-argument agreement stays
+with the `Generate.gate` syntax check, which stages the runner with the source and owns it. The check is scoped to the ONE module the
 runner imports: a bundle may legally carry other `checks`-role files, and reading their text too would let a sibling
 module vouch for a name `use <spec_id>_checks` cannot resolve. The category `bundle_checks_abi_violation` joins
 `GENERATE_BUNDLE_FAILURE_CATEGORIES`, which derives its `("generate", "reuse")` route and the in-loop repair predicate
@@ -2942,7 +2946,7 @@ most expensive mistake in this entry. The runner's import list IS dynamic in the
 `use ... only:` list, reasoning that a hard-coded ten "would demand names this node's runner never imports". That
 demand is real and already enforced: `_validate_checks_source_files` requires all ten of every M3c node. The rank-2
 `shallow_water2d` runner imports six, so the prompt was instructing the producer to author exactly what
-`Generate.static` rejects — reproducing this very defect (prompt disagrees with a gate) inside its own fix. The
+the `Generate.gate` static check rejects — reproducing this very defect (prompt disagrees with a gate) inside its own fix. The
 authority for "which names" was never the renderer's IMPORT list; it is `CHECKS_PUBLIC_NAMES`, which the renderer
 selects a subset FROM. Checking the renderer and not the other gate is how a distillation looks verified and is not
 ([[project-prompt-distillation-correctness-surface]] states the rule; this violated it while citing it).
@@ -2953,9 +2957,9 @@ submodule all compile, LINK and `call` fine (each verified by compiling and runn
 `subroutine` header rejected all three, with findings telling the producer to write the subroutine it had already
 written: an unexitable repair loop on a LEGAL bundle. A layer that is STRICTER than the gate it pre-empts converts a
 clean pass into a terminal thrash, which is worse than not pre-empting at all — the residual (a name published but
-defined nowhere) stays with `Generate.syntax`, which reports it precisely.
+defined nowhere) stays with the `Generate.gate` syntax check, which reports it precisely.
 
-Sharing the parser also surfaced two FALSE POSITIVES that predate this work and had been sitting in `Generate.static`
+Sharing the parser also surfaced two FALSE POSITIVES that predate this work and had been sitting in the `Generate.gate` static check
 alone (both confirmed legal with `gfortran -fsyntax-only -std=f2008`, both now fixed in the shared function, so both
 gates improve at once): a logical line was never split at its `;` statement separators, so `public :: a; public :: b`
 lost `a` (its token was `a;`) and invented a name `public` — the repo's existing string- and paren-aware
@@ -2967,7 +2971,7 @@ on a module gfortran accepts. Excluding quotes from the prefix fixes it; a real 
 contains one. Extraction did not cause these, but it did widen their blast radius from one deterministic gate to the
 producer's repair loop, which is reason enough to fix them here.
 
-The parse is delegated to `validate_pipeline_semantics.checks_module_abi_facts` — the SAME parser `Generate.static`
+The parse is delegated to `validate_pipeline_semantics.checks_module_abi_facts` — the SAME parser the `Generate.gate` static check
 uses, extracted so both gates share it. `_CHECKS_PUBLIC_NAMES` is now an import of `runner_renderer`'s tuple rather
 than a second copy, pinned with `is`: two equal tuples are equal right up to the commit that edits one, and one fact
 with two authorities is what this entry is about. The first implementation was a second hand-rolled Fortran parser, and every
@@ -2979,7 +2983,7 @@ callback read as exported. Those are not seven bugs; they are one: **a second im
 Review then found the recovery path reproducing the defect verbatim. A COLD-FALLBACK repair (reached exactly when
 recovery is happening — the session has been GC'd, or an outer reopen seeds one) lifts the launch template's static
 paragraphs by prefix, and the ABI paragraph was added to the template and silently not lifted: the producer was handed
-the runner source with no statement that it must publish all ten as subroutines, and none of the `Generate.static`
+the runner source with no statement that it must publish all ten as subroutines, and none of the `Generate.gate` static-check
 prohibitions either. The lift is now driven by `PURE_REPAIR_STATIC_PARAGRAPH_PREFIXES`, a LIST, so a third static
 paragraph cannot be omitted the same way, and a test asserts the repair against the TEMPLATE'S OWN paragraph text
 rather than a literal copy. (Lifting also had to drop the `<doc>` placeholder line each paragraph ends with — nothing
@@ -2999,7 +3003,7 @@ A third round found the isolation half of the same gate still reading LINES. `ch
 through the statement splitter and its docstring says why; `_validate_checks_source_harness_isolation`, split out of
 the SAME function eleven lines away, was not — so a harness `use` written as the second statement of a `;`-joined line
 (legal, gfortran rc=0) was invisible to an anchored `^\s*use\b` regex. That one is fail-OPEN and nothing downstream
-catches it: the harness IS staged for `Generate.syntax`, and the bundle contract has no isolation layer. Both halves
+catches it: the harness IS staged for the `Generate.gate` syntax check, and the bundle contract has no isolation layer. Both halves
 now go through `_fortran_statements`, one helper, for the same reason the ABI tuple is one import.
 
 The same round found a SECOND definition of "is this line a placeholder" — the repair lift's `<[a-z_]+>` next to the
@@ -3011,9 +3015,9 @@ one-fact-two-authorities shape as the duplicated ABI tuple. The lift now reuses 
 A fourth round found the two gates disagreeing about WHICH FILE, rather than about its contents.
 `m3c_literal_name_violation` matched `logical_path` case-INSENSITIVELY (it predates this work), while
 `_validate_checks_source_files` opens `<spec_id>_checks.f90` verbatim on a case-sensitive filesystem. A bundle naming
-its file `Shallow_Water2d_Checks.f90` was therefore accepted here, staged, passed `Generate.lint` and
-`Generate.syntax` — Fortran resolves `use` by MODULE name and never by filename, so the mixed case is invisible to the
-compiler — and was then rejected by `Generate.static` on the name: a phase reopen, from the layer whose whole job is to
+its file `Shallow_Water2d_Checks.f90` was therefore accepted here, staged, passed the `Generate.gate` lint and
+syntax checks — Fortran resolves `use` by MODULE name and never by filename, so the mixed case is invisible to the
+compiler — and was then rejected by the `Generate.gate` static check on the name: a phase reopen, from the layer whose whole job is to
 not be more permissive than the gate it pre-empts. The comparison is now exact, and its mirror image is preserved and
 documented: the MODULE name stays casefolded, because a Fortran identifier genuinely is case-insensitive. Two
 comparisons, two different authorities — the filesystem and the language — and the bug was using one rule for both.
@@ -3034,14 +3038,14 @@ CERTIFIED pipeline are accepted: zero false positives, and each of those modules
 imports fewer, which is the on-disk proof that ten is the contract. All 8 rejected pairs belong to pipelines that never
 passed Generate, and each is a genuine ABI guess: the failed sw2d P arm's four attempts, plus four flux attempts from
 the defect-B/C era that authored the prefixed `<spec_id>__checks` instead of `checks_compute`. A regression test drives
-the REAL `Generate.static` gate with a bundle this layer accepts, so the two agreeing is pinned rather than asserted.
+the REAL `Generate.gate` static check with a bundle this layer accepts, so the two agreeing is pinned rather than asserted.
 
-**Known gap (accepted).** `Generate.syntax` owns dummy-argument agreement: nothing before it checks that an imported
+**Known gap (accepted).** The `Generate.gate` syntax check owns dummy-argument agreement: nothing before it checks that an imported
 callback's dummies match the runner's `call` sites. The runner is inlined so the producer can read them off.
 
 An earlier draft filed a second "gap" here — that nothing enforces the stub bodies of the ABI names a runner does not
 import — on the rationale that "nothing downstream can see it either". That rationale was FALSE, and a review caught
-it: `Generate.syntax` compiles `<spec_id>_checks.f90` itself, so it sees every stub body whether or not the runner
+it: the `Generate.gate` syntax check compiles `<spec_id>_checks.f90` itself, so it sees every stub body whether or not the runner
 imports the name. The prompt's stub recipe was therefore load-bearing and incomplete — transcribed verbatim it earned
 `Unused dummy argument 'name'` and `Dummy argument 'val' ... declared INTENT(OUT) but was not set` under the real gate
 argv, on 4 of 10 names of every node. It now spells out the rule-3 `associate` binding and the `intent(out)`

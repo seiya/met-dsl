@@ -231,7 +231,7 @@ Fortran module that publishes `symbol`), `kind` (`operation` or `checks_interfac
 An identifier — `symbol`, `module`, and in `state_bindings` (`state_variable`,
 `storage_symbol`, `module`) — is a Fortran identifier of at most `FORTRAN_IDENTIFIER_MAX`
 (63) characters, the f2008/f2018 limit; a longer name is rejected here rather than deferred to
-the `Generate.syntax` compiler gate.
+the `Generate.gate` syntax-check compiler gate.
 
 `module` exists so the host renders the boundary glue `use <module>, only: <symbol>`
 mechanically. A file may define several modules or name them freely, and the host never

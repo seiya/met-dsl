@@ -127,7 +127,7 @@ workspace/
             │   └── <source_id>/
             │       ├── src/                       (generated source code, including `command_log.jsonl`)
             │       ├── source_meta.json
-            │       └── lint_meta.json             (conductor-authored Generate.lint deliverable)
+            │       └── gate_meta.json             (single conductor-authored Generate.gate deliverable; lint/syntax/static checkers)
             ├── binary/
             │   └── <binary_id>/
             │       ├── bin/
@@ -186,11 +186,12 @@ workspace/
 | `workspace/ir/.../<ir_id>/compile_static_meta.json` | Compile (`Compile.static`) | conductor (deterministic in-process; `_compile_static_inproc`) | conductor routing | records the `--stage compile` / `check_artifact_syntax` / `workspace_root` verdict; the leaf cannot write it |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/src/` | Generate | substep agent | subsequent phases | |
 | `workspace/pipelines/.../<pipeline_id>/source/<source_id>/source_meta.json` | Generate | substep agent (Edit/Write) | Build / validator | |
-| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/lint_meta.json` | Generate (`Generate.lint`) | conductor (deterministic in-process; `_lint_inproc`) | validator (`post_generate`) | records the `run_linter` verdict; the leaf cannot write it |
-| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/static_meta.json` | Generate (`Generate.static`) | conductor (deterministic in-process; `_static_inproc`) | conductor routing | records the `post_generate` / `workspace_root` verdict; the leaf cannot write it |
+| `workspace/pipelines/.../<pipeline_id>/source/<source_id>/gate_meta.json` | Generate (`Generate.gate`) | conductor (deterministic in-process; `_gate_inproc` composing `_gate_lint_check` / `_gate_syntax_check` / `_gate_static_check`) | validator (`post_generate`) / conductor routing | single union verdict of the lint / syntax / static checks (`checkers`, `failure_categories`, composed `failure_excerpt`); the leaf cannot write it |
 | `workspace/pipelines/.../<pipeline_id>/binary/<binary_id>/binary_meta.json` | Build | step agent (Edit/Write) | Validate / validator | pins `source_source_id` |
 | `workspace/pipelines/.../<pipeline_id>/runs/<run_id>/<node_key_safe>/verdict.json` | Validate/judge | substep agent (Edit/Write) | runtime / validator / upper node | |
 | `workspace/pipelines/.../<pipeline_id>/lineage.json` | added by each phase | (via write-step-result) | runtime / validator | the phase id lineage |
+
+> The retired per-checker meta files `lint_meta.json` / `syntax_meta.json` / `static_meta.json` (superseded by the single `gate_meta.json`) are no longer written. A workspace produced before this change may still contain them; they are **inert** read-only history and are neither consumed nor deleted.
 
 ## Generation rule of node_key_safe
 

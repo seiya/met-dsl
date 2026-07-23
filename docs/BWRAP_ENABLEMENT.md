@@ -56,7 +56,7 @@ The run must reach `orchestration_meta.json` `status=pass` with a real
 |---|---|
 | Leaves actually ran sandboxed | each `agents/<arid>/dialogs/child.response.json` has `sandbox_enforced: true` **and** a `sandbox_command` starting with `bwrap`; the leaf produced a real reply (not an immediate launch error) |
 | Real auth + `--session-id` transcript worked | `~/.claude/projects/<slug>/<session_id>.jsonl` exists and has assistant turns for each leaf (auth/config-home bind is functional) |
-| MCP `build-runtime` invoked | the deterministic conductor substeps (`generate.lint` / `build` / `validate.execute`, run in-process — not LLM leaves) recorded `run_linter` / `compile_project` / `run_program` evidence (`command_log.jsonl` present, `ok:true`) |
+| MCP `build-runtime` invoked | the deterministic conductor substeps (`generate.gate` / `build` / `validate.execute`, run in-process — not LLM leaves) recorded `run_linter` / `run_syntax_check` / `compile_project` / `run_program` evidence (`command_log.jsonl` present, `ok:true`) |
 | Hooks fired in-sandbox | the run completed without a `*_violation` due to a missing hook decision; gate-friction behavior is unchanged |
 | **Build output landed in write_roots (highest risk)** | the **Build phase passed** — `compile_project` wrote `.o`/`.mod` to the per-run object dir and the exe to `binary/<binary_id>/bin/` with no `unauthorized_write_violation` / EROFS. This is the make-or-break check. |
 
