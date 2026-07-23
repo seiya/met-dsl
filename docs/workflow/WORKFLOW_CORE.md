@@ -294,7 +294,7 @@ The contract details per phase use the files under [phases/](phases/) as the can
 |-------|----------|---------|
 | 0 Spec (manual) | [phases/phase_00_spec.md](phases/phase_00_spec.md) | - |
 | 1 Compile | [phases/phase_01_compile.md](phases/phase_01_compile.md) | generate / static / verify |
-| 2 Generate | [phases/phase_02_generate.md](phases/phase_02_generate.md) | generate / lint / syntax / static / verify |
+| 2 Generate | [phases/phase_02_generate.md](phases/phase_02_generate.md) | generate / gate / verify |
 | 3 Build | [phases/phase_03_build.md](phases/phase_03_build.md) | - |
 | 4 Validate | [phases/phase_04_validate.md](phases/phase_04_validate.md) | pre_judge / execute / judge / post_judge |
 
