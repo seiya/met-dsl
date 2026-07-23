@@ -97,6 +97,10 @@ PINNED: dict[str, str] = {
     # pure templates renamed the checker-gate anchors (Generate.lint/syntax/static ->
     # Generate.gate's lint/syntax/static check). Checker terminology preserved; substep name only.
     "pure-12": "35239881cab2c79d1f59a52985d21c8cdc330c05c1b2a1f7106ac436b107d11c",
+    # pure-13: rule (6) split into (6a) infrastructure neutral-token lowering (trigger corrected
+    # — a component public_api no longer implies infrastructure) + (6b) component published-surface
+    # pin (operation entrypoints / model subroutines == IR public_api.published_operations).
+    "pure-13": "d656ccd45489006020ad09c52abb0b42ed826cd149230fd4c13804cab6344dc5",
 }
 
 
