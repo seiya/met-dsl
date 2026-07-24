@@ -16,8 +16,10 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import tools.orchestration_runtime as wc_runtime
 import tools.workflow_conductor as wc
@@ -2533,6 +2535,97 @@ class UsageResetEpochParseTests(unittest.TestCase):
         self.assertEqual(wc._parse_usage_reset_epoch(stderr), 1799999999)
 
 
+class UsageResetHumanParseTests(unittest.TestCase):
+    """`_parse_usage_reset_human` resolves a TZ-anchored human-worded reset ("resets 10:20pm
+    (Asia/Tokyo)") on the TERMINAL usage-limit line into a unix epoch — the form the real CLI emits.
+    It requires BOTH an am/pm time-of-day AND a parenthesized IANA timezone (the instant is never
+    guessed from the host-local TZ), resolves to the occurrence nearest `now`, and never raises."""
+
+    NOW = 1_752_200_000.0  # 2025-07-11 11:13:20 Asia/Tokyo
+
+    def _sl(self, tail: str) -> str:
+        return f"You've hit your session limit · resets {tail}"
+
+    def _epoch(self, y, mo, d, h, mi, tz="Asia/Tokyo") -> int:
+        return int(datetime(y, mo, d, h, mi, tzinfo=ZoneInfo(tz)).timestamp())
+
+    def test_real_captured_string_resolves(self) -> None:
+        # The exact string a killed leaf produced (middle-dot separator, lowercase 10:20pm, IANA TZ).
+        self.assertEqual(
+            wc._parse_usage_reset_human(self._sl("10:20pm (Asia/Tokyo)"), self.NOW),
+            self._epoch(2025, 7, 11, 22, 20))
+
+    def test_near_future(self) -> None:
+        self.assertEqual(
+            wc._parse_usage_reset_human(self._sl("12:20pm (Asia/Tokyo)"), self.NOW),
+            self._epoch(2025, 7, 11, 12, 20))
+
+    def test_bare_hour_with_at_prefix(self) -> None:
+        self.assertEqual(
+            wc._parse_usage_reset_human(self._sl("at 5pm (Asia/Tokyo)"), self.NOW),
+            self._epoch(2025, 7, 11, 17, 0))
+
+    def test_noon_and_midnight_boundaries(self) -> None:
+        self.assertEqual(  # 12pm == noon, today (future)
+            wc._parse_usage_reset_human(self._sl("at 12pm (Asia/Tokyo)"), self.NOW),
+            self._epoch(2025, 7, 11, 12, 0))
+        self.assertEqual(  # 12am == midnight; today's is past -> tomorrow's
+            wc._parse_usage_reset_human(self._sl("12am (Asia/Tokyo)"), self.NOW),
+            self._epoch(2025, 7, 12, 0, 0))
+
+    def test_no_timezone_declines(self) -> None:
+        self.assertIsNone(wc._parse_usage_reset_human(self._sl("6:10pm"), self.NOW))
+
+    def test_weekday_form_declines(self) -> None:
+        self.assertIsNone(wc._parse_usage_reset_human(
+            "Claude AI weekly limit reached; resets Monday (Asia/Tokyo)", self.NOW))
+
+    def test_unknown_timezone_never_raises(self) -> None:
+        self.assertIsNone(
+            wc._parse_usage_reset_human(self._sl("6:10pm (Not/AZone)"), self.NOW))
+
+    def test_non_usage_line_is_ignored(self) -> None:
+        # A reset-looking string NOT on a usage-limit line is not parsed (terminal-line gate).
+        self.assertIsNone(wc._parse_usage_reset_human(
+            "resets 10:20pm (Asia/Tokyo) in the plot legend", self.NOW))
+        self.assertIsNone(wc._parse_usage_reset_human("", self.NOW))
+
+    def test_just_past_within_grace_resolves_to_the_past(self) -> None:
+        # now 18:12 JST, reset 6:10pm -> today 18:10 (2 min past, within grace): a stale-by-minutes
+        # message resolves to the just-passed instant (the caller floors it to a margin-only wait).
+        now = float(self._epoch(2025, 7, 11, 18, 12))
+        self.assertEqual(
+            wc._parse_usage_reset_human(self._sl("6:10pm (Asia/Tokyo)"), now),
+            self._epoch(2025, 7, 11, 18, 10))
+
+    def test_midnight_forward(self) -> None:
+        now = float(self._epoch(2025, 7, 11, 23, 50))
+        self.assertEqual(
+            wc._parse_usage_reset_human(self._sl("12:10am (Asia/Tokyo)"), now),
+            self._epoch(2025, 7, 12, 0, 10))
+
+    def test_midnight_back(self) -> None:
+        # now just after midnight, reset 11:55pm -> YESTERDAY's 23:55 (within grace).
+        now = float(self._epoch(2025, 7, 12, 0, 2))
+        self.assertEqual(
+            wc._parse_usage_reset_human(self._sl("11:55pm (Asia/Tokyo)"), now),
+            self._epoch(2025, 7, 11, 23, 55))
+
+    def test_stale_beyond_grace_flips_to_tomorrow(self) -> None:
+        # now 18:30, reset 6:10pm (20 min past, > grace) -> tomorrow's 18:10 (caller then declines >6h).
+        now = float(self._epoch(2025, 7, 11, 18, 30))
+        self.assertEqual(
+            wc._parse_usage_reset_human(self._sl("6:10pm (Asia/Tokyo)"), now),
+            self._epoch(2025, 7, 12, 18, 10))
+
+    def test_terminal_line_governs(self) -> None:
+        # A machine epoch earlier, a human TZ reset on the TERMINAL line -> the human parser reads
+        # the terminal line (mirrors the epoch parser's terminal-line discipline).
+        stderr = "session limit reached|1752200000\n" + self._sl("12:20pm (Asia/Tokyo)")
+        self.assertEqual(wc._parse_usage_reset_human(stderr, self.NOW),
+                         self._epoch(2025, 7, 11, 12, 20))
+
+
 class LeafChildEnvTest(unittest.TestCase):
     """WI-A: the leaf's output ceiling is part of the CONDUCTOR'S leaf contract (it lives in
     _child_env, not in `.claude/settings.json`, so it cannot leak into the operator's own
@@ -2782,18 +2875,25 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertEqual(oc.infra_error[0], "llm_usage_limit")  # still classified (fail_closed)
         self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
 
-    def test_usage_reset_wait_declines_without_a_machine_epoch(self) -> None:
-        """Opted in but no machine-form epoch (a human-worded reset) => no guessing: the current
-        fail_closed behavior is preserved and nothing is slept or tombstoned."""
+    def test_usage_reset_wait_declines_a_human_reset_without_a_timezone(self) -> None:
+        """Opted in but the human reset has NO parenthesized IANA timezone ("resets 6:10pm"): the
+        instant is never guessed from the conductor host's local timezone, so the wait declines
+        (fail_closed preserved, nothing slept or tombstoned) and emits
+        `leaf_usage_limit_wait_declined(no_reset_time)` so the decline is greppable. (A human reset
+        WITH a TZ now engages — see test_usage_reset_wait_engages_on_human_tz_reset.)"""
         c = self._conductor(
             [wc.ProcResult(1, "", "You've hit your session limit; resets 6:10pm")],
             wait_usage_reset=True)
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
         oc = c.run_substep(self._refs(), "compile", "verify")
         self.assertEqual(len(c.spawns), 1)
         self.assertEqual(oc.attempts, 1)
         self.assertEqual(oc.infra_error[0], "llm_usage_limit")
         self.assertEqual(c.slept, [])
         self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
+        declined = [f["reason"] for e, f in events if e == "leaf_usage_limit_wait_declined"]
+        self.assertEqual(declined, ["no_reset_time"])
 
     def test_usage_reset_wait_declines_when_reset_exceeds_the_cap(self) -> None:
         """A reset further out than MAX_USAGE_LIMIT_WAIT_SECONDS (6h) is a weekly limit or a
@@ -2829,6 +2929,63 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertEqual(len(reasons), 2)
         self.assertTrue(any("leaf_transient_retry_orphan" in r for r in reasons))
         self.assertTrue(any("leaf_usage_limit_wait_orphan" in r for r in reasons))
+
+    def test_usage_reset_wait_engages_on_human_tz_reset(self) -> None:
+        """The real fix: --wait-usage-reset ON + the REAL CLI's human-worded, TZ-anchored reset
+        (the machine `|<epoch>` form never appears in practice). Resolves `12:20pm (Asia/Tokyo)` to
+        now+4000s and sleeps that + the 120s margin, then re-launches the same substep."""
+        now = 1_752_200_000.0  # 2025-07-11 11:13:20 Asia/Tokyo
+        c = self._conductor(
+            [wc.ProcResult(1, "", "You've hit your session limit · resets 12:20pm (Asia/Tokyo)"),
+             wc.ProcResult(0, "done", "")],
+            wait_usage_reset=True)
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(len(c.spawns), 2)
+        self.assertEqual(c.slept, [4120.0])  # 4000s to 12:20pm JST + 120s margin
+        waits = [f for e, f in events if e == "leaf_usage_limit_wait"]
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0]["reset_epoch"], int(now) + 4000)
+        sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertEqual(len(sup), 1)
+        self.assertIn("leaf_usage_limit_wait_orphan", sup[0]["--reason"])
+
+    def test_usage_reset_wait_plan_declined_emits_reason(self) -> None:
+        """Every decline except the flag-off short-circuit emits `leaf_usage_limit_wait_declined`
+        with a reason (no_reset_time / over_6h_cap / budget_spent), so an opted-in run that did not
+        wait is greppable — the invisibility of this decline is what masked the envelope mismatch.
+        A resolvable reset returns a plan and emits nothing."""
+        now = 1_752_200_000.0
+
+        def plan(stderr, waits_done=0, *, flag=True):
+            c = self._conductor([wc.ProcResult(1, "", stderr)], wait_usage_reset=flag)
+            events: list = []
+            c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+            with mock.patch.object(wc.time, "time", return_value=now):
+                result = c._usage_reset_wait_plan(
+                    wc.ProcResult(1, "", stderr), waits_done,
+                    node_key="component/x@0.1.0", step="compile", substep="verify")
+            declined = [f["reason"] for e, f in events if e == "leaf_usage_limit_wait_declined"]
+            return result, declined
+
+        r, d = plan("You've hit your session limit; resets 6:10pm")  # human, no TZ
+        self.assertIsNone(r)
+        self.assertEqual(d, ["no_reset_time"])
+        r, d = plan(f"usage limit reached|{int(now) + 7 * 3600}")    # machine, > 6h
+        self.assertIsNone(r)
+        self.assertEqual(d, ["over_6h_cap"])
+        r, d = plan(f"usage limit reached|{int(now) + 200}", waits_done=1)  # budget spent
+        self.assertIsNone(r)
+        self.assertEqual(d, ["budget_spent"])
+        r, d = plan(f"usage limit reached|{int(now) + 200}", flag=False)    # opted OUT
+        self.assertIsNone(r)
+        self.assertEqual(d, [])
+        r, d = plan("You've hit your session limit · resets 12:20pm (Asia/Tokyo)")  # resolvable
+        self.assertIsNotNone(r)
+        self.assertEqual(d, [])
 
     def test_client_error_is_never_retried(self) -> None:
         """The WI-A interlock: if the configured leaf model's output ceiling is below

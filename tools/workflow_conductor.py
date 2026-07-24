@@ -32,9 +32,10 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -1520,11 +1521,20 @@ _LEAF_RETRY_NOTICE_RE = re.compile(r"\bretrying\b|attempt \d+/\d+")
 
 # --wait-usage-reset (opt-in): a usage limit is a multi-hour HARD STOP, so the conductor's DEFAULT
 # stays fail_closed (a manual `--resume` after the reset — see deterministic_followups L5). When the
-# operator opts in AND the dead leaf carried a MACHINE-FORM reset time (a trailing `|<unix-epoch>`
-# on its usage-limit error line), the conductor waits it out IN PLACE and re-launches the same
-# substep — a same-run, substep-granular resume instead of a next-day fresh run. A human-worded
-# reset ("resets 6:10pm...") carries no epoch, so it is NOT waited (guessing the reset instant would
-# either burn the budget early or oversleep). All three bounds are hard:
+# operator opts in AND the dead leaf's terminal usage-limit line carries a RESOLVABLE reset instant,
+# the conductor waits it out IN PLACE and re-launches the same substep — a same-run, substep-granular
+# resume instead of a next-day fresh run. Two forms resolve, tried in order on the SAME terminal line:
+#   (1) MACHINE form — a trailing `|<unix-epoch>` (`_parse_usage_reset_epoch`);
+#   (2) HUMAN form — a wall-clock time-of-day + a parenthesized IANA timezone
+#       ("resets 10:20pm (Asia/Tokyo)"), resolved to an epoch by `_parse_usage_reset_human`.
+# The real CLI emits form (2), not (1), so (2) is what actually arms the wait in practice; (1) is
+# kept first for backward-compat and any future machine envelope. A human reset WITHOUT a
+# parenthesized IANA TZ ("resets 6:10pm"), or without a time-of-day ("resets Monday"), is NOT
+# resolved — the reset instant is not guessed from the host's local TZ (that would make the wait
+# depend on where the conductor runs and could wake into a still-shut window), so it declines to
+# fail_closed and emits `leaf_usage_limit_wait_declined` for visibility. All three bounds are hard,
+# and — with the +margin, the 6h cap, and the nearest-occurrence resolution — a resolved human
+# instant is safe even a few minutes stale (it floors to a margin-only relaunch):
 MAX_USAGE_LIMIT_WAITS = 1  # per substep; a distinct budget from the transient-retry retries above
 # The session window is 5h; a reset further out than this is a weekly limit or a misparsed epoch,
 # neither of which the in-place wait should sit on — fall back to fail_closed.
@@ -1536,42 +1546,38 @@ USAGE_LIMIT_WAIT_MARGIN_SECONDS = 120
 # Ten digits pins it to a plausible unix-second epoch (through year 2286) and keeps an ordinary
 # `|<number>` in the model's own prose from being read as a reset time.
 _USAGE_RESET_EPOCH_RE = re.compile(r"\|(\d{10})\s*$")
+# The human-form reset the real CLI emits: `... resets 10:20pm (Asia/Tokyo)` (also `resets at 5pm`,
+# `resets 12am`). The time-of-day requires an am/pm marker (so a weekday word `resets Monday` never
+# matches); the TZ must be a parenthesized IANA `Area/City` name — a reset without one is NOT
+# resolved (the instant is never guessed from the host-local TZ; see the design note above).
+_USAGE_RESET_HUMAN_TIME_RE = re.compile(
+    r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.IGNORECASE)
+_USAGE_RESET_HUMAN_TZ_RE = re.compile(r"\(([A-Za-z]+(?:/[A-Za-z_]+)+)\)")
+# A human wall-clock reset is printed to the minute, and the leaf-death → conductor-processing lag
+# plus clock skew can leave the terminal message a few minutes stale. Resolve to the occurrence
+# NEAREST `now` (yesterday/today/tomorrow at that wall time) that is no more than this far in the
+# past, so a just-passed reset floors to a margin-only relaunch instead of jumping to tomorrow (and
+# being declined by the 6h cap). Only ever reaches into the PAST, so it can never manufacture a
+# large positive wait.
+_USAGE_RESET_HUMAN_GRACE_SECONDS = 900
 
 
-def _parse_usage_reset_epoch(stderr: str) -> int | None:
-    """The unix-second reset epoch a usage-limit leaf carried as a trailing `|<10-digit>`, or None
-    when absent (a human-worded reset, or none at all).
-
-    Deliberately a SEPARATE scan from `_classify_leaf_infra_error`, over the RAW stream: the
-    classifier returns a 2-tuple whose evidence line is clipped to 160 chars, which can fall short
-    of a trailing epoch, and widening that tuple would ripple through its three positional consumers.
-    Only lines the `llm_usage_limit` pattern itself matches are considered (so a stray `|1234567890`
-    is never mistaken for a reset time).
-
-    Selects the epoch from the TERMINAL usage-limit line — the LAST one, skipping recovered
-    retry-notice banners — so it AGREES with `_classify_leaf_infra_error`, which tags the run from
-    that same terminal line (most-severe-then-last). Returning the FIRST match instead would let a
-    stale, non-terminal message govern the wait: e.g. an earlier session message with an in-window
-    epoch followed by a terminal weekly limit would wait on the stale epoch and burn the single
-    permitted wait on a limit that is not the one that fired; the reverse ordering would decline a
-    valid session wait. When the terminal usage-limit line carries NO epoch (a human-worded weekly
-    limit) the result is None even if an earlier line had one — the wait is governed by the cause
-    that actually terminated the leaf, not by an epoch the run went on to survive.
+def _terminal_usage_limit_line(stderr: str) -> str | None:
+    """The TERMINAL usage-limit line of a leaf's stderr — the LAST line the `llm_usage_limit`
+    pattern matches, skipping recovered retry-notice banners — or None when there is none.
 
     STDERR ONLY — deliberately NOT stdout. stdout is a `claude -p` leaf's OWN OUTPUT SURFACE (the
     model's result text for an agentic leaf; the JSON envelope for a pure leaf), i.e. untrusted
-    content. `_classify_leaf_infra_error` may PROMOTE an `llm_usage_limit` tag out of stdout, and
-    that promotion was documented-safe only because a usage limit was terminal — promoting it could
-    only ever REMOVE a re-launch (see `_CROSS_STREAM_PROMOTING_TAGS`). The wait ADDS one (a multi-hour
-    sleep + relaunch), so arming it from stdout would let a leaf that crashed for an unrelated reason,
-    but whose prose happens to contain `usage limit reached|<future epoch>`, park an opted-in run for
-    hours. Only the trusted CLI error channel (stderr) may arm the wait; a usage limit seen only on
-    stdout still classifies (fail_closed labelled `llm_usage_limit`) but declines the wait — the safe
-    default. (If a real CLI emits the machine epoch only on stdout, the operator gets the current
-    manual-`--resume` behavior; a follow-up would key the wait off a verified machine envelope.)"""
+    content that could park an opted-in run for hours if it happened to contain a usage-limit string.
+    Only the trusted CLI error channel (stderr) may arm the wait.
+
+    Selecting the TERMINAL line makes the wait AGREE with `_classify_leaf_infra_error`, which tags
+    the run from that same line (most-severe-then-last): the wait is governed by the cause that
+    actually terminated the leaf, never by an earlier message the run went on to survive. Shared by
+    the machine-epoch and human-reset parsers so they resolve against the identical line."""
     usage_pattern = _LEAF_INFRA_ERROR_PATTERNS[0][1]
     lines = (stderr or "").splitlines()
-    terminal_epoch: int | None = None
+    terminal: str | None = None
     for idx, line in enumerate(lines):
         # Skip a recovered retry-notice banner AND the line it continues from, exactly as the
         # classifier does — a `Retrying... (attempt 1/10)` line the run survived is not terminal.
@@ -1581,11 +1587,80 @@ def _parse_usage_reset_epoch(stderr: str) -> int | None:
             continue
         if not usage_pattern.search(line.lower()):
             continue
-        # LAST usage-limit line wins (the terminal message). Its epoch — or None when the terminal
-        # line is human-worded — supersedes any earlier line's epoch.
-        match = _USAGE_RESET_EPOCH_RE.search(line)
-        terminal_epoch = int(match.group(1)) if match else None
-    return terminal_epoch
+        terminal = line  # last usage-limit line wins
+    return terminal
+
+
+def _parse_usage_reset_epoch(stderr: str) -> int | None:
+    """The unix-second reset epoch a usage-limit leaf carried as a trailing `|<10-digit>` on its
+    TERMINAL usage-limit line, or None when absent (a human-worded reset, or none at all).
+
+    MACHINE FORM ONLY. The human-worded form ("resets 10:20pm (Asia/Tokyo)") is resolved separately
+    by `_parse_usage_reset_human`; `_usage_reset_wait_plan` tries this machine parser FIRST and falls
+    back to the human parser on the same terminal line (via `_terminal_usage_limit_line`).
+
+    Ten digits pins the suffix to a plausible unix-second epoch and keeps a stray `|1234567890` in
+    the model's own prose from being read as a reset time (only the terminal usage-limit line is
+    considered). When that line carries NO epoch (a human-worded weekly limit, or a session limit
+    the machine envelope simply omits) the result is None even if an earlier line had one — the wait
+    is governed by the cause that actually terminated the leaf, not by an epoch the run survived."""
+    line = _terminal_usage_limit_line(stderr)
+    if line is None:
+        return None
+    match = _USAGE_RESET_EPOCH_RE.search(line)
+    return int(match.group(1)) if match else None
+
+
+def _parse_usage_reset_human(stderr: str, now: float) -> int | None:
+    """The unix-second reset epoch resolved from a HUMAN-worded reset on the TERMINAL usage-limit
+    line — a wall-clock time-of-day + a parenthesized IANA timezone, e.g. `resets 10:20pm
+    (Asia/Tokyo)` — or None when the line is not resolvable.
+
+    Returns None (declines, no wait) when: there is no terminal usage-limit line; the line has no
+    `h[:mm](am|pm)` time-of-day (a weekday-worded `resets Monday`); or the line has no parenthesized
+    IANA timezone. The timezone is REQUIRED — the instant is never guessed from the conductor host's
+    local TZ, which would make the wait depend on where the run executes and could resolve to a
+    plausible-but-wrong instant that wakes into a still-shut window.
+
+    Resolution: the wall time is matched to the occurrence NEAREST `now` among yesterday / today /
+    tomorrow (in the parsed TZ) that is no more than `_USAGE_RESET_HUMAN_GRACE_SECONDS` in the past.
+    This picks the next upcoming reset, or a just-passed one when the message is minutes stale
+    (which then floors, in `_usage_reset_wait_plan`, to a margin-only relaunch), and it handles both
+    midnight-wrap directions. The caller's 6h cap declines an occurrence resolved further out (a
+    message stale beyond the grace flips cleanly to tomorrow and is capped). A DST fold/gap can skew
+    the resolved instant by up to 1h on the 1-2 days/year a transition lands in-window; that is
+    absorbed by the +margin and the relaunch preflight probe (the same residual the machine path
+    carries). NEVER raises (a bad/unknown TZ or missing tzdata → None), matching its siblings.
+
+    `now` is passed in (not read here) so the machine and human paths and the wait math all see one
+    `time.time()` instant, and so the resolution is deterministically testable."""
+    try:
+        line = _terminal_usage_limit_line(stderr)
+        if line is None:
+            return None
+        time_match = _USAGE_RESET_HUMAN_TIME_RE.search(line)
+        tz_match = _USAGE_RESET_HUMAN_TZ_RE.search(line)
+        if time_match is None or tz_match is None:
+            return None
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2) or 0)
+        meridiem = time_match.group(3).lower()
+        if not (1 <= hour <= 12) or not (0 <= minute <= 59):
+            return None
+        if meridiem == "am":
+            hour24 = 0 if hour == 12 else hour
+        else:  # pm
+            hour24 = 12 if hour == 12 else hour + 12
+        tz = ZoneInfo(tz_match.group(1))
+        today = datetime.fromtimestamp(now, tz).date()
+        candidates = [
+            datetime(d.year, d.month, d.day, hour24, minute, tzinfo=tz).timestamp()
+            for d in (today - timedelta(days=1), today, today + timedelta(days=1))
+        ]
+        eligible = [e for e in candidates if e >= now - _USAGE_RESET_HUMAN_GRACE_SECONDS]
+        return int(min(eligible)) if eligible else None
+    except Exception:
+        return None
 
 
 def _classify_leaf_infra_error(stderr: str, stdout: str = "") -> tuple[str, str] | None:
@@ -3132,7 +3207,8 @@ clean:
             # uses — so a non-usage crash whose prose happens to match the usage pattern is not waited.
             if (category == "pure_transport" and infra_error is not None
                     and infra_error[0] == "llm_usage_limit"):
-                plan = self._usage_reset_wait_plan(proc, usage_waits)
+                plan = self._usage_reset_wait_plan(
+                    proc, usage_waits, node_key=refs.node_key, step=phase, substep=substep)
                 if plan is not None:
                     wait_seconds, reset_epoch = plan
                     self._wait_for_usage_reset(
@@ -3500,7 +3576,8 @@ clean:
             # waited, matching run_substep).
             if (category == "pure_transport" and infra_error is not None
                     and infra_error[0] == "llm_usage_limit"):
-                plan = self._usage_reset_wait_plan(proc, usage_waits)
+                plan = self._usage_reset_wait_plan(
+                    proc, usage_waits, node_key=refs.node_key, step=phase, substep=substep)
                 if plan is not None:
                     wait_seconds, reset_epoch = plan
                     self._wait_for_usage_reset(
@@ -5567,14 +5644,16 @@ clean:
                 and attempt < MAX_LEAF_TRANSIENT_RETRIES)
             if not retryable:
                 # --wait-usage-reset (opt-in): a usage limit is normally terminal (fail_closed for
-                # a manual post-reset --resume). When the operator opted in AND the leaf carried a
-                # machine-form reset epoch, wait it out in place and re-launch — a same-run,
-                # substep-granular resume instead of a next-day fresh run. Bounded by
-                # MAX_USAGE_LIMIT_WAITS, a budget DISTINCT from the transient-retry budget above; a
-                # usage limit is never a transient-retry tag, so this cannot compound with it.
+                # a manual post-reset --resume). When the operator opted in AND the leaf's terminal
+                # line carried a resolvable reset (a machine `|<epoch>` or a TZ-anchored human reset),
+                # wait it out in place and re-launch — a same-run, substep-granular resume instead of
+                # a next-day fresh run. Bounded by MAX_USAGE_LIMIT_WAITS, a budget DISTINCT from the
+                # transient-retry budget above; a usage limit is never a transient-retry tag, so this
+                # cannot compound with it.
                 if (not deterministic and infra_error is not None
                         and infra_error[0] == "llm_usage_limit"):
-                    plan = self._usage_reset_wait_plan(proc, usage_waits)
+                    plan = self._usage_reset_wait_plan(
+                        proc, usage_waits, node_key=refs.node_key, step=phase, substep=substep)
                     if plan is not None:
                         wait_seconds, reset_epoch = plan
                         self._wait_for_usage_reset(
@@ -5616,26 +5695,49 @@ clean:
         that the loop does not otherwise block."""
         time.sleep(seconds)
 
-    def _usage_reset_wait_plan(self, proc: ProcResult,
-                               waits_done: int) -> tuple[float, int] | None:
+    def _usage_reset_wait_plan(self, proc: ProcResult, waits_done: int, *,
+                               node_key: str, step: str,
+                               substep: str | None) -> tuple[float, int] | None:
         """`(wait_seconds, reset_epoch)` when a usage-limit-killed leaf should be waited out and
         re-launched in place, or None to keep the current fail_closed behavior.
 
-        None (fall back to fail_closed) whenever ANY precondition misses — the flag is off, the
-        per-substep wait budget is spent, the leaf carried no machine-form reset epoch ON STDERR (a
-        human-worded reset is not guessed at, and a usage limit seen only on the leaf's untrusted
-        stdout does not arm the wait — see `_parse_usage_reset_epoch`), or the reset lies further out
-        than MAX_USAGE_LIMIT_WAIT_SECONDS (a weekly limit or a misparse, not a session window). The
-        wait sleeps slightly PAST the reset (USAGE_LIMIT_WAIT_MARGIN_SECONDS) so the re-launch's
-        preflight live-probe finds the window actually open; a reset already in the past waits only
-        that margin."""
-        if not self.wait_usage_reset or waits_done >= MAX_USAGE_LIMIT_WAITS:
+        Called only for an `llm_usage_limit`-tagged death (the call-site guard). Tries the MACHINE
+        reset epoch first (`_parse_usage_reset_epoch`), then the HUMAN TZ-anchored form
+        (`_parse_usage_reset_human`) on the same terminal line — the real CLI emits the latter. One
+        `time.time()` read is shared with the human parser and the `remaining` math.
+
+        None (fall back to fail_closed) whenever ANY precondition misses — the flag is off; the
+        per-substep wait budget is spent; the terminal line carries neither a machine epoch nor a
+        resolvable TZ-anchored human reset (a human reset with no IANA TZ / no time-of-day is not
+        guessed at, and a usage limit seen only on the leaf's untrusted stdout does not arm the wait
+        — see `_parse_usage_reset_epoch` / `_parse_usage_reset_human`); or the reset lies further out
+        than MAX_USAGE_LIMIT_WAIT_SECONDS (a weekly limit or a misparse, not a session window). Every
+        decline EXCEPT the flag-off short-circuit emits `leaf_usage_limit_wait_declined` with a
+        reason, so a run that opted in but did not wait is greppable — the invisibility of this
+        decline is exactly what masked the machine-vs-human envelope mismatch.
+
+        The wait sleeps slightly PAST the reset (USAGE_LIMIT_WAIT_MARGIN_SECONDS) so the re-launch's
+        preflight live-probe finds the window actually open; a reset already in the past (a
+        minutes-stale human message) waits only that margin."""
+        if not self.wait_usage_reset:
             return None
-        reset_epoch = _parse_usage_reset_epoch(proc.stderr or "")
+
+        def _decline(reason: str) -> None:
+            self.emit("leaf_usage_limit_wait_declined", node_key=node_key, step=step,
+                      substep=substep, reason=reason)
+
+        if waits_done >= MAX_USAGE_LIMIT_WAITS:
+            _decline("budget_spent")
+            return None
+        now = time.time()
+        reset_epoch = (_parse_usage_reset_epoch(proc.stderr or "")
+                       or _parse_usage_reset_human(proc.stderr or "", now))
         if reset_epoch is None:
+            _decline("no_reset_time")
             return None
-        remaining = reset_epoch - time.time()
+        remaining = reset_epoch - now
         if remaining > MAX_USAGE_LIMIT_WAIT_SECONDS:
+            _decline("over_6h_cap")
             return None
         wait_seconds = max(0.0, remaining) + USAGE_LIMIT_WAIT_MARGIN_SECONDS
         return (wait_seconds, reset_epoch)

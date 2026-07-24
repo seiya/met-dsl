@@ -528,12 +528,20 @@ re-run confirming Build passes on attempt 1 (operator-gated).
     whole run, and the manual `--resume` re-ran `compile.generate` from scratch (a re-paid 491s cold
     producer), because `--resume` only sees the phase-granular checkpoint. The response is the
     **opt-in `--wait-usage-reset` flag** (default OFF keeps this manual behavior). When set AND the
-    dead leaf carried a **machine-form reset epoch on STDERR** (a trailing `|<unix-epoch>` on its
-    usage-limit line — a human-worded "resets 6:10pm" is never guessed at, and a usage limit on the
-    leaf's untrusted stdout does not arm the wait), the conductor waits it out in place (to the reset
-    + a 120s margin) and re-launches the SAME substep — a same-run, substep-granular resume. Bounded
-    hard: one wait per substep (a budget distinct from the transient-retry budget), at most 6h (a
-    longer reset is a weekly limit or a misparse → fail_closed). It is NOT recovered automatically on
+    dead leaf's terminal usage-limit line on STDERR carries a **resolvable reset instant** — a
+    machine `|<unix-epoch>` OR a TZ-anchored human reset (`resets 10:20pm (Asia/Tokyo)`) resolved to
+    the nearest occurrence within a 15-min grace — the conductor waits it out in place (to the reset
+    + a 120s margin) and re-launches the SAME substep, a same-run substep-granular resume. **The real
+    CLI emits the human form, not a machine epoch, so the human path is what actually arms the wait;
+    the 2026-07 advdiff closure that motivated this flag (a session limit with `resets 10:20pm
+    (Asia/Tokyo)`) originally declined precisely because only the assumed machine epoch was parsed —
+    that was the first real usage limit the flag ever met.** A human reset without a parenthesized
+    IANA timezone (`resets 6:10pm`) or without a time-of-day (`resets Monday`) is NOT resolved (the
+    instant is never guessed from the host's local timezone), and a usage limit on the leaf's
+    untrusted stdout does not arm the wait — every such decline emits `leaf_usage_limit_wait_declined`
+    (reason `no_reset_time` / `over_6h_cap` / `budget_spent`) so the next incident is greppable.
+    Bounded hard: one wait per substep (a budget distinct from the transient-retry budget), at most
+    6h (a longer reset is a weekly limit or a misparse → fail_closed). It is NOT recovered automatically on
     `--resume` (a per-invocation preference recorded on the invocation block and refreshed to the
     effective value on resume); re-pass the flag to keep it active.
     Canonical: `docs/ORCHESTRATION.md` "leaf transient retry"; operator guidance:
