@@ -3120,10 +3120,22 @@ class StdoutFormatTests(unittest.TestCase):
         wait_line = f({"status": "info", "event": "leaf_usage_limit_wait",
                        "node_key": "n", "step": "generate", "substep": "generate",
                        "reset_epoch": 1752200000, "wait_seconds": 420.0, "wait_attempt": 1,
+                       "reset_source": "scrape_human", "window": None,
                        "dead_agent_run_id": "ar_dead", "orchestration_id": "o"})
         self.assertEqual(
             wait_line,
-            "    [warn   ] usage limit in generate.generate [wait 1]: "
+            "    [warn   ] usage limit in generate.generate [wait 1] (source=scrape_human): "
+            "waiting 420.0s for the reset, then re-launching",
+        )
+        # A probe-sourced instant additionally names the window it was observed on — the operator
+        # can tell a host-observed reset from one scraped out of the dead leaf's own output, which
+        # is the only one that can be wrong about which window stopped the run.
+        self.assertEqual(
+            f({"status": "info", "event": "leaf_usage_limit_wait", "node_key": "n",
+               "step": "generate", "substep": "generate", "reset_epoch": 1752200000,
+               "wait_seconds": 420.0, "wait_attempt": 1, "reset_source": "probe",
+               "window": "session", "dead_agent_run_id": "ar_dead", "orchestration_id": "o"}),
+            "    [warn   ] usage limit in generate.generate [wait 1] (source=probe/session): "
             "waiting 420.0s for the reset, then re-launching",
         )
         # Item C: a transport-substep resume announces the producer reuse, the skipped producer
