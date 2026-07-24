@@ -275,9 +275,9 @@ class DegeneratePredicateTest(unittest.TestCase):
     def test_verdict_only_pass_beside_a_concrete_one_is_deliberately_not_flagged(self) -> None:
         # DELIBERATE set-level scope (do NOT change to per-predicate): a single verdict-only PASS
         # predicate beside a concrete one must NOT be flagged. An individual pass test can legitimately
-        # assert an aggregate criterion — this is the shape of the CERTIFIED
-        # infrastructure/harness_fortran_cpu IR, whose `l0_multi_case_evidence_pass` is verdict-only
-        # beside five `checks.*` pass tests. A per-predicate rule would false-reject that certified IR.
+        # assert an aggregate criterion — this is the shape of a harness-suite IR, where the
+        # multi-target `l0_multi_case_evidence_pass` may reduce to `verdict.*` while its sibling pass
+        # tests carry the `checks.*` / metric conditions. A per-predicate rule would false-reject it.
         # Whether a specific test dropped a threshold it should carry is a per-test FIDELITY question
         # owned by Compile.verify (which reads tests.md), not this deterministic gate.
         preds = [

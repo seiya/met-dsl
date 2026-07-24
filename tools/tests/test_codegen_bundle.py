@@ -1950,8 +1950,9 @@ class ContractPlumbingTest(unittest.TestCase):
         # MANIFEST, never a stale assertion.
         self.assertEqual({node_key.rsplit("@", 1)[0] for node_key in harnesses},
                          {"infrastructure/harness_fortran_cpu"},
-                         "the harness catalog entry no longer parses (or a harness was "
-                         "added/removed) — fix this test's parser, not the manifest")
+                         "the parsed harness set is not the single expected harness: either the "
+                         "catalog entry stopped parsing (fix the parser) or a harness was "
+                         "added/renamed (fix THIS assertion) — never the manifest")
         # (1) No stale key: every declared manifest names a node_key the catalog carries.
         for node_key in cb.HARNESS_CAPABILITY_MANIFESTS:
             with self.subTest(node_key=node_key):
