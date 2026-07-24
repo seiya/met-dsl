@@ -3223,11 +3223,20 @@ case-hardcoded writer. The existing machinery is the detector: `_check_ref` pins
 predicate metric ref verbatim against the declared addresses at Compile, and at execute `_resolve_predicate_ref` reads
 the ref as a whole-string key of the case's `metrics` map — an empty map resolves `ref_absent` ⇒ `structural_violation`
 ⇒ the harness node's own `Validate.execute` fails closed. The `N/A` sibling is asserted by value (`eq not_computed`), so
-a writer that drops the `N/A` leaf fires structurally, and the `na_allowed` condition on `selftest.metric_na`
-(`ge 0.0`) is satisfied by the honest `null` but never by the supplied `-1.0`, so a writer that serializes the numeric
-value in place of `null` fires as a physics fail. The `na_allowed` condition carries no structural detection of its own
-(an absent ref satisfies it); the drop is detected by the `selftest.metric_leaf` band and the
-`selftest.metric_na_reason_na` equality.
+a writer that drops the `N/A` leaf fires structurally. The `selftest.metric_na` condition asserts the honest-`N/A`
+encoding by comparing (`eq`) against a NON-NUMERIC token with `na_allowed`: the honest `null` passes (via `na_allowed`),
+while any PRESENT numeric value — the supplied out-of-band `-1.0`, or a nonnegative placeholder such as `0.0` — never
+equals the token and fails as a physics mismatch, so a serialized number is caught regardless of its sign. (An earlier
+form compared `ge 0.0`, which accepted a nonnegative placeholder; the `eq`-token form closes that.) The `na_allowed`
+clause carries no structural detection of its own (an absent ref satisfies it); the full drop is detected by the
+`selftest.metric_leaf` band and the `selftest.metric_na_reason_na` equality.
+
+**One N/A residual the DSL cannot reach.** A writer that emits the `selftest.metric_na_reason_na` sibling but omits the
+`"selftest.metric_na": null` key is accepted: `_resolve_predicate_ref` resolves a present-`null` to `(True, None)` and
+an absent leaf to `(False, None)`, and `_eval_condition` collapses both to the `na_allowed`-satisfied branch — so no
+condition can require the `null` key to be physically present (and `value: null` is not an authorable comparison, the
+schema gate rejects it). This is benign: a consuming node reads an absent metric and a `null` metric identically through
+the same `na_allowed` mechanism, so the omission cannot mislead a downstream verdict.
 
 **What the detection rests on.** The deterministic half is unconditional: given an IR whose
 `test_predicates` carry the metric-address conditions, `_check_ref` pins each ref verbatim against
