@@ -1636,6 +1636,122 @@ class TransportFailureTest(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertEqual(got[0], "llm_rate_limit")
 
+    def test_classify_leaf_infra_error_tags_the_whole_you_have_hit_your_limit_family(self) -> None:
+        """The CLI's observed abort family is `You've hit your <window> limit · resets <time>`, with
+        no "reached". Only the `session` member used to tag (via the bare `session limit` phrase);
+        its siblings matched NOTHING, so a real weekly / 5-hour quota stop terminalized UNTAGGED —
+        no `llm_usage_limit` in the reason, no wait even when opted in, and not even a
+        `leaf_usage_limit_wait_declined` to grep for. The window word is deliberately not
+        enumerated, so a window the CLI invents next is covered too."""
+        for window in ("session", "weekly", "Opus weekly", "5-hour", "monthly"):
+            line = f"You've hit your {window} limit · resets 3pm (Asia/Tokyo)"
+            got = wc._classify_leaf_infra_error("", line)
+            self.assertIsNotNone(got, line)
+            self.assertEqual(got[0], "llm_usage_limit", line)
+            # ...and the whole family reaches the wait, not just the one shape on record.
+            self.assertEqual(wc._sole_content_usage_limit_line(line, allow_envelope=True), line)
+        # The un-contracted wording tags and arms identically.
+        self.assertEqual(wc._classify_leaf_infra_error(
+            "", "You have hit your weekly limit · resets 3pm (Asia/Tokyo)")[0], "llm_usage_limit")
+
+    def test_the_hit_your_limit_alternative_excludes_non_quota_windows(self) -> None:
+        """The window is intentionally unconstrained so a window the CLI invents next is covered —
+        but that makes it overlap the OTHER tags' vocabulary. `You've hit your rate limit · resets
+        3pm (Asia/Tokyo)` leads the line and carries a reset cue, so nothing else stops it: it took
+        rank 0 as a quota stop, which strips a rate limit of its transient retries and can sleep the
+        run for hours over a seconds-long throttle. Worse via an envelope, where the `"result":"`
+        prefix bypasses the line-leading `API Error:` shape the sibling test relies on.
+
+        Excluded by NAME (not by an allowlist of quota windows, which would re-break the
+        open-ended-window property): these families have their own tags or are prompt-size
+        failures."""
+        # Qualified forms too — the exclusion looks ahead across the whole window, not just the
+        # word adjacent to `your`, so a model-named rate limit is excluded like a bare one.
+        # Separator variants included: the CLI spells its own rate-limit vocabulary `rate limit`,
+        # `rate-limit` and `rate_limit`, and a whitespace-only exclusion let the hyphen through.
+        for window in ("rate", "request", "prompt", "context", "token", "output",
+                       "Opus rate", "per-minute request", "Claude Opus 4 rate",
+                       "rate-", "rate_", "request-", "prompt-", "Opus rate-"):
+            # A trailing separator in `window` glues it to `limit` (`rate-limit`); otherwise the
+            # usual space.
+            bare = (f"You've hit your {window}limit · resets 3pm (Asia/Tokyo)"
+                    if window.endswith(("-", "_"))
+                    else f"You've hit your {window} limit · resets 3pm (Asia/Tokyo)")
+            envelope = json.dumps({"is_error": True, "api_error_status": 429,
+                                   "terminal_reason": "api_error", "result": bare})
+            got = wc._classify_leaf_infra_error("", bare)
+            self.assertNotEqual(got[0] if got else None, "llm_usage_limit", bare)
+            self.assertIsNone(wc._sole_content_usage_limit_line(bare, allow_envelope=False), bare)
+            self.assertIsNone(wc._sole_content_usage_limit_line(envelope, allow_envelope=True), bare)
+        # ...while every quota window, including ones not enumerated anywhere, still tags and arms.
+        for window in ("session", "weekly", "hourly", "5-hour", "Opus weekly", "monthly", "daily",
+                       "Claude Opus 4 weekly"):
+            line = f"You've hit your {window} limit · resets 3pm (Asia/Tokyo)"
+            self.assertEqual(wc._classify_leaf_infra_error("", line)[0], "llm_usage_limit", line)
+            self.assertEqual(wc._sole_content_usage_limit_line(line, allow_envelope=False), line)
+
+    def test_the_hit_your_limit_alternative_does_not_steal_other_tags(self) -> None:
+        """`llm_usage_limit` is rank 0 AND cross-stream-promoting, so this alternative must not be
+        the loosest pattern in the table. Two clauses keep it honest and BOTH are pinned here:
+
+        * the `^` anchor — the CLI's abort LEADS the line, so a message that merely contains the
+          phrase keeps its own, more specific tag. Without it a 429 reads as a quota stop and loses
+          its two retries, and a 400 sends the operator off to wait out a quota instead of fixing
+          the request;
+        * the trailing reset-instant cue (`resets` plus a CLOCK token) — a leaf that OPENS a line in
+          the second person ("you've hit your CFL limit, so dt must shrink") is prose, not a quota
+          stop, and tagging it terminalizes the substep on its first launch. Note what the cue is
+          NOT: advice words (`try again` / `upgrade`) and a bare digit both admitted ordinary prose,
+          and the imperative `reset` is not the CLI's `resets` — see the negatives below."""
+        for line, want in (
+                # These carry a RESOLVABLE reset cue as well, so only the ANCHOR separates them from
+                # the CLI's abort — drop `^` and each one silently becomes a quota stop. Cases whose
+                # cue is absent are carried by the lookahead and would not catch that mutation.
+                # The first two also use a QUOTA window, so the non-quota-window exclusion cannot
+                # reject them either: when that exclusion was added it silently took over every
+                # counterexample here and left the anchor unpinned.
+                ("API Error: 529 overloaded_error - you've hit your weekly limit, resets 3pm "
+                 "(Asia/Tokyo)", "llm_overloaded"),
+                ("stream disconnected: you've hit your weekly limit, resets 3pm (Asia/Tokyo)",
+                 "llm_transport_flake"),
+                ("API Error: 429 rate_limit_error - you've hit your rate limit, resets 3pm "
+                 "(Asia/Tokyo)", "llm_rate_limit"),
+                ("API Error: 400 invalid_request_error you've hit your prompt limit; it resets 9am "
+                 "(Asia/Tokyo)", "llm_client_error"),
+                ("API Error: 429 rate_limit_error - you've hit your rate limit", "llm_rate_limit"),
+                ("API Error: 400 invalid_request_error you've hit your prompt limit",
+                 "llm_client_error"),
+                ("Server is temporarily limiting requests (not your usage limit)",
+                 "llm_rate_limit")):
+            got = wc._classify_leaf_infra_error(line, "")
+            self.assertIsNotNone(got, line)
+            self.assertEqual(got[0], want, line)
+        for prose in ("you've hit your CFL limit, so dt must shrink",
+                      "You've hit your iteration limit; increase max_iter and rerun.",
+                      "you have hit your array bound limit in the halo exchange",
+                      # Line-leading AND second-person, but the cue is advice, not an instant.
+                      "You've hit your CFL limit — try again with a smaller dt.",
+                      "You've hit your memory limit, upgrade the node or shrink the grid.",
+                      # A relative unit must END on a word boundary, or the `h` of "hundred"
+                      # satisfies the cue and ordinary prose becomes a quota stop.
+                      "You've hit your iteration limit; resets in 2 hundred steps",
+                      "You've hit your CFL limit, so the sweep resets in 3 hundredths",
+                      # A `resets` with no time is a counter, not a quota window — and "a time"
+                      # means a CLOCK token: a bare digit lets ordinary prose through, and the
+                      # IMPERATIVE `reset` is not the CLI's `resets` at all.
+                      "You've hit your array bound limit; the halo index resets each sweep.",
+                      "You've hit your array bound limit; the halo index resets to 0 each sweep.",
+                      "You've hit your iteration limit - reset max_iter to 500 and rerun.",
+                      "You've hit your CFL limit, so reset dt to 0.5 and rerun.",
+                      "You've hit your memory limit; reset the grid to 256 cells.",
+                      "You've hit your wall-clock limit, so the counter resets at step 3."):
+            self.assertIsNone(wc._classify_leaf_infra_error(prose, ""), prose)
+            self.assertIsNone(wc._classify_leaf_infra_error("", prose), prose)
+        # An unanchored mutation reaches the wait too, not just the tag: this line leads with an
+        # API error, so it must never be admitted as an abort shape either.
+        self.assertIsNone(wc._sole_content_usage_limit_line(
+            "API Error: 429 rate_limit_error - you've hit your rate limit, resets 3pm (Asia/Tokyo)", allow_envelope=True))
+
     def test_classify_leaf_infra_error_does_not_fire_on_the_leafs_own_prose(self) -> None:
         """A failed `claude -p` leaf writes its output to STDOUT, so the classifier is fed the
         model's own prose and the compiler's diagnostics. Generic words must not tag them."""
@@ -2480,36 +2596,44 @@ class UsageResetEpochParseTests(unittest.TestCase):
     """`_parse_usage_reset_epoch` reads the MACHINE-FORM reset epoch a usage-limit leaf may carry
     as a trailing `|<10-digit>`. It is a separate scan from the classifier (whose evidence is
     clipped), it only trusts an epoch on a line the `llm_usage_limit` pattern itself matches (so a
-    stray `|<number>` is never mistaken for a reset time), and it reads ONLY stderr — the trusted CLI
-    error channel — never the leaf's untrusted stdout output surface."""
+    stray `|<number>` is never mistaken for a reset time), and it reads stderr — the trusted CLI
+    error channel — FIRST, consulting the leaf's untrusted stdout only through the sole-content
+    carve-out (see `UsageLimitTerminalLineStreamTests`)."""
 
     def test_machine_form_reset_yields_the_epoch(self) -> None:
         self.assertEqual(
-            wc._parse_usage_reset_epoch("Claude AI usage limit reached|1752200000"),
+            wc._parse_usage_reset_epoch("Claude AI usage limit reached|1752200000", "", allow_envelope=True),
             1752200000)
 
     def test_human_worded_reset_has_no_epoch(self) -> None:
         # The CLI's human form ("resets 6:10pm") carries no machine time -> the caller must not wait.
         self.assertIsNone(
-            wc._parse_usage_reset_epoch("You've hit your session limit; resets 6:10pm"))
+            wc._parse_usage_reset_epoch("You've hit your session limit; resets 6:10pm", "", allow_envelope=True))
 
-    def test_stdout_is_never_trusted_to_arm_a_wait(self) -> None:
-        # SECURITY: stdout is the leaf's own output surface (untrusted). The wait ADDS a multi-hour
-        # sleep+relaunch, so a usage-limit epoch that appears only on stdout — whether the real CLI's
-        # result text or a crashed leaf's prose containing `usage limit reached|<epoch>` — must NOT
-        # arm the wait. `_parse_usage_reset_epoch` takes stderr ONLY, so there is no stdout argument
-        # a caller could pass to arm it.
-        import inspect
-        params = list(inspect.signature(wc._parse_usage_reset_epoch).parameters)
-        self.assertEqual(params, ["stderr"])  # no stdout parameter at all
+    def test_stdout_arms_only_as_the_cli_abort_shape(self) -> None:
+        # SECURITY: stdout is the leaf's own output surface (untrusted), but the real CLI prints the
+        # usage limit THERE with an empty stderr, so it cannot simply be ignored. Only the CLI's
+        # abort SHAPE arms it — see UsageLimitTerminalLineStreamTests for the full population.
+        now_epoch = 1752200000
+        self.assertEqual(
+            wc._parse_usage_reset_epoch("", f"Claude AI usage limit reached|{now_epoch}", allow_envelope=True),
+            now_epoch)
+        # A leaf's own single-line output that merely MENTIONS a limit does not arm it.
+        self.assertIsNone(wc._parse_usage_reset_epoch(
+            "", f'{{"is_error":true,"result":"stopped: usage limit reached|{now_epoch}"}}', allow_envelope=True))
+        # stderr still wins when it names a usage limit: stdout may only fill a stderr SILENCE.
+        self.assertEqual(
+            wc._parse_usage_reset_epoch("Claude AI usage limit reached|1799999999",
+                                        f"Claude AI usage limit reached|{now_epoch}", allow_envelope=True),
+            1799999999)
 
     def test_pipe_epoch_on_a_non_usage_line_is_ignored(self) -> None:
         # A `|<10-digit>` that is NOT on a usage-limit line (here the leaf's own numerical prose)
         # must not be read as a reset time.
         self.assertIsNone(
-            wc._parse_usage_reset_epoch("the solver step is |1752200000 in code units"))
+            wc._parse_usage_reset_epoch("the solver step is |1752200000 in code units", "", allow_envelope=True))
         # Nothing at all.
-        self.assertIsNone(wc._parse_usage_reset_epoch(""))
+        self.assertIsNone(wc._parse_usage_reset_epoch("", "", allow_envelope=True))
 
     def test_terminal_usage_line_epoch_wins_over_an_earlier_one(self) -> None:
         # Multiple usage-limit records: the LAST (terminal) line governs the wait, mirroring the
@@ -2518,21 +2642,414 @@ class UsageResetEpochParseTests(unittest.TestCase):
         stderr = ("Claude AI usage limit reached|1752200000\n"
                   "the run continued...\n"
                   "Claude AI usage limit reached|1799999999")
-        self.assertEqual(wc._parse_usage_reset_epoch(stderr), 1799999999)
+        self.assertEqual(wc._parse_usage_reset_epoch(stderr, "", allow_envelope=True), 1799999999)
 
     def test_terminal_usage_line_without_epoch_supersedes_an_earlier_epoch(self) -> None:
         # Codex P2: an earlier session message with an in-window epoch, then a TERMINAL weekly limit
         # with no machine epoch -> None (do not wait on the stale epoch; the weekly limit fired).
         stderr = ("session limit reached|1752200000\n"
                   "Claude AI weekly limit reached; resets Monday")
-        self.assertIsNone(wc._parse_usage_reset_epoch(stderr))
+        self.assertIsNone(wc._parse_usage_reset_epoch(stderr, "", allow_envelope=True))
 
     def test_recovered_retry_notice_epoch_is_not_taken_as_terminal(self) -> None:
         # A recovered `Retrying...` banner that mentions a usage limit + epoch is skipped (as the
         # classifier skips it); only the genuine terminal line's epoch is returned.
         stderr = ("API Error (usage limit reached|1752200000) Retrying in 1s (attempt 1/10)\n"
                   "Claude AI usage limit reached|1799999999")
-        self.assertEqual(wc._parse_usage_reset_epoch(stderr), 1799999999)
+        self.assertEqual(wc._parse_usage_reset_epoch(stderr, "", allow_envelope=True), 1799999999)
+        # Without the case below the skip is untested: above, the banner is simply outranked by a
+        # later line, so deleting the skip entirely would still pass. A banner that IS the terminal
+        # usage-limit line means the run was still retrying — nothing terminal to wait on.
+        self.assertIsNone(wc._parse_usage_reset_epoch(
+            "API Error (usage limit reached|1752200000) Retrying in 1s (attempt 1/10)", "",
+            allow_envelope=True))
+        # The HUMAN form is what actually pins the skip: the machine assertions above pass even
+        # with the skip deleted, because `_USAGE_RESET_EPOCH_RE` is end-anchored and a banner never
+        # ends with the epoch. A banner carrying a resolvable human reset would, without the skip,
+        # wait out a message the run SURVIVED.
+        banner = ("You've hit your session limit · resets 3pm (Asia/Tokyo) · "
+                  "Retrying in 1s (attempt 1/10)")
+        self.assertIsNone(wc._parse_usage_reset_human(banner, 1_752_200_000.0, "",
+                                                      allow_envelope=True))
+        # The `nxt` half of the rule: a line the banner CONTINUES FROM is skipped too, because the
+        # CLI wraps one notice across two lines (`API Error (429 ...)` / `· Retrying ...`). So a
+        # usage-limit line immediately followed by a banner is part of that notice, not terminal.
+        self.assertIsNone(wc._parse_usage_reset_epoch(
+            "Claude AI usage limit reached|1799999999\n"
+            "API Error (usage limit reached|1752200000) Retrying in 1s (attempt 1/10)", "",
+            allow_envelope=True))
+
+
+class UsageLimitTerminalLineStreamTests(unittest.TestCase):
+    """WHICH STREAM may arm the wait, and WHICH stdout shape. `_terminal_usage_limit_line` reads
+    stderr (the trusted CLI error channel) first and falls back to stdout only through
+    `_sole_content_usage_limit_line`, which admits ONLY the CLI's abort shape: a single short line
+    that OPENS with the limit. Reading stderr ALONE made `--wait-usage-reset` inert against the real
+    CLI; a per-line "nothing but usage limits" test would have been inert in the OTHER direction,
+    because a pure leaf's entire stdout is one JSON line, so any model-authored text inside it would
+    have satisfied a per-line test (see `test_a_leafs_own_single_line_output_never_arms`).
+
+    The stdout rule is strictly NARROWER than `_classify_leaf_infra_error`'s cross-stream rule (which
+    lets stdout OUTRANK stderr): here a stderr usage-limit line always wins."""
+
+    # VERBATIM from the two recorded incidents (workspace/orchestrations/
+    # orch_20260724T065835Z_0178fdbb/agents/a8275885-.../dialogs/leaf.stdout.log, 60 bytes, and
+    # orch_20260723T121827Z_5e3a1633/agents/dcc840ec-.../dialogs/leaf.stdout.log, 61 bytes).
+    # Both had a 0-byte stderr. `workspace/` is gitignored, so the bytes are pinned here.
+    REAL = "You've hit your session limit · resets 5:50pm (Asia/Tokyo)"
+    REAL_PRIOR = "You've hit your session limit · resets 10:20pm (Asia/Tokyo)"
+    # The shape of a real pure-leaf stdout: ONE line, `--output-format json`, newlines escaped.
+    # Keys copied from a recorded envelope; 15 of the 46 stdout logs on record are this shape
+    # (17 are single-line; the other 2 are the usage-limit aborts).
+    PURE_ENVELOPE = ('{"is_error":false,"duration_api_ms":49500,"num_turns":1,'
+                     '"stop_reason":"end_turn","session_id":"c7261ba0","result":"%s"}')
+
+    def test_stderr_wins_and_stdout_fills_only_a_stderr_silence(self) -> None:
+        self.assertEqual(wc._terminal_usage_limit_line("usage limit reached (stderr)", self.REAL, allow_envelope=True),
+                         "usage limit reached (stderr)")
+        self.assertEqual(wc._terminal_usage_limit_line("", self.REAL, allow_envelope=True), self.REAL)
+        # A non-usage stderr (an unrelated crash) is still a stderr SILENCE for this purpose, so the
+        # carve-out applies — matching the classifier, which promotes the stdout usage tag there.
+        self.assertEqual(wc._terminal_usage_limit_line("Traceback (most recent call last):",
+                                                       self.REAL, allow_envelope=True), self.REAL)
+        self.assertIsNone(wc._terminal_usage_limit_line("", "", allow_envelope=True))
+
+    def test_both_recorded_incidents_arm(self) -> None:
+        # The production envelope, byte-for-byte, including the trailing newline the CLI writes.
+        for recorded in (self.REAL, self.REAL_PRIOR):
+            self.assertEqual(wc._sole_content_usage_limit_line(recorded + "\n", allow_envelope=True), recorded)
+        # Blank padding around it is still sole content.
+        self.assertEqual(wc._sole_content_usage_limit_line(f"\n{self.REAL}\n\n", allow_envelope=True), self.REAL)
+        # The machine form kept for backward-compat, bare and prefixed, plus the window forms —
+        # every alternative of `_CLI_USAGE_ABORT_LINE_RE` is exercised here, so none can be deleted
+        # or narrowed silently.
+        for line in ("Claude AI usage limit reached|1752200000", "usage limit reached|1752200000",
+                     "session limit reached|1752200000", "weekly limit reached|1752200000",
+                     "5-hour limit reached|1752200000",
+                     "you hit your session limit · resets 3pm (Asia/Tokyo)",
+                     "You have hit your weekly limit · resets 3pm (Asia/Tokyo)"):
+            self.assertEqual(wc._sole_content_usage_limit_line(line, allow_envelope=True), line, line)
+        self.assertIsNone(wc._sole_content_usage_limit_line("", allow_envelope=True))
+
+    def test_a_leafs_own_single_line_output_never_arms(self) -> None:
+        """The P1 hole a per-line predicate leaves open: a pure leaf's whole stdout is ONE line, and
+        an agentic leaf's result text can be one unbroken paragraph, so "every line matches" is
+        satisfied by model-authored text. The length ceiling and the anchored abort pattern are what
+        actually exclude them."""
+        poison = "session limit reached, resets 11:30pm (Asia/Tokyo)"
+        # A pure leaf's single-line JSON envelope carrying the phrase inside model-authored text.
+        self.assertIsNone(wc._sole_content_usage_limit_line(self.PURE_ENVELOPE % poison, allow_envelope=True))
+        # An agentic leaf's one-paragraph result text (single line, no newline) mentioning a limit.
+        for prose in (f"I could not finish: the {poison}.",
+                      "The rate-limiting step is bounded by the usage limit; resets 3pm "
+                      "(Asia/Tokyo) per the table.",
+                      f"Note to the reviewer — {poison} — so the run stopped early."):
+            self.assertIsNone(wc._sole_content_usage_limit_line(prose, allow_envelope=True), prose)
+        # Sole content, right shape, but far too long to be the CLI's one-line abort. The lengths
+        # are LITERAL, not derived from the constant — deriving them makes the assertion pass for
+        # any ceiling, including one raised past the 1.6 kB smallest recorded leaf envelope.
+        self.assertIsNone(wc._sole_content_usage_limit_line(self.REAL + " " + "x" * 400, allow_envelope=True))
+        # 1530 chars = smallest ORDINARY (non-error) single-line leaf envelope in any recorded
+        # workspace (1657 chars in the live one); the ceiling must sit below it so no leaf envelope
+        # can ever pass as an abort.
+        self.assertLess(wc._CLI_USAGE_ABORT_LINE_MAX_CHARS, 1530)
+        # The ceiling itself: MAX chars admits, MAX + 1 declines.
+        pad = wc._CLI_USAGE_ABORT_LINE_MAX_CHARS - len(self.REAL)
+        self.assertEqual(wc._sole_content_usage_limit_line(self.REAL + "x" * pad, allow_envelope=True),
+                         self.REAL + "x" * pad)
+        self.assertIsNone(wc._sole_content_usage_limit_line(self.REAL + "x" * (pad + 1), allow_envelope=True))
+        # Multi-line stdout is never the abort shape, even if every line matches.
+        self.assertIsNone(wc._sole_content_usage_limit_line(f"usage limit reached\n{self.REAL}", allow_envelope=True))
+        for other in ('{"status": "pass", "output_refs": []}', "Implemented the solver."):
+            self.assertIsNone(wc._sole_content_usage_limit_line(f"{self.REAL}\n{other}", allow_envelope=True), other)
+            self.assertIsNone(wc._sole_content_usage_limit_line(f"{other}\n{self.REAL}", allow_envelope=True), other)
+
+    def test_the_cli_abort_envelope_unwraps_only_when_the_cli_itself_errored(self) -> None:
+        """The enveloped shape (the only recorded usage limit to strike a PURE leaf): the CLI
+        completes its `--output-format json` envelope and carries the abort in `result`. Unwrapping
+        is gated on the CLI-AUTHORED keys, and each gate is pinned here:
+
+        * `is_error is True` — an envelope the run RECOVERED into (`is_error:false`) must not arm,
+          even when it still reports the error status it retried past. Without this gate that
+          recovered envelope waits out a quota the run never hit.
+        * an error status (`terminal_reason == "api_error"` or `api_error_status`) — a normal
+          completed envelope is never unwrapped, so model-authored `result` text stays inert.
+        * the inner text still faces every abort-shape clause, so `result` prose cannot arm."""
+        abort = "You've hit your session limit · resets 12:30pm (Asia/Tokyo)"
+
+        def envelope(**over):
+            doc = {"type": "result", "subtype": "success", "is_error": True,
+                   "api_error_status": 429, "num_turns": 1, "result": abort,
+                   "terminal_reason": "api_error"}
+            doc.update(over)
+            return json.dumps(doc)
+
+        def sole(**over):
+            return wc._sole_content_usage_limit_line(envelope(**over), allow_envelope=True)
+
+        self.assertEqual(sole(), abort)
+        # EACH error-status form alone is enough — pinned separately, or the disjunction can lose a
+        # branch silently (`is_error` would then be deciding every case in this test).
+        self.assertEqual(sole(api_error_status=None), abort)          # terminal_reason only
+        self.assertEqual(sole(terminal_reason="end_turn"), abort)     # api_error_status only
+        # ...and with NEITHER status, an `is_error:true` envelope is not the CLI's abort envelope.
+        self.assertIsNone(sole(api_error_status=None, terminal_reason="end_turn"))
+        # RECOVERED: the CLI retried past the error, so the envelope is a success. Must not arm,
+        # even though it still reports the status it retried past.
+        self.assertIsNone(sole(is_error=False, terminal_reason="end_turn"))
+        self.assertIsNone(sole(is_error=False))
+        # A normal completed envelope whose model-authored result merely quotes the message.
+        self.assertIsNone(sole(is_error=False, api_error_status=None, terminal_reason="end_turn"))
+        # Error envelope, but the inner text is the leaf's prose rather than the CLI's abort.
+        self.assertIsNone(sole(result=f"I stopped early — {abort} — see the log."))
+        # A non-str `result` must decline, not raise: `.splitlines()` on a dict would crash the
+        # conductor out of `_usage_reset_wait_plan` instead of fail-closing.
+        self.assertIsNone(sole(result={"message": abort}))
+        self.assertIsNone(sole(result=None))
+        # Multi-line inner text is not the one-line abort shape.
+        self.assertIsNone(sole(result=f"{abort}\nI also wrote the bundle."))
+        # The envelope itself is bounded: a leaf cannot pad an abort-shaped `result` inside an
+        # arbitrarily large wrapper (the agentic path cannot reach here at all — next test).
+        self.assertIsNone(sole(padding="z" * wc._CLI_ABORT_ENVELOPE_MAX_CHARS))
+        # ...but that bound is a PARSE-COST guard, not a security bound, and must stay well above
+        # every real envelope. Envelope size is dominated by the CLI's own accounting blocks
+        # (705..1578 chars across the 112 recorded envelopes), not by `result`, so a bound sized to
+        # the one recorded abort envelope (771 chars) would silently decline the fatter ones — the
+        # inertness bug once more. Largest recorded envelope: 47370 chars.
+        self.assertGreater(wc._CLI_ABORT_ENVELOPE_MAX_CHARS, 47370)
+
+    def test_an_enveloped_abort_is_tagged_whatever_the_cli_key_order(self) -> None:
+        """The classifier must see the abort INSIDE the envelope, for EVERY window and at any
+        `"result":"` offset. Two traps, both of which bit:
+
+        * a strictly line-anchored pattern cannot see it at all, and only `usage` / `session` have an
+          unanchored fallback phrase — so an enveloped `weekly` / `5-hour` abort terminalized with no
+          tag, no wait and no decline event to grep;
+        * a POSITIONAL bound on the prefix rots with the CLI's key order. It has already changed:
+          `"result":"` sits at 128..202 chars in the 2026-07-19/21/23 envelopes but at 1132..1424 in
+          every envelope the current CLI writes (`usage` / `modelUsage` moved ahead of it), so a
+          `{0,300}` bound was inert for the CLI actually in use."""
+        # The CURRENT CLI's key order, verbatim from a live-workspace envelope.
+        def envelope(window: str) -> str:
+            return json.dumps({
+                "is_error": True, "duration_api_ms": 646, "num_turns": 1,
+                "stop_reason": "stop_sequence", "session_id": "s", "total_cost_usd": 0,
+                "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": 0, "output_tokens": 0,
+                          "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+                          "service_tier": "standard", "iterations": [], "speed": "standard"},
+                "modelUsage": {}, "permission_denials": [], "terminal_reason": "api_error",
+                "fast_mode_state": "off", "subtype": "success", "api_error_status": 429,
+                "result": f"You've hit your {window} limit · resets 3pm (Asia/Tokyo)"},
+                separators=(",", ":"))   # the CLI writes COMPACT JSON, as the recorded bytes show
+
+        for window in ("session", "usage", "weekly", "hourly", "5-hour", "Opus weekly", "monthly"):
+            line = envelope(window)
+            self.assertGreater(line.index('"result":"'), 300, "key order sanity")
+            got = wc._classify_leaf_infra_error("", line)
+            self.assertIsNotNone(got, window)
+            self.assertEqual(got[0], "llm_usage_limit", window)
+            # ...and the same line arms on a `--output-format json` launch.
+            self.assertEqual(wc._sole_content_usage_limit_line(line, allow_envelope=True),
+                             f"You've hit your {window} limit · resets 3pm (Asia/Tokyo)", window)
+
+    def test_arming_requires_the_message_to_lead_the_line(self) -> None:
+        """The ARMING pattern's `^` anchor, pinned with the only kind of input that can isolate it:
+        the line must ALSO satisfy the classifier clause, or that clause rejects it first and the
+        assertion passes whatever the anchor does (which is how this pin was silently lost when the
+        tagging and arming patterns were split). Here the bare `session limit` fallback phrase
+        matches anywhere, so only the anchor separates arming from declining."""
+        line = "Job aborted: you've hit your session limit · resets 3pm (Asia/Tokyo)"
+        self.assertLess(len(line), wc._CLI_USAGE_ABORT_LINE_MAX_CHARS)
+        self.assertTrue(wc._LEAF_INFRA_ERROR_PATTERNS[0][1].search(line.lower()))  # clause passes
+        self.assertIsNone(wc._sole_content_usage_limit_line(line, allow_envelope=False))
+        self.assertIsNone(wc._sole_content_usage_limit_line(line, allow_envelope=True))
+
+    def test_the_taggable_prefix_must_not_be_reused_for_arming(self) -> None:
+        """The tagging pattern is one notch wider than the arming pattern ON PURPOSE. Arming an
+        envelope goes through `_cli_abort_envelope_result`, whose CLI-authored-key gates are the
+        trust boundary; if `_CLI_USAGE_ABORT_LINE_RE` used the taggable form instead, a bare
+        `"result":"` prefix would arm directly and skip those gates — a short forgery an AGENTIC
+        leaf (where `allow_envelope` is False) could write as its whole stdout."""
+        forgery = '{"a":1,"result":"You\'ve hit your session limit - resets 3pm (Asia/Tokyo)"}'
+        self.assertLess(len(forgery), wc._CLI_USAGE_ABORT_LINE_MAX_CHARS)   # short enough to arm
+        self.assertIsNotNone(wc._classify_leaf_infra_error("", forgery))    # and it IS tagged
+        self.assertIsNone(wc._CLI_USAGE_ABORT_LINE_RE.match(forgery))       # but not abort-shaped
+        self.assertIsNone(wc._sole_content_usage_limit_line(forgery, allow_envelope=False))
+        # Even where envelopes ARE expected it declines: no `is_error` / error-status keys.
+        self.assertIsNone(wc._sole_content_usage_limit_line(forgery, allow_envelope=True))
+
+    def test_only_a_json_output_format_launch_may_unwrap_an_envelope(self) -> None:
+        """`allow_envelope` is the trust boundary: the CLI authors an envelope ONLY for a leaf
+        launched with `--output-format json` (the pure loops). An agentic leaf's stdout is its own
+        text, so a JSON line there is MODEL-written and its `is_error` / `api_error_status` keys
+        prove nothing — unwrapping it would hand the leaf the abort shape with the length ceiling
+        applied to the inner text instead of its whole output. Across 711 recorded leaf stdout logs
+        an envelope appears iff the launch was pure, with zero exceptions."""
+        abort = "You've hit your session limit · resets 12:30pm (Asia/Tokyo)"
+        env = json.dumps({"is_error": True, "api_error_status": 429, "result": abort,
+                          "terminal_reason": "api_error"})
+        self.assertEqual(wc._sole_content_usage_limit_line(env, allow_envelope=True), abort)
+        self.assertIsNone(wc._sole_content_usage_limit_line(env, allow_envelope=False))
+        # The bare shape is unaffected by the gate — it is the CLI's own abort either way.
+        bare = "You've hit your session limit · resets 5:50pm (Asia/Tokyo)"
+        for gate in (True, False):
+            self.assertEqual(wc._sole_content_usage_limit_line(bare, allow_envelope=gate), bare)
+
+    def test_a_recovered_retry_banner_alone_never_arms_from_stdout(self) -> None:
+        # A `Retrying...` banner naming a usage limit is a message the run SURVIVED; even as the
+        # only stdout content it must not arm a wait (the stderr scan skips it for the same reason).
+        # The banner must be one the abort pattern ACCEPTS, or it is rejected a clause earlier and
+        # this passes without exercising the retry-notice clause at all — so use the CLI's own
+        # lead-in wording with a retry notice appended.
+        banner = ("You've hit your session limit · resets 3pm (Asia/Tokyo) · "
+                  "Retrying in 1s (attempt 1/10)")
+        self.assertIsNotNone(wc._CLI_USAGE_ABORT_LINE_RE.match(banner))  # reaches the clause
+        self.assertIsNone(wc._sole_content_usage_limit_line(banner, allow_envelope=True))
+        self.assertIsNone(wc._sole_content_usage_limit_line(
+            "API Error (usage limit reached) · Retrying in 1s (attempt 1/10)", allow_envelope=True))
+
+    def test_arming_implies_the_classifier_would_tag(self) -> None:
+        """`_is_cli_usage_abort_line` also requires the classifier's own usage pattern, so the
+        carve-out can only ever NARROW — never contradict — the `llm_usage_limit` tag that reached
+        the wait. Since the machine-form alternative was tightened to `<window> limit reached` +
+        `|<epoch>` (its window list being the classifier's own shared constant) and the lead-in
+        alternative is a subset of the classifier's taggable form, that clause is now PROVABLY
+        implied: no input can match the abort pattern without the classifier matching too. So it is
+        no longer pinnable by a counterexample, and asserting the IMPLICATION is the honest test —
+        a future widening of either alternative that broke it would fail here."""
+        candidates = [
+            f"{lead} {window} limit {tail}"
+            for lead in ("You've hit your", "You’ve hit your", "You have hit your", "you hit your")
+            for window in ("session", "weekly", "hourly", "5-hour", "Opus weekly", "monthly")
+            for tail in ("· resets 3pm (Asia/Tokyo)", "· resets Monday", "· resets 18:00",
+                         "· resets in 2 hours", "· resets tomorrow")
+        ] + [
+            # Whitespace variants included deliberately: the arming pattern spells this `limit\\s+
+            # reached` while the classifier once spelled it with a literal space, so `usage  limit
+            # reached|…` matched the former and not the latter — the implication held only modulo
+            # normalization. Both now use `\\s+`.
+            f"{prefix}{window}{sep}limit{sep}reached|1752200000"
+            for prefix in ("", "Claude ", "Claude AI ")
+            for window in ("usage", "session", "weekly", "hourly", "5-hour")
+            for sep in (" ", "  ", "\t")
+        ] + [
+            # Near-misses that must NOT match the abort pattern at all (so the implication is not
+            # vacuously satisfied by an empty match set).
+            "Session limit resets at 5pm (Asia/Tokyo)", "weekly limit resets 3pm (Asia/Tokyo)",
+            "usage limit reached", "Job aborted: you've hit your session limit · resets 3pm (JST)",
+            # The epoch must be a PLAUSIBLE unix second, matching `_USAGE_RESET_EPOCH_RE` exactly —
+            # a `|<digits>` of any other length resolves to no epoch, so admitting it would just
+            # move the decline one clause later.
+            "usage limit reached|5", "usage limit reached|175220000000000",
+        ]
+        matched = 0
+        for line in candidates:
+            if wc._CLI_USAGE_ABORT_LINE_RE.match(line):
+                matched += 1
+                self.assertIsNotNone(wc._LEAF_INFRA_ERROR_PATTERNS[0][1].search(line.lower()), line)
+        self.assertEqual(matched, 4 * 6 * 5 + 3 * 5 * 3)   # every abort form, and only those
+
+    def test_both_parsers_reach_the_stdout_carve_out(self) -> None:
+        # The human parser is the one that matters in production; the machine parser shares the
+        # same terminal-line resolution, so neither may regress to stderr-only independently.
+        now = 1_784_878_725.0  # 2026-07-24 16:38 JST
+        self.assertEqual(wc._parse_usage_reset_human("", now, self.REAL + "\n", allow_envelope=True),
+                         int(datetime(2026, 7, 24, 17, 50,
+                                      tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()))
+        self.assertIsNone(wc._parse_usage_reset_human("", now, f"{self.REAL}\nresult text", allow_envelope=True))
+        self.assertEqual(wc._parse_usage_reset_epoch("", "usage limit reached|1752200000", allow_envelope=True),
+                         1752200000)
+
+    def test_the_shared_lead_in_is_verbose_safe(self) -> None:
+        """`_USAGE_ABORT_HIT_YOUR_LIMIT` is interpolated into the classifier pattern (compiled with
+        NO flags) and into `_CLI_USAGE_ABORT_LINE_RE` (compiled `re.VERBOSE`, which STRIPS unescaped
+        literal whitespace). A literal space in the shared string therefore means two DIFFERENT
+        regexes while the comments claim they are identical — a `try again` cue silently became
+        `tryagain` in the abort pattern, admitting a nonsense token and declining the real wording.
+        Any whitespace in this constant must be written `\\s`."""
+        import re as _re
+        # No unescaped literal whitespace: strip the escapes first, then look for real spaces.
+        without_escapes = _re.sub(r"\\.", "", wc._USAGE_ABORT_HIT_YOUR_LIMIT)
+        self.assertNotRegex(without_escapes, r"\s")
+        # And the property that matters: VERBOSE compilation does not change what it matches.
+        plain = _re.compile(wc._USAGE_ABORT_HIT_YOUR_LIMIT, _re.IGNORECASE)
+        verbose = _re.compile(wc._USAGE_ABORT_HIT_YOUR_LIMIT, _re.IGNORECASE | _re.VERBOSE)
+        for line in ("You've hit your weekly limit · resets 3pm (Asia/Tokyo)",
+                     "You've hit your weekly limit, try again in 3 hours",
+                     "You've hit your 5-hour limit · resets Monday",
+                     "You've hit your weekly limit · resets next week"):
+            self.assertEqual(bool(plain.match(line)), bool(verbose.match(line)), line)
+        # The cue keyword itself: `resets` (what the CLI writes), not the imperative `reset`.
+        self.assertIsNone(wc._classify_leaf_infra_error(
+            "", "You've hit your weekly limit, reset 3pm (Asia/Tokyo)"))
+        # ...and the keyword is required — a clock token alone is not a quota message.
+        self.assertIsNone(wc._classify_leaf_infra_error(
+            "", "You've hit your weekly limit at 3pm (Asia/Tokyo)"))
+
+    def test_every_wording_the_classifier_tags_here_also_arms(self) -> None:
+        """The two rules share a lead-in but are compiled separately, so a divergent re-inline into
+        either one is invisible unless the AGREEMENT is asserted directly: for this family, anything
+        the classifier tags `llm_usage_limit` must also satisfy the abort pattern, or the wait
+        declines a wording the run was tagged from — the inert-feature failure, one wording at a
+        time. (The converse is not required: the abort pattern is allowed to be narrower.)"""
+        windows = ("session", "weekly", "hourly", "5-hour", "Opus weekly",
+                   "Claude Opus 4 weekly", "Opus 4.5 weekly", "monthly")
+        tails = ("· resets 3pm (Asia/Tokyo)", "· resets 10:20pm (Asia/Tokyo)", "· resets Monday",
+                 "· resets tomorrow", "· resets at midnight", ", your quota resets 3pm (Asia/Tokyo)",
+                 # 24-hour clock and relative windows: the cue must not be am/pm-only, or a CLI
+                 # that switches wording goes silently untagged for the non-fallback windows.
+                 "· resets 18:00 (Asia/Tokyo)", "· resets in 2 hours", "· resets Mon 9am",
+                 "· resets in 1 hour", "· resets in 45 minutes", "· resets in 3 hrs")
+        # Every lead-in variant, so a divergent re-inline that drops one is caught here too.
+        leads = ("You've hit your", "You’ve hit your", "You have hit your", "you hit your")
+        checked = 0
+        for window in windows:
+            for tail in tails:
+                line = f"{leads[checked % len(leads)]} {window} limit {tail}"
+                if wc._LEAF_INFRA_ERROR_PATTERNS[0][1].search(line.lower()):
+                    self.assertIsNotNone(wc._CLI_USAGE_ABORT_LINE_RE.match(line), line)
+                    checked += 1
+        self.assertEqual(checked, len(windows) * len(tails))  # every row really was tagged
+        # The `<window> limit reached` family likewise: the two window lists are one constant.
+        for window in ("usage", "session", "weekly", "hourly", "5-hour"):
+            line = f"{window.capitalize()} limit reached|1752200000"
+            self.assertTrue(wc._LEAF_INFRA_ERROR_PATTERNS[0][1].search(line.lower()), line)
+            self.assertIsNotNone(wc._CLI_USAGE_ABORT_LINE_RE.match(line), line)
+
+    def test_the_lead_in_window_budget_is_bounded_from_both_sides(self) -> None:
+        """The `[^\\n]{0,40}` window and the `{0,80}`/`{0,30}` cue distances are pinned NARROW by the
+        family test above; widening them is the dangerous direction and is pinned here. With a
+        400-char window this sentence starts tagging (rank 0, so it would cost a real transport
+        failure its retries)."""
+        # EVERY sentence here carries a real clock token, so the cue cannot be what rejects it —
+        # only the bound under test can. (Sentences without one are rejected by the cue and would
+        # make this test vacuous, which is exactly what happened once the cue was tightened.)
+        # `[^\n]{0,40}` — the limit sits far past the lead-in.
+        self.assertIsNone(wc._classify_leaf_infra_error(
+            "", "You've hit your first milestone: the runtime is now under the wall-clock limit, "
+                "so the nightly cache resets at midnight."))
+        # `{0,80}` — `resets` sits far past the limit.
+        self.assertIsNone(wc._classify_leaf_infra_error(
+            "", "You've hit your CFL limit, so the timestep must shrink; the diagnostic table "
+                "below lists each scheme, its stencil width and its stability bound, and the "
+                "sweep counter resets at midnight."))
+        # `{0,30}` — the clock token sits far past `resets`.
+        self.assertIsNone(wc._classify_leaf_infra_error(
+            "", "You've hit your CFL limit and the counter resets after the halo exchange, the "
+                "flux update and the boundary pass at midnight."))
+
+    def test_stdout_is_a_required_argument_on_every_resolver(self) -> None:
+        """The regression that caused the incident was a resolver that COULD NOT see stdout. A
+        defaulted `stdout=""` would let a future call site silently degrade back to stderr-only with
+        no failing test and a decline reason indistinguishable from a genuine one, so every resolver
+        takes it as a required parameter."""
+        import inspect
+        for fn in (wc._terminal_usage_limit_line, wc._parse_usage_reset_epoch,
+                   wc._parse_usage_reset_human):
+            params = inspect.signature(fn).parameters
+            self.assertIn("stdout", params, fn.__name__)
+            self.assertIs(params["stdout"].default, inspect.Parameter.empty, fn.__name__)
 
 
 class UsageResetHumanParseTests(unittest.TestCase):
@@ -2552,77 +3069,77 @@ class UsageResetHumanParseTests(unittest.TestCase):
     def test_real_captured_string_resolves(self) -> None:
         # The exact string a killed leaf produced (middle-dot separator, lowercase 10:20pm, IANA TZ).
         self.assertEqual(
-            wc._parse_usage_reset_human(self._sl("10:20pm (Asia/Tokyo)"), self.NOW),
+            wc._parse_usage_reset_human(self._sl("10:20pm (Asia/Tokyo)"), self.NOW, "", allow_envelope=True),
             self._epoch(2025, 7, 11, 22, 20))
 
     def test_near_future(self) -> None:
         self.assertEqual(
-            wc._parse_usage_reset_human(self._sl("12:20pm (Asia/Tokyo)"), self.NOW),
+            wc._parse_usage_reset_human(self._sl("12:20pm (Asia/Tokyo)"), self.NOW, "", allow_envelope=True),
             self._epoch(2025, 7, 11, 12, 20))
 
     def test_bare_hour_with_at_prefix(self) -> None:
         self.assertEqual(
-            wc._parse_usage_reset_human(self._sl("at 5pm (Asia/Tokyo)"), self.NOW),
+            wc._parse_usage_reset_human(self._sl("at 5pm (Asia/Tokyo)"), self.NOW, "", allow_envelope=True),
             self._epoch(2025, 7, 11, 17, 0))
 
     def test_noon_and_midnight_boundaries(self) -> None:
         self.assertEqual(  # 12pm == noon, today (future)
-            wc._parse_usage_reset_human(self._sl("at 12pm (Asia/Tokyo)"), self.NOW),
+            wc._parse_usage_reset_human(self._sl("at 12pm (Asia/Tokyo)"), self.NOW, "", allow_envelope=True),
             self._epoch(2025, 7, 11, 12, 0))
         self.assertEqual(  # 12am == midnight; today's is past -> tomorrow's
-            wc._parse_usage_reset_human(self._sl("12am (Asia/Tokyo)"), self.NOW),
+            wc._parse_usage_reset_human(self._sl("12am (Asia/Tokyo)"), self.NOW, "", allow_envelope=True),
             self._epoch(2025, 7, 12, 0, 0))
 
     def test_no_timezone_declines(self) -> None:
-        self.assertIsNone(wc._parse_usage_reset_human(self._sl("6:10pm"), self.NOW))
+        self.assertIsNone(wc._parse_usage_reset_human(self._sl("6:10pm"), self.NOW, "", allow_envelope=True))
 
     def test_weekday_form_declines(self) -> None:
         self.assertIsNone(wc._parse_usage_reset_human(
-            "Claude AI weekly limit reached; resets Monday (Asia/Tokyo)", self.NOW))
+            "Claude AI weekly limit reached; resets Monday (Asia/Tokyo)", self.NOW, "", allow_envelope=True))
 
     def test_unknown_timezone_never_raises(self) -> None:
         self.assertIsNone(
-            wc._parse_usage_reset_human(self._sl("6:10pm (Not/AZone)"), self.NOW))
+            wc._parse_usage_reset_human(self._sl("6:10pm (Not/AZone)"), self.NOW, "", allow_envelope=True))
 
     def test_non_usage_line_is_ignored(self) -> None:
         # A reset-looking string NOT on a usage-limit line is not parsed (terminal-line gate).
         self.assertIsNone(wc._parse_usage_reset_human(
-            "resets 10:20pm (Asia/Tokyo) in the plot legend", self.NOW))
-        self.assertIsNone(wc._parse_usage_reset_human("", self.NOW))
+            "resets 10:20pm (Asia/Tokyo) in the plot legend", self.NOW, "", allow_envelope=True))
+        self.assertIsNone(wc._parse_usage_reset_human("", self.NOW, "", allow_envelope=True))
 
     def test_just_past_within_grace_resolves_to_the_past(self) -> None:
         # now 18:12 JST, reset 6:10pm -> today 18:10 (2 min past, within grace): a stale-by-minutes
         # message resolves to the just-passed instant (the caller floors it to a margin-only wait).
         now = float(self._epoch(2025, 7, 11, 18, 12))
         self.assertEqual(
-            wc._parse_usage_reset_human(self._sl("6:10pm (Asia/Tokyo)"), now),
+            wc._parse_usage_reset_human(self._sl("6:10pm (Asia/Tokyo)"), now, "", allow_envelope=True),
             self._epoch(2025, 7, 11, 18, 10))
 
     def test_midnight_forward(self) -> None:
         now = float(self._epoch(2025, 7, 11, 23, 50))
         self.assertEqual(
-            wc._parse_usage_reset_human(self._sl("12:10am (Asia/Tokyo)"), now),
+            wc._parse_usage_reset_human(self._sl("12:10am (Asia/Tokyo)"), now, "", allow_envelope=True),
             self._epoch(2025, 7, 12, 0, 10))
 
     def test_midnight_back(self) -> None:
         # now just after midnight, reset 11:55pm -> YESTERDAY's 23:55 (within grace).
         now = float(self._epoch(2025, 7, 12, 0, 2))
         self.assertEqual(
-            wc._parse_usage_reset_human(self._sl("11:55pm (Asia/Tokyo)"), now),
+            wc._parse_usage_reset_human(self._sl("11:55pm (Asia/Tokyo)"), now, "", allow_envelope=True),
             self._epoch(2025, 7, 11, 23, 55))
 
     def test_stale_beyond_grace_flips_to_tomorrow(self) -> None:
         # now 18:30, reset 6:10pm (20 min past, > grace) -> tomorrow's 18:10 (caller then declines >6h).
         now = float(self._epoch(2025, 7, 11, 18, 30))
         self.assertEqual(
-            wc._parse_usage_reset_human(self._sl("6:10pm (Asia/Tokyo)"), now),
+            wc._parse_usage_reset_human(self._sl("6:10pm (Asia/Tokyo)"), now, "", allow_envelope=True),
             self._epoch(2025, 7, 12, 18, 10))
 
     def test_terminal_line_governs(self) -> None:
         # A machine epoch earlier, a human TZ reset on the TERMINAL line -> the human parser reads
         # the terminal line (mirrors the epoch parser's terminal-line discipline).
         stderr = "session limit reached|1752200000\n" + self._sl("12:20pm (Asia/Tokyo)")
-        self.assertEqual(wc._parse_usage_reset_human(stderr, self.NOW),
+        self.assertEqual(wc._parse_usage_reset_human(stderr, self.NOW, "", allow_envelope=True),
                          self._epoch(2025, 7, 11, 12, 20))
 
     def test_iana_zone_with_offset_or_hyphens_resolves(self) -> None:
@@ -2631,7 +3148,7 @@ class UsageResetHumanParseTests(unittest.TestCase):
         # not be declined by a too-narrow charset (Codex P2). The `)` anchor means it never
         # truncated to a different valid zone, so the pre-fix bug was a missed wait, not a wrong one.
         for tz in ("Etc/GMT+5", "Etc/GMT-14", "America/Port-au-Prince"):
-            e = wc._parse_usage_reset_human(self._sl(f"3pm ({tz})"), self.NOW)
+            e = wc._parse_usage_reset_human(self._sl(f"3pm ({tz})"), self.NOW, "", allow_envelope=True)
             self.assertIsNotNone(e, tz)  # not declined
             # The resolved instant reads 15:00 in the PARSED zone: the WHOLE name reached ZoneInfo
             # and the correct offset was applied (a truncated/wrong zone would read a different hour;
@@ -2643,15 +3160,15 @@ class UsageResetHumanParseTests(unittest.TestCase):
     def test_non_zone_parenthetical_is_not_a_timezone(self) -> None:
         # A parenthetical that is not an IANA Area/City shape (no slash, or a non-letter start) is
         # never mistaken for a zone -> declines.
-        self.assertIsNone(wc._parse_usage_reset_human(self._sl("3pm (the run)"), self.NOW))
-        self.assertIsNone(wc._parse_usage_reset_human(self._sl("3pm (1/2)"), self.NOW))
+        self.assertIsNone(wc._parse_usage_reset_human(self._sl("3pm (the run)"), self.NOW, "", allow_envelope=True))
+        self.assertIsNone(wc._parse_usage_reset_human(self._sl("3pm (1/2)"), self.NOW, "", allow_envelope=True))
 
     def test_earlier_non_zone_parenthetical_does_not_shadow_the_timezone(self) -> None:
         # The first parenthetical `ZoneInfo` ACCEPTS wins, not merely the first matching the shape:
         # a zone-SHAPED non-zone earlier on the line must not decline an otherwise resolvable reset.
         for prefix in ("(opus/sonnet)", "(plan-1/of-2)"):
             line = f"You've hit your session limit {prefix} · resets 3pm (Asia/Tokyo)"
-            self.assertEqual(wc._parse_usage_reset_human(line, self.NOW),
+            self.assertEqual(wc._parse_usage_reset_human(line, self.NOW, "", allow_envelope=True),
                              self._epoch(2025, 7, 11, 15, 0), prefix)
 
 
@@ -2886,33 +3403,21 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertIn("llm_usage_limit", oc.decision.reason)
         self.assertIn("[attempts=2]", oc.decision.reason)
 
-    def test_usage_limit_on_stdout_only_does_not_arm_the_wait(self) -> None:
+    def test_usage_limit_in_a_leafs_own_stdout_does_not_arm_the_wait(self) -> None:
         """SECURITY (Codex P2): the classifier PROMOTES an `llm_usage_limit` tag out of stdout, but
-        stdout is the leaf's own untrusted output surface. A usage-limit epoch seen ONLY on stdout —
-        e.g. a leaf that crashed for an unrelated reason whose prose contains
-        `usage limit reached|<future epoch>` — must NOT arm the (multi-hour) wait, even opted in. It
-        is still classified/fail_closed as `llm_usage_limit`, but the wait declines (no sleep, no
-        relaunch)."""
-        now = 1_752_200_000.0
-        c = self._conductor(
-            [wc.ProcResult(1, f"Claude AI usage limit reached|{int(now) + 300}", "")],
-            wait_usage_reset=True)
-        with mock.patch.object(wc.time, "time", return_value=now):
-            oc = c.run_substep(self._refs(), "compile", "verify")
-        self.assertEqual(len(c.spawns), 1)                 # no relaunch
-        self.assertEqual(c.slept, [])                      # no wait
-        self.assertEqual(oc.infra_error[0], "llm_usage_limit")  # still classified (fail_closed)
-        self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
+        stdout is the leaf's own untrusted output surface. A leaf that crashed for an unrelated
+        reason whose OWN OUTPUT contains `usage limit reached|<future epoch>` must NOT arm the
+        (multi-hour) wait, even opted in — it is still classified/fail_closed as `llm_usage_limit`,
+        but the wait declines (no sleep, no relaunch).
 
-    def test_human_reset_on_stdout_only_does_not_arm_the_wait(self) -> None:
-        """SECURITY: the TZ-anchored human reset is now the PRIMARY arming path, so it too must be
-        read from stderr ONLY. A reset that appears only on the leaf's untrusted stdout (a crash
-        whose prose contains `resets 3pm (Asia/Tokyo)`) must NOT arm the multi-hour wait — it still
-        fail_closes and emits `leaf_usage_limit_wait_declined(no_reset_time)`. This pins the stderr-
-        only property against a refactor that pipes `proc.stdout` into `_parse_usage_reset_human`."""
+        The stdout here is a pure leaf's real shape — ONE line of `--output-format json` envelope
+        with the phrase inside model-authored text — i.e. exactly the input a per-line "nothing but
+        usage limits" predicate would have armed on. What separates it from the real CLI (next test)
+        is the abort shape: length and a line-leading limit phrase."""
         now = 1_752_200_000.0
         c = self._conductor(
-            [wc.ProcResult(1, "You've hit your session limit · resets 3pm (Asia/Tokyo)", "")],
+            [wc.ProcResult(1, '{"is_error":true,"num_turns":3,"session_id":"c7261ba0","result":'
+                              f'"stopped — usage limit reached|{int(now) + 300}"}}', "")],
             wait_usage_reset=True)
         events: list = []
         c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
@@ -2924,6 +3429,68 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
         declined = [f["reason"] for e, f in events if e == "leaf_usage_limit_wait_declined"]
         self.assertEqual(declined, ["no_reset_time"])
+
+    def test_the_agentic_loop_never_unwraps_an_envelope(self) -> None:
+        """WIRING pin for `allow_envelope`. `run_substep` runs AGENTIC leaves — a pure substep is
+        dispatched away before this loop — and an agentic leaf is launched without
+        `--output-format json`, so a JSON line on its stdout is MODEL-written and its `is_error` /
+        `api_error_status` keys prove nothing. Passing `True` here would let a leaf that crashed for
+        an unrelated reason park the run for hours, with the 200-char ceiling applied to the inner
+        text instead of its whole output. The stdout below is the CLI's real abort envelope, so only
+        the call site's argument separates arming from declining."""
+        now = 1_784_878_725.0
+        envelope = json.dumps({
+            "type": "result", "is_error": True, "api_error_status": 429, "num_turns": 1,
+            "result": "You've hit your session limit · resets 5:50pm (Asia/Tokyo)",
+            "terminal_reason": "api_error"})
+        # The same bytes DO arm once unwrapping is allowed — so this test fails if the wiring flips,
+        # not because the envelope is unresolvable.
+        self.assertIsNotNone(wc._sole_content_usage_limit_line(envelope, allow_envelope=True))
+        c = self._conductor([wc.ProcResult(1, envelope, "")], wait_usage_reset=True)
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(len(c.spawns), 1)                 # no relaunch
+        self.assertEqual(c.slept, [])                      # no wait
+        self.assertEqual(oc.infra_error[0], "llm_usage_limit")  # still classified (fail_closed)
+        declined = [f for e, f in events if e == "leaf_usage_limit_wait_declined"]
+        self.assertEqual([f["reason"] for f in declined], ["no_reset_time"])
+        # The decline must name the dead leaf and quote what it decided from — a bare reason is
+        # what made the stderr-only bug take two rounds to find.
+        self.assertEqual(declined[0]["dead_agent_run_id"], "child-1")
+        self.assertIn("session limit", declined[0]["evidence"])
+        self.assertLessEqual(len(declined[0]["evidence"]), 160)
+
+    def test_real_cli_shape_on_stdout_arms_the_wait(self) -> None:
+        """REGRESSION (the opted-in E2E that still fail_closed): the real `claude -p` reports a usage
+        limit by aborting with that ONE line on STDOUT and an EMPTY stderr — both incidents on record
+        are byte-for-byte this shape. Reading stderr alone made `--wait-usage-reset` inert in
+        production while every unit test passed, so this pins the ACTUAL production envelope: sole
+        stdout content + human TZ reset -> wait, tombstone, relaunch."""
+        # 2026-07-24 07:38:45 UTC = 16:38 JST, the incident's leaf-death instant; the CLI said the
+        # window reopens at 5:50pm — i.e. 1h11m out, inside the 6h cap.
+        now = 1_784_878_725.0
+        c = self._conductor(
+            [wc.ProcResult(1, "You've hit your session limit · resets 5:50pm (Asia/Tokyo)\n", ""),
+             wc.ProcResult(0, "done", "")],
+            wait_usage_reset=True)
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(len(c.spawns), 2)             # dead attempt + the recovered launch
+        waits = [f for e, f in events if e == "leaf_usage_limit_wait"]
+        self.assertEqual(len(waits), 1)
+        # 17:50 JST resolved from the TZ on the line, + the 120s margin.
+        expected = datetime(2026, 7, 24, 17, 50, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+        self.assertEqual(waits[0]["reset_epoch"], int(expected))
+        self.assertEqual(c.slept, [expected - now + wc.USAGE_LIMIT_WAIT_MARGIN_SECONDS])
+        self.assertNotIn("leaf_usage_limit_wait_declined", [e for e, _ in events])
+        sup = [cap for s, cap in c.calls if s == "add-superseded-runs"]
+        self.assertEqual(len(sup), 1)
+        self.assertIn("leaf_usage_limit_wait_orphan", sup[0]["--reason"])
 
     def test_usage_reset_wait_declines_a_human_reset_without_a_timezone(self) -> None:
         """Opted in but the human reset has NO parenthesized IANA timezone ("resets 6:10pm"): the
@@ -3003,6 +3570,108 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertEqual(len(sup), 1)
         self.assertIn("leaf_usage_limit_wait_orphan", sup[0]["--reason"])
 
+    def test_an_enveloped_decline_quotes_the_unwrapped_message(self) -> None:
+        """For the ENVELOPED shape the classifier's evidence is the raw envelope clipped at 160
+        chars, which truncates mid-`result` and hides the wording the operator has to judge. The
+        decline must quote the unwrapped message instead — the docs promise the operator can see
+        "the wording that was not resolvable"."""
+        # An enveloped abort whose reset has no timezone: tagged, but not resolvable -> declines.
+        abort = "You've hit your session limit · resets 12:30pm"
+        env = json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                          "api_error_status": 429, "duration_ms": 646, "num_turns": 1,
+                          "result": abort, "terminal_reason": "api_error"})
+        self.assertGreater(len(env), 160)                       # the raw line would truncate
+        c = self._conductor([wc.ProcResult(1, env, "")], wait_usage_reset=True)
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=1_752_200_000.0):
+            c._usage_reset_wait_plan(wc.ProcResult(1, env, ""), 0, node_key="component/x@0.1.0",
+                                     step="generate", substep="generate",
+                                     dead_agent_run_id="child-1",
+                                     evidence=wc._classify_leaf_infra_error("", env)[1],
+                                     allow_envelope=True)
+        declined = [f for e, f in events if e == "leaf_usage_limit_wait_declined"]
+        self.assertEqual([f["reason"] for f in declined], ["no_reset_time"])
+        self.assertEqual(declined[0]["evidence"], abort)        # the message, not the wrapper
+
+    def test_a_lone_surrogate_in_the_leafs_result_does_not_crash_the_decline(self) -> None:
+        """`json.loads` turns an escaped `\\ud800` in the leaf's `result` into a REAL lone
+        surrogate. Emitting it unsanitized fails at `emit`'s `json.dumps(..., ensure_ascii=False)`
+        write — a fail_closed decline becoming a conductor crash, on input the leaf controls. The
+        envelope itself is plain ASCII, so nothing upstream rejects it."""
+        abort = "You've hit your session limit \ud800 · resets 3pm"      # no IANA TZ -> declines
+        env = json.dumps({"is_error": True, "api_error_status": 429,
+                          "terminal_reason": "api_error", "result": abort})
+        self.assertTrue(env.isascii())                    # survives every upstream check
+        c = self._conductor([], wait_usage_reset=True)
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=1_752_200_000.0):
+            c._usage_reset_wait_plan(
+                wc.ProcResult(1, env, ""), 0, node_key="component/x@0.1.0", step="generate",
+                substep="generate", dead_agent_run_id="child-1", evidence="e",
+                allow_envelope=True)
+        declined = [f for e, f in events if e == "leaf_usage_limit_wait_declined"]
+        self.assertEqual([f["reason"] for f in declined], ["no_reset_time"])
+        # The real emit round-trip must not raise, and the wording must survive readably.
+        payload = json.dumps({"evidence": declined[0]["evidence"]}, ensure_ascii=False)
+        payload.encode("utf-8")                                   # would raise unsanitized
+        self.assertIn("session limit", declined[0]["evidence"])
+
+    def test_the_enveloped_evidence_override_is_narrow(self) -> None:
+        """The unwrap-for-evidence override may only fire when stdout is the stream the resolver
+        ACTUALLY consulted, and only with shape-checked text. Otherwise it re-creates the failure it
+        was meant to fix — quoting a `result` the decision was never made from — which is exactly
+        what the comment above it warns against.
+
+        Two independent guards, one case each:
+        * stderr NAMED the usage limit, so the terminal line came from there: the classifier's line
+          must survive even though stdout happens to be a CLI error envelope;
+        * stdout IS the consulted stream but its `result` is ordinary leaf prose, not an abort: the
+          override must not quote it."""
+        now = 1_752_200_000.0
+        c = self._conductor([], wait_usage_reset=True)
+
+        def decline(stderr: str, result_text: str, evidence: str) -> dict:
+            env = json.dumps({"is_error": True, "api_error_status": 429,
+                              "terminal_reason": "api_error", "result": result_text})
+            events: list = []
+            c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+            with mock.patch.object(wc.time, "time", return_value=now):
+                c._usage_reset_wait_plan(
+                    wc.ProcResult(1, env, stderr), 0, node_key="component/x@0.1.0",
+                    step="generate", substep="generate", dead_agent_run_id="child-1",
+                    evidence=evidence, allow_envelope=True)
+            return [f for e, f in events if e == "leaf_usage_limit_wait_declined"][0]
+
+        # (1) stderr decided it -> keep the classifier's line. The stdout result is a PERFECTLY
+        # abort-shaped message, so only the stderr guard (not the shape check) can reject it.
+        classifier_line = "Claude AI weekly limit reached; resets Monday"
+        got = decline(classifier_line, "You've hit your session limit · resets 3pm (Asia/Tokyo)",
+                      classifier_line)
+        self.assertEqual(got["evidence"], classifier_line)
+        # (2) stdout decided it, but its result is prose -> no override either.
+        got = decline("", "I finished the bundle but the host write failed; see log.",
+                      "some classifier line")
+        self.assertEqual(got["evidence"], "some classifier line")
+
+        # (3) ...and the third guard: on the AGENTIC path a JSON line is model-written, so its
+        # `result` is never quoted as evidence however abort-shaped it looks — otherwise the event
+        # would tell the operator the CLI aborted on a quota when the leaf died of something else
+        # and merely wrote that sentence.
+        env = json.dumps({"type": "result", "is_error": True, "api_error_status": 429,
+                          "terminal_reason": "api_error",
+                          "result": "You've hit your session limit · resets 3pm (Asia/Tokyo)"})
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            c._usage_reset_wait_plan(
+                wc.ProcResult(1, env, ""), 0, node_key="component/x@0.1.0", step="compile",
+                substep="verify", dead_agent_run_id="child-1", evidence=env[:160],
+                allow_envelope=False)
+        got = [f for e, f in events if e == "leaf_usage_limit_wait_declined"][0]
+        self.assertTrue(got["evidence"].startswith('{"type"'), got["evidence"])
+
     def test_usage_reset_wait_plan_declined_emits_reason(self) -> None:
         """Every decline except the flag-off short-circuit emits `leaf_usage_limit_wait_declined`
         with a reason (no_reset_time / over_6h_cap / budget_spent), so an opted-in run that did not
@@ -3017,7 +3686,9 @@ class LeafTransientRetryTest(unittest.TestCase):
             with mock.patch.object(wc.time, "time", return_value=now):
                 result = c._usage_reset_wait_plan(
                     wc.ProcResult(1, "", stderr), waits_done,
-                    node_key="component/x@0.1.0", step="compile", substep="verify")
+                    node_key="component/x@0.1.0", step="compile", substep="verify",
+                    dead_agent_run_id="child-1", evidence="usage limit reached",
+                    allow_envelope=False)
             declined = [f["reason"] for e, f in events if e == "leaf_usage_limit_wait_declined"]
             return result, declined
 
@@ -3037,21 +3708,48 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertEqual(d, [])
 
+    def test_both_parser_call_sites_pass_the_envelope_gate(self) -> None:
+        """`_usage_reset_wait_plan` calls two parsers and each takes `allow_envelope` separately, so
+        one wiring can be hardcoded off with the other still correct — invisible unless BOTH are
+        driven through the plan with an enveloped stdout. The machine form has never occurred in
+        production (it is backward-compat only), which is exactly why its wiring needs a pin rather
+        than trust."""
+        now = 1_752_200_000.0
+        c = self._conductor([], wait_usage_reset=True)
+
+        def plan(result_text: str):
+            env = json.dumps({"is_error": True, "api_error_status": 429,
+                              "terminal_reason": "api_error", "result": result_text})
+            with mock.patch.object(wc.time, "time", return_value=now):
+                return c._usage_reset_wait_plan(
+                    wc.ProcResult(1, env, ""), 0, node_key="component/x@0.1.0", step="generate",
+                    substep="generate", dead_agent_run_id="child-1", evidence="e",
+                    allow_envelope=True)
+
+        machine = plan(f"usage limit reached|{int(now) + 300}")
+        self.assertIsNotNone(machine)
+        self.assertEqual(machine[1], int(now) + 300)
+        human = plan("You've hit your session limit · resets 12:20pm (Asia/Tokyo)")
+        self.assertIsNotNone(human)
+        self.assertNotEqual(human[1], machine[1])
+
     def test_machine_epoch_wins_over_human_on_the_same_line(self) -> None:
         """Precedence: when the terminal line carries BOTH a trailing machine `|<epoch>` AND a
         TZ-anchored human reset, the machine epoch is used (tried first). Both forms here resolve to
         DIFFERENT instants, so the plan picking the machine one is meaningful, not vacuous."""
         now = 1_752_200_000.0  # 11:13 JST; the human 3pm is ~3h47m out, the machine epoch is 10min
         line = f"session limit reached resets 3pm (Asia/Tokyo)|{int(now) + 600}"
-        self.assertEqual(wc._parse_usage_reset_epoch(line), int(now) + 600)
-        human = wc._parse_usage_reset_human(line, now)
+        self.assertEqual(wc._parse_usage_reset_epoch(line, "", allow_envelope=True), int(now) + 600)
+        human = wc._parse_usage_reset_human(line, now, "", allow_envelope=True)
         self.assertIsNotNone(human)
         self.assertNotEqual(human, int(now) + 600)
         c = self._conductor([wc.ProcResult(1, "", line)], wait_usage_reset=True)
         with mock.patch.object(wc.time, "time", return_value=now):
             plan = c._usage_reset_wait_plan(
                 wc.ProcResult(1, "", line), 0,
-                node_key="component/x@0.1.0", step="compile", substep="verify")
+                node_key="component/x@0.1.0", step="compile", substep="verify",
+                dead_agent_run_id="child-1", evidence="usage limit reached",
+                    allow_envelope=False)
         self.assertIsNotNone(plan)
         self.assertEqual(plan[1], int(now) + 600)   # reset_epoch is the MACHINE value
         self.assertEqual(plan[0], 600.0 + 120.0)    # wait = machine 600s + margin, not the ~3h47m

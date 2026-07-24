@@ -16,7 +16,9 @@ import os
 import re
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1062,6 +1064,69 @@ class PureUsageLimitWaitTest(unittest.TestCase):
             # the dead usage attempt is tombstoned under the wait's own prefix
             reasons = [cap["--reason"] for s, cap in c.calls if s == "add-superseded-runs"]
             self.assertTrue(any("leaf_usage_limit_wait_orphan" in r for r in reasons))
+
+    def test_transport_usage_limit_waits_on_the_real_cli_abort_envelope(self) -> None:
+        """REGRESSION, the production shape THIS loop actually met: the only recorded usage limit to
+        strike a pure leaf (`orch_20260719T021249Z_419ebdf9`, `generate.generate`, its run log
+        showing `pure_bundle_attempt_failed / pure_transport`) did NOT have its abort pre-empt the
+        `--output-format json` envelope — the CLI completed the envelope and put the message in
+        `result`, with `is_error` / `api_error_status` / `terminal_reason` stamped alongside. Stdout
+        was 773 bytes, so a bare-line-only carve-out declines it and this loop stays inert exactly
+        where the expensive substeps live. Bytes below are verbatim from that log (`workspace*/` is
+        gitignored, so they are pinned here); the sibling test above uses the machine-form-on-stderr
+        shape, which production has never produced."""
+        # 2026-07-19 02:12 UTC = 11:12 JST, before the recorded 12:30pm JST reset.
+        now = datetime(2026, 7, 19, 11, 12, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+        # VERBATIM from that log (771 chars / 773 bytes), including the CLI accounting blocks
+        # that dominate envelope size — a re-serialized minimal fixture would be ~250 chars
+        # and could not exercise the envelope-size guard at all.
+        recorded_stdout = (
+            '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"duration_ms":64'
+            '6,"duration_api_ms":0,"num_turns":1,"result":"You\'ve hit your session limit · resets 12:30pm'
+            ' (Asia/Tokyo)","stop_reason":"stop_sequence","session_id":"160cb9c9-b595-4a87-aa72-fc1cf86c4'
+            '878","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_rea'
+            'd_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_re'
+            'quests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"epheme'
+            'ral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":'
+            '{},"permission_denials":[],"terminal_reason":"api_error","fast_mode_state":"off","uuid":"ab0'
+            '9298a-847a-415f-87d6-88205cc51fb4"}')
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            c = self._conductor(
+                repo,
+                [wc.ProcResult(1, recorded_stdout, ""),
+                 wc.ProcResult(0, _envelope(_valid_bundle()), "")],
+                wait_usage_reset=True)
+            with mock.patch.object(wc.time, "time", return_value=now):
+                oc = c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+            self.assertEqual(oc.status, "pass")
+            self.assertEqual(c._spawn, 2)          # waited, then relaunched
+            reset = datetime(2026, 7, 19, 12, 30, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+            self.assertEqual(c.slept, [reset - now + wc.USAGE_LIMIT_WAIT_MARGIN_SECONDS])
+
+    def test_a_declined_wait_names_the_dead_leaf_and_its_evidence(self) -> None:
+        """A decline is the operator's only breadcrumb when a wording is not resolvable, and a bare
+        `no_reset_time` is what made the stderr-only bug take two investigations. The event must name
+        the dead attempt's arid and quote the classifier's own line, from EVERY loop."""
+        now = 1_752_200_000.0
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            refs = _write_node(repo)
+            c = self._conductor(
+                repo,
+                # A usage limit with no resolvable reset -> declines.
+                [wc.ProcResult(1, "You've hit your session limit; resets soon", ""),
+                 wc.ProcResult(0, _envelope(_valid_bundle()), "")],
+                wait_usage_reset=True)
+            events: list = []
+            c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+            with mock.patch.object(wc.time, "time", return_value=now):
+                c._run_pure_generate_substep(refs, "generate", "generate", None, ())
+            declined = [f for e, f in events if e == "leaf_usage_limit_wait_declined"]
+            self.assertEqual([f["reason"] for f in declined], ["no_reset_time"])
+            self.assertTrue(declined[0]["dead_agent_run_id"])
+            self.assertIn("session limit", declined[0]["evidence"])
 
     def test_transport_wait_does_not_pollute_the_repair_turn(self) -> None:
         """A transport wait must leave the repair carriers clean: the launch AFTER the wait is a

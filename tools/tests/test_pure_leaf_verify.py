@@ -14,8 +14,10 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 os.environ.setdefault("METDSL_DEP_READINESS_ALLOW_PERSISTED_FALLBACK", "1")
 
@@ -210,6 +212,90 @@ class PureVerifySubstepTests(unittest.TestCase):
         self.assertTrue((c.repo_root / refs.source_dir() / "source_meta.json").exists())
         reasons = [cap["--reason"] for s, cap in c.calls if s == "add-superseded-runs"]
         self.assertTrue(any("leaf_usage_limit_wait_orphan" in r for r in reasons))
+
+    def test_wait_usage_reset_recovers_the_real_cli_stdout_abort(self) -> None:
+        """REGRESSION, production shapes: the CLI reports a usage limit on STDOUT with a 0-byte
+        stderr, in one of two recorded shapes — the bare message (5 of the 6 incidents on record) or
+        the `--output-format json` envelope carrying it in `result` (the 1 that struck a pure leaf;
+        pinned in the producer suite). Either must wait; the sibling test above uses the
+        machine-form-on-stderr shape, which production has never produced. Both are accepted on this
+        loop: a pure launch may still abort bare, so the bare path must work here too — only the
+        converse (unwrapping an envelope) is gated on the launch mode."""
+        # 2026-07-24 07:38:45 UTC = 16:38 JST, the bare incident's leaf-death instant.
+        now = 1_784_878_725.0
+        recorded_stdout = "You've hit your session limit · resets 5:50pm (Asia/Tokyo)\n"
+
+        class _C(_PureFakeConductor):
+            def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+                self._spawn = getattr(self, "_spawn", 0)
+                proc = self.procs[min(self._spawn, len(self.procs) - 1)]
+                self._spawn += 1
+                return proc
+
+            def _sleep_backoff(self, seconds):  # type: ignore[override]
+                self.slept.append(seconds)
+
+        self._tmp = tempfile.TemporaryDirectory()
+        repo = Path(self._tmp.name)
+        refs = _verify_node(repo)
+        (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
+        c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
+               backend="claude", env={}, wait_usage_reset=True)
+        c.procs = [wc.ProcResult(1, recorded_stdout, ""),
+                   wc.ProcResult(0, _envelope(_verdict("pass")), "")]
+        c.slept = []
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c._run_pure_verify_substep(refs, "generate", "verify", ())
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(c._spawn, 2)                # waited, then relaunched
+        reset = datetime(2026, 7, 24, 17, 50, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+        self.assertEqual(c.slept, [reset - now + wc.USAGE_LIMIT_WAIT_MARGIN_SECONDS])
+
+    def test_wait_usage_reset_recovers_the_real_cli_abort_envelope(self) -> None:
+        """The ENVELOPED shape on the reviewer loop. `_run_pure_verify_substep` launches
+        `--output-format json` exactly as the producer does, so it must pass `allow_envelope=True`
+        too — the recorded enveloped abort (verbatim below, from the producer-loop incident) is what
+        this loop would meet, and with the gate off it declines `no_reset_time` and fail_closes.
+        Without this test that wiring can be flipped with a green suite, re-creating the defect for
+        half the pure surface."""
+        now = datetime(2026, 7, 19, 11, 12, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+        RECORDED_ABORT_ENVELOPE = (
+            '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"duration_ms":64'
+            '6,"duration_api_ms":0,"num_turns":1,"result":"You\'ve hit your session limit · resets 12:30pm'
+            ' (Asia/Tokyo)","stop_reason":"stop_sequence","session_id":"160cb9c9-b595-4a87-aa72-fc1cf86c4'
+            '878","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_rea'
+            'd_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_re'
+            'quests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"epheme'
+            'ral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":'
+            '{},"permission_denials":[],"terminal_reason":"api_error","fast_mode_state":"off","uuid":"ab0'
+            '9298a-847a-415f-87d6-88205cc51fb4"}')
+        class _C(_PureFakeConductor):
+            def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
+                self._spawn = getattr(self, "_spawn", 0)
+                proc = self.procs[min(self._spawn, len(self.procs) - 1)]
+                self._spawn += 1
+                return proc
+
+            def _sleep_backoff(self, seconds):  # type: ignore[override]
+                self.slept.append(seconds)
+
+        self._tmp = tempfile.TemporaryDirectory()
+        repo = Path(self._tmp.name)
+        refs = _verify_node(repo)
+        (repo / "workspace" / "orchestrations" / "o").mkdir(parents=True, exist_ok=True)
+        c = _C(repo_root=repo, orchestration_id="o", orchestration_agent_run_id="orch",
+               backend="claude", env={}, wait_usage_reset=True)
+        c.procs = [wc.ProcResult(1, RECORDED_ABORT_ENVELOPE, ""),
+                   wc.ProcResult(0, _envelope(_verdict("pass")), "")]
+        c.slept = []
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c._run_pure_verify_substep(refs, "generate", "verify", ())
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(c._spawn, 2)
+        reset = datetime(2026, 7, 19, 12, 30, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+        self.assertEqual(c.slept, [reset - now + wc.USAGE_LIMIT_WAIT_MARGIN_SECONDS])
+        sup = [cap for sub, cap in c.calls if sub == "add-superseded-runs"]
+        self.assertTrue(any("leaf_usage_limit_wait_orphan" in cap["--reason"] for cap in sup))
 
     def test_unencodable_valid_verdict_is_schema_violation_not_transport(self) -> None:
         # Codex review (defect 1): a schema-SOUND verdict whose last_fail_reason holds a lone
