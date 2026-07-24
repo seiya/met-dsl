@@ -1647,8 +1647,7 @@ def _parse_usage_reset_human(stderr: str, now: float) -> int | None:
         if line is None:
             return None
         time_match = _USAGE_RESET_HUMAN_TIME_RE.search(line)
-        tz_match = _USAGE_RESET_HUMAN_TZ_RE.search(line)
-        if time_match is None or tz_match is None:
+        if time_match is None:
             return None
         hour = int(time_match.group(1))
         minute = int(time_match.group(2) or 0)
@@ -1659,7 +1658,20 @@ def _parse_usage_reset_human(stderr: str, now: float) -> int | None:
             hour24 = 0 if hour == 12 else hour
         else:  # pm
             hour24 = 12 if hour == 12 else hour + 12
-        tz = ZoneInfo(tz_match.group(1))
+        # Take the first parenthesized token `ZoneInfo` ACCEPTS, not merely the first that matches
+        # the shape: an earlier non-zone parenthetical that happens to look like `Area/City`
+        # (`(opus/sonnet)`, `(plan-1/of-2)`) must not shadow the real timezone later on the line and
+        # decline an otherwise resolvable reset. Still fail-closed — a line with no acceptable zone
+        # yields None.
+        tz = None
+        for tz_match in _USAGE_RESET_HUMAN_TZ_RE.finditer(line):
+            try:
+                tz = ZoneInfo(tz_match.group(1))
+                break
+            except Exception:
+                continue
+        if tz is None:
+            return None
         today = datetime.fromtimestamp(now, tz).date()
         candidates = [
             datetime(d.year, d.month, d.day, hour24, minute, tzinfo=tz).timestamp()

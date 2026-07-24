@@ -2646,6 +2646,14 @@ class UsageResetHumanParseTests(unittest.TestCase):
         self.assertIsNone(wc._parse_usage_reset_human(self._sl("3pm (the run)"), self.NOW))
         self.assertIsNone(wc._parse_usage_reset_human(self._sl("3pm (1/2)"), self.NOW))
 
+    def test_earlier_non_zone_parenthetical_does_not_shadow_the_timezone(self) -> None:
+        # The first parenthetical `ZoneInfo` ACCEPTS wins, not merely the first matching the shape:
+        # a zone-SHAPED non-zone earlier on the line must not decline an otherwise resolvable reset.
+        for prefix in ("(opus/sonnet)", "(plan-1/of-2)"):
+            line = f"You've hit your session limit {prefix} · resets 3pm (Asia/Tokyo)"
+            self.assertEqual(wc._parse_usage_reset_human(line, self.NOW),
+                             self._epoch(2025, 7, 11, 15, 0), prefix)
+
 
 class LeafChildEnvTest(unittest.TestCase):
     """WI-A: the leaf's output ceiling is part of the CONDUCTOR'S leaf contract (it lives in
