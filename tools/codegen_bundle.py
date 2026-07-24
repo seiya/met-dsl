@@ -253,12 +253,12 @@ CAPABILITY_FOR_CAPTURE: dict[str, str] = {"harness_registration": "state_registr
 # (Z6), the manifest moves into the spec and this table becomes its projection.
 #
 # `sync_single_case@1` is defined as exactly the canonical interface block of
-# `harness_fortran_cpu@0.6.0` §5.1 (13 operations, 5 published types, `dp = float64`
+# `harness_fortran_cpu@0.7.0` §5.1 (13 operations, 5 published types, `dp = float64`
 # (rendered `real64`), `case_id_len = 64`). Its mechanical enforcer remains
 # `tools/runner_renderer.py:assert_harness_pin`; this contract names the ABI, it does not
 # re-check it.
 HARNESS_CAPABILITY_MANIFESTS: dict[str, frozenset[str]] = {
-    "infrastructure/harness_fortran_cpu@0.6.0": frozenset({"sync_single_case@1"}),
+    "infrastructure/harness_fortran_cpu@0.7.0": frozenset({"sync_single_case@1"}),
 }
 
 

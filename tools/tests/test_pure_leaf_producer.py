@@ -31,7 +31,7 @@ from tools.pure_leaf import PURE_PROMPT_CONTRACT_VERSION
 _NODE = "problem/shallow_water2d@0.3.0"
 _SAFE = wc.node_key_safe(_NODE)
 _SPEC_ID = "shallow_water2d"
-_HARNESS = "infrastructure/harness_fortran_cpu@0.6.0"
+_HARNESS = "infrastructure/harness_fortran_cpu@0.7.0"
 _HARNESS_SPEC_ID = "harness_fortran_cpu"
 _SPEC_PATH = "spec/problem/ocean/shallow_water2d"
 

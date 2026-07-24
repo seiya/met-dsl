@@ -14477,7 +14477,7 @@ class LocalOperationLoweringGateTests(unittest.TestCase):
         ir = self._ir(
             steps=[{"step_id": "s1", "operation_ref": "mystery_op",
                     "inputs": ["u"], "outputs": ["y"]}],
-            node_key="infrastructure/harness_fortran_cpu@0.6.0",
+            node_key="infrastructure/harness_fortran_cpu@0.7.0",
         )
         self.assertEqual(self._run(ir), [])
 

@@ -2836,7 +2836,7 @@ the first place — the previous text named `module` / `capture` and left every 
   `checks_getter` bindings — compliant with the prompt and rejected by the host. The rule is therefore written as a
   biconditional, with the reason the producer can act on: `capability_requirements` states what the code USES, not what
   the harness offers. `HARNESS_CAPABILITY_MANIFESTS` gives
-  `harness_fortran_cpu@0.6.0` only `sync_single_case@1` (`state_registration` is Z6-reserved), so on today's certified
+  `harness_fortran_cpu@0.7.0` only `sync_single_case@1` (`state_registration` is Z6-reserved), so on today's certified
   harness every `harness_registration` binding is rejected by the capability layer and `checks_getter` with a null
   `capability` is the only accepted form. The rule is keyed to the INLINED MANIFEST rather than hard-coding that fact:
   `checks_getter` is mandated UNLESS the manifest lists `state_registration@N`, and the token may be declared only as
@@ -3196,3 +3196,42 @@ pin is universal.
 `public_api.published_operations`, the profile `compile.generate` prompt must carry the op-name catalog, `--stage compile`
 must pass first try, and generate must converge with no syntax-gate retry. sw2d closure likewise. _orch id + result
 pending._
+
+## Harness per-case metrics drop — the defect class the harness self-test could not detect (LANDED 2026-07-24, spec `0.6.0` → `0.7.0`)
+
+The 2026-07-23 billed re-auth closure (`advdiff1d_linear --with-deps`) fail_closed at the problem node with
+`validate_execute_structural_violation`: the regenerated and certified `harness_fortran_cpu@0.6.0` emitted
+`"metrics": {}` for every case instead of folding the caller-supplied `h_metric` array, so every metric-address
+predicate of the consumer resolved `ref_absent`. `0.5.0` folded the metrics correctly; the regeneration lost it.
+
+**Why the harness node passed.** The `0.6.0` `controlled_spec.md` / `tests.md` stated that the L0 self-test supplies no
+metrics and left the metric-leaf / `N/A` encoding to consuming physics nodes. The self-test therefore never exercised
+the fold, no predicate referenced a metric address, and no deterministic gate requires a non-empty per-case `metrics`
+(`_validate_diagnostics_contract_output` pins `checks` / `verdict` only). The defect was structurally undetectable in
+the node that produces it and surfaced one closure level up, at billed cost.
+
+**The fix is a spec-level detection pull-in, not a new gate.** `0.7.0` adds the L0 case + single-target test
+`l0_metric_leaf_pass`: the case supplies two sentinel `h_metric` records (`selftest.metric_leaf` = `0.25`, exactly
+representable in binary floating point; `selftest.metric_na` with `is_na = true`, `reason_na = 'not_computed'`, and the
+out-of-band `value = -1.0` a correct writer never serializes), and `tests.md` §5 pins the three emitted addresses
+(`selftest.metric_leaf`, `selftest.metric_na`, `selftest.metric_na_reason_na`) into `diagnostics_contract.metrics`,
+§6 stating the `pass_when.all` conditions verbatim. The existing machinery is the detector: `_check_ref` pins each
+predicate metric ref verbatim against the declared addresses at Compile, and at execute `_resolve_predicate_ref` reads
+the ref as a whole-string key of the case's `metrics` map — an empty map resolves `ref_absent` ⇒ `structural_violation`
+⇒ the harness node's own `Validate.execute` fails closed. The `N/A` sibling is asserted by value (`eq not_computed`), so
+a writer that drops the `N/A` leaf fires structurally, and the `na_allowed` condition on `selftest.metric_na`
+(`ge 0.0`) is satisfied by the honest `null` but never by the supplied `-1.0`, so a writer that serializes the numeric
+value in place of `null` fires as a physics fail.
+
+**Scope.** §5.1, the published operations and types, the component layouts, and the generated ABI are unchanged; the
+runtime (`verdict_evaluator` / `workflow_conductor` / `orchestration_runtime` / `runner_renderer`) is unchanged — it
+behaved as designed throughout. The `0.7.0` ripple is the version pin set only: `spec_catalog.yaml`,
+`HARNESS_CAPABILITY_MANIFESTS`, `harness_capabilities.schema.json`, `CODEGEN_BUNDLE_CONTRACT.md`, and the unit-test
+node_key pins. Consumer `deps.yaml` constraints (`>=0.3.0 <1.0.0`) already admit `0.7.0`.
+
+**Acceptance vehicle.** The pending billed re-auth closure IS the acceptance: `harness_fortran_cpu@0.7.0` is not
+certified, so `run_workflow.py spec/problem/dynamics/advection_diffusion/advdiff1d_linear/ validate --with-deps`
+re-runs the closure from the harness. A regenerated harness that drops the metric fold must stop at the harness node's
+own `l0_metric_leaf_pass` structural violation; a harness that passes must carry non-empty `per_case.*.metrics` through
+to the problem node's numeric predicates. The detection gap is not declared closed before that closure passes end to
+end. _orch id + result pending._
