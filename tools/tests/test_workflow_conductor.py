@@ -2625,6 +2625,27 @@ class UsageResetHumanParseTests(unittest.TestCase):
         self.assertEqual(wc._parse_usage_reset_human(stderr, self.NOW),
                          self._epoch(2025, 7, 11, 12, 20))
 
+    def test_iana_zone_with_offset_or_hyphens_resolves(self) -> None:
+        # A valid IANA name carrying `+`/`-`/digits (fixed-offset `Etc/GMT+5`, hyphenated
+        # `America/Port-au-Prince`) must reach ZoneInfo WHOLE and resolve with the CORRECT offset —
+        # not be declined by a too-narrow charset (Codex P2). The `)` anchor means it never
+        # truncated to a different valid zone, so the pre-fix bug was a missed wait, not a wrong one.
+        for tz in ("Etc/GMT+5", "Etc/GMT-14", "America/Port-au-Prince"):
+            e = wc._parse_usage_reset_human(self._sl(f"3pm ({tz})"), self.NOW)
+            self.assertIsNotNone(e, tz)  # not declined
+            # The resolved instant reads 15:00 in the PARSED zone: the WHOLE name reached ZoneInfo
+            # and the correct offset was applied (a truncated/wrong zone would read a different hour;
+            # e.g. `Etc/GMT+5` interpreted as `Etc/GMT` would read 10:00 here). Day-agnostic, since a
+            # far-offset zone's 3pm can resolve to a different calendar day relative to `now`.
+            self.assertEqual(
+                datetime.fromtimestamp(e, ZoneInfo(tz)).strftime("%H:%M"), "15:00", tz)
+
+    def test_non_zone_parenthetical_is_not_a_timezone(self) -> None:
+        # A parenthetical that is not an IANA Area/City shape (no slash, or a non-letter start) is
+        # never mistaken for a zone -> declines.
+        self.assertIsNone(wc._parse_usage_reset_human(self._sl("3pm (the run)"), self.NOW))
+        self.assertIsNone(wc._parse_usage_reset_human(self._sl("3pm (1/2)"), self.NOW))
+
 
 class LeafChildEnvTest(unittest.TestCase):
     """WI-A: the leaf's output ceiling is part of the CONDUCTOR'S leaf contract (it lives in

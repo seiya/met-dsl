@@ -1552,7 +1552,15 @@ _USAGE_RESET_EPOCH_RE = re.compile(r"\|(\d{10})\s*$")
 # resolved (the instant is never guessed from the host-local TZ; see the design note above).
 _USAGE_RESET_HUMAN_TIME_RE = re.compile(
     r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.IGNORECASE)
-_USAGE_RESET_HUMAN_TZ_RE = re.compile(r"\(([A-Za-z]+(?:/[A-Za-z_]+)+)\)")
+# The parenthesized IANA zone name is passed UNCHANGED to `ZoneInfo` (the validator), so the
+# charset must admit every IANA name shape: letters/digits/underscore, plus the `+`/`-` that
+# appear in fixed-offset zones (`Etc/GMT+5`, `Etc/GMT-14`) and hyphenated cities
+# (`America/Port-au-Prince`). The first segment starts with a letter (every IANA area does) and at
+# least one `/`-segment is required, so a plain parenthetical word or `(1/2)` is never mistaken for
+# a zone. Anchoring the WHOLE token to `)` is load-bearing: a narrower charset would stop at the
+# first `+`/`-`, then fail the `)` anchor and DECLINE a valid zone — it never truncates to a
+# different (wrong-offset) zone, so the failure was a missed wait, not a wrong one.
+_USAGE_RESET_HUMAN_TZ_RE = re.compile(r"\(([A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)+)\)")
 # A human wall-clock reset is printed to the minute, and the leaf-death → conductor-processing lag
 # plus clock skew can leave the terminal message a few minutes stale. Resolve to the occurrence
 # NEAREST `now` (yesterday/today/tomorrow at that wall time) that is no more than this far in the
