@@ -30632,5 +30632,250 @@ class DependencyFreshnessTests(unittest.TestCase):
             self.assertEqual(stale_level, 0)
 
 
+class HostPycacheRedirectExemptionTest(unittest.TestCase):
+    """The in-process conductor host redirects its bytecode cache to workspace/.pycache/
+    (run_workflow sets sys.pycache_prefix); _is_host_pycache_redirect_write exempts only that
+    redirect root from the unauthorized-write terminal diff, and nothing else — a repo-tree
+    __pycache__/ write still surfaces (defense-in-depth for an explicit agent py_compile).
+
+    The three producers that must agree (host sys.pycache_prefix, _gate_python_env's
+    PYTHONPYCACHEPREFIX, and this exemption) all derive from _HOST_PYCACHE_REDIRECT_PREFIX;
+    the drift-guard tests below pin each to that single constant so a silent divergence
+    (which would resurface the exact bug this fixes) fails the suite."""
+
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+    def test_real_cpython_redirect_path_shape_is_exempt(self):
+        # Real-behavior-driven (no fictional fixture shape): drive CPython's own
+        # cache_from_source under the production sys.pycache_prefix so the asserted path is
+        # EXACTLY what the interpreter writes on disk (it mirrors the absolute source dir under
+        # the prefix, with NO extra __pycache__/ segment).
+        import importlib.util
+        from tools.orchestration_runtime import (
+            _is_host_pycache_redirect_write,
+            _HOST_PYCACHE_REDIRECT_PREFIX,
+        )
+        repo = self._REPO_ROOT
+        prefix_abs = (repo / _HOST_PYCACHE_REDIRECT_PREFIX).resolve()
+        saved = sys.pycache_prefix
+        try:
+            sys.pycache_prefix = str(prefix_abs)
+            for src in ("mcp_servers/build_runtime_server.py",
+                        "tools/hooks/lint_evidence.py"):
+                pyc_abs = Path(importlib.util.cache_from_source(str(repo / src)))
+                # Sanity: the real path is under the redirect prefix and carries no __pycache__ seg.
+                self.assertTrue(pyc_abs.is_relative_to(prefix_abs))
+                self.assertNotIn("__pycache__", pyc_abs.relative_to(prefix_abs).parts)
+                rel = pyc_abs.relative_to(repo).as_posix()
+                self.assertTrue(
+                    _is_host_pycache_redirect_write(rel),
+                    f"real redirect path not exempted: {rel}")
+        finally:
+            sys.pycache_prefix = saved
+
+    def test_repo_tree_bytecode_is_still_flagged(self):
+        from tools.orchestration_runtime import _is_host_pycache_redirect_write
+
+        # An in-place __pycache__ write in the repo SOURCE tree is NOT exempt — an explicit
+        # agent py_compile writes here and must still surface as an unauthorized write.
+        self.assertFalse(_is_host_pycache_redirect_write(
+            "mcp_servers/__pycache__/build_runtime_server.cpython-313.pyc"))
+        self.assertFalse(_is_host_pycache_redirect_write(
+            "tools/hooks/__pycache__/lint_evidence.cpython-313.pyc"))
+        # A genuine artifact under an orchestration root is unaffected.
+        self.assertFalse(_is_host_pycache_redirect_write(
+            "workspace/orchestrations/orch_x/pipelines/p/src/model.f90"))
+
+    def test_prefix_boundary_is_not_a_substring_match(self):
+        from tools.orchestration_runtime import _is_host_pycache_redirect_write
+
+        # A sibling dir sharing the string prefix but not the path boundary must not match.
+        self.assertFalse(_is_host_pycache_redirect_write("workspace/.pycacheX/y.pyc"))
+        self.assertFalse(_is_host_pycache_redirect_write("workspace/.pycache-old/y.pyc"))
+
+    def test_exemption_predicate_is_keyed_on_the_shared_constant(self):
+        # Ties the exemption to _HOST_PYCACHE_REDIRECT_PREFIX: any path under the constant is
+        # exempt; a path just outside it is not.
+        from tools.orchestration_runtime import (
+            _is_host_pycache_redirect_write,
+            _HOST_PYCACHE_REDIRECT_PREFIX,
+        )
+        self.assertTrue(_is_host_pycache_redirect_write(
+            f"{_HOST_PYCACHE_REDIRECT_PREFIX}/anything/here.pyc"))
+        self.assertFalse(_is_host_pycache_redirect_write(
+            f"{_HOST_PYCACHE_REDIRECT_PREFIX}-not/here.pyc"))
+
+    def test_gate_python_env_prefix_derives_from_the_shared_constant(self):
+        # Drift-guard producer (2): _gate_python_env's PYTHONPYCACHEPREFIX must be the redirect
+        # root built from the SAME constant the exemption uses, and it must also suppress
+        # in-place bytecode for gate subprocesses.
+        from tools.orchestration_runtime import _gate_python_env, _HOST_PYCACHE_REDIRECT_PREFIX
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = _gate_python_env(root)
+            self.assertEqual(
+                env["PYTHONPYCACHEPREFIX"],
+                str((root / _HOST_PYCACHE_REDIRECT_PREFIX).resolve()))
+            self.assertEqual(env.get("PYTHONDONTWRITEBYTECODE"), "1")
+
+    def test_workspace_layout_allowlist_contains_the_redirect_leaf_segment(self):
+        # Drift-guard consumer (4): validate_workspace_root's canonical top-level allowlist must
+        # contain the redirect prefix's LEAF segment, else _scan_workspace_layout would flag the
+        # redirect target as a non-canonical workspace directory. Pinned here (not by a runtime
+        # import into the standalone validator) so a rename of the constant that misses that file
+        # fails the suite.
+        from tools.orchestration_runtime import _HOST_PYCACHE_REDIRECT_PREFIX
+        from tools.validate_workspace_root import ALLOWED_WORKSPACE_TOP_LEVEL_DIRS
+        leaf_segment = _HOST_PYCACHE_REDIRECT_PREFIX.split("/")[-1]
+        self.assertIn(leaf_segment, ALLOWED_WORKSPACE_TOP_LEVEL_DIRS)
+        # The prefix is exactly workspace/<leaf> (one segment under workspace/), matching how
+        # _scan_workspace_layout enumerates top-level children of workspace/.
+        self.assertEqual(_HOST_PYCACHE_REDIRECT_PREFIX, f"workspace/{leaf_segment}")
+
+    def test_symlinked_redirect_root_is_rejected_before_use(self):
+        # The host writes AND later loads bytecode from the redirect root, so a symlinked root is
+        # a code-execution vector (target may be outside the repo — invisible to the FS-diff — or
+        # inside a leaf-writable subtree = cache poisoning). `_scan_workspace_layout` does not
+        # catch it (is_dir() follows symlinks), so run_workflow must reject it itself.
+        from tools.run_workflow import _validated_pycache_redirect_root
+        from tools.orchestration_runtime import _HOST_PYCACHE_REDIRECT_PREFIX
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            (repo / "workspace").mkdir()
+            # Happy path: absent root (created later by CPython) and a real dir both pass.
+            self.assertEqual(
+                _validated_pycache_redirect_root(repo), repo / _HOST_PYCACHE_REDIRECT_PREFIX)
+            (repo / _HOST_PYCACHE_REDIRECT_PREFIX).mkdir()
+            self.assertEqual(
+                _validated_pycache_redirect_root(repo), repo / _HOST_PYCACHE_REDIRECT_PREFIX)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            (repo / "workspace").mkdir()
+            outside = repo.parent / "outside_target"
+            outside.mkdir(exist_ok=True)
+            (repo / _HOST_PYCACHE_REDIRECT_PREFIX).symlink_to(outside)
+            with self.assertRaises(ValueError) as ctx:
+                _validated_pycache_redirect_root(repo)
+            self.assertIn("symlink", str(ctx.exception))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # A symlink at an ANCESTOR component (workspace/ itself) is rejected too.
+            repo = Path(tmp).resolve()
+            real_ws = repo.parent / "real_workspace"
+            real_ws.mkdir(exist_ok=True)
+            (repo / "workspace").symlink_to(real_ws)
+            with self.assertRaises(ValueError):
+                _validated_pycache_redirect_root(repo)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # A symlink DEEP INSIDE the cache (the mirrored source path) is rejected: CPython
+            # follows it when loading cached modules, and this subtree is exempt from the
+            # write-diff, so the payload would leave no trace.
+            repo = Path(tmp).resolve()
+            mirrored = repo / _HOST_PYCACHE_REDIRECT_PREFIX / "home" / "u" / "met-dsl"
+            mirrored.mkdir(parents=True)
+            target = repo.parent / "leaf_writable"
+            target.mkdir(exist_ok=True)
+            (mirrored / "tools").symlink_to(target)
+            with self.assertRaises(ValueError) as ctx:
+                _validated_pycache_redirect_root(repo)
+            self.assertIn("symlink inside", str(ctx.exception))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # A symlinked FILE inside the cache is rejected as well.
+            repo = Path(tmp).resolve()
+            mirrored = repo / _HOST_PYCACHE_REDIRECT_PREFIX / "home"
+            mirrored.mkdir(parents=True)
+            payload = repo.parent / "forged.pyc"
+            payload.write_bytes(b"")
+            (mirrored / "mod.cpython-313.pyc").symlink_to(payload)
+            with self.assertRaises(ValueError):
+                _validated_pycache_redirect_root(repo)
+
+    def test_write_root_resolving_into_the_redirect_root_is_rejected(self):
+        # The exemption unconditionally suppresses every change under the redirect root, so that
+        # subtree must never be leaf-writable. `.resolve()` follows symlinks, so a symlinked
+        # directory write root (e.g. workspace/pipelines -> .pycache) would otherwise be
+        # bind-mounted writable and let a leaf hide arbitrary files — or bytecode the trusted host
+        # later imports — there. render_bwrap_command must fail closed instead.
+        from tools.orchestration_runtime import render_bwrap_command, _HOST_PYCACHE_REDIRECT_PREFIX
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            (repo / _HOST_PYCACHE_REDIRECT_PREFIX).mkdir(parents=True)
+            tmp_dir = repo / "workspace" / "tmp" / "arid"
+            tmp_dir.mkdir(parents=True)
+            # A symlinked write root whose target is the redirect cache.
+            (repo / "workspace" / "pipelines").symlink_to(repo / _HOST_PYCACHE_REDIRECT_PREFIX)
+            profile = {
+                "repo_root": str(repo),
+                "tmp_dir": str(tmp_dir),
+                "workspace_tmp_rw_abs": str(tmp_dir),
+                "write_roots": ["workspace/pipelines/"],
+                "read_roots": [],
+            }
+            with self.assertRaises(ValueError) as ctx:
+                render_bwrap_command(profile=profile, command_argv=["claude"])
+            self.assertIn("redirect root", str(ctx.exception))
+
+    def test_run_workflow_sets_pycache_prefix_from_the_shared_constant(self):
+        # Drift-guard producer (1): the host sys.pycache_prefix assignment is not unit-callable
+        # (it lives inside run_workflow.main()), so pin it by source text — its removal would
+        # silently reintroduce the original defect while every predicate test still passes.
+        import re
+        from tools.orchestration_runtime import _HOST_PYCACHE_REDIRECT_PREFIX
+        src = (self._REPO_ROOT / "tools" / "run_workflow.py").read_text(encoding="utf-8")
+        # The assignment must spell the prefix as a LITERAL, derived here FROM the constant so a
+        # rename of the constant fails this test unless run_workflow is updated too. It must NOT
+        # import orchestration_runtime to read the constant: that import would compile the
+        # ~20k-line module into tools/__pycache__/ BEFORE the redirect is active (it is not in
+        # sys.modules at that point — validate_pipeline_semantics deliberately does not import it
+        # and _default_claude_agent_model runs later), defeating the redirect's purpose.
+        segments = _HOST_PYCACHE_REDIRECT_PREFIX.split("/")
+        literal_path = r"\s*/\s*".join(re.escape(f'"{seg}"') for seg in segments)
+        # The redirect root is built from the literal inside _validated_pycache_redirect_root.
+        self.assertIsNotNone(
+            re.search(r"^\s*root\s*=\s*repo_root\s*/\s*" + literal_path + r"\s*$",
+                      src, re.MULTILINE),
+            "the redirect root must be built from the constant's value as a literal")
+        # Anchored to the FULL assignment form (not a bare `sys.pycache_prefix =`), because
+        # main()'s save/restore wrapper also assigns that attribute — a looser pattern would
+        # match the restore line instead and silently test the wrong statement.
+        assign_m = re.search(
+            r"^\s*sys\.pycache_prefix\s*=\s*str\(_pycache_resolved\)", src, re.MULTILINE)
+        self.assertIsNotNone(
+            assign_m, "the sys.pycache_prefix redirect assignment was not found")
+        # The assignment must be gated by the symlink/integrity validation, never raw.
+        gate_m = re.search(
+            r"^\s*_pycache_resolved\s*=\s*_validated_pycache_redirect_root\(repo_root\)",
+            src, re.MULTILINE)
+        self.assertIsNotNone(gate_m, "the redirect root must go through the integrity gate")
+        self.assertLess(gate_m.start(), assign_m.start())
+        # No MODULE-LEVEL orchestration_runtime import: it would execute at run_workflow import
+        # time, before main() installs the redirect, writing that module's .pyc into the source
+        # tree. Function-local imports (e.g. _default_claude_agent_model) are fine — they run later.
+        self.assertIsNone(
+            re.search(r"^from tools\.orchestration_runtime import", src, re.MULTILINE),
+            "module-level orchestration_runtime import writes its .pyc into the repo source "
+            "tree before main() installs the sys.pycache_prefix redirect")
+        # Ordering pin: the assignment must precede the in-process conductor import/dispatch,
+        # else the redirect is inactive when build_runtime_server / lint_evidence first compile.
+        # main() is not unit-callable, so pin source POSITION instead. Anchor to line-start
+        # (^\s*) so the comment mentions of the same string do not false-match.
+        conductor_m = re.search(
+            r"^\s*from tools\.workflow_conductor import run_conductor", src, re.MULTILINE)
+        self.assertIsNotNone(conductor_m, "run_conductor import line not found")
+        self.assertLess(
+            assign_m.start(), conductor_m.start(),
+            "sys.pycache_prefix must be set before the in-process conductor import")
+        # The redirect is process-global and main() is called IN-PROCESS by tests/embedders, so it
+        # must be scoped to the call: pin the save/restore wrapper (its loss would leak this run's
+        # cache dir — often a deleted temp root — into the caller's interpreter).
+        self.assertRegex(
+            src,
+            r"saved_pycache_prefix\s*=\s*sys\.pycache_prefix\s*\n\s*try:\s*\n"
+            r"(?:.*\n)*?\s*finally:\s*\n\s*sys\.pycache_prefix\s*=\s*saved_pycache_prefix")
+
+
 if __name__ == "__main__":
     unittest.main()

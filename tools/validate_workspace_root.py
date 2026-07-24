@@ -268,6 +268,10 @@ ALLOWED_WORKSPACE_TOP_LEVEL_DIRS = {
     "ir",       # Compile step output: workspace/ir/<node_key_safe>/<ir_id>/
     "index",
     "tmp",
+    # Leaf segment of orchestration_runtime._HOST_PYCACHE_REDIRECT_PREFIX (`workspace/.pycache`):
+    # the redirected Python bytecode cache for the in-process conductor host + gate subprocesses.
+    # Must stay in sync with that constant (a standalone-validator import of the heavy runtime
+    # module is avoided; test_orchestration_runtime.py drift-guards the coupling instead).
     ".pycache",
 }
 NODE_KEY_SAFE_PATTERN = re.compile(

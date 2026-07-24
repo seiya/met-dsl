@@ -129,6 +129,22 @@ SUBSTEP_AWARE_STEPS = frozenset({"compile", "generate", "validate"})
 # A same-value re-call permits a cleanup retry only when the cleanup_committed marker is absent (F2).
 IDEMPOTENT_TERMINAL_STATUSES = TERMINAL_STATUSES | {"fail_closed"}
 
+# Single source of truth for the repo-relative root that Python bytecode is redirected into
+# (out of the repo SOURCE tree). It is consumed by sites that MUST agree, else the
+# unauthorized-write exemption silently stops matching and repo-tree `.pyc` writes resurface as
+# violations:
+#   1. run_workflow.py sets the in-process conductor host's `sys.pycache_prefix` to
+#      `<repo>/<this>` (redirects the host interpreter's lazy imports),
+#   2. `_gate_python_env` sets gate subprocesses' `PYTHONPYCACHEPREFIX` to `<repo>/<this>`,
+#   3. `_is_host_pycache_redirect_write` exempts writes under `<this>` from the terminal
+#      write-diff (see `_validate_actual_write_paths`).
+#   4. validate_workspace_root.ALLOWED_WORKSPACE_TOP_LEVEL_DIRS must list this prefix's LEAF
+#      segment (`.pycache`) as a canonical top-level workspace dir, else _scan_workspace_layout
+#      flags the redirect target as a "non-canonical workspace directory".
+# test_orchestration_runtime.py drift-guards (1) via a source-text pin and (2)/(3)/(4) via unit
+# assertions, all keyed on this constant.
+_HOST_PYCACHE_REDIRECT_PREFIX = "workspace/.pycache"
+
 
 _DEPENDENCY_READINESS_STAGES: tuple[str, ...] = (
     "ir_ref",
@@ -5792,7 +5808,7 @@ def _inline_gate_result(
 def _gate_python_env(repo_root: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    env["PYTHONPYCACHEPREFIX"] = str((repo_root / "workspace" / ".pycache").resolve())
+    env["PYTHONPYCACHEPREFIX"] = str((repo_root / _HOST_PYCACHE_REDIRECT_PREFIX).resolve())
     return env
 
 
@@ -7840,6 +7856,21 @@ def render_bwrap_command(
             continue
         is_dir_root = rel.strip().endswith("/")
         abs_path = (Path(repo_root) / _normalize_rel_posix(rel)).resolve()
+        # INVARIANT for _is_host_pycache_redirect_write: the host bytecode-cache redirect root
+        # must never become leaf-writable. `.resolve()` follows symlinks, so a symlinked write
+        # root (e.g. a pre-existing `workspace/pipelines -> .pycache`) would otherwise resolve
+        # here and be bind-mounted WRITABLE — the leaf could then write arbitrary files, or
+        # POISONED BYTECODE the trusted host later imports, into a subtree whose every change
+        # that exemption unconditionally suppresses from the terminal write-diff. Reject it
+        # fail-closed (the caller turns this into sandbox_enforcement_violation). Directory
+        # roots are checked here because only file pins carry the symlink guard below.
+        _pycache_abs = (Path(repo_root) / _HOST_PYCACHE_REDIRECT_PREFIX).resolve()
+        if abs_path == _pycache_abs or abs_path.is_relative_to(_pycache_abs):
+            raise ValueError(
+                f"write_roots entry {rel!r} resolves into the host bytecode-cache redirect root "
+                f"({_pycache_abs}); that subtree is exempt from unauthorized-write validation and "
+                f"must never be leaf-writable (check for a symlink in the path)"
+            )
         if not abs_path.exists():
             # File pins must be pre-created by build_bwrap_profile before render.
             if not is_dir_root:
@@ -8138,10 +8169,16 @@ def _should_ignore_runtime_snapshot_path(
     # unauthorized-write validation to any child write under a `workspace_*` path
     # (the diff is the defense-in-depth backstop for an output_manifest_write_guard
     # bypass). Correctness of write validation outranks the snapshot-size win.
-    # NOTE: No blanket pyc/__pycache__ exemption here.  PYTHONDONTWRITEBYTECODE=1
-    # (set in run_workflow.py) is the primary protection against incidental bytecode
-    # writes.  Any explicit bytecode generation (e.g. python3 -m py_compile) is an
-    # agent action that SHOULD surface as an unauthorized_write_violation.
+    # NOTE: No blanket pyc/__pycache__ exemption here.  Incidental bytecode is kept out of the
+    # repo source tree at the WRITER, by role: the leaf / agent-launch subprocess path inherits
+    # PYTHONDONTWRITEBYTECODE=1 (base_env in run_workflow.py); run-gate subprocesses get it from
+    # _gate_python_env (which ALSO redirects PYTHONPYCACHEPREFIX to workspace/.pycache/); and the
+    # IN-PROCESS conductor host redirects its cache to workspace/.pycache/ via sys.pycache_prefix
+    # (run_workflow.py). Writes under that redirect root are exempted by
+    # _is_host_pycache_redirect_write (see _validate_actual_write_paths).  A *.pyc that still lands
+    # in a repo-tree __pycache__/ is therefore an explicit bytecode generation (e.g.
+    # python3 -m py_compile) — an agent action that SHOULD surface as an
+    # unauthorized_write_violation, and is not exempted anywhere.
     orch_root = _normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}")
     runtime_prefixes = (
         f"{orch_root}/access_logs/",
@@ -8396,10 +8433,40 @@ def _declared_output_refs(payload: dict[str, Any]) -> list[str]:
     ]
 
 
+def _is_host_pycache_redirect_write(rel_path: str) -> bool:
+    """True if `rel_path` is under the in-process conductor host's redirected bytecode cache
+    (``workspace/.pycache/``; see _HOST_PYCACHE_REDIRECT_PREFIX and run_workflow.py).
+
+    The workflow conductor runs in-process in run_workflow.py, whose sys.pycache_prefix is
+    redirected here, so its lazy imports (build_runtime_server / tools.hooks.lint_evidence,
+    imported during compile.static / generate.gate) write *.pyc under this tree. That is a
+    trusted HOST write that lands in the child-window FS-diff and must be exempted from the
+    unauthorized-write check.
+
+    This is NOT a blanket ``*.pyc`` / ``__pycache__`` exemption: an explicit ``py_compile`` by
+    the (bwrap-confined) leaf writes to the compiled source's own ``__pycache__`` — never under
+    ``workspace/.pycache/``, whose pycache_prefix redirect only this host process sets (the leaf
+    env carries no PYTHONPYCACHEPREFIX) — so such a write still surfaces as an unauthorized write.
+
+    The exemption is the WHOLE redirect subtree (not a ``.pyc``-suffix filter) deliberately: the
+    only writer that can reach this dir is the trusted host (bwrap binds the repo read-only, so a
+    confined leaf hits EROFS here — see build_bwrap_profile / render_bwrap_command), and it writes
+    only bytecode plus CPython's atomic-write temp siblings (``<name>.pyc.<int>``, named
+    ``f'{path}.{id(path)}'`` in importlib._bootstrap_external). Matching the subtree covers those
+    temp files too; a suffix filter would spuriously flag them.
+    """
+    return _repo_path_under_prefix(_normalize_rel_posix(rel_path), _HOST_PYCACHE_REDIRECT_PREFIX)
+
+
 def _orchestration_allowed_write_roots(orchestration_id: str) -> list[str]:
+    # Host bytecode cache under workspace/.pycache/ (both the sys.pycache_prefix host redirect and
+    # _gate_python_env's PYTHONPYCACHEPREFIX) is handled by the broad _is_host_pycache_redirect_write
+    # exemption in _validate_actual_write_paths, which runs for every actor role BEFORE write_roots
+    # are consulted. A per-orch workspace/.pycache/<orch_id>/ write_root entry here is therefore
+    # never reached (and never matched a real cache path anyway: the prefix mirrors the absolute
+    # source path, not an <orch_id> subdir), so it is intentionally omitted.
     return [
         _with_trailing_slash(_normalize_rel_posix(f"workspace/orchestrations/{orchestration_id}")),
-        _with_trailing_slash(_normalize_rel_posix(f"workspace/.pycache/{orchestration_id}")),
     ]
 
 
@@ -9272,6 +9339,13 @@ def _validate_actual_write_paths(
         if parent_tmp_root and _repo_path_under_prefix(path, parent_tmp_root):
             continue
         if manifest_allowed_tmp_root and _repo_path_under_prefix(path, manifest_allowed_tmp_root):
+            continue
+        if _is_host_pycache_redirect_write(path):
+            # In-process conductor host bytecode cache, redirected out of the repo source tree
+            # into workspace/.pycache/ (run_workflow sets sys.pycache_prefix). A trusted host
+            # write that lands in the child-window FS-diff; exempt. NOT a blanket pyc exemption
+            # (see _is_host_pycache_redirect_write): a leaf's explicit py_compile writes to the
+            # source's own __pycache__, never here, so it still surfaces.
             continue
         if path in manifest_integrity_protected_logs:
             # Canonical MCP-owned audit logs are pre-validated against
