@@ -3240,7 +3240,12 @@ re-certify the drop silently. Tightening that would mean a deterministic Compile
 `diagnostics_contract.metrics` ⊇ the addresses parsed out of `tests.md` §5, which requires a §5 address grammar every
 node's `tests.md` obeys; it is out of scope here and is filed as the follow-up below. The counter-measures inside this
 change are authoring ones: §6 states the `pass_when.all` conditions verbatim (`ref` / `op` / `value` / `per_case` /
-`na_allowed`) so the transcription is mechanical, and §5 names the IR carrier explicitly.
+`na_allowed`) so the transcription is mechanical, and §5 names the IR carrier explicitly. The fold requirement itself
+(`controlled_spec.md` §2 / §6) is likewise not deterministic: its enforcer is `Generate.verify` G1/G5 (the fixed-JSON /
+`case_id`-branching output rule), which is the one downstream substep that reads `controlled_spec.md`. A writer that
+branches on `case_id` and emits this suite's three expected keys satisfies all five predicate conditions — the
+deterministic literal-metric heuristics in `validate_pipeline_semantics` match neither
+`select case (trim(results(i)%case_id))` nor `metrics(<N>) =` in that shape.
 
 **Filed follow-up (not implemented).** A `tests.md` §5 metric-address grammar plus a Compile-stage pin
 (`diagnostics_contract.metrics` ⊇ the declared addresses, the mate of the existing `test_id` set-equality pin
@@ -3249,8 +3254,9 @@ deterministic gate. Blocked on the grammar: today's `tests.md` §5 sections diff
 vs the problem spec's `5-2` list), so a parser written against one shape would false-reject the others.
 
 **Scope.** §5.1, the published operations and types, the component layouts, and the generated ABI are unchanged; the
-runtime (`verdict_evaluator` / `workflow_conductor` / `orchestration_runtime` / `runner_renderer`) is unchanged — it
-behaved as designed throughout. The `0.7.0` ripple is the version pin set only: `spec_catalog.yaml`,
+runtime behavior (`verdict_evaluator` / `workflow_conductor` / `orchestration_runtime` / `runner_renderer`) is unchanged
+— it behaved as designed throughout, and the only code edit is a docstring correction in
+`verdict_evaluator.degenerate_predicate_violations`. The `0.7.0` ripple is otherwise the version pin set only: `spec_catalog.yaml`,
 `HARNESS_CAPABILITY_MANIFESTS`, `harness_capabilities.schema.json`, `CODEGEN_BUNDLE_CONTRACT.md`, and the unit-test
 node_key pins. Consumer `deps.yaml` constraints (`>=0.3.0 <1.0.0`) already admit `0.7.0`.
 

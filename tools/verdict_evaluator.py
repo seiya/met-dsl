@@ -563,7 +563,8 @@ def degenerate_predicate_violations(predicates: Any) -> list[str]:
     degenerate: an individual pass test can legitimately assert an aggregate criterion — a
     multi-target evidence test such as the ``infrastructure/harness_fortran_cpu`` suite's
     ``l0_multi_case_evidence_pass`` may reduce to ``verdict.*`` while its sibling pass tests carry the
-    ``checks.<id>`` / metric-address conditions, and a per-predicate rule would false-reject it. Whether a specific pass test that COULD carry a threshold instead dropped it to ``verdict.*``
+    ``checks.<id>`` / metric-address conditions, and a per-predicate rule would false-reject it.
+    Whether a specific pass test that COULD carry a threshold instead dropped it to ``verdict.*``
     is a per-test FIDELITY question — it needs ``tests.md`` (which this gate cannot read) to decide,
     so it belongs to ``Compile.verify`` (the R2 fidelity checklist item: each predicate is a truthful
     translation of its ``tests.md`` §6/§7 prose), not to this deterministic necessary-condition gate.
