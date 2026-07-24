@@ -219,6 +219,18 @@ class _PureFakeConductor(wc.Conductor):
     def _claude_session_resumable(self, arid):  # type: ignore[override]
         return True
 
+    # `--wait-usage-reset` asks the host CLI for the reset instant (`claude -p /usage`) before
+    # falling back to scraping the dead leaf's stdout. Stubbed for EVERY fake so no test spawns the
+    # real backend, and stubbed as a FAILED probe so these loops exercise the scrape fallback — the
+    # path they were written against. `usage_probe_calls` is asserted by the wait tests, so removing
+    # this override cannot go unnoticed.
+    usage_probe_result: tuple = (None, {"outcome": "probe_error", "duration_ms": 0,
+                                        "excerpt": "stubbed: no probe in tests"})
+
+    def _run_usage_probe(self):  # type: ignore[override]
+        self.usage_probe_calls = getattr(self, "usage_probe_calls", 0) + 1
+        return self.usage_probe_result
+
 
 def _envelope(bundle_or_text, *, model="claude-opus-4-8", is_error=False) -> str:
     result = bundle_or_text if isinstance(bundle_or_text, str) else json.dumps(bundle_or_text)
@@ -1064,6 +1076,9 @@ class PureUsageLimitWaitTest(unittest.TestCase):
             # the dead usage attempt is tombstoned under the wait's own prefix
             reasons = [cap["--reason"] for s, cap in c.calls if s == "add-superseded-runs"]
             self.assertTrue(any("leaf_usage_limit_wait_orphan" in r for r in reasons))
+            # the wait consulted the host `/usage` probe first and fell back to the scrape;
+            # the stub is what keeps the suite from spawning the real backend
+            self.assertEqual(c.usage_probe_calls, 1)
 
     def test_transport_usage_limit_waits_on_the_real_cli_abort_envelope(self) -> None:
         """REGRESSION, the production shape THIS loop actually met: the only recorded usage limit to

@@ -559,6 +559,27 @@ re-run confirming Build passes on attempt 1 (operator-gated).
     6h (a longer reset is a weekly limit or a misparse → fail_closed). It is NOT recovered automatically on
     `--resume` (a per-invocation preference recorded on the invocation block and refreshed to the
     effective value on resume); re-pass the flag to keep it active.
+    **The scrape above is now the FALLBACK, not the primary source.** Everything it must defend
+    against follows from the instant being read out of an untrusted stdout; the host can instead ask
+    the CLI directly, and `claude --output-format json -p /usage` answers with the server's own
+    accounting at 0 tokens (`num_turns: 0`, ~1s) — dates and window names included, and with no
+    forgery surface at all, since no leaf authored the bytes. So `_usage_reset_wait_plan` runs that
+    probe first (`_run_usage_probe` / `_parse_usage_probe_rows`) and falls back to the scrape on any
+    failure, which means the worst case is exactly the behavior above. The `result` is trusted only
+    when the envelope proves it is the built-in `/usage` command (`num_turns == 0`); a binary that
+    ran it as a prompt replies at `num_turns >= 1` with model-authored text, which is rejected so it
+    is never parsed. Two further gates keep the probe from being weaker than what it fronts: the
+    row's window family must be the one the dead leaf's own line NAMED (else a weekly stop could be
+    waited on the session row, waking hours early into a shut window), and that window must be
+    reported **fully exhausted (100% used)** — the replacement for the abort-shape clauses, which the
+    probe path does not run and which exist because the `llm_usage_limit` tag can be promoted out of
+    the leaf's own prose. A window with headroom (95..99%) has not actually been reached, so it does
+    not corroborate the death and declines to the scrape. `leaf_usage_limit_probe` records the outcome of every
+    attempt, `reset_source` / `window` are carried on the wait and decline events, and the 6h cap is
+    unchanged for both sources. One thing is deliberately left unverified: whether `/usage` still
+    answers once the quota is gone — the state cannot be reproduced on demand, so the probe is
+    primary-WITH-fallback and the event's bounded `excerpt` is what the next real incident will
+    answer it with.
     Canonical: `docs/ORCHESTRATION.md` "leaf transient retry"; operator guidance:
     `docs/RUNBOOK.md`.
   - **The manual-`--resume` fallback is also substep-granular now (default-on, C).** The wait above

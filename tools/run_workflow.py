@@ -1660,7 +1660,14 @@ def _format_event_human(payload: dict[str, Any]) -> str | None:
         substep = payload.get("substep") or "step"
         wait = payload.get("wait_seconds", "?")
         attempt = payload.get("wait_attempt", "?")
-        return (f"    [warn   ] usage limit in {phase}.{substep} [wait {attempt}]: "
+        # Name the source: a host-side `/usage` probe observed the reset (and which window), while a
+        # scraped instant was read out of the dead leaf's own output and can be wrong about the
+        # window. The operator deciding whether to let a multi-hour park stand needs that distinction
+        # without grepping the raw event stream.
+        source = payload.get("reset_source")
+        window = payload.get("window")
+        origin = f" (source={source}{f'/{window}' if window else ''})" if source else ""
+        return (f"    [warn   ] usage limit in {phase}.{substep} [wait {attempt}]{origin}: "
                 f"waiting {wait}s for the reset, then re-launching")
 
     if status == "info" and event == "transport_substep_resume":

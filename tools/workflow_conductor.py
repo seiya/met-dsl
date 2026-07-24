@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -1973,6 +1973,246 @@ def _parse_usage_reset_human(stderr: str, now: float, stdout: str, *,
         return None
 
 
+# --wait-usage-reset, PRIMARY reset source (issue #8). Everything above SCRAPES the reset instant out
+# of a dead leaf's UNTRUSTED stdout, which is why it needs the whole anti-forgery apparatus
+# (`allow_envelope`, `_cli_abort_envelope_result`, the abort-shape clauses) — and even then the
+# scraped line carries no DATE (yesterday/today/tomorrow is guessed within a 15-min grace) and no
+# WINDOW NAME (the 6h cap stands in for "probably not the weekly one").
+#
+# The HOST can simply ask instead: `claude --output-format json -p /usage` is a local slash command
+# that spends 0 tokens (`num_turns: 0`, ~1.0s on the recorded run) and answers with the server's own
+# accounting, dates and window names included:
+#
+#     You are currently using your subscription to power your Claude Code usage
+#
+#     Current session: 31% used · resets Jul 25, 3:49am (Asia/Tokyo)
+#     Current week (all models): 86% used · resets Jul 28, 9:59am (Asia/Tokyo)
+#     Current week (Fable): 33% used · resets Jul 28, 10am (Asia/Tokyo)
+#
+# Because the CONDUCTOR runs it, there is no forgery surface at all: no leaf authored these bytes, so
+# NONE of the abort-shape clauses above apply here and none are duplicated below. The probe is tried
+# FIRST and the scrape remains the fallback, so every failure mode degrades to exactly today's
+# behavior.
+#
+# OPEN QUESTION (deliberately unanswered here): whether `/usage` still answers once the quota is
+# actually exhausted — the one state that cannot be reproduced on demand. That is why the probe is
+# primary-with-fallback rather than a replacement, and why `leaf_usage_limit_probe` records the raw
+# outcome of EVERY attempt: the next real incident answers it from the event stream, without a
+# purpose-built experiment. (The sibling lesson from the scrape's two failed rounds: an invisible
+# decline hides the defect.)
+# Generous against a ~1.0s observed probe: the cost of a slow probe is a delayed fallback, while the
+# cost of a tight timeout is losing the primary source on a loaded host.
+USAGE_PROBE_TIMEOUT_SECONDS = 60
+# SECURITY floor on arming the wait from a probe row — see `_probe_reset_for_evidence`. The
+# classifier's `llm_usage_limit` tag can come from the leaf's OWN stdout prose
+# (`_CROSS_STREAM_PROMOTING_TAGS`), and the probe path does not pass through the abort-shape clauses
+# that catch that. The server-observed usage percentage is the replacement gate, and it must be a
+# FULLY exhausted window (100%): the probe's job is to CORROBORATE that the named window is out of
+# quota, and a window with headroom (95..99%) does not — the leaf cannot have been stopped by a limit
+# it had not reached, so such a death is a mis-attribution or a local-approximation artifact, and the
+# correct action is to decline to the scrape (whose abort-shape clauses still decide) rather than sit
+# on a multi-hour wait. `/usage`'s percentage is explicitly approximate and local-only, so a genuine
+# exhaustion may read under 100 on this host; that only ever costs the probe a decline-to-scrape (the
+# safe direction) and the `leaf_usage_limit_probe` event records the observed percentage, so a real
+# incident reporting e.g. 99 is the evidence that would justify lowering this — never a guess.
+USAGE_PROBE_EXHAUSTED_MIN_PCT = 100
+# Bounded raw evidence for `leaf_usage_limit_probe`. Sized to cover the whole window block of the
+# recorded live response (~270 chars once whitespace is collapsed): the excerpt is the ONLY record of
+# what `/usage` said when it could not be parsed, which is precisely the exhausted-quota response the
+# open question is about, so clipping it at the sibling decline's 160 would cut it off mid-window.
+_USAGE_PROBE_EXCERPT_MAX_CHARS = 400
+_USAGE_PROBE_MONTHS = {name: idx for idx, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+# One `/usage` window row. `re.VERBOSE` DROPS literal spaces, so every gap is spelled `\s+`/`\s*`.
+# The window label is `session` or `week<anything but a colon>` — the real response names two week
+# rows (`Current week (all models)`, `Current week (<model>)`), and the label is kept whole so the
+# event says which one matched. The date is fully specified (`Jul 25`), which is the whole reason the
+# probe beats the scrape: no yesterday/today/tomorrow guess. The minutes are OPTIONAL because the
+# real response prints `10am` for an on-the-hour reset. The `^` is redundant with the caller's
+# `.match()` and is kept deliberately (a stats line like `  92% of your usage ...` must never be read
+# as a window); the test asserts the PATTERN's own anchoring so neither spelling can be dropped
+# silently on the strength of the other.
+_USAGE_PROBE_ROW_RE = re.compile(
+    r"""^\s*Current\s+(?P<window>session|week[^:\n]*?)\s*:\s*
+        (?P<pct>\d{1,3})%\s+used\b
+        [^\n]*?
+        \bresets\s+(?P<month>[A-Za-z]{3})[a-z]*\s+(?P<day>\d{1,2})\s*,\s*
+        (?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>am|pm)\b""",
+    re.IGNORECASE | re.VERBOSE)
+# The window FAMILY named by the dead leaf's own abort line, matched against the probe's row labels.
+# `\b` on both sides is load-bearing: an enveloped abort's classifier evidence is raw JSON, whose
+# `"session_id"` must not be read as the session window (the underscore is a word char, so the `\b`
+# after `session` keeps `\bsessions?\b` from matching there either). Both families admit the plural
+# for symmetry — a wording of `sessions limit` / `weekly limit` alike names its family — but never
+# fail OPEN by doing so: a family this does not recognise merely declines to the scrape. The
+# classifier's other windows (`usage`, `hourly`, `<n>-hour` — `_USAGE_LIMIT_WINDOWS`) have no
+# counterpart row, so they match nothing and fall back to the scrape.
+_USAGE_PROBE_EVIDENCE_FAMILY_RES = (
+    ("session", re.compile(r"\bsessions?\b", re.IGNORECASE)),
+    ("week", re.compile(r"\bweek(?:ly|s)?\b", re.IGNORECASE)),
+)
+
+
+def _parse_usage_probe_rows(result_text: str, now: float) -> list[dict[str, Any]]:
+    """The window rows of a `/usage` probe response's `result` text, as
+    `{window_label, family, used_pct, reset_epoch}` — `[]` when it names none.
+
+    HOST-AUTHORED INPUT: the conductor ran the probe itself, so this text is the CLI's own, not a
+    leaf's. None of the anti-forgery shape clauses that guard the stdout scrape
+    (`_sole_content_usage_limit_line` and friends) apply, and none are repeated here.
+
+    Per-LINE degradation on purpose: a line this does not recognise is skipped, so a future wording
+    change costs the rows it touched and nothing else (the caller then finds no matching window and
+    falls back to the scrape). NEVER raises, matching its scrape siblings.
+
+    The response prints a month/day but no YEAR, so the year is resolved the same way the scrape
+    resolves its missing date: the previous, current, and next years (in the parse timezone) are
+    tried in ascending order and the EARLIEST occurrence not more than `_USAGE_RESET_HUMAN_GRACE_SECONDS`
+    in the past is taken — the `min(eligible)` semantics of the scrape's yesterday/today/tomorrow
+    resolution. The previous year matters only at the New Year boundary (a Dec-31 reset seen just
+    after midnight on Jan 1, still within grace, resolves to the just-passed occurrence rather than
+    one ~a year out); the next year handles the forward Dec→Jan wrap; the Feb-29 case fails the
+    non-leap years and takes the next leap year. `now` is passed in so one `time.time()` instant
+    governs the whole decision and the resolution is deterministically testable.
+
+    The wall-clock is resolved through `datetime(...).timestamp()`, so a DST fold/gap can skew the
+    instant by up to 1h on the 1-2 days/year a transition lands in-window — the same residual
+    `_parse_usage_reset_human` carries, absorbed the same way (the +margin and the relaunch preflight
+    probe). Not worth a fold-aware resolution the scrape does not have."""
+    rows: list[dict[str, Any]] = []
+    for line in (result_text or "").splitlines():
+        try:
+            match = _USAGE_PROBE_ROW_RE.match(line)
+            if match is None:
+                continue
+            month = _USAGE_PROBE_MONTHS.get(match.group("month").lower()[:3])
+            if month is None:
+                continue
+            hour = int(match.group("hour"))
+            minute = int(match.group("minute") or 0)
+            if not (1 <= hour <= 12) or not (0 <= minute <= 59):
+                continue
+            if match.group("meridiem").lower() == "am":
+                hour24 = 0 if hour == 12 else hour
+            else:
+                hour24 = 12 if hour == 12 else hour + 12
+            # Same first-zone-`ZoneInfo`-ACCEPTS idiom as the human scrape: `(all models)` /
+            # `(Fable)` in the label are rejected by the shape, and a model name that happened to
+            # look like `Area/City` is rejected by `ZoneInfo` rather than shadowing the real zone.
+            tz = None
+            for tz_match in _USAGE_RESET_HUMAN_TZ_RE.finditer(line):
+                try:
+                    tz = ZoneInfo(tz_match.group(1))
+                    break
+                except Exception:
+                    continue
+            if tz is None:
+                continue
+            reset_epoch: float | None = None
+            base_year = datetime.fromtimestamp(now, tz).year
+            # PREVIOUS / current / next year, ascending, taking the EARLIEST occurrence not more
+            # than the grace in the past — the same `min(eligible)` resolution the scrape's
+            # yesterday/today/tomorrow parser uses. The previous year is load-bearing at the New Year
+            # boundary: `/usage` run just after midnight on Jan 1 can still report a Dec 31 reset that
+            # just passed (within grace); without `base_year - 1` the earliest candidate would be
+            # Dec 31 of THIS year — ~a year out — which the caller then "resolves" and declines under
+            # the 6h cap WITHOUT trying the scrape, killing an otherwise-recoverable relaunch. The
+            # next year still handles the forward Dec→Jan wrap, and Feb-29 falls through invalid
+            # years to the next leap year.
+            for year in (base_year - 1, base_year, base_year + 1):
+                try:
+                    candidate = datetime(year, month, int(match.group("day")),
+                                         hour24, minute, tzinfo=tz).timestamp()
+                except ValueError:      # e.g. Feb 29 of a non-leap year
+                    continue
+                if candidate >= now - _USAGE_RESET_HUMAN_GRACE_SECONDS:
+                    reset_epoch = candidate
+                    break
+            if reset_epoch is None:
+                continue
+            # Sanitize the label at CONSTRUCTION, not just where the raw response is excerpted:
+            # `json.loads` turns an escaped `\ud800` in the CLI's response into a REAL lone
+            # surrogate, and this label is emitted verbatim on `leaf_usage_limit_probe`
+            # (`windows` / `matched_window`) and, once matched, on `leaf_usage_limit_wait` /
+            # `_declined` (`window`). Any of those would fail `emit`'s
+            # `json.dumps(..., ensure_ascii=False)` and turn a fail_closed usage-limit path into a
+            # conductor crash — the same round-trip the excerpt uses, applied once at the source so
+            # every downstream emit of the label is safe. (`family` / `used_pct` / `reset_epoch` are
+            # safe literals and integers.)
+            label = " ".join(match.group("window").split()).encode(
+                "utf-8", "backslashreplace").decode("utf-8")
+            rows.append({
+                "window_label": label,
+                "family": "session" if label.lower().startswith("session") else "week",
+                "used_pct": int(match.group("pct")),
+                "reset_epoch": int(reset_epoch),
+            })
+        except Exception:
+            continue
+    return rows
+
+
+def _probe_reset_for_evidence(evidence: str,
+                              rows: list[dict[str, Any]]) -> tuple[str, int | None, str | None]:
+    """`(outcome, reset_epoch, window_label)` for arming the wait from probe rows.
+
+    `outcome` is `resolved` (and then `reset_epoch` is set) or the reason the probe declined, which
+    the caller emits verbatim on `leaf_usage_limit_probe` — the decline reasons ARE the field
+    evidence this feature collects, so they are returned rather than collapsed into None.
+
+    WINDOW AGREEMENT IS REQUIRED (operator decision). The dead leaf's own abort line names the window
+    that stopped it (`You've hit your session limit …`); only a probe row of that family may arm the
+    wait. Waking on the wrong window is the failure this excludes structurally: a weekly stop matched
+    to the session row would sleep a couple of hours and then fail the relaunch preflight against a
+    window still shut. `window_unmatched` covers both "the abort named no family this probe reports"
+    (`usage` / `hourly` / `<n>-hour`) and "it named one but the probe listed no such row";
+    `window_ambiguous` covers a family whose rows disagree on the instant (the real response's two
+    week rows can reset a minute apart) — a disagreement is not resolved by picking one.
+
+    `window_not_exhausted` is the SECURITY gate, not a sanity check. The `llm_usage_limit` tag that
+    reached the wait may have been promoted out of the leaf's own stdout prose
+    (`_CROSS_STREAM_PROMOTING_TAGS`), and the recorded Codex P2 incident is exactly that: a leaf that
+    died of a HOOK DENIAL, printing `Session limit resets at 5pm`, armed a real multi-hour wait until
+    the abort-shape clauses were tightened. The probe path bypasses those clauses, so the
+    server-observed usage percentage replaces them — a session row always EXISTS (at 31%, say), so
+    without this gate the probe would re-open that hole with better date parsing. The floor is FULL
+    exhaustion (`USAGE_PROBE_EXHAUSTED_MIN_PCT`, 100): a window with headroom (95..99%) has demonstrably
+    NOT been reached, so it cannot be the cause of the death and the probe must not corroborate it —
+    such a row declines to the scrape, where the abort-shape clauses still stand. The gate is applied
+    to the HIGHEST row of the family: a `week` stop is caused by whichever of its rows is full, not by
+    the least-used one."""
+    families = {family for family, pattern in _USAGE_PROBE_EVIDENCE_FAMILY_RES
+                if pattern.search(evidence or "")}
+    if len(families) != 1:      # named none, or named both — no unambiguous window to match
+        return ("window_unmatched", None, None)
+    family = families.pop()
+    matched = [row for row in rows if row.get("family") == family]
+    if not matched:
+        return ("window_unmatched", None, None)
+    epochs = {int(row["reset_epoch"]) for row in matched}
+    if len(epochs) != 1:
+        return ("window_ambiguous", None, None)
+    top = max(matched, key=lambda row: int(row.get("used_pct") or 0))
+    label = str(top.get("window_label") or family)
+    if int(top.get("used_pct") or 0) < USAGE_PROBE_EXHAUSTED_MIN_PCT:
+        return ("window_not_exhausted", None, label)
+    return ("resolved", epochs.pop(), label)
+
+
+class UsageResetWaitPlan(NamedTuple):
+    """What `_usage_reset_wait_plan` decided: how long to sleep, to which instant, from WHICH source
+    and (probe only) for which window. A NamedTuple, so the positional `(wait_seconds, reset_epoch)`
+    reading the plan had before the probe existed still holds. `reset_source` / `window` exist to be
+    emitted: an operator reading `leaf_usage_limit_wait` must be able to tell a host-observed reset
+    from one scraped out of a dead leaf's stdout, since only the latter can be wrong about the
+    window."""
+    wait_seconds: float
+    reset_epoch: int
+    reset_source: str
+    window: str | None
+
+
 def _classify_leaf_infra_error(stderr: str, stdout: str = "") -> tuple[str, str] | None:
     """(tag, evidence_line) when a failed leaf's captured output names an LLM-infrastructure
     cause; None when nothing matches (the caller then keeps its generic reporting).
@@ -3524,11 +3764,11 @@ clean:
                     dead_agent_run_id=child_arid, evidence=infra_error[1],
                     allow_envelope=True)   # pure leaves ARE `--output-format json`
                 if plan is not None:
-                    wait_seconds, reset_epoch = plan
                     self._wait_for_usage_reset(
                         node_key=refs.node_key, step=phase, substep=substep,
-                        dead_agent_run_id=child_arid, wait_seconds=wait_seconds,
-                        reset_epoch=reset_epoch, wait_attempt=usage_waits + 1)
+                        dead_agent_run_id=child_arid, wait_seconds=plan.wait_seconds,
+                        reset_epoch=plan.reset_epoch, reset_source=plan.reset_source,
+                        window=plan.window, wait_attempt=usage_waits + 1)
                     usage_waits += 1
                     continue
             # A content violation within budget: warm-resume the SAME producer session for a
@@ -3896,11 +4136,11 @@ clean:
                     dead_agent_run_id=child_arid, evidence=infra_error[1],
                     allow_envelope=True)   # pure leaves ARE `--output-format json`
                 if plan is not None:
-                    wait_seconds, reset_epoch = plan
                     self._wait_for_usage_reset(
                         node_key=refs.node_key, step=phase, substep=substep,
-                        dead_agent_run_id=child_arid, wait_seconds=wait_seconds,
-                        reset_epoch=reset_epoch, wait_attempt=usage_waits + 1)
+                        dead_agent_run_id=child_arid, wait_seconds=plan.wait_seconds,
+                        reset_epoch=plan.reset_epoch, reset_source=plan.reset_source,
+                        window=plan.window, wait_attempt=usage_waits + 1)
                     usage_waits += 1
                     continue
             # A schema violation within budget: warm-resume the SAME reviewer session for a bounded
@@ -5980,11 +6220,11 @@ clean:
                         substep=substep, dead_agent_run_id=child_arid,
                         evidence=infra_error[1], allow_envelope=False)
                     if plan is not None:
-                        wait_seconds, reset_epoch = plan
                         self._wait_for_usage_reset(
                             node_key=refs.node_key, step=phase, substep=substep,
-                            dead_agent_run_id=child_arid, wait_seconds=wait_seconds,
-                            reset_epoch=reset_epoch, wait_attempt=usage_waits + 1)
+                            dead_agent_run_id=child_arid, wait_seconds=plan.wait_seconds,
+                            reset_epoch=plan.reset_epoch, reset_source=plan.reset_source,
+                            window=plan.window, wait_attempt=usage_waits + 1)
                         usage_waits += 1
                         continue
                 # `attempts` counts EVERY launch (transient retries + usage waits + this one), so a
@@ -6020,27 +6260,129 @@ clean:
         that the loop does not otherwise block."""
         time.sleep(seconds)
 
+    def _run_usage_probe(self) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+        """`(rows, meta)` from a HOST-side `claude --output-format json -p /usage` — the PRIMARY
+        reset source for `--wait-usage-reset` (see `_parse_usage_probe_rows`). `rows` is None when
+        the probe produced nothing usable, and `meta` then names the outcome; on success `meta`
+        carries only the timing + excerpt and the caller decides the outcome from the rows.
+
+        Run by the CONDUCTOR, not a leaf: no untrusted prompt is involved, so it needs no bwrap
+        (same trust model as the preflight backend probes in `orchestration_runtime`) and its output
+        needs none of the abort-shape anti-forgery clauses the stdout scrape carries. It spends 0
+        tokens — `/usage` is a local slash command that answers at `num_turns: 0`.
+
+        The argv base is `leaf_command`'s (`--llm-command` wrapper if configured, else the bare
+        backend), so the probe interrogates the executable the LEAF actually uses rather than a
+        hardcoded `claude` — the same reasoning as `_ensure_codex_feature_cache`.
+
+        The `result` is trusted ONLY when the envelope proves it came from the BUILT-IN `/usage`
+        slash command, not from a model turn. `--output-format json -p /usage` on the real CLI
+        answers at `num_turns == 0` (a local command, 0 tokens); an older or `--llm-command`-wrapped
+        binary that does not recognise `/usage` would instead run it as an ordinary PROMPT, and the
+        model's reply — attacker-uncontrolled but still model-authored, and free to contain
+        window-shaped text — would arrive at `num_turns >= 1` (or with the field absent). Requiring
+        `num_turns == 0` keeps that model output from being read as trusted usage data and arming a
+        multi-hour wait; a response that fails it declines to the scrape, where the abort-shape
+        clauses independently decide. This is the probe's equivalent of the scrape's forgery guard:
+        the scrape distrusts a leaf's stdout, and here the conductor distrusts anything the probe's
+        own model produced.
+
+        NEVER raises: a timeout, a missing binary, a nonzero exit, unparseable output, an envelope
+        that is itself an error, or one that consumed a model turn all return `(None, meta)` and the
+        caller falls back to the scrape, i.e. to exactly today's behavior. An `is_error` envelope is
+        not an exception either — it is the very field evidence the open question needs, so its raw
+        text is kept in `excerpt` and reported as `probe_unparseable`."""
+        started = time.monotonic()
+
+        def _meta(outcome: str | None, excerpt: str = "") -> dict[str, Any]:
+            meta: dict[str, Any] = {
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                # Same backslashreplace round-trip the decline excerpt uses, so `emit`'s
+                # `json.dumps(..., ensure_ascii=False)` can always encode what it is handed.
+                "excerpt": (" ".join((excerpt or "").split())[:_USAGE_PROBE_EXCERPT_MAX_CHARS]
+                            .encode("utf-8", "backslashreplace").decode("utf-8")),
+            }
+            if outcome is not None:
+                meta["outcome"] = outcome
+            return meta
+
+        if self.backend != "claude":
+            return None, _meta("backend_unsupported")
+        base = shlex.split(self.llm_command) if self.llm_command.strip() else [self.backend]
+        argv = [*(base or [self.backend]), "--output-format", "json", "-p", "/usage"]
+        try:
+            # `env=self.env`, matching every other conductor subprocess: the probe must query the
+            # SAME account/endpoint context the leaf runs under, or its reset instant is for the
+            # wrong quota. `self.env` is the leaf base env (auth, PATH, workflow mode); a bare
+            # `os.environ` would diverge the moment a per-run endpoint/account override lands there
+            # and not in the process environment — and this is the trusted PRIMARY source, so a
+            # confidently-wrong instant here arms a multi-hour wait ahead of the scrape.
+            proc = subprocess.run(argv, cwd=self.repo_root, env=self.env, text=True,
+                                  capture_output=True, check=False,
+                                  timeout=USAGE_PROBE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            return None, _meta("probe_timeout")
+        except Exception as exc:      # missing binary, decode failure, OS error
+            return None, _meta("probe_error", f"{type(exc).__name__}: {exc}")
+        if proc.returncode != 0:
+            return None, _meta("probe_error", proc.stderr or proc.stdout or "")
+        try:
+            doc = json.loads(proc.stdout or "")
+        except Exception:
+            return None, _meta("probe_unparseable", proc.stdout or "")
+        result = doc.get("result") if isinstance(doc, dict) else None
+        # Trust the `result` only as the BUILT-IN `/usage` command's output: `is_error` false, a
+        # string result, AND `num_turns == 0` (no model turn was consumed). A binary that ran
+        # `/usage` as a prompt yields model-authored text at `num_turns >= 1` — reject it so it is
+        # never parsed into trusted rows. The raw envelope is kept as the excerpt for diagnosis.
+        if (not isinstance(doc, dict) or doc.get("is_error") is True
+                or doc.get("num_turns") != 0 or not isinstance(result, str)):
+            return None, _meta("probe_unparseable", proc.stdout or "")
+        rows = _parse_usage_probe_rows(result, time.time())
+        if not rows:
+            # Answered, but named no window this parser recognises — a wording change, or (the open
+            # question) whatever `/usage` says once the quota is gone. The excerpt is the record.
+            return None, _meta("probe_unparseable", result)
+        return rows, _meta(None, result)
+
     def _usage_reset_wait_plan(self, proc: ProcResult, waits_done: int, *,
                                node_key: str, step: str, substep: str | None,
                                dead_agent_run_id: str, evidence: str,
-                               allow_envelope: bool) -> tuple[float, int] | None:
-        """`(wait_seconds, reset_epoch)` when a usage-limit-killed leaf should be waited out and
+                               allow_envelope: bool) -> UsageResetWaitPlan | None:
+        """The `UsageResetWaitPlan` for a usage-limit-killed leaf that should be waited out and
         re-launched in place, or None to keep the current fail_closed behavior.
 
-        Called only for an `llm_usage_limit`-tagged death (the call-site guard). Tries the MACHINE
-        reset epoch first (`_parse_usage_reset_epoch`), then the HUMAN TZ-anchored form
-        (`_parse_usage_reset_human`) on the same terminal line — the real CLI emits the latter. One
-        `time.time()` read is shared with the human parser and the `remaining` math.
+        Called only for an `llm_usage_limit`-tagged death (the call-site guard). Two reset sources,
+        tried in order (the probe resolves its rows against its own `time.time()`; the SCRAPE path
+        and the `remaining` math share the single `now` read here, so the scrape and the wait
+        arithmetic see one instant):
+
+        1. PROBE (`reset_source="probe"`) — the host asks the CLI (`_run_usage_probe`), and the row
+           whose window the dead leaf's own abort line NAMES arms the wait, provided that window is
+           actually exhausted (`_probe_reset_for_evidence`). Host-authored, dated, and window-named.
+        2. SCRAPE — the dead leaf's terminal usage-limit line: the MACHINE epoch
+           (`_parse_usage_reset_epoch`, `reset_source="scrape_machine"`) then the HUMAN TZ-anchored
+           form (`_parse_usage_reset_human`, `reset_source="scrape_human"`), which is what the real
+           CLI emits and therefore what armed the wait before the probe existed.
+
+        The probe is PRIMARY and the scrape stays the fallback, so every probe failure — including
+        the unverified case where `/usage` itself is refused once the quota is gone — degrades to
+        exactly the previous behavior rather than to no wait at all. Every probe attempt emits
+        `leaf_usage_limit_probe` with its raw outcome, which is how the next real incident answers
+        that open question without a purpose-built experiment.
 
         None (fall back to fail_closed) whenever ANY precondition misses — the flag is off; the
-        per-substep wait budget is spent; the terminal line carries neither a machine epoch nor a
-        resolvable TZ-anchored human reset (a human reset with no IANA TZ / no time-of-day is not
-        guessed at, and a usage limit sharing the leaf's untrusted stdout with any other output does
-        not arm the wait — see `_sole_content_usage_limit_line`); or the reset lies further out
-        than MAX_USAGE_LIMIT_WAIT_SECONDS (a weekly limit or a misparse, not a session window). Every
-        decline EXCEPT the flag-off short-circuit emits `leaf_usage_limit_wait_declined` with a
-        reason, so a run that opted in but did not wait is greppable — the invisibility of this
-        decline is exactly what masked the machine-vs-human envelope mismatch.
+        per-substep wait budget is spent; neither source resolved an instant (the probe declined AND
+        the terminal line carries neither a machine epoch nor a resolvable TZ-anchored human reset —
+        a human reset with no IANA TZ / no time-of-day is not guessed at, and a usage limit sharing
+        the leaf's untrusted stdout with any other output does not arm the wait, see
+        `_sole_content_usage_limit_line`); or the reset lies further out than
+        MAX_USAGE_LIMIT_WAIT_SECONDS. That cap applies to BOTH sources unchanged: a weekly reset days
+        out is still not something to sit on, the difference being that a probe-sourced decline now
+        names the window it declined instead of inferring one. Every decline EXCEPT the flag-off
+        short-circuit emits `leaf_usage_limit_wait_declined` with a reason, so a run that opted in
+        but did not wait is greppable — the invisibility of this decline is exactly what masked the
+        machine-vs-human envelope mismatch.
 
         The wait sleeps slightly PAST the reset (USAGE_LIMIT_WAIT_MARGIN_SECONDS) so the re-launch's
         preflight live-probe finds the window actually open; a reset already in the past (a
@@ -6048,24 +6390,29 @@ clean:
         if not self.wait_usage_reset:
             return None
 
-        def _decline(reason: str) -> None:
+        # The line the wait is actually DECIDED from — the classifier's own tagged line, except for
+        # the enveloped shape where that line is raw JSON clipped at 160 chars (it truncates
+        # mid-`result` and hides the wording). Computed once and used for BOTH the decline excerpt
+        # and the probe's window match, so the operator-facing evidence and the window the code
+        # matched on are the same text. The override is narrow in both uses: stdout must be the
+        # stream the resolver actually consulted (stderr named no usage limit) AND the text must
+        # pass the shape check — otherwise it would quote, and match on, a `result` the decision was
+        # never made from.
+        inner = None
+        if allow_envelope and _stream_terminal_usage_limit_line(proc.stderr or "") is None:
+            inner = _sole_content_usage_limit_line(proc.stdout or "", allow_envelope=True)
+        decision_line = " ".join(inner.split())[:160] if inner else evidence
+
+        def _decline(reason: str, *, window: str | None = None,
+                     reset_source: str | None = None) -> None:
             # The arid and the offending line are what the NEXT unrecognised envelope will be
             # diagnosed from: without them the operator gets a bare `no_reset_time` and has to
             # guess which `agents/<arid>/dialogs/` to open — and this decline being uninformative
-            # is what let the stderr-only bug survive two rounds of investigation. `evidence` is the
-            # CLASSIFIER's own line (`infra_error[1]`), i.e. the line the `llm_usage_limit` tag came
-            # from — not a stream tail, which on a leaf with noisy stderr would quote something the
-            # decision was never made from. Same field the sibling `leaf_transient_retry` emits.
-            # For the ENVELOPED shape the classifier's line is the raw envelope clipped at 160
-            # chars, which cuts off mid-`result` and hides the very wording the operator needs; the
-            # unwrapped message is the honest excerpt there. Overridden ONLY when stdout is the
-            # stream the resolver actually consulted (stderr named no usage limit) and only with
-            # SHAPE-CHECKED text — otherwise this re-creates the very thing the paragraph above
-            # rejects, quoting a `result` the decision was never made from.
-            inner = None
-            if allow_envelope and _stream_terminal_usage_limit_line(proc.stderr or "") is None:
-                inner = _sole_content_usage_limit_line(proc.stdout or "", allow_envelope=True)
-            excerpt = " ".join(inner.split())[:160] if inner else evidence
+            # is what let the stderr-only bug survive two rounds of investigation. `decision_line`
+            # is the CLASSIFIER's own line (`infra_error[1]`), i.e. the line the `llm_usage_limit`
+            # tag came from — not a stream tail, which on a leaf with noisy stderr would quote
+            # something the decision was never made from — with the enveloped-shape override applied
+            # above. Same field the sibling `leaf_transient_retry` emits.
             # `json.loads` turns an escaped lone surrogate (`\ud800`) in the leaf's `result` into a
             # REAL surrogate, which `emit`'s `json.dumps(..., ensure_ascii=False)` then cannot encode
             # on write — turning this fail_closed decline into a conductor crash. Same
@@ -6074,29 +6421,56 @@ clean:
             # branches keeps the emit unconditionally safe.)
             self.emit("leaf_usage_limit_wait_declined", node_key=node_key, step=step,
                       substep=substep, reason=reason, dead_agent_run_id=dead_agent_run_id,
-                      evidence=excerpt.encode("utf-8", "backslashreplace").decode("utf-8"))
+                      window=window, reset_source=reset_source,
+                      evidence=decision_line.encode("utf-8", "backslashreplace").decode("utf-8"))
 
         if waits_done >= MAX_USAGE_LIMIT_WAITS:
+            # Before the probe on purpose: a spent budget cannot wait whatever `/usage` answers, so
+            # probing here would spend a subprocess (and its timeout) on a decision already made.
             _decline("budget_spent")
             return None
+
+        rows, probe_meta = self._run_usage_probe()
+        probe_epoch: int | None = None
+        window: str | None = None
+        probe_outcome = probe_meta.get("outcome")
+        if rows is not None:
+            probe_outcome, probe_epoch, window = _probe_reset_for_evidence(decision_line, rows)
+        # Emitted for EVERY attempt, resolved or not: this event is the field evidence that answers
+        # whether `/usage` still responds once the quota is exhausted — the one open question the
+        # design could not settle offline. `windows` carries the parsed rows so a decline can be
+        # re-judged after the fact; `excerpt` carries the raw text when there were none.
+        self.emit("leaf_usage_limit_probe", node_key=node_key, step=step, substep=substep,
+                  outcome=probe_outcome, windows=rows or [], matched_window=window,
+                  reset_epoch=probe_epoch, duration_ms=probe_meta.get("duration_ms"),
+                  excerpt=probe_meta.get("excerpt", ""), dead_agent_run_id=dead_agent_run_id)
+
         now = time.time()
-        reset_epoch = (
-            _parse_usage_reset_epoch(proc.stderr or "", proc.stdout or "",
-                                     allow_envelope=allow_envelope)
-            or _parse_usage_reset_human(proc.stderr or "", now, proc.stdout or "",
-                                        allow_envelope=allow_envelope))
+        if probe_epoch is not None:
+            reset_epoch: int | None = probe_epoch
+            reset_source = "probe"
+        else:
+            window = None       # the scrape resolves no window name; do not carry the probe's
+            reset_epoch = _parse_usage_reset_epoch(proc.stderr or "", proc.stdout or "",
+                                                   allow_envelope=allow_envelope)
+            reset_source = "scrape_machine"
+            if reset_epoch is None:
+                reset_epoch = _parse_usage_reset_human(proc.stderr or "", now, proc.stdout or "",
+                                                       allow_envelope=allow_envelope)
+                reset_source = "scrape_human"
         if reset_epoch is None:
             _decline("no_reset_time")
             return None
         remaining = reset_epoch - now
         if remaining > MAX_USAGE_LIMIT_WAIT_SECONDS:
-            _decline("over_6h_cap")
+            _decline("over_6h_cap", window=window, reset_source=reset_source)
             return None
         wait_seconds = max(0.0, remaining) + USAGE_LIMIT_WAIT_MARGIN_SECONDS
-        return (wait_seconds, reset_epoch)
+        return UsageResetWaitPlan(wait_seconds, reset_epoch, reset_source, window)
 
     def _wait_for_usage_reset(self, *, node_key: str, step: str, substep: str | None,
                               dead_agent_run_id: str, wait_seconds: float, reset_epoch: int,
+                              reset_source: str, window: str | None,
                               wait_attempt: int) -> None:
         """Tombstone the usage-limit-killed attempt, announce the wait, and sleep out the reset
         before the caller re-launches the substep.
@@ -6113,6 +6487,7 @@ clean:
             reason=f"leaf_usage_limit_wait_orphan: attempt={wait_attempt}")
         self.emit("leaf_usage_limit_wait", node_key=node_key, step=step,
                   substep=substep, reset_epoch=reset_epoch, wait_seconds=wait_seconds,
+                  reset_source=reset_source, window=window,
                   wait_attempt=wait_attempt, dead_agent_run_id=dead_agent_run_id)
         self._sleep_backoff(wait_seconds)
 

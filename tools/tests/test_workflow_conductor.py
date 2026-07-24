@@ -13,6 +13,7 @@ import glob
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -518,6 +519,17 @@ class _FakeConductor(wc.Conductor):
     def new_agent_run_id(self):  # type: ignore[override]
         self._n = getattr(self, "_n", 0) + 1
         return f"child-{self._n}"
+
+    # `--wait-usage-reset` probes the real `claude` binary from the HOST. Stubbed here for EVERY
+    # fake conductor so no test can spawn it, and stubbed as a FAILED probe so the default is the
+    # scrape fallback — i.e. the behavior every pre-probe wait test was written against. Tests that
+    # exercise the probe set `usage_probe_result` (and read `usage_probe_calls`).
+    usage_probe_result: tuple = (None, {"outcome": "probe_error", "duration_ms": 0,
+                                        "excerpt": "stubbed: no probe in tests"})
+
+    def _run_usage_probe(self):  # type: ignore[override]
+        self.usage_probe_calls = getattr(self, "usage_probe_calls", 0) + 1
+        return self.usage_probe_result
 
     def spawn_leaf(self, prompt_text, child_env, **kwargs):  # type: ignore[override]
         return wc.ProcResult(0, "", "")
@@ -3172,6 +3184,456 @@ class UsageResetHumanParseTests(unittest.TestCase):
                              self._epoch(2025, 7, 11, 15, 0), prefix)
 
 
+class UsageProbeParseTests(unittest.TestCase):
+    """`_parse_usage_probe_rows` turns the `result` text of a HOST-run
+    `claude --output-format json -p /usage` into window rows — the PRIMARY reset source, which
+    unlike the stdout scrape carries an explicit DATE and an explicit WINDOW NAME.
+
+    The fixture is the real thing: `_REAL_USAGE_PROBE_RESULT` is the verbatim `result` of an actual
+    probe (2026-07-25, `is_error:false`, `num_turns:0`, 1074ms, 0 tokens). A hand-written fixture
+    here would be exactly the "fixture fiction" failure this repo has already paid for once — the
+    parser would be verified against a shape that does not exist."""
+
+    # Verbatim `result` of a real probe run on 2026-07-25 (envelope keys observed alongside it:
+    # type/subtype/is_error/duration_ms/duration_api_ms/num_turns/stop_reason/session_id/
+    # total_cost_usd/usage/modelUsage/permission_denials/fast_mode_state/uuid).
+    REAL_RESULT = (
+        "You are currently using your subscription to power your Claude Code usage\n"
+        "\n"
+        "Current session: 31% used · resets Jul 25, 3:49am (Asia/Tokyo)\n"
+        "Current week (all models): 86% used · resets Jul 28, 9:59am (Asia/Tokyo)\n"
+        "Current week (Fable): 33% used · resets Jul 28, 10am (Asia/Tokyo)\n"
+        "\n"
+        "What's contributing to your limits usage?\n"
+        "Approximate, based on local sessions on this machine — does not include other devices "
+        "or claude.ai. Behaviors are independent characteristics, not a breakdown.\n"
+        "\n"
+        "Last 24h · 3287 requests · 17 sessions\n"
+        "  92% of your usage came from subagent-heavy sessions\n"
+        "  62% of your usage was at >150k context\n"
+        "  31% of your usage came from sessions active for 8+ hours\n"
+        "  Top skills: /review 2%, /codex:review 1%\n"
+        "  Top subagents: general-purpose 39%\n"
+        "  Top plugins: codex 1%\n"
+        "  Top MCP servers: build-runtime 4%\n"
+        "\n"
+        "Last 7d · 12043 requests · 225 sessions\n"
+        "  82% of your usage came from subagent-heavy sessions\n"
+        "  55% of your usage was at >150k context\n"
+        "  15% of your usage came from sessions active for 8+ hours\n"
+        "  Top skills: /codex:review 2%, /collect-review-data 1%\n"
+        "  Top subagents: general-purpose 16%, Plan 4%, Explore 2%, claude 1%\n"
+        "  Top plugins: codex 2%\n"
+        "  Top MCP servers: build-runtime 2%"
+    )
+    # 2026-07-25 00:00 Asia/Tokyo — before every reset instant the fixture names, so the
+    # current-year assumption holds and nothing rolls forward.
+    NOW = datetime(2026, 7, 25, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+
+    @staticmethod
+    def _epoch(y, mo, d, h, mi=0, tz="Asia/Tokyo") -> int:
+        return int(datetime(y, mo, d, h, mi, tzinfo=ZoneInfo(tz)).timestamp())
+
+    def test_the_real_probe_response_parses_into_its_three_windows(self) -> None:
+        """The whole point of the probe: dated instants and named windows, from live bytes. The
+        `10am` row also pins the OPTIONAL minutes — an on-the-hour reset prints no `:mm`, and a
+        parser requiring them would silently drop that row."""
+        rows = wc._parse_usage_probe_rows(self.REAL_RESULT, self.NOW)
+        self.assertEqual(rows, [
+            {"window_label": "session", "family": "session", "used_pct": 31,
+             "reset_epoch": self._epoch(2026, 7, 25, 3, 49)},
+            {"window_label": "week (all models)", "family": "week", "used_pct": 86,
+             "reset_epoch": self._epoch(2026, 7, 28, 9, 59)},
+            {"window_label": "week (Fable)", "family": "week", "used_pct": 33,
+             "reset_epoch": self._epoch(2026, 7, 28, 10, 0)},
+        ])
+
+    def test_the_surrounding_report_lines_are_skipped(self) -> None:
+        """Degrade per LINE, not per response. The real response's stats block is full of
+        `<n>% ...` lines and the header names "usage" outright; none of them is a window."""
+        rows = wc._parse_usage_probe_rows(self.REAL_RESULT, self.NOW)
+        self.assertEqual(len(rows), 3)                       # not 3 + the `92%`/`62%`/`31%` lines
+        for line in ("  92% of your usage came from subagent-heavy sessions",
+                     "You are currently using your subscription to power your Claude Code usage",
+                     "Last 24h · 3287 requests · 17 sessions",
+                     "  Top skills: /review 2%, /codex:review 1%"):
+            self.assertEqual(wc._parse_usage_probe_rows(line, self.NOW), [], line)
+
+    def test_every_clause_of_the_row_pattern_is_load_bearing(self) -> None:
+        """Per-clause mutation of the row: a green suite is not proof a pattern is pinned unless
+        each clause is shown to be the one doing the work. Each variant below breaks EXACTLY one
+        clause of the real row and must yield no row at all (the caller then finds no window and
+        falls back to the scrape) — never a row with a guessed field."""
+        good = "Current session: 31% used · resets Jul 25, 3:49am (Asia/Tokyo)"
+        self.assertEqual(len(wc._parse_usage_probe_rows(good, self.NOW)), 1)
+        broken = {
+            # no IANA timezone -> the instant would depend on where the conductor runs
+            "no_tz": "Current session: 31% used · resets Jul 25, 3:49am",
+            "unparseable_tz": "Current session: 31% used · resets Jul 25, 3:49am (Mars/Base)",
+            # no percentage -> the exhaustion gate would have nothing to stand on
+            "no_pct": "Current session: used · resets Jul 25, 3:49am (Asia/Tokyo)",
+            # no date -> this is the scrape's shape, which the probe exists to replace
+            "no_date": "Current session: 31% used · resets 3:49am (Asia/Tokyo)",
+            "no_meridiem": "Current session: 31% used · resets Jul 25, 3:49 (Asia/Tokyo)",
+            "unknown_month": "Current session: 31% used · resets Xyz 25, 3:49am (Asia/Tokyo)",
+            "hour_out_of_range": "Current session: 31% used · resets Jul 25, 13:49am "
+                                 "(Asia/Tokyo)",
+            # not a window row at all: the label must be `session`/`week...`, anchored at line start
+            "unknown_window": "Current month: 31% used · resets Jul 25, 3:49am (Asia/Tokyo)",
+            "not_line_leading": "note: Current session: 31% used · resets Jul 25, 3:49am "
+                                "(Asia/Tokyo)",
+        }
+        for name, line in broken.items():
+            self.assertEqual(wc._parse_usage_probe_rows(line, self.NOW), [], name)
+        # The line anchor is spelled TWICE — `^` in the pattern and `.match()` at the call site —
+        # so dropping either one alone leaves the other holding, and a test driving only
+        # `_parse_usage_probe_rows` cannot tell them apart (`not_line_leading` above passes under
+        # either mutation). Assert the pattern's own anchoring directly, so both spellings are
+        # pinned independently rather than only their conjunction.
+        self.assertIsNone(wc._USAGE_PROBE_ROW_RE.search(broken["not_line_leading"]))
+
+    def test_a_zone_shaped_model_name_does_not_shadow_the_timezone(self) -> None:
+        """The label carries a model name in parentheses, so the zone is the first parenthetical
+        `ZoneInfo` ACCEPTS — not the first that merely looks like `Area/City`."""
+        line = "Current week (claude/opus): 99% used · resets Jul 28, 10am (Asia/Tokyo)"
+        rows = wc._parse_usage_probe_rows(line, self.NOW)
+        self.assertEqual([r["window_label"] for r in rows], ["week (claude/opus)"])
+        self.assertEqual(rows[0]["reset_epoch"], self._epoch(2026, 7, 28, 10, 0))
+
+    def test_a_year_end_reset_rolls_into_the_next_year(self) -> None:
+        """The response prints no YEAR. A Jan reset seen from late December belongs to next year;
+        assuming the current one would resolve ~12 months in the past and lose the row."""
+        now = datetime(2026, 12, 31, 23, 30, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+        rows = wc._parse_usage_probe_rows(
+            "Current session: 99% used · resets Jan 1, 4am (Asia/Tokyo)", now)
+        self.assertEqual([r["reset_epoch"] for r in rows], [self._epoch(2027, 1, 1, 4, 0)])
+
+    def test_a_just_passed_reset_stays_within_the_grace_instead_of_rolling(self) -> None:
+        """Within the same 15-min grace the scrape uses: a message minutes stale must floor to a
+        margin-only relaunch, not jump a whole year forward."""
+        reset = datetime(2026, 7, 25, 3, 49, tzinfo=ZoneInfo("Asia/Tokyo"))
+        rows = wc._parse_usage_probe_rows(
+            "Current session: 99% used · resets Jul 25, 3:49am (Asia/Tokyo)",
+            reset.timestamp() + 300)
+        self.assertEqual([r["reset_epoch"] for r in rows], [int(reset.timestamp())])
+        # ...and past the grace it does roll, where the caller's 6h cap then declines it.
+        rows = wc._parse_usage_probe_rows(
+            "Current session: 99% used · resets Jul 25, 3:49am (Asia/Tokyo)",
+            reset.timestamp() + 4000)
+        self.assertEqual([r["reset_epoch"] for r in rows], [self._epoch(2027, 7, 25, 3, 49)])
+
+    def test_a_dec31_reset_seen_just_after_new_year_resolves_to_the_just_passed_occurrence(
+            self) -> None:
+        """New Year boundary (Codex P2): `/usage` run at 00:05 on Jan 1 can still report a Dec 31
+        reset that passed ~6 min ago, within the grace. It must resolve to the just-passed occurrence
+        (PREVIOUS year → a margin-only relaunch), NOT to Dec 31 of the current year ~a year out —
+        which the caller would 'resolve' and then decline under the 6h cap WITHOUT trying the scrape,
+        killing an otherwise-recoverable relaunch. The previous-year candidate is what fixes it."""
+        tz = ZoneInfo("Asia/Tokyo")
+        just_passed = datetime(2026, 12, 31, 23, 59, tzinfo=tz)
+        now = datetime(2027, 1, 1, 0, 5, tzinfo=tz).timestamp()      # 6 min after the reset
+        rows = wc._parse_usage_probe_rows(
+            "Current session: 100% used · resets Dec 31, 11:59pm (Asia/Tokyo)", now)
+        self.assertEqual([r["reset_epoch"] for r in rows], [int(just_passed.timestamp())])
+        # sanity: the resolved instant is in the PAST relative to now (floors to a margin-only wait),
+        # not ~a year in the future
+        self.assertLess(rows[0]["reset_epoch"], now)
+
+    def test_a_leap_day_reset_falls_through_to_the_leap_year(self) -> None:
+        """Feb 29 of the assumed year simply does not exist in 3 years out of 4; the row must take
+        the next year that has one rather than raising or vanishing."""
+        now = datetime(2027, 12, 20, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo")).timestamp()
+        rows = wc._parse_usage_probe_rows(
+            "Current week: 99% used · resets Feb 29, 10am (Asia/Tokyo)", now)
+        self.assertEqual([r["reset_epoch"] for r in rows], [self._epoch(2028, 2, 29, 10, 0)])
+
+    def test_the_parser_never_raises(self) -> None:
+        for text in ("", "\x00\ud800 not text", "Current session: 999999999999% used",
+                     "Current session: 31% used · resets Feb 31, 3am (Asia/Tokyo)"):
+            self.assertEqual(wc._parse_usage_probe_rows(text, self.NOW), [], repr(text))
+
+    def test_a_surrogate_in_a_matched_label_is_sanitized_at_construction(self) -> None:
+        """`json.loads` of the CLI response can turn an escaped `\\ud800` into a REAL lone surrogate
+        inside a window label. That label is emitted verbatim on `leaf_usage_limit_probe` (and,
+        once matched, on the wait/decline `window`), where `emit`'s `json.dumps(ensure_ascii=False)`
+        would raise on it — a fail_closed path becoming a conductor crash, the class the repo has
+        already paid for. Unlike `test_the_parser_never_raises`, this label DOES match a row, so the
+        surrogate survives into the row unless it is sanitized at construction."""
+        line = "Current week (Fab\ud800le): 99% used · resets Jul 28, 10am (Asia/Tokyo)"
+        rows = wc._parse_usage_probe_rows(line, self.NOW)
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("\ud800", rows[0]["window_label"])
+        # the real emit round-trip must not raise on the row or the derived window
+        json.dumps({"windows": rows}, ensure_ascii=False).encode("utf-8")
+        _, _, window = wc._probe_reset_for_evidence("You've hit your weekly limit", rows)
+        json.dumps({"window": window}, ensure_ascii=False).encode("utf-8")
+
+
+class UsageProbeWindowMatchTests(unittest.TestCase):
+    """`_probe_reset_for_evidence` decides whether a probe row may arm the wait. Two gates, both
+    operator decisions: the row's window must be the one the dead leaf's own abort line NAMED, and
+    that window must actually be exhausted."""
+
+    NOW = UsageProbeParseTests.NOW
+
+    def _rows(self, *specs) -> list:
+        return [{"window_label": label, "family": family, "used_pct": pct, "reset_epoch": epoch}
+                for label, family, pct, epoch in specs]
+
+    def _real_rows(self, session_pct: int = 31) -> list:
+        rows = wc._parse_usage_probe_rows(UsageProbeParseTests.REAL_RESULT, self.NOW)
+        for row in rows:
+            if row["family"] == "session":
+                row["used_pct"] = session_pct
+        return rows
+
+    def test_the_recorded_incident_line_selects_the_session_row(self) -> None:
+        """The abort line of both recorded incidents, against the real probe response: the session
+        row is the one that arms (once exhausted), never one of the week rows."""
+        rows = self._real_rows(session_pct=100)
+        got = wc._probe_reset_for_evidence(
+            "You've hit your session limit · resets 5:50pm (Asia/Tokyo)", rows)
+        self.assertEqual(got, ("resolved", UsageProbeParseTests._epoch(2026, 7, 25, 3, 49),
+                               "session"))
+
+    def test_an_unexhausted_window_never_arms_the_wait(self) -> None:
+        """SECURITY, and the whole reason the probe needs a gate of its own. The `llm_usage_limit`
+        tag can be PROMOTED out of the leaf's own stdout prose, and the recorded Codex P2 incident
+        is precisely that (a hook-denial death whose prose said `Session limit resets at 5pm` armed
+        a real multi-hour wait). The scrape catches it with the abort-shape clauses; the probe does
+        not run them, and a session row ALWAYS exists — so without this gate the hole reopens with
+        better dates. At 31% used, nothing arms."""
+        got = wc._probe_reset_for_evidence("Session limit resets at 5pm", self._real_rows())
+        self.assertEqual(got, ("window_not_exhausted", None, "session"))
+        # ...and the floor is exactly where the constant says it is, in both directions.
+        just_under = wc.USAGE_PROBE_EXHAUSTED_MIN_PCT - 1
+        rows = self._rows(("session", "session", just_under, 1_800_000_000))
+        self.assertEqual(wc._probe_reset_for_evidence("session limit", rows)[0],
+                         "window_not_exhausted")
+        rows = self._rows(("session", "session", wc.USAGE_PROBE_EXHAUSTED_MIN_PCT, 1_800_000_000))
+        self.assertEqual(wc._probe_reset_for_evidence("session limit", rows)[0], "resolved")
+
+    def test_the_floor_is_full_exhaustion_not_a_near_limit(self) -> None:
+        """The floor is FULL exhaustion (100), pinned ABSOLUTELY so a regression to a near-limit
+        value is caught. A window with headroom does not corroborate that the leaf was stopped by a
+        limit it had not reached, so 95..99% declines to the scrape (where the abort-shape clauses
+        still decide) — this is the Codex P2 the near-limit floor would have re-opened. A separate
+        absolute assertion is needed because the relative boundary test above passes under any floor
+        value, so it alone would not catch the floor sliding back down."""
+        self.assertEqual(wc.USAGE_PROBE_EXHAUSTED_MIN_PCT, 100)
+        for pct in (95, 96, 97, 98, 99):
+            rows = self._rows(("session", "session", pct, 1_800_000_000))
+            self.assertEqual(wc._probe_reset_for_evidence("session limit", rows),
+                             ("window_not_exhausted", None, "session"), pct)
+        rows = self._rows(("session", "session", 100, 1_800_000_000))
+        self.assertEqual(wc._probe_reset_for_evidence("session limit", rows),
+                         ("resolved", 1_800_000_000, "session"))
+
+    def test_a_window_the_probe_does_not_report_falls_back_to_the_scrape(self) -> None:
+        """The classifier tags four more window words than `/usage` reports rows for
+        (`_USAGE_LIMIT_WINDOWS`). None of them may be matched to a row by proximity — an unmatched
+        window declines to the scrape, which is exactly the pre-probe behavior."""
+        rows = self._real_rows(session_pct=100)
+        for evidence in ("Claude AI usage limit reached", "hourly limit reached",
+                         "5-hour limit reached", "You've hit your limit"):
+            self.assertEqual(wc._probe_reset_for_evidence(evidence, rows),
+                             ("window_unmatched", None, None), evidence)
+
+    def test_an_enveloped_session_id_is_not_read_as_the_session_window(self) -> None:
+        """The enveloped abort's classifier evidence is raw JSON clipped at 160 chars, whose keys
+        include `session_id`. Reading that as "the session window" would match the session row on
+        a line that never named a window — the `\\b` boundaries are what prevent it."""
+        clipped = json.dumps({"type": "result", "is_error": True, "api_error_status": 429,
+                              "session_id": "c10ba1a6-b119-421d-8206-56b04e512edd"})[:160]
+        self.assertIn("session_id", clipped)
+        self.assertEqual(wc._probe_reset_for_evidence(clipped, self._real_rows(session_pct=100)),
+                         ("window_unmatched", None, None))
+
+    def test_a_weekly_abort_selects_the_week_family_when_its_rows_agree(self) -> None:
+        rows = self._rows(("week (all models)", "week", 100, 1_800_000_000),
+                          ("week (Fable)", "week", 99, 1_800_000_000),
+                          ("session", "session", 100, 1_700_000_000))
+        for evidence in ("You've hit your weekly limit", "Claude AI weekly limit reached",
+                         "You've hit your week limit"):
+            self.assertEqual(wc._probe_reset_for_evidence(evidence, rows),
+                             ("resolved", 1_800_000_000, "week (all models)"), evidence)
+
+    def test_disagreeing_rows_of_one_family_decline_rather_than_pick_one(self) -> None:
+        """The REAL response's two week rows reset a minute apart (9:59am vs 10am), so this is not
+        hypothetical. Picking either would be guessing which window stopped the leaf."""
+        rows = self._real_rows()
+        for row in rows:
+            row["used_pct"] = 100
+        self.assertEqual(wc._probe_reset_for_evidence("You've hit your weekly limit", rows),
+                         ("window_ambiguous", None, None))
+
+    def test_an_evidence_line_naming_both_families_declines(self) -> None:
+        """Two windows named, no way to tell which stopped the leaf — decline to the scrape rather
+        than arm on whichever the code happens to test first."""
+        rows = self._rows(("session", "session", 100, 1_700_000_000),
+                          ("week", "week", 100, 1_800_000_000))
+        self.assertEqual(wc._probe_reset_for_evidence("session and weekly limits reached", rows),
+                         ("window_unmatched", None, None))
+
+    def test_no_rows_at_all_is_unmatched_not_resolved(self) -> None:
+        self.assertEqual(wc._probe_reset_for_evidence("You've hit your session limit", []),
+                         ("window_unmatched", None, None))
+
+    def test_family_matching_is_symmetric_across_singular_and_plural(self) -> None:
+        """Both families admit the plural, and both keep their word boundary. `session_id` — the key
+        that appears in an enveloped abort's raw-JSON evidence — must NOT be read as the session
+        window under either spelling."""
+        rows = self._rows(("session", "session", 100, 1_700_000_000),
+                          ("week (all models)", "week", 100, 1_800_000_000))
+        self.assertEqual(wc._probe_reset_for_evidence("your sessions limit", rows)[1],
+                         1_700_000_000)
+        self.assertEqual(wc._probe_reset_for_evidence("your session limit", rows)[1],
+                         1_700_000_000)
+        self.assertEqual(wc._probe_reset_for_evidence('{"session_id":"abc"}', rows),
+                         ("window_unmatched", None, None))
+
+
+class UsageProbeRunnerTests(unittest.TestCase):
+    """`Conductor._run_usage_probe` — the host-side subprocess seam. It must interrogate the
+    executable the LEAF uses, and it must never raise: every failure returns `(None, meta)` and the
+    caller falls back to the stdout scrape, i.e. to the pre-probe behavior."""
+
+    def _conductor(self, backend: str = "claude", llm_command: str = "") -> wc.Conductor:
+        return wc.Conductor(repo_root=Path("/tmp/repo"), orchestration_id="orch_x",
+                            orchestration_agent_run_id="ORCH", backend=backend,
+                            env={"MARKER": "leaf-env"}, llm_command=llm_command)
+
+    def _envelope(self, result: str, **over) -> str:
+        doc = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 0,
+               "duration_ms": 1074, "result": result}
+        doc.update(over)
+        return json.dumps(doc)
+
+    def test_the_probe_runs_the_leafs_own_executable_with_the_usage_command(self) -> None:
+        """Same base as `leaf_command` / `_ensure_codex_feature_cache`: a `--llm-command` wrapper is
+        what the leaf will run, so a hardcoded `claude` here would probe a different binary. And it
+        is the HOST that runs it — no bwrap, because there is no untrusted prompt (the argv is a
+        constant), which is the entire reason the response needs no anti-forgery clauses."""
+        seen: list = []
+
+        def fake_run(argv, **kw):
+            seen.append((argv, kw))
+            return subprocess.CompletedProcess(argv, 0, self._envelope(
+                "Current session: 99% used · resets Jul 25, 3:49am (Asia/Tokyo)"), "")
+
+        with mock.patch.object(wc.subprocess, "run", fake_run):
+            rows, meta = self._conductor(llm_command="npx claude-wrapper --flag")._run_usage_probe()
+        self.assertEqual(len(rows), 1)
+        argv, kw = seen[0]
+        self.assertEqual(argv, ["npx", "claude-wrapper", "--flag",
+                                "--output-format", "json", "-p", "/usage"])
+        self.assertEqual(kw["cwd"], Path("/tmp/repo"))
+        self.assertEqual(kw["timeout"], wc.USAGE_PROBE_TIMEOUT_SECONDS)
+        self.assertIs(kw["check"], False)
+        # env is the leaf's, not a bare os.environ: the probe must query the SAME account/endpoint
+        # context the leaf runs under, or its reset instant is for the wrong quota.
+        self.assertEqual(kw["env"], {"MARKER": "leaf-env"})
+        self.assertNotIn("outcome", meta)          # success: the caller decides from the rows
+        self.assertIn("Current session", meta["excerpt"])
+        # and with no wrapper configured it is the bare backend
+        with mock.patch.object(wc.subprocess, "run", fake_run):
+            self._conductor()._run_usage_probe()
+        self.assertEqual(seen[1][0][0], "claude")
+
+    def test_codex_is_unsupported_and_spawns_nothing(self) -> None:
+        def explode(*a, **kw):
+            raise AssertionError("codex must not be probed")
+
+        with mock.patch.object(wc.subprocess, "run", explode):
+            rows, meta = self._conductor(backend="codex")._run_usage_probe()
+        self.assertIsNone(rows)
+        self.assertEqual(meta["outcome"], "backend_unsupported")
+
+    def test_every_failure_mode_degrades_to_the_scrape(self) -> None:
+        """Each of these is a documented outcome value the operator greps for, and none may raise:
+        a probe that threw would turn a fail_closed usage limit into a conductor crash."""
+        cases = {
+            "probe_timeout": lambda *a, **kw: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired("claude", 60)),
+            "probe_error": lambda *a, **kw: (_ for _ in ()).throw(
+                FileNotFoundError("no such file: claude")),
+        }
+        for outcome, runner in cases.items():
+            with mock.patch.object(wc.subprocess, "run", runner):
+                rows, meta = self._conductor()._run_usage_probe()
+            self.assertIsNone(rows, outcome)
+            self.assertEqual(meta["outcome"], outcome)
+        # nonzero exit, non-JSON stdout, an `is_error` envelope, and a response naming no window
+        procs = {
+            "probe_error": subprocess.CompletedProcess([], 1, "", "not logged in"),
+            "probe_unparseable": subprocess.CompletedProcess([], 0, "Usage: claude [options]", ""),
+        }
+        for outcome, proc in procs.items():
+            with mock.patch.object(wc.subprocess, "run", lambda *a, _p=proc, **kw: _p):
+                rows, meta = self._conductor()._run_usage_probe()
+            self.assertIsNone(rows, outcome)
+            self.assertEqual(meta["outcome"], outcome)
+
+    def test_a_response_that_consumed_a_model_turn_is_rejected(self) -> None:
+        """SECURITY (Codex P2): the probe trusts `result` ONLY as the built-in `/usage` command's
+        output, proven by `num_turns == 0`. A binary that does not recognise `/usage` runs it as an
+        ordinary PROMPT, and the model's reply — free to contain window-shaped text — arrives at
+        `num_turns >= 1`. Parsing it would arm a multi-hour wait on model-authored data, the very
+        thing the scrape's forgery clauses exist to prevent. Such a response is rejected (reported
+        `probe_unparseable`, raw text kept) so it is never parsed into rows, even when its text WOULD
+        have parsed as a fully-exhausted window."""
+        armed = ("Current session: 100% used · resets Jul 25, 3:49am (Asia/Tokyo)")
+        # sanity: at num_turns 0 this exact text parses and arms
+        ok = self._envelope(armed, num_turns=0)
+        with mock.patch.object(wc.subprocess, "run",
+                               lambda *a, **kw: subprocess.CompletedProcess([], 0, ok, "")):
+            rows, _ = self._conductor()._run_usage_probe()
+        self.assertEqual(len(rows), 1)
+        # ...but the SAME text at num_turns >= 1 (or with the field absent) is rejected
+        for over in ({"num_turns": 1}, {"num_turns": 3}, {"num_turns": None}):
+            env = self._envelope(armed, **over)
+            if over["num_turns"] is None:               # simulate an older CLI omitting the field
+                doc = json.loads(env)
+                doc.pop("num_turns")
+                env = json.dumps(doc)
+            with mock.patch.object(wc.subprocess, "run",
+                                   lambda *a, _e=env, **kw: subprocess.CompletedProcess([], 0, _e, "")):
+                rows, meta = self._conductor()._run_usage_probe()
+            self.assertIsNone(rows, over)
+            self.assertEqual(meta["outcome"], "probe_unparseable", over)
+            self.assertIn("session", meta["excerpt"])
+
+    def test_an_error_envelope_is_kept_as_field_evidence(self) -> None:
+        """The OPEN QUESTION this feature cannot answer offline: does `/usage` still answer once the
+        quota is gone? If it does not, THIS is the shape that arrives, and its raw text is the only
+        record — so it is reported as unparseable with the message preserved, not swallowed."""
+        env = self._envelope("You've hit your session limit · resets 5:50pm (Asia/Tokyo)",
+                             is_error=True, api_error_status=429, terminal_reason="api_error")
+        with mock.patch.object(wc.subprocess, "run",
+                               lambda *a, **kw: subprocess.CompletedProcess([], 0, env, "")):
+            rows, meta = self._conductor()._run_usage_probe()
+        self.assertIsNone(rows)
+        self.assertEqual(meta["outcome"], "probe_unparseable")
+        self.assertIn("session limit", meta["excerpt"])
+
+    def test_a_response_naming_no_window_is_unparseable_with_the_text_kept(self) -> None:
+        """A wording change is indistinguishable, from here, from an exhausted-quota answer — both
+        are "answered but nothing parsed". The excerpt must carry enough of it to tell them apart
+        afterwards, which is why it is wider than the decline's 160."""
+        text = ("You are currently using your subscription to power your Claude Code usage\n\n"
+                "Session limit reached. Your limit will reset later today.\n\n"
+                + "x" * 500)
+        with mock.patch.object(
+                wc.subprocess, "run",
+                lambda *a, **kw: subprocess.CompletedProcess([], 0, self._envelope(text), "")):
+            rows, meta = self._conductor()._run_usage_probe()
+        self.assertIsNone(rows)
+        self.assertEqual(meta["outcome"], "probe_unparseable")
+        self.assertIn("Session limit reached", meta["excerpt"])
+        self.assertEqual(len(meta["excerpt"]), wc._USAGE_PROBE_EXCERPT_MAX_CHARS)
+        self.assertGreaterEqual(meta["duration_ms"], 0)
+
+
 class LeafChildEnvTest(unittest.TestCase):
     """WI-A: the leaf's output ceiling is part of the CONDUCTOR'S leaf contract (it lives in
     _child_env, not in `.claude/settings.json`, so it cannot leak into the operator's own
@@ -3753,6 +4215,226 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan[1], int(now) + 600)   # reset_epoch is the MACHINE value
         self.assertEqual(plan[0], 600.0 + 120.0)    # wait = machine 600s + margin, not the ~3h47m
+
+    # -- --wait-usage-reset: host-side `/usage` probe as the PRIMARY reset source (issue #8) ----
+
+    # The recorded incident instant: 2026-07-24 07:38:45 UTC = 16:38 JST. Its abort line says the
+    # session window reopens at 5:50pm JST, i.e. now+4275s — so a probe-sourced instant chosen
+    # DIFFERENT from that separates "the probe decided" from "the scrape decided".
+    _INCIDENT_NOW = 1_784_878_725.0
+    _INCIDENT_ABORT = "You've hit your session limit · resets 5:50pm (Asia/Tokyo)\n"
+    _INCIDENT_SCRAPE_EPOCH = int(datetime(2026, 7, 24, 17, 50,
+                                          tzinfo=ZoneInfo("Asia/Tokyo")).timestamp())
+
+    def _probe_rows(self, *specs) -> list:
+        return [{"window_label": label, "family": family, "used_pct": pct, "reset_epoch": epoch}
+                for label, family, pct, epoch in specs]
+
+    def _probe_ok(self, rows: list) -> tuple:
+        return (rows, {"duration_ms": 12, "excerpt": "Current session: ..."})
+
+    def test_the_probe_is_the_primary_reset_source_and_beats_the_scrape(self) -> None:
+        """The point of issue #8: the reset instant comes from the HOST asking `/usage`, not from
+        scraping the dead leaf's stdout. Both sources resolve here and they resolve to DIFFERENT
+        instants, so "the probe won" is an assertion rather than a coincidence — and the wait event
+        says which source it was, because only the scraped one can be wrong about the window."""
+        c = self._conductor([wc.ProcResult(1, self._INCIDENT_ABORT, ""),
+                             wc.ProcResult(0, "done", "")], wait_usage_reset=True)
+        probe_epoch = int(self._INCIDENT_NOW) + 1800
+        c.usage_probe_result = self._probe_ok(
+            self._probe_rows(("session", "session", 100, probe_epoch),
+                             ("week (all models)", "week", 86, probe_epoch + 200_000)))
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=self._INCIDENT_NOW):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(oc.status, "pass")
+        self.assertEqual(len(c.spawns), 2)
+        self.assertEqual(c.slept, [1800.0 + wc.USAGE_LIMIT_WAIT_MARGIN_SECONDS])
+        waits = [f for e, f in events if e == "leaf_usage_limit_wait"]
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0]["reset_epoch"], probe_epoch)      # NOT the scraped 5:50pm
+        self.assertNotEqual(probe_epoch, self._INCIDENT_SCRAPE_EPOCH)
+        self.assertEqual(waits[0]["reset_source"], "probe")
+        self.assertEqual(waits[0]["window"], "session")
+        # ...and the probe attempt itself is on the record, rows included.
+        probes = [f for e, f in events if e == "leaf_usage_limit_probe"]
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0]["outcome"], "resolved")
+        self.assertEqual(probes[0]["matched_window"], "session")
+        self.assertEqual(probes[0]["reset_epoch"], probe_epoch)
+        self.assertEqual([r["window_label"] for r in probes[0]["windows"]],
+                         ["session", "week (all models)"])
+        self.assertEqual(probes[0]["dead_agent_run_id"], "child-1")
+        self.assertEqual(probes[0]["duration_ms"], 12)
+
+    def test_a_failed_probe_falls_back_to_the_scrape_unchanged(self) -> None:
+        """NON-REGRESSION, and the reason the probe is primary-WITH-fallback: the open question
+        (does `/usage` answer at all once the quota is gone?) is unanswerable offline, so every
+        probe failure must land on exactly the pre-probe behavior — the recorded incident's stdout
+        abort, resolved by the human scrape. Each outcome is also greppable in its own right."""
+        for outcome in ("probe_timeout", "probe_error", "probe_unparseable",
+                        "backend_unsupported"):
+            c = self._conductor([wc.ProcResult(1, self._INCIDENT_ABORT, ""),
+                                 wc.ProcResult(0, "done", "")], wait_usage_reset=True)
+            c.usage_probe_result = (None, {"outcome": outcome, "duration_ms": 3,
+                                           "excerpt": "raw probe text"})
+            events: list = []
+            c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+            with mock.patch.object(wc.time, "time", return_value=self._INCIDENT_NOW):
+                oc = c.run_substep(self._refs(), "compile", "verify")
+            self.assertEqual(oc.status, "pass", outcome)
+            waits = [f for e, f in events if e == "leaf_usage_limit_wait"]
+            self.assertEqual(waits[0]["reset_epoch"], self._INCIDENT_SCRAPE_EPOCH, outcome)
+            self.assertEqual(waits[0]["reset_source"], "scrape_human", outcome)
+            self.assertIsNone(waits[0]["window"], outcome)
+            probes = [f for e, f in events if e == "leaf_usage_limit_probe"]
+            self.assertEqual([p["outcome"] for p in probes], [outcome])
+            self.assertEqual(probes[0]["windows"], [])
+            self.assertEqual(probes[0]["excerpt"], "raw probe text")   # the field evidence
+
+        # the machine form (backward-compat) falls back just as cleanly, and says so
+        now = 1_752_200_000.0
+        c = self._conductor([wc.ProcResult(1, "", f"usage limit reached|{int(now) + 300}"),
+                             wc.ProcResult(0, "done", "")], wait_usage_reset=True)
+        events = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            c.run_substep(self._refs(), "compile", "verify")
+        waits = [f for e, f in events if e == "leaf_usage_limit_wait"]
+        self.assertEqual(waits[0]["reset_source"], "scrape_machine")
+
+    def test_a_probe_that_reports_an_unexhausted_window_does_not_arm_the_wait(self) -> None:
+        """SECURITY — the fail-open this feature could have reintroduced. The `llm_usage_limit` tag
+        reaching the wait may have been promoted out of the leaf's OWN stdout prose: the recorded
+        Codex P2 incident is a HOOK-DENIAL death whose stdout said `Session limit resets at 5pm`,
+        and it armed a real multi-hour wait until the abort-shape clauses were tightened. The probe
+        path does not run those clauses, and a session row always EXISTS — so the server-observed
+        percentage is what stands in for them. At 31% used, nothing arms, and the scrape (whose
+        abort-shape clauses still reject this stdout) declines too: the run fail_closes exactly as
+        it does today."""
+        denial_stdout = ("Session limit resets at 5pm (Asia/Tokyo)\n"
+                         "note: the write was denied by the PreToolUse hook\n")
+        c = self._conductor([wc.ProcResult(1, denial_stdout, "")], wait_usage_reset=True)
+        c.usage_probe_result = self._probe_ok(self._probe_rows(
+            ("session", "session", 31, int(self._INCIDENT_NOW) + 1800)))
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=self._INCIDENT_NOW):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(oc.infra_error[0], "llm_usage_limit")   # still tagged and fail_closed
+        self.assertEqual(len(c.spawns), 1)                       # no relaunch
+        self.assertEqual(c.slept, [])                            # and no multi-hour sleep
+        probes = [f for e, f in events if e == "leaf_usage_limit_probe"]
+        self.assertEqual([p["outcome"] for p in probes], ["window_not_exhausted"])
+        self.assertIsNone(probes[0]["reset_epoch"])
+        declined = [f["reason"] for e, f in events if e == "leaf_usage_limit_wait_declined"]
+        self.assertEqual(declined, ["no_reset_time"])
+
+    def test_a_probe_window_the_abort_line_does_not_name_declines(self) -> None:
+        """Window agreement is required (operator decision): a reset taken from a window the dead
+        leaf never named could wake hours early into a window still shut. Here the abort names the
+        SESSION window while the probe reports only week rows — decline, fall back to the scrape."""
+        now = 1_752_200_000.0
+        c = self._conductor([], wait_usage_reset=True)
+        c.usage_probe_result = self._probe_ok(self._probe_rows(
+            ("week (all models)", "week", 100, int(now) + 1800)))
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            plan = c._usage_reset_wait_plan(
+                wc.ProcResult(1, "You've hit your session limit · resets 12:20pm (Asia/Tokyo)", ""),
+                0, node_key="component/x@0.1.0", step="compile", substep="verify",
+                dead_agent_run_id="child-1",
+                evidence="You've hit your session limit · resets 12:20pm (Asia/Tokyo)",
+                allow_envelope=False)
+        probes = [f for e, f in events if e == "leaf_usage_limit_probe"]
+        self.assertEqual([p["outcome"] for p in probes], ["window_unmatched"])
+        # the scrape still resolves it — the probe declining is not the wait declining
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.reset_source, "scrape_human")
+        self.assertEqual(plan.reset_epoch, int(now) + 4000)
+
+    def test_a_probe_resolved_weekly_reset_is_still_capped_at_six_hours(self) -> None:
+        """The 6h cap applies to BOTH sources unchanged — a weekly reset days out is not something
+        to sit on, however trustworthy its source. What the probe adds is that the decline now NAMES
+        the window it declined instead of the operator inferring it from the wait that did not
+        happen."""
+        now = 1_752_200_000.0
+        c = self._conductor([], wait_usage_reset=True)
+        c.usage_probe_result = self._probe_ok(self._probe_rows(
+            ("week (all models)", "week", 100, int(now) + 3 * 86400),
+            ("week (Fable)", "week", 99, int(now) + 3 * 86400)))
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            plan = c._usage_reset_wait_plan(
+                wc.ProcResult(1, "", "Claude AI weekly limit reached"), 0,
+                node_key="component/x@0.1.0", step="compile", substep="verify",
+                dead_agent_run_id="child-1", evidence="Claude AI weekly limit reached",
+                allow_envelope=False)
+        self.assertIsNone(plan)
+        declined = [f for e, f in events if e == "leaf_usage_limit_wait_declined"]
+        self.assertEqual([f["reason"] for f in declined], ["over_6h_cap"])
+        self.assertEqual(declined[0]["window"], "week (all models)")
+        self.assertEqual(declined[0]["reset_source"], "probe")
+
+    def test_no_probe_runs_when_the_flag_is_off_or_the_budget_is_spent(self) -> None:
+        """The probe is a subprocess with a 60s timeout; spending it on a decision already made
+        would be pure latency. Flag OFF short-circuits before anything at all (no probe, no event —
+        the opted-out run must stay byte-identical), and a spent wait budget cannot wait whatever
+        `/usage` answers."""
+        def probe_plan(*, flag: bool, waits_done: int):
+            c = self._conductor([], wait_usage_reset=flag)
+
+            def explode():
+                raise AssertionError("the probe must not run here")
+
+            c._run_usage_probe = explode  # type: ignore[assignment]
+            events: list = []
+            c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+            plan = c._usage_reset_wait_plan(
+                wc.ProcResult(1, "", "usage limit reached|1752200300"), waits_done,
+                node_key="component/x@0.1.0", step="compile", substep="verify",
+                dead_agent_run_id="child-1", evidence="usage limit reached",
+                allow_envelope=False)
+            return plan, [e for e, _ in events]
+
+        plan, events = probe_plan(flag=False, waits_done=0)
+        self.assertIsNone(plan)
+        self.assertEqual(events, [])
+        plan, events = probe_plan(flag=True, waits_done=wc.MAX_USAGE_LIMIT_WAITS)
+        self.assertIsNone(plan)
+        self.assertEqual(events, ["leaf_usage_limit_wait_declined"])
+
+    def test_the_enveloped_abort_is_the_window_source_not_the_raw_envelope(self) -> None:
+        """For a PURE leaf the classifier's evidence is the raw JSON envelope clipped at 160 chars,
+        which can truncate before `result` and whose keys include `session_id`. The window match
+        therefore runs on the same UNWRAPPED, shape-checked message the decline quotes — one notion
+        of "the line this was decided from", so the operator-facing evidence and the text the code
+        matched on cannot diverge."""
+        now = 1_752_200_000.0
+        env = json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                          "api_error_status": 429, "duration_ms": 646, "num_turns": 1,
+                          "session_id": "c10ba1a6-b119-421d-8206-56b04e512edd",
+                          "result": "You've hit your session limit · resets 12:30pm (Asia/Tokyo)",
+                          "terminal_reason": "api_error"})
+        self.assertNotIn("session limit", env[:160])       # the classifier's line names no window
+        c = self._conductor([], wait_usage_reset=True)
+        c.usage_probe_result = self._probe_ok(self._probe_rows(
+            ("session", "session", 100, int(now) + 1800)))
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            plan = c._usage_reset_wait_plan(
+                wc.ProcResult(1, env, ""), 0, node_key="component/x@0.1.0", step="generate",
+                substep="generate", dead_agent_run_id="child-1", evidence=env[:160],
+                allow_envelope=True)
+        probes = [f for e, f in events if e == "leaf_usage_limit_probe"]
+        self.assertEqual([p["outcome"] for p in probes], ["resolved"])
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.reset_source, "probe")
+        self.assertEqual(plan.reset_epoch, int(now) + 1800)
 
     def test_client_error_is_never_retried(self) -> None:
         """The WI-A interlock: if the configured leaf model's output ceiling is below

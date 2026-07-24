@@ -212,6 +212,9 @@ class PureVerifySubstepTests(unittest.TestCase):
         self.assertTrue((c.repo_root / refs.source_dir() / "source_meta.json").exists())
         reasons = [cap["--reason"] for s, cap in c.calls if s == "add-superseded-runs"]
         self.assertTrue(any("leaf_usage_limit_wait_orphan" in r for r in reasons))
+        # the wait consulted the host `/usage` probe first and fell back to the scrape;
+        # the stub is what keeps the suite from spawning the real backend
+        self.assertEqual(c.usage_probe_calls, 1)
 
     def test_wait_usage_reset_recovers_the_real_cli_stdout_abort(self) -> None:
         """REGRESSION, production shapes: the CLI reports a usage limit on STDOUT with a 0-byte
@@ -296,6 +299,9 @@ class PureVerifySubstepTests(unittest.TestCase):
         self.assertEqual(c.slept, [reset - now + wc.USAGE_LIMIT_WAIT_MARGIN_SECONDS])
         sup = [cap for sub, cap in c.calls if sub == "add-superseded-runs"]
         self.assertTrue(any("leaf_usage_limit_wait_orphan" in cap["--reason"] for cap in sup))
+        # the wait consulted the host `/usage` probe first and fell back to the scrape;
+        # the stub is what keeps the suite from spawning the real backend
+        self.assertEqual(c.usage_probe_calls, 1)
 
     def test_unencodable_valid_verdict_is_schema_violation_not_transport(self) -> None:
         # Codex review (defect 1): a schema-SOUND verdict whose last_fail_reason holds a lone
