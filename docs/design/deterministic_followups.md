@@ -528,17 +528,32 @@ re-run confirming Build passes on attempt 1 (operator-gated).
     whole run, and the manual `--resume` re-ran `compile.generate` from scratch (a re-paid 491s cold
     producer), because `--resume` only sees the phase-granular checkpoint. The response is the
     **opt-in `--wait-usage-reset` flag** (default OFF keeps this manual behavior). When set AND the
-    dead leaf's terminal usage-limit line on STDERR carries a **resolvable reset instant** — a
+    dead leaf's terminal usage-limit line carries a **resolvable reset instant** — a
     machine `|<unix-epoch>` OR a TZ-anchored human reset (`resets 10:20pm (Asia/Tokyo)`) resolved to
     the nearest occurrence within a 15-min grace — the conductor waits it out in place (to the reset
     + a 120s margin) and re-launches the SAME substep, a same-run substep-granular resume. **The real
-    CLI emits the human form, not a machine epoch, so the human path is what actually arms the wait;
-    the 2026-07 advdiff closure that motivated this flag (a session limit with `resets 10:20pm
-    (Asia/Tokyo)`) originally declined precisely because only the assumed machine epoch was parsed —
-    that was the first real usage limit the flag ever met.** A human reset without a parenthesized
+    CLI emits the human form on STDOUT with an EMPTY stderr, so both the wording and the stream had
+    to be corrected before the flag could ever fire; the 2026-07 advdiff closure that motivated it
+    declined twice for these two reasons in turn (first the assumed machine epoch, then the assumed
+    stderr channel) — each time the evidence for the *next* miss was already sitting in the same
+    log.** Hence the terminal line is resolved **stderr-first with a narrow stdout carve-out**: stdout
+    arms the wait only in the CLI's **abort shape** — a *single* non-blank line, within
+    `_CLI_USAGE_ABORT_LINE_MAX_CHARS`, *opening* with the limit (`_CLI_USAGE_ABORT_LINE_RE`, anchored
+    and narrower than the classifier's bare phrase match), not a recovered retry banner, and a line
+    the classifier's own usage pattern matches too (the carve-out may only narrow that tag) — applied
+    either to stdout directly (every agentic launch: there is no envelope mode, so the abort IS the
+    stdout) or, for a `--output-format json` launch whose envelope the CLI completed, to the message
+    it carried in `result` (`_cli_abort_envelope_result`,
+    gated on the CLI's own `is_error` / error-status keys). That second shape is the one that struck
+    the only recorded PURE-leaf usage limit, so admitting the bare line alone left the flag inert for
+    both pure loops — the original bug one layer in. Every
+    clause is load-bearing: the tempting "every non-blank line matches the usage-limit pattern"
+    formulation is **vacuous for a pure leaf**, whose entire stdout is ONE line (a JSON envelope with
+    newlines escaped, up to 47 kB across the recorded workspaces), and for an agentic leaf's one-paragraph result text —
+    model-authored text mentioning a limit would have armed a multi-hour wait. A human reset without a parenthesized
     IANA timezone (`resets 6:10pm`) or without a time-of-day (`resets Monday`) is NOT resolved (the
-    instant is never guessed from the host's local timezone), and a usage limit on the leaf's
-    untrusted stdout does not arm the wait — every such decline emits `leaf_usage_limit_wait_declined`
+    instant is never guessed from the host's local timezone), and a leaf's own stdout output that
+    merely mentions a limit does not arm the wait — every such decline emits `leaf_usage_limit_wait_declined`
     (reason `no_reset_time` / `over_6h_cap` / `budget_spent`) so the next incident is greppable.
     Bounded hard: one wait per substep (a budget distinct from the transient-retry budget), at most
     6h (a longer reset is a weekly limit or a misparse → fail_closed). It is NOT recovered automatically on
