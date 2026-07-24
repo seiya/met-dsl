@@ -3240,7 +3240,10 @@ re-certify the drop silently. Tightening that would mean a deterministic Compile
 `diagnostics_contract.metrics` ⊇ the addresses parsed out of `tests.md` §5, which requires a §5 address grammar every
 node's `tests.md` obeys; it is out of scope here and is filed as the follow-up below. The counter-measures inside this
 change are authoring ones: §6 states the `pass_when.all` conditions verbatim (`ref` / `op` / `value` / `per_case` /
-`na_allowed`) so the transcription is mechanical, and §5 names the IR carrier explicitly. The fold requirement itself
+`na_allowed`) so the transcription is mechanical, and §5 names the IR carrier explicitly. One further writer defect is
+outside the predicates' reach and likewise rests on the §5 fold statement: a writer that emits a `_reason_na` sibling
+for EVERY record rather than only the `is_na` ones satisfies all five conditions (nothing pins the emitted key set ⊆
+the declared addresses). The fold requirement itself
 (`controlled_spec.md` §2 / §6) is likewise not deterministic: its enforcer is `Generate.verify` G1/G5 (the fixed-JSON /
 `case_id`-branching output rule), which is the one downstream substep that reads `controlled_spec.md`. A writer that
 branches on `case_id` and emits this suite's three expected keys satisfies all five predicate conditions — the

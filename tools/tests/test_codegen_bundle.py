@@ -1944,9 +1944,14 @@ class ContractPlumbingTest(unittest.TestCase):
         harnesses = {f"{kind}/{spec_id}@{version}"
                      for kind, spec_id, version, family in entries
                      if kind == "infrastructure" and family == "harness"}
-        self.assertIn("infrastructure/harness_fortran_cpu@0.7.0", harnesses,
-                      "the harness catalog entry no longer parses — fix this test's parser, "
-                      "not the assertion")
+        # Non-vacuity canary, deliberately VERSION-FREE: it proves the parse found the harness
+        # entry (so the checks below are not an empty loop) without pinning a version this test
+        # would then false-fail on at the next bump — the failure it must report is a stale
+        # MANIFEST, never a stale assertion.
+        self.assertEqual({node_key.rsplit("@", 1)[0] for node_key in harnesses},
+                         {"infrastructure/harness_fortran_cpu"},
+                         "the harness catalog entry no longer parses (or a harness was "
+                         "added/removed) — fix this test's parser, not the manifest")
         # (1) No stale key: every declared manifest names a node_key the catalog carries.
         for node_key in cb.HARNESS_CAPABILITY_MANIFESTS:
             with self.subTest(node_key=node_key):
