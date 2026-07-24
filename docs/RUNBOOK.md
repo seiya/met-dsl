@@ -167,6 +167,8 @@ Behavior:
 
 When you edit a `spec` that other nodes depend on — a shared component, or the `harness_fortran_cpu` infrastructure node — bump its `spec_version` in all three places that carry it (`controlled_spec.md` §0, `tests.md` §0 `spec_ref.spec_version`, and `spec/registry/spec_catalog.yaml`), bump `tests.md`'s own `test_profile_version` if the test profile changed, and — if the change is breaking — tighten the dependents' `version_constraint` in their `deps.yaml`. **Do not bump the dependents' own `spec_version`**: their content did not change.
 
+Bumping the `harness_fortran_cpu` infrastructure node carries one more REQUIRED pin: the `node_key` key of `HARNESS_CAPABILITY_MANIFESTS` in `tools/codegen_bundle.py`. An undeclared harness node_key provides nothing (`harness_provided_capabilities` returns `None`), and every physics node's `capability_requirements` is non-empty, so a stale key fails **every** dependent's `Generate` with `bundle_capability_unsatisfied` — in a billed run. `tools/tests/test_codegen_bundle.py` pins the key against `spec_catalog.yaml`, so the unit suite catches the omission before the run. Update the documentary copies in the same commit: `spec/schema/generate/harness_capabilities.schema.json` (description + `examples`) and `docs/workflow/CODEGEN_BUNDLE_CONTRACT.md`.
+
 Re-certifying the dependents is then a single command. Each certified node records the dependency closure it was built against in its `dependency_graph.json` sidecar; readiness re-derives that closure from the current `deps.yaml` + `spec_catalog.yaml` and compares, so every node certified against the old version is automatically **stale** (= not ready) and gets re-run:
 
 ```bash

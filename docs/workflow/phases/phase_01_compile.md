@@ -156,7 +156,7 @@ io_contract:
   #                        residual) as a per-case metric of the case where it first becomes computable
   #                        (CHECKS_MODULE_CONTRACT.md §2/§3), and the predicate compares it there.
   # diagnostics_contract.metrics (OPTIONAL): per-case metric addresses the predicates reference; the
-  # intermediate per-case addressing pin for problem specs (until R1 fixes the harness output shape). e.g.
+  # intermediate per-case addressing pin for any spec kind (until R1 fixes the harness output shape). e.g.
   #   metrics: ["cfl.max", "metrics.mass_drift_rel", "errors.analytic_h.l2_rel_tend", "convergence.n32_to_n64.analytic_h_order"]
 
 dependency:

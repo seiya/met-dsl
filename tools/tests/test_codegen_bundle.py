@@ -1925,6 +1925,50 @@ class ContractPlumbingTest(unittest.TestCase):
             with self.subTest(node=f"{kind}/{spec_id}@{version}"):
                 self.assertRegex(f"{kind}/{spec_id}@{version}", re.compile(cb.NODE_KEY_PATTERN))
 
+    def test_harness_manifest_keys_track_the_catalogued_harness_versions(self) -> None:
+        # `HARNESS_CAPABILITY_MANIFESTS` is keyed by node_key, so a harness `spec_version`
+        # bump that moves `spec_catalog.yaml` without moving the manifest key leaves the new
+        # node_key undeclared. `harness_provided_capabilities` then returns None ("provides
+        # nothing") and every dependent's non-empty `capability_requirements` fails
+        # `bundle_capability_unsatisfied` — fleet-wide, in a BILLED run, with a green unit
+        # suite. Pin both directions against the catalog so the omission fails here instead.
+        catalog = (Path(__file__).resolve().parents[2] / "spec" / "registry"
+                   / "spec_catalog.yaml").read_text(encoding="utf-8")
+        entries = re.findall(
+            r"- spec_kind:\s*(\S+)\s*\n\s*spec_id:\s*(\S+)\s*\n\s*spec_version:\s*(\S+)"
+            r"(?:\s*\n\s*\S+:.*)*?\s*\n\s*family:\s*(\S+)",
+            catalog)
+        self.assertTrue(entries, "spec_catalog.yaml parse produced no entries")
+        catalogued = {f"{kind}/{spec_id}@{version}"
+                      for kind, spec_id, version, _family in entries}
+        harnesses = {f"{kind}/{spec_id}@{version}"
+                     for kind, spec_id, version, family in entries
+                     if kind == "infrastructure" and family == "harness"}
+        self.assertIn("infrastructure/harness_fortran_cpu@0.7.0", harnesses,
+                      "the harness catalog entry no longer parses — fix this test's parser, "
+                      "not the assertion")
+        # (1) No stale key: every declared manifest names a node_key the catalog carries.
+        for node_key in cb.HARNESS_CAPABILITY_MANIFESTS:
+            with self.subTest(node_key=node_key):
+                self.assertIn(node_key, catalogued,
+                              "HARNESS_CAPABILITY_MANIFESTS declares a node_key absent from "
+                              "spec_catalog.yaml (stale after a version bump?)")
+        # (2) No missing key: every catalogued `family: harness` node declares a manifest.
+        for node_key in harnesses:
+            with self.subTest(node_key=node_key):
+                self.assertIsNotNone(
+                    cb.harness_provided_capabilities(node_key),
+                    "a catalogued harness provides no capabilities — add its node_key to "
+                    "HARNESS_CAPABILITY_MANIFESTS (see docs/RUNBOOK.md, updating a shared "
+                    "dependency spec)")
+        # (3) The schema's documentary example names a declared manifest, so the shipped
+        # example cannot drift into illustrating an undeclared harness.
+        example_keys = {m["node_key"]
+                        for example in self.capability_schema.get("examples", [])
+                        for m in example.get("manifests", [])}
+        self.assertTrue(example_keys)
+        self.assertLessEqual(example_keys, set(cb.HARNESS_CAPABILITY_MANIFESTS))
+
     def test_negotiation_survives_hostile_input(self) -> None:
         # A caller may negotiate before validating, so untrusted shapes must yield a result —
         # and every reported element is a string, so a caller may join them.

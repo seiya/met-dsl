@@ -14,7 +14,7 @@ This suite verifies the published runner-plumbing operations of `harness_fortran
 
 ## 2. Input-defaulting rules
 - Each normal case supplies a small fixed set of sentinel values to the emitter under test (including a negative, a subnormal-scale, and a large-magnitude real for the numeric case).
-- The metric case (`l0_metric_leaf_pass`) supplies exactly two fixed sentinel `h_metric` records and no other sentinel payload. It carries the same `grid` / `time` / `boundary` inputs as every other case, and — like every case — its own dispatch entry naming the plumbing aspect it verifies, here the diagnostics fold (`harness_fortran_cpu__write_diagnostics`). The two records, whose field values are the case's input data, are:
+- The metric case (`l0_metric_leaf_pass`) supplies exactly two fixed sentinel `h_metric` records and no other sentinel payload. It carries the same `grid` / `time` / `boundary` inputs as every other case, and — like every case — its own `inputs.profile_selection` entry naming the plumbing aspect it verifies, here the diagnostics fold (`harness_fortran_cpu__write_diagnostics`). The two records, whose field values are the case's input data, are:
   - `{ name = 'selftest.metric_leaf', value = 0.25, is_na = false, reason_na = '' }`
   - `{ name = 'selftest.metric_na', value = -1.0, is_na = true, reason_na = 'not_computed' }`
   There is no third record: `selftest.metric_na_reason_na` is a key the writer derives from the second record's `is_na` / `reason_na` (§5), never a supplied `h_metric`.

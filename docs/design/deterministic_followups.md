@@ -3234,7 +3234,7 @@ value in place of `null` fires as a physics fail. The `na_allowed` condition car
 `diagnostics_contract.metrics` at Compile and `_resolve_predicate_ref` fails the run structurally at execute. The other
 half is the `tests.md` §5/§6 → IR transcription, which is `Compile.verify`'s R2 fidelity item, NOT a deterministic
 gate: no gate requires a given test's predicate to carry a metric condition (`degenerate_predicate_violations` is
-deliberately set-level, and the five sibling `checks.*` pass tests already clear it), so an IR that reduced
+deliberately set-level, and the sibling `checks.*` pass tests already clear it), so an IR that reduced
 `l0_metric_leaf_pass` to its `checks.metric_leaf.status` condition alone would be schema-conformant and would
 re-certify the drop silently. Tightening that would mean a deterministic Compile-stage pin of
 `diagnostics_contract.metrics` ⊇ the addresses parsed out of `tests.md` §5, which requires a §5 address grammar every
@@ -3255,8 +3255,8 @@ vs the problem spec's `5-2` list), so a parser written against one shape would f
 
 **Scope.** §5.1, the published operations and types, the component layouts, and the generated ABI are unchanged; the
 runtime behavior (`verdict_evaluator` / `workflow_conductor` / `orchestration_runtime` / `runner_renderer`) is unchanged
-— it behaved as designed throughout, and the only code edit is a docstring correction in
-`verdict_evaluator.degenerate_predicate_violations`. The `0.7.0` ripple is otherwise the version pin set only: `spec_catalog.yaml`,
+— it behaved as designed throughout, and the only edit to those four modules is a docstring correction in
+`verdict_evaluator.degenerate_predicate_violations`. The `0.7.0` ripple is otherwise the version pin set: `spec_catalog.yaml`,
 `HARNESS_CAPABILITY_MANIFESTS`, `harness_capabilities.schema.json`, `CODEGEN_BUNDLE_CONTRACT.md`, and the unit-test
 node_key pins. Consumer `deps.yaml` constraints (`>=0.3.0 <1.0.0`) already admit `0.7.0`.
 
@@ -3264,8 +3264,17 @@ node_key pins. Consumer `deps.yaml` constraints (`>=0.3.0 <1.0.0`) already admit
 certified, so `run_workflow.py spec/problem/dynamics/advection_diffusion/advdiff1d_linear/ validate --with-deps`
 re-runs the closure from the harness. A regenerated harness that drops the metric fold stops at the harness node's own
 `l0_metric_leaf_pass` structural violation (given the transcription above); a harness that passes must carry non-empty
-`per_case.*.metrics` through to the problem node's numeric predicates. Two artifacts of the fresh harness run are worth
-reading even on a pass, because they are what the transcription half rests on: the certified IR's
-`io_contract.diagnostics_contract.metrics` (must hold the three `selftest.*` addresses) and its
-`test_predicates[l0_metric_leaf_pass].pass_when.all` (must hold the five conditions of §6). The detection gap is not
-declared closed before that closure passes end to end. _orch id + result pending._
+`per_case.*.metrics` through to the problem node's numeric predicates. The `shallow_water2d` closure depends on the same
+harness and is re-certified the same way; a `shallow_water2d` run without `--with-deps` fails closed at
+`workflow-launch-check` with `dependency_not_ready` naming the drifted harness.
+
+Acceptance is BOTH of the following, because a green closure alone does not prove the transcription half:
+1. every node of the `advdiff1d_linear` and `shallow_water2d` closures passes; and
+2. the freshly certified harness IR carries the detector — `io_contract.diagnostics_contract.metrics` ⊇ the three
+   `selftest.*` addresses, and `test_predicates[l0_metric_leaf_pass].pass_when.all` == the five conditions of `tests.md`
+   §6. A closure that passes with a reduced predicate re-certifies the drop silently and leaves the gap open.
+
+Reading a failure: a `structural_violation` on `l0_metric_leaf_pass` at the HARNESS node is the detector firing on a
+regenerated writer (a `Generate` repair), whereas an IR whose `step_10_write_diagnostics` description reads "empty
+metrics" — the shape the `0.6.0` IR carried — is a Compile transcription defect (a `Compile` reopen), not a writer
+defect. The detection gap is not declared closed before both acceptance conditions hold. _orch id + result pending._
