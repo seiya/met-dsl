@@ -1059,7 +1059,67 @@ def _resolve_existing_ref_path(repo_root: Path, ref: str, *, field_name: str) ->
     return resolved
 
 
+def _validated_pycache_redirect_root(repo_root: Path) -> Path:
+    """The host bytecode-cache redirect root (`<repo>/workspace/.pycache`), proven safe to trust.
+
+    The host both WRITES bytecode here and, on later runs, LOADS it — so a cache root that is a
+    symlink (or sits under one) is a code-execution vector: `.resolve()` follows it and the
+    trusted, UNSANDBOXED host would import bytecode from an attacker-chosen location, either
+    outside the repo (invisible to the terminal FS-diff) or inside a leaf-writable subtree (cache
+    poisoning). The workspace validator does not catch this — `_scan_workspace_layout` tests
+    `child.is_dir()`, which follows symlinks.
+
+    Requiring resolution to be an IDENTITY rejects a symlink at any component and simultaneously
+    proves the target stays inside repo_root (which the caller has already resolved). Raises
+    ValueError so the caller can fail the run closed rather than silently trust the target.
+    """
+    root = repo_root / "workspace" / ".pycache"
+    resolved = root.resolve()
+    if resolved != root:
+        raise ValueError(
+            f"{root} must not be a symlink nor sit under one (it resolves to {resolved}); the "
+            f"host writes AND loads bytecode there, so a redirected cache root is a "
+            f"code-execution vector. Remove/replace it with a real directory and re-run."
+        )
+    if root.exists():
+        if not root.is_dir():
+            raise ValueError(f"{root} exists but is not a directory; remove it and re-run.")
+        # Descendant symlinks are exactly as dangerous as a symlinked root: CPython follows a
+        # symlinked directory in the mirrored source path when it writes AND when it LOADS a
+        # cached module, so a link planted below the root (e.g. `.pycache/<mirror>/tools ->` a
+        # leaf-writable pipeline dir) redirects trusted-host bytecode just the same — and because
+        # this whole subtree is exempt from the terminal write-diff, the payload leaves no trace
+        # there. Walk without following links (so a symlinked dir is reported, not descended).
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            for name in (*dirnames, *filenames):
+                entry = Path(dirpath) / name
+                if entry.is_symlink():
+                    raise ValueError(
+                        f"{entry} is a symlink inside the bytecode-cache redirect root {root}; "
+                        f"the host loads bytecode from this subtree, so any symlink in it is a "
+                        f"code-execution vector. Delete {root} and re-run."
+                    )
+    return resolved
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Entry point. Thin wrapper that scopes the process-global `sys.pycache_prefix` redirect
+    (installed by `_run_main` once repo_root is known) to THIS call.
+
+    `main()` is also called IN-PROCESS — repeatedly, and often against temporary repo roots, by
+    tools/tests/test_run_workflow.py, and potentially by an embedding caller. Leaking the redirect
+    past the run would leave the caller's interpreter writing bytecode into that run's cache dir,
+    which for a temporary root is deleted afterwards (later imports would silently recreate it).
+    Restore the prior value unconditionally so the redirect lasts exactly as long as the run.
+    """
+    saved_pycache_prefix = sys.pycache_prefix
+    try:
+        return _run_main(argv)
+    finally:
+        sys.pycache_prefix = saved_pycache_prefix
+
+
+def _run_main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     # Raw command line as invoked, for the reproduction record persisted to
     # orchestration_meta.json#invocation. Captured before any normalization so it
@@ -1082,6 +1142,43 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     repo_root = Path(args.repo_root).resolve()
+
+    # Redirect THIS host interpreter's bytecode cache out of the repo SOURCE tree, as early as
+    # repo_root allows, so every module imported from here on (notably the conductor's
+    # lazy build_runtime_server / tools.hooks.lint_evidence during compile.static / generate.gate)
+    # compiles into workspace/.pycache/ instead of mcp_servers/__pycache__/ etc. Those in-repo
+    # writes land in a child window's FS-diff and are misattributed as unauthorized_write_violation
+    # — the defect this prevents. base_env's PYTHONDONTWRITEBYTECODE (set below) cannot do this
+    # job: it governs SUBPROCESSES only, and sys.dont_write_bytecode is fixed at interpreter start.
+    #
+    # The prefix is a LITERAL on purpose: importing orchestration_runtime here to read its
+    # _HOST_PYCACHE_REDIRECT_PREFIX would itself compile that ~20k-line module and write
+    # tools/__pycache__/orchestration_runtime.*.pyc into the source tree BEFORE this redirect is
+    # active (it is not yet in sys.modules at this point — validate_pipeline_semantics
+    # deliberately does not import it, and _default_claude_agent_model runs much later). The
+    # literal is drift-guarded against that constant by
+    # test_orchestration_runtime.HostPycacheRedirectExemptionTest, the same test-pin technique
+    # validate_workspace_root's allowlist entry uses to avoid the identical heavy import.
+    # This attribute is process-global; `main()` (the wrapper above) saves and restores it so an
+    # in-process caller does not inherit this run's redirect.
+    #
+    # Integrity-gated before use (see _validated_pycache_redirect_root): a symlinked cache root
+    # would let the trusted host load bytecode from an attacker-chosen location.
+    try:
+        _pycache_resolved = _validated_pycache_redirect_root(repo_root)
+    except ValueError as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "fail",
+                    "reason": "invalid_pycache_redirect_root",
+                    "detail": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+    sys.pycache_prefix = str(_pycache_resolved)
 
     resume_mode = bool(args.resume)
 
@@ -1387,6 +1484,9 @@ def main(argv: list[str] | None = None) -> int:
     # (b) the orchestration agent launch subprocess, and (c) any grandchild
     # `python3 tools/...` invocations the agent makes.
     base_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    # NOTE: this only covers SUBPROCESSES. The IN-PROCESS conductor host's own bytecode is kept
+    # out of the repo source tree by the `sys.pycache_prefix` redirect installed near the top of
+    # main() (see the comment there for why it must run that early and why it uses a literal).
 
     # Closure-aware resume: the resumed orchestration is a node of a `--with-deps`
     # closure, so re-derive the closure and drive it to the TARGET (spec_ref is the
