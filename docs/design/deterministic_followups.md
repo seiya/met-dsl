@@ -3215,13 +3215,38 @@ the node that produces it and surfaced one closure level up, at billed cost.
 representable in binary floating point; `selftest.metric_na` with `is_na = true`, `reason_na = 'not_computed'`, and the
 out-of-band `value = -1.0` a correct writer never serializes), and `tests.md` §5 pins the three emitted addresses
 (`selftest.metric_leaf`, `selftest.metric_na`, `selftest.metric_na_reason_na`) into `diagnostics_contract.metrics`,
-§6 stating the `pass_when.all` conditions verbatim. The existing machinery is the detector: `_check_ref` pins each
+§6 stating the `pass_when.all` conditions verbatim. `controlled_spec.md` §2 / §6 additionally state the `metrics` body
+as a fold over the supplied records and forbid a literal or `case_id`-selected body — the 0.6.0 IR's
+`step_10_write_diagnostics` description had transcribed the old "the self-test supplies no metrics" sentence as "emits
+… empty metrics {}", so a self-test that only pins THIS suite's expected keys would remain satisfiable by a
+case-hardcoded writer. The existing machinery is the detector: `_check_ref` pins each
 predicate metric ref verbatim against the declared addresses at Compile, and at execute `_resolve_predicate_ref` reads
 the ref as a whole-string key of the case's `metrics` map — an empty map resolves `ref_absent` ⇒ `structural_violation`
 ⇒ the harness node's own `Validate.execute` fails closed. The `N/A` sibling is asserted by value (`eq not_computed`), so
 a writer that drops the `N/A` leaf fires structurally, and the `na_allowed` condition on `selftest.metric_na`
 (`ge 0.0`) is satisfied by the honest `null` but never by the supplied `-1.0`, so a writer that serializes the numeric
-value in place of `null` fires as a physics fail.
+value in place of `null` fires as a physics fail. The `na_allowed` condition carries no structural detection of its own
+(an absent ref satisfies it); the drop is detected by the `selftest.metric_leaf` band and the
+`selftest.metric_na_reason_na` equality.
+
+**What the detection rests on.** The deterministic half is unconditional: given an IR whose
+`test_predicates` carry the metric-address conditions, `_check_ref` pins each ref verbatim against
+`diagnostics_contract.metrics` at Compile and `_resolve_predicate_ref` fails the run structurally at execute. The other
+half is the `tests.md` §5/§6 → IR transcription, which is `Compile.verify`'s R2 fidelity item, NOT a deterministic
+gate: no gate requires a given test's predicate to carry a metric condition (`degenerate_predicate_violations` is
+deliberately set-level, and the five sibling `checks.*` pass tests already clear it), so an IR that reduced
+`l0_metric_leaf_pass` to its `checks.metric_leaf.status` condition alone would be schema-conformant and would
+re-certify the drop silently. Tightening that would mean a deterministic Compile-stage pin of
+`diagnostics_contract.metrics` ⊇ the addresses parsed out of `tests.md` §5, which requires a §5 address grammar every
+node's `tests.md` obeys; it is out of scope here and is filed as the follow-up below. The counter-measures inside this
+change are authoring ones: §6 states the `pass_when.all` conditions verbatim (`ref` / `op` / `value` / `per_case` /
+`na_allowed`) so the transcription is mechanical, and §5 names the IR carrier explicitly.
+
+**Filed follow-up (not implemented).** A `tests.md` §5 metric-address grammar plus a Compile-stage pin
+(`diagnostics_contract.metrics` ⊇ the declared addresses, the mate of the existing `test_id` set-equality pin
+`_parse_test_ids_from_tests_md`). It would convert the transcription half from `Compile.verify` fidelity to a
+deterministic gate. Blocked on the grammar: today's `tests.md` §5 sections differ per node (the harness's bullet form
+vs the problem spec's `5-2` list), so a parser written against one shape would false-reject the others.
 
 **Scope.** §5.1, the published operations and types, the component layouts, and the generated ABI are unchanged; the
 runtime (`verdict_evaluator` / `workflow_conductor` / `orchestration_runtime` / `runner_renderer`) is unchanged — it
@@ -3231,7 +3256,10 @@ node_key pins. Consumer `deps.yaml` constraints (`>=0.3.0 <1.0.0`) already admit
 
 **Acceptance vehicle.** The pending billed re-auth closure IS the acceptance: `harness_fortran_cpu@0.7.0` is not
 certified, so `run_workflow.py spec/problem/dynamics/advection_diffusion/advdiff1d_linear/ validate --with-deps`
-re-runs the closure from the harness. A regenerated harness that drops the metric fold must stop at the harness node's
-own `l0_metric_leaf_pass` structural violation; a harness that passes must carry non-empty `per_case.*.metrics` through
-to the problem node's numeric predicates. The detection gap is not declared closed before that closure passes end to
-end. _orch id + result pending._
+re-runs the closure from the harness. A regenerated harness that drops the metric fold stops at the harness node's own
+`l0_metric_leaf_pass` structural violation (given the transcription above); a harness that passes must carry non-empty
+`per_case.*.metrics` through to the problem node's numeric predicates. Two artifacts of the fresh harness run are worth
+reading even on a pass, because they are what the transcription half rests on: the certified IR's
+`io_contract.diagnostics_contract.metrics` (must hold the three `selftest.*` addresses) and its
+`test_predicates[l0_metric_leaf_pass].pass_when.all` (must hold the five conditions of §6). The detection gap is not
+declared closed before that closure passes end to end. _orch id + result pending._
