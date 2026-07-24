@@ -2875,6 +2875,27 @@ class LeafTransientRetryTest(unittest.TestCase):
         self.assertEqual(oc.infra_error[0], "llm_usage_limit")  # still classified (fail_closed)
         self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
 
+    def test_human_reset_on_stdout_only_does_not_arm_the_wait(self) -> None:
+        """SECURITY: the TZ-anchored human reset is now the PRIMARY arming path, so it too must be
+        read from stderr ONLY. A reset that appears only on the leaf's untrusted stdout (a crash
+        whose prose contains `resets 3pm (Asia/Tokyo)`) must NOT arm the multi-hour wait — it still
+        fail_closes and emits `leaf_usage_limit_wait_declined(no_reset_time)`. This pins the stderr-
+        only property against a refactor that pipes `proc.stdout` into `_parse_usage_reset_human`."""
+        now = 1_752_200_000.0
+        c = self._conductor(
+            [wc.ProcResult(1, "You've hit your session limit · resets 3pm (Asia/Tokyo)", "")],
+            wait_usage_reset=True)
+        events: list = []
+        c.emit = lambda event, **f: events.append((event, f))  # type: ignore[assignment]
+        with mock.patch.object(wc.time, "time", return_value=now):
+            oc = c.run_substep(self._refs(), "compile", "verify")
+        self.assertEqual(len(c.spawns), 1)                 # no relaunch
+        self.assertEqual(c.slept, [])                      # no wait
+        self.assertEqual(oc.infra_error[0], "llm_usage_limit")  # still classified (fail_closed)
+        self.assertNotIn("add-superseded-runs", [s for s, _ in c.calls])
+        declined = [f["reason"] for e, f in events if e == "leaf_usage_limit_wait_declined"]
+        self.assertEqual(declined, ["no_reset_time"])
+
     def test_usage_reset_wait_declines_a_human_reset_without_a_timezone(self) -> None:
         """Opted in but the human reset has NO parenthesized IANA timezone ("resets 6:10pm"): the
         instant is never guessed from the conductor host's local timezone, so the wait declines
@@ -2986,6 +3007,25 @@ class LeafTransientRetryTest(unittest.TestCase):
         r, d = plan("You've hit your session limit · resets 12:20pm (Asia/Tokyo)")  # resolvable
         self.assertIsNotNone(r)
         self.assertEqual(d, [])
+
+    def test_machine_epoch_wins_over_human_on_the_same_line(self) -> None:
+        """Precedence: when the terminal line carries BOTH a trailing machine `|<epoch>` AND a
+        TZ-anchored human reset, the machine epoch is used (tried first). Both forms here resolve to
+        DIFFERENT instants, so the plan picking the machine one is meaningful, not vacuous."""
+        now = 1_752_200_000.0  # 11:13 JST; the human 3pm is ~3h47m out, the machine epoch is 10min
+        line = f"session limit reached resets 3pm (Asia/Tokyo)|{int(now) + 600}"
+        self.assertEqual(wc._parse_usage_reset_epoch(line), int(now) + 600)
+        human = wc._parse_usage_reset_human(line, now)
+        self.assertIsNotNone(human)
+        self.assertNotEqual(human, int(now) + 600)
+        c = self._conductor([wc.ProcResult(1, "", line)], wait_usage_reset=True)
+        with mock.patch.object(wc.time, "time", return_value=now):
+            plan = c._usage_reset_wait_plan(
+                wc.ProcResult(1, "", line), 0,
+                node_key="component/x@0.1.0", step="compile", substep="verify")
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan[1], int(now) + 600)   # reset_epoch is the MACHINE value
+        self.assertEqual(plan[0], 600.0 + 120.0)    # wait = machine 600s + margin, not the ~3h47m
 
     def test_client_error_is_never_retried(self) -> None:
         """The WI-A interlock: if the configured leaf model's output ceiling is below
